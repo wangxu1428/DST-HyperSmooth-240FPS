@@ -1,10 +1,10 @@
 local GLOBAL = GLOBAL
 local TheSim = GLOBAL.TheSim
 local TheInput = GLOBAL.TheInput
-local TheFrontEnd = GLOBAL.TheFrontEnd
 local KnownModIndex = GLOBAL.KnownModIndex
 local Text = GLOBAL.require("widgets/text")
 local pcall = GLOBAL.pcall
+local rawget = GLOBAL.rawget
 local getmetatable = GLOBAL.getmetatable
 local type = GLOBAL.type
 local pairs = GLOBAL.pairs
@@ -43,10 +43,23 @@ local FPS_PRESETS = { 60, 120, 144, 240, 0 }
 local current_target_fps = TARGET_FPS
 local current_skeletal_tween = SKELETAL_TWEEN and true or false
 
+local function HasNativePlugin()
+    return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
+end
+
 local function SyncToNativePlugin()
+    -- Primary path (v2.2.1+): 0ms direct C++ <-> Lua VM memory bridge (immune to
+    -- Documents/OneDrive/WeGame/Steam Cloud path mismatches!)
+    local fnFps = rawget(GLOBAL, "HyperSmooth_SetFps")
+    if type(fnFps) == "function" then
+        pcall(fnFps, current_target_fps)
+    end
+    local fnSkel = rawget(GLOBAL, "HyperSmooth_SetSkeletal")
+    if type(fnSkel) == "function" then
+        pcall(fnSkel, current_skeletal_tween)
+    end
+    -- Fallback persistence path for v2.2.0 DLLs and cross-restart config sync
     if TheSim and TheSim.SetPersistentString then
-        -- Writes to Documents/Klei/DoNotStarveTogether/<id>/client_save/dst_smooth_highfps_cfg
-        -- Picked up automatically by bin64/dinput8.dll within ~250ms (no restart needed).
         local payload = string.format("fps=%d;skeletal=%d", current_target_fps, current_skeletal_tween and 1 or 0)
         TheSim:SetPersistentString(CFG_FILENAME, payload, false)
     end
@@ -58,17 +71,26 @@ SyncToNativePlugin()
 --------------------------------------------------------------------------------
 -- 1. Fast Mod Scan: cache parsed modinfo for disabled mods so switching menus
 --    doesn't re-read & re-compile 70+ unused modinfo.lua files from disk.
---    All mods remain visible and toggleable; enabled mods always reload fresh.
+--    v2.2.1: preserves savedata.known_mods[modname].modinfo write-back and
+--    bypasses cache on ServerCreationScreen / game_modes mods (100% DSA safe).
 --------------------------------------------------------------------------------
 if FAST_MOD_SCAN and KnownModIndex and KnownModIndex.LoadModInfo then
     local old_LoadModInfo = KnownModIndex.LoadModInfo
     KnownModIndex.LoadModInfo = function(self, modname, prev_info)
-        if prev_info ~= nil and modname ~= nil then
-            local enabled = (self.IsModEnabledAny and self:IsModEnabledAny(modname))
-                or (self.IsModTempEnabled and self:IsModTempEnabled(modname))
-                or (self.IsModForceEnabled and self:IsModForceEnabled(modname))
-            if not enabled then
-                return prev_info
+        if prev_info ~= nil and modname ~= nil and prev_info.version ~= nil and prev_info.game_modes == nil then
+            local fe = GLOBAL.TheFrontEnd
+            local scr = fe and fe:GetActiveScreen()
+            local in_server_creation = scr ~= nil and scr.name == "ServerCreationScreen"
+            if not in_server_creation and modname ~= "workshop-2657513551" then
+                local enabled = (self.IsModEnabledAny and self:IsModEnabledAny(modname))
+                    or (self.IsModTempEnabled and self:IsModTempEnabled(modname))
+                    or (self.IsModForceEnabled and self:IsModForceEnabled(modname))
+                if not enabled then
+                    if self.savedata and self.savedata.known_mods and self.savedata.known_mods[modname] then
+                        self.savedata.known_mods[modname].modinfo = prev_info
+                    end
+                    return prev_info
+                end
             end
         end
         return old_LoadModInfo(self, modname, prev_info)
@@ -114,9 +136,20 @@ if KEEP_SHARD_ASSETS and TheSim and getmetatable then
         local old_LoadPrefabs = idx.LoadPrefabs
         local old_UnloadPrefabs = idx.UnloadPrefabs
 
+        local function IsPureMultiplayerClient(s)
+            if not s or s.one_player_mode then
+                return false
+            end
+            local net = GLOBAL.TheNet
+            if net and net.GetIsServer and net:GetIsServer() then
+                return false
+            end
+            return true
+        end
+
         idx.LoadPrefabs = function(sim, prefabs, ...)
             local s = GLOBAL.Settings
-            if s and s.current_asset_set == "BACKEND" and type(prefabs) == "table" and #prefabs == 1 then
+            if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and type(prefabs) == "table" and #prefabs == 1 then
                 local w = prefabs[1]
                 if VANILLA_WORLDS[w] then
                     s._hakimi_kept_worlds = s._hakimi_kept_worlds or {}
@@ -135,7 +168,7 @@ if KEEP_SHARD_ASSETS and TheSim and getmetatable then
             if s and type(prefabs) == "table" and #prefabs == 1 then
                 local w = prefabs[1]
                 if VANILLA_WORLDS[w] then
-                    if s.current_asset_set == "BACKEND" and s.last_asset_set == "BACKEND" then
+                    if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and s.last_asset_set == "BACKEND" then
                         -- Shard migration (Forest <-> Caves): keep previous layer hot in RAM!
                         s._hakimi_kept_worlds = s._hakimi_kept_worlds or {}
                         s._hakimi_kept_worlds[w] = true
@@ -306,10 +339,9 @@ end
 --------------------------------------------------------------------------------
 -- 7. 240Hz Zero-Churn CPU & GC Optimizations:
 --    a) DistanceFade: inline scalar dot product (eliminates 240 Vector3 allocs/sec per tree/canopy).
---    b) HoverText: dirty-check SetString & SetColour on hover widgets (skips 99% redundant
---       table allocations & C++ TextWidget rebuilds; 100% compatible with ShowMe / Insight).
---    c) Input:OnUpdate: lossless stationary hit-test cache (0ms latency on mouse/camera move
+--    b) Input:OnUpdate: lossless stationary hit-test cache (0ms latency on mouse/camera move
 --       or UI screens; skips ~75% redundant 240Hz C++ GetEntitiesAtScreenPoint scans).
+--    (v2.2.1: removed HoverText SetString wrapper for 100% ShowMe / Insight RPC compatibility.)
 --------------------------------------------------------------------------------
 if REDUCE_240HZ_CHURN then
     AddComponentPostInit("distancefade", function(self)
@@ -336,46 +368,6 @@ if REDUCE_240HZ_CHURN then
         end
     end)
 
-    local function WrapZeroChurnText(txt)
-        if not txt then
-            return
-        end
-        local old_SetString = txt.SetString
-        if old_SetString then
-            local last_s = nil
-            txt.SetString = function(w, str)
-                local s = str or ""
-                if s == last_s and w.string == str then
-                    return
-                end
-                last_s = s
-                return old_SetString(w, str)
-            end
-        end
-        local old_SetColour = txt.SetColour
-        if old_SetColour then
-            local lr, lg, lb, la = nil, nil, nil, nil
-            txt.SetColour = function(w, r, g, b, a)
-                local cr, cg, cb, ca
-                if type(r) == "table" then
-                    cr, cg, cb, ca = r[1], r[2], r[3], r[4]
-                else
-                    cr, cg, cb, ca = r, g, b, a
-                end
-                if w.colour ~= nil and cr == lr and cg == lg and cb == lb and ca == la then
-                    return
-                end
-                lr, lg, lb, la = cr, cg, cb, ca
-                return old_SetColour(w, r, g, b, a)
-            end
-        end
-    end
-
-    AddClassPostConstruct("widgets/hoverer", function(self)
-        WrapZeroChurnText(self.text)
-        WrapZeroChurnText(self.secondarytext)
-    end)
-
     if TheInput and TheInput.OnUpdate then
         local old_InputOnUpdate = TheInput.OnUpdate
         local last_mx, last_my = nil, nil
@@ -390,7 +382,8 @@ if REDUCE_240HZ_CHURN then
             if not inp.mouse_enabled then
                 return old_InputOnUpdate(inp)
             end
-            local screen = TheFrontEnd and TheFrontEnd:GetActiveScreen()
+            local fe = GLOBAL.TheFrontEnd
+            local screen = fe and fe:GetActiveScreen()
             local world = GLOBAL.TheWorld
             local cam = GLOBAL.TheCamera
             if world and cam and cam.currentpos and screen and screen.name == "HUD" and GetTick and GetTimeRealSeconds then
@@ -430,6 +423,7 @@ end
 local fps_hud_text = nil
 local toast_timer = 0
 local toast_msg = nil
+local hud_dirty_now = false
 
 local function FormatTargetLabel(fps)
     if fps == 0 then
@@ -438,53 +432,90 @@ local function FormatTargetLabel(fps)
     return tostring(fps) .. " FPS"
 end
 
+local function CanTriggerInGameHotkey()
+    local player = GLOBAL.ThePlayer
+    local fe = GLOBAL.TheFrontEnd
+    if not player or not fe then
+        return false
+    end
+    local screen = fe:GetActiveScreen()
+    if not screen or (screen.name ~= "HUD" and screen.name ~= "MapScreen") then
+        return false
+    end
+    local hud = player.HUD
+    if hud then
+        if hud.IsChatInputScreenOpen and hud:IsChatInputScreenOpen() then return false end
+        if hud.IsConsoleScreenOpen and hud:IsConsoleScreenOpen() then return false end
+    end
+    return true
+end
+
 AddClassPostConstruct("screens/playerhud", function(self)
-    if SHOW_FPS_HUD then
-        local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 24, ""))
-        txt:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
-        txt:SetVAnchor(GLOBAL.ANCHOR_TOP)
-        txt:SetRegionSize(520, 32)
-        txt:SetHAlign(GLOBAL.ANCHOR_RIGHT)
-        txt:SetPosition(-276, -24, 0)
-        txt:SetColour(0.55, 1.0, 0.65, 0.92)
-        txt:SetClickable(false)
-        fps_hud_text = txt
+    -- Re-sync on entering world so any session reload matches active config immediately
+    SyncToNativePlugin()
 
-        local accum_time = 0
-        local accum_frames = 0
-        local old_OnUpdate = self.OnUpdate
+    local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 24, ""))
+    txt:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
+    txt:SetVAnchor(GLOBAL.ANCHOR_TOP)
+    txt:SetRegionSize(680, 32)
+    txt:SetHAlign(GLOBAL.ANCHOR_RIGHT)
+    txt:SetPosition(-356, -24, 0)
+    txt:SetColour(0.55, 1.0, 0.65, 0.92)
+    txt:SetClickable(false)
+    if not SHOW_FPS_HUD then
+        txt:Hide()
+    end
+    fps_hud_text = txt
 
-        self.OnUpdate = function(hud, dt)
-            if old_OnUpdate then
-                old_OnUpdate(hud, dt)
+    local accum_time = 0
+    local accum_frames = 0
+    local last_real_fps = 0
+    local last_ms = 0
+    local old_OnUpdate = self.OnUpdate
+
+    self.OnUpdate = function(hud, dt)
+        if old_OnUpdate then
+            old_OnUpdate(hud, dt)
+        end
+        if not (fps_hud_text and fps_hud_text.inst and fps_hud_text.inst:IsValid()) then
+            return
+        end
+        if dt and dt > 0 and dt < 1.0 then
+            accum_time = accum_time + dt
+            accum_frames = accum_frames + 1
+        end
+        if toast_timer > 0 then
+            toast_timer = toast_timer - (dt or 0)
+            if toast_timer <= 0 and not SHOW_FPS_HUD then
+                fps_hud_text:Hide()
             end
-            if not (fps_hud_text and fps_hud_text.inst and fps_hud_text.inst:IsValid()) then
-                return
-            end
-            if dt and dt > 0 and dt < 1.0 then
-                accum_time = accum_time + dt
-                accum_frames = accum_frames + 1
-            end
-            if toast_timer > 0 then
-                toast_timer = toast_timer - (dt or 0)
-            end
-            if accum_time >= 0.25 then
-                local real_fps = accum_frames / accum_time
-                local ms = (accum_time / accum_frames) * 1000.0
-                if toast_timer > 0 and toast_msg then
-                    fps_hud_text:SetString(string.format("%.0f FPS (%.1fms) | %s", real_fps, ms, toast_msg))
-                else
-                    fps_hud_text:SetString(string.format("%.0f FPS (%.1fms)", real_fps, ms))
-                end
-                if real_fps >= 110 then
-                    fps_hud_text:SetColour(0.45, 1.0, 0.65, 0.92)
-                elseif real_fps >= 58 then
-                    fps_hud_text:SetColour(1.0, 0.92, 0.45, 0.92)
-                else
-                    fps_hud_text:SetColour(1.0, 0.45, 0.45, 0.92)
-                end
+        end
+        if hud_dirty_now or accum_time >= 0.25 then
+            if accum_time > 0 and accum_frames > 0 then
+                last_real_fps = accum_frames / accum_time
+                last_ms = (accum_time / accum_frames) * 1000.0
                 accum_time = 0
                 accum_frames = 0
+            end
+            hud_dirty_now = false
+
+            if toast_timer > 0 and toast_msg then
+                if not SHOW_FPS_HUD then
+                    fps_hud_text:Show()
+                    fps_hud_text:SetString(toast_msg)
+                else
+                    fps_hud_text:SetString(string.format("%.0f FPS (%.1fms) | %s", last_real_fps, last_ms, toast_msg))
+                end
+            elseif SHOW_FPS_HUD then
+                fps_hud_text:SetString(string.format("%.0f FPS (%.1fms)", last_real_fps, last_ms))
+            end
+
+            if last_real_fps >= 110 then
+                fps_hud_text:SetColour(0.45, 1.0, 0.65, 0.92)
+            elseif last_real_fps >= 58 then
+                fps_hud_text:SetColour(1.0, 0.92, 0.45, 0.92)
+            else
+                fps_hud_text:SetColour(1.0, 0.45, 0.45, 0.92)
             end
         end
     end
@@ -494,8 +525,7 @@ end)
 if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
     local key_code = GLOBAL[HOTKEY_NAME]
     TheInput:AddKeyUpHandler(key_code, function()
-        local screen = TheFrontEnd and TheFrontEnd:GetActiveScreen()
-        if not screen or screen.name ~= "HUD" then
+        if not CanTriggerInGameHotkey() then
             return
         end
         local next_idx = 1
@@ -507,8 +537,13 @@ if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
         end
         current_target_fps = FPS_PRESETS[next_idx]
         SyncToNativePlugin()
-        toast_msg = "Target -> " .. FormatTargetLabel(current_target_fps)
-        toast_timer = 2.5
+        if HasNativePlugin() then
+            toast_msg = "Target -> " .. FormatTargetLabel(current_target_fps)
+        else
+            toast_msg = "Target -> " .. FormatTargetLabel(current_target_fps) .. " (Need bin64/dinput8.dll)"
+        end
+        toast_timer = 3.0
+        hud_dirty_now = true
     end)
 end
 
@@ -516,13 +551,17 @@ end
 if HOTKEY_SKELETAL and GLOBAL[HOTKEY_SKELETAL] then
     local skel_key = GLOBAL[HOTKEY_SKELETAL]
     TheInput:AddKeyUpHandler(skel_key, function()
-        local screen = TheFrontEnd and TheFrontEnd:GetActiveScreen()
-        if not screen or screen.name ~= "HUD" then
+        if not CanTriggerInGameHotkey() then
             return
         end
         current_skeletal_tween = not current_skeletal_tween
         SyncToNativePlugin()
-        toast_msg = "Skeletal 240fps -> " .. (current_skeletal_tween and "ON" or "OFF")
-        toast_timer = 2.5
+        if HasNativePlugin() then
+            toast_msg = "Skeletal 240fps -> " .. (current_skeletal_tween and "ON" or "OFF")
+        else
+            toast_msg = "Skeletal 240fps -> " .. (current_skeletal_tween and "ON" or "OFF") .. " (Need bin64/dinput8.dll)"
+        end
+        toast_timer = 3.0
+        hud_dirty_now = true
     end)
 end

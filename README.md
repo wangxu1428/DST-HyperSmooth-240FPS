@@ -1,7 +1,13 @@
-# DST HyperSmooth 240FPS & FastLoad (v2.2.0 · Final Ceiling Edition)
+# DST HyperSmooth 240FPS & FastLoad (v2.2.1 · Stability & Hotkey Hotfix)
 
 > **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼补帧、全套高刷修复、反 GC 掉帧与全链路极速加载伴侣**  
 > **Client-Only 240FPS 2D Skeletal Tweening, Complete High-FPS Fixes, Anti-Stutter GC & Full-Stack Fast-Load Suite for Don't Starve Together (64-bit)**
+
+### v2.2.1 紧急修复更新 / Hotfix Notes
+- **修复局内热键 F9 / F10 全员失效**：修复 `modmain.lua` 加载期捕获 `TheFrontEnd == nil` 导致的拦截 Bug，并在 `dinput8.dll` 新增 `luaL_openlibs` **0ms 直通 Lua VM 原生桥接**（无视我的文档 / OneDrive / WeGame 路径差异；未安装 DLL 时自动提示）。
+- **彻底修复老麦暗影陷阱/暗影囚笼闪退**（及植物人藤蔓陷阱、月雹、裂隙等 `ALT_RENDERPATH` 资产闪退）：在主世界渲染钩子精准识别 `Build->altRenderPath` 自动直通原版帧指针，并将三通道缓冲升级为独立定长数组池（零 `realloc` / 零跨通道覆盖）。
+- **彻底修复 ShowMe（中文 / 原版）默认不显示详情冲突**：移除对 `widgets/hoverer` 的 `SetString` 拦截，100% 兼容所有悬停信息与异步 RPC Mod。
+- **彻底修复独行长路 (Don't Starve Alone) 多模组世界生成兼容问题**：补全 `Fast Mod Scan` 的 `known_mods` 回写并在建房界面自动旁路；`Keep Shard Assets` 自动旁路单人模式与本地主机；客户端优先级调整为 `ABOVE_NORMAL` 绝不抢占子专服建图 CPU。
 
 ---
 
@@ -34,11 +40,10 @@
   - `DeployHelper`：修复灭火器/避雷针/发电机等建筑放置辅助圈按帧递减导致 240Hz 闪烁的问题。
 - **240Hz 零冗余 CPU & GC 减负**：
   - `DistanceFade`：将树冠/洞穴柱体透明淡出改为零分配标量点积，消除 240Hz 下每秒数千次 `Vector3` 临时表分配。
-  - `Input:OnUpdate`：静止帧无损缓存鼠标实体拾取结果（鼠标移动/镜头移动/界面切换 0ms 零延迟刷新；静止时跳过 ~75% 冗余 C++ 实体扫描与表分配）。
-  - `HoverText`：对悬停提示文本与颜色加脏检查，跳过 99% 无效表分配与 C++ `TextWidget` 重排（100% 兼容 ShowMe / Insight）。
-- **联机上下洞穴零卸载秒切**：纯客户端保留地面 (`forest`) 与洞穴 (`cave`) 原版资产常驻内存，联机反复上下洞穴零重复解压；退回主界面自动安全释放（建议 >= 8GB 内存）。
+  - `Input:OnUpdate`：静止帧无损缓存鼠标实体拾取结果（鼠标移动/镜头移动/界面切换 0ms 零延迟刷新；静止时跳过 ~75% 冗余 C++ 实体扫描与表分配；100% 兼容 ShowMe / Insight）。
+- **联机上下洞穴零卸载秒切**：纯客户端保留地面 (`forest`) 与洞穴 (`cave`) 原版资产常驻内存（自动旁路独行长路单人模式与本地主机），联机反复上下洞穴零重复解压；退回主界面自动安全释放（建议 >= 8GB 内存）。
 - **模组与网络等待全清空**：缓存未启用模组 `modinfo` 免重复读盘、跳过 Steam 热门模组榜请求 (`QueryTopMods`)、跳过主界面 MOTD 远程海报阻塞等待（不影响登录与联机）。
-- **轻量右上角 FPS/帧时间 HUD & 局内热键联动**：`F9` 切帧率、`F10` 开关骨骼补帧，通过持久化桥接文件与 `dinput8.dll` 毫秒级热联动。
+- **轻量右上角 FPS/帧时间 HUD & 0ms 直通内存热键**：`F9` 切帧率、`F10` 开关骨骼补帧，通过 `dinput8.dll` 原生 Lua VM 桥接 0ms 即时联动（并保留多路径文件桥接兜底）。
 
 ---
 
@@ -64,7 +69,7 @@
 - **方式 B（本地解压安装）**：将压缩包中的 `mods/dst_smooth_highfps` 文件夹复制到游戏根目录的 `mods/` 下（例如 `...\Steam\steamapps\common\Don't Starve Together\mods\dst_smooth_highfps`），进入游戏在「客户端模组」中勾选启用。
 
 ### 第二步：安装原生引擎伴侣插件（解锁 240 帧、骨骼补帧、反 GC 掉帧与 2.5 倍加载）
-1. 前往本仓库 **[Releases 页面](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)** 下载最新版 `DST_HyperSmooth_v2.2.0_Release.zip`（或单独下载 `dinput8.dll`）。
+1. 前往本仓库 **[Releases 页面](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)** 下载最新版 `DST_HyperSmooth_v2.2.1_Release.zip`（或单独下载 `dinput8.dll`）。
 2. 将压缩包中的 `bin64/dinput8.dll` 复制到游戏根目录的 **`bin64/`** 文件夹内（与 `dontstarve_steam_x64.exe` 同目录）。
 3. 正常从 Steam 启动 64 位《饥荒联机版》即可自动生效！
 4. 首次启动后，插件会在 `bin64/` 下自动生成配置文件 `dst_fps.ini` 和运行日志 `dst_fps_plugin.log`（仅在加载完成时输出一条精简汇总，无持续刷屏）。

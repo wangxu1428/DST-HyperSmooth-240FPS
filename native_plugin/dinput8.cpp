@@ -1,24 +1,22 @@
 // =============================================================================
-// DST HyperSmooth & FastLoad Native Companion Plugin v2.2.0 (dinput8.dll x64)
+// DST HyperSmooth & FastLoad Native Companion Plugin v2.2.1 (dinput8.dll x64)
 // =============================================================================
 // Production-grade, universal x86-64 compatible native plugin for Don't Starve Together:
 //   1. Transparent System32\dinput8.dll proxy (single export: DirectInput8Create)
 //   2. Cross-version AOB FrameLimiter unlock (60/120/144/165/240/360/Unlimited)
 //   3. Native 2-byte Hybrid Frame Pacer (Sleep(1) + 2ms precision spin-wait)
-//   4. 1ms High-Res Timer + Client/Local Server Priority Boost + Databundle RAM Pre-warm
+//   4. 1ms High-Res Timer + Balanced Priority Boost + Databundle RAM Pre-warm
 //   5. Hardware `rep stosb` fix for MSVC 2008 std::vector<uint8_t> byte-by-byte fill
 //   6. libdeflate v1.23 (runtime CPUID AVX-512/AVX2/BMI2/SSE2) whole-entry zip hook
 //   7. True 240fps Full-World 2D Skeletal Animation Interpolation (Main World + Overlay + UI):
-//      - Persistent AnimNode* tracking ([rbx+8] for Main World AnimRenderCommand,
-//        parent-bound key for Overlay FollowSymbol, direct rbx for UI AnimNode)
-//      - Continuous floating-point QPC sub-tick frame interpolator (handles 30fps, 40fps,
-//        SetDeltaTimeMultiplier speed scaling, one-shot craft/jump/attack, and network jitter)
+//      - Persistent AnimNode* tracking + ALT_RENDERPATH auto-bypass (fixes Maxwell shadow_trap/
+//        shadow_pillar, Wormwood trap_vines, lunarhaildrop, wagboss_fissure crashes!)
+//      - 3 isolated fixed-array ring pools (Main 16 / Overlay 32 / UI 16, zero realloc/UAF)
+//      - Continuous floating-point QPC sub-tick frame interpolator + NaN/Inf/fmodf guards
 //      - 8,192-slot 4-probe LRU entity tracker (0% eviction in 1,000+ entity megabases)
 //      - Two-pass bone matching (exact + sprite-swap fallback) & boss-scale 420px/135deg guards
-//   8. Smooth 240Hz Lua GC Pacer & Anti-Freeze Guard (Simulation::CollectGarbage hook):
-//      FPS-scaled sub-ms GC step budget (0.35ms @ 240Hz = 84ms/s throughput, 3x tighter 1% low)
-//      + emergency-only full-GC safety floor (eliminates 60-200ms combat/megabase freezes)
-//   9. Live hot-reload bridge with Steam Workshop Companion Mod (F9 FPS / F10 Skeletal)
+//   8. Smooth 240Hz Lua GC Pacer & Anti-Freeze Guard (Simulation::CollectGarbage hook)
+//   9. 0ms Direct C++ <-> Lua VM Native Bridge (luaL_openlibs) + Multi-path file fallback
 // =============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -31,6 +29,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_set>
@@ -46,6 +45,16 @@ using ZSeekFileFunc_t = int32_t (*)(void* opaque, void* stream, uint32_t offset,
 using AnimGetFrame_t = const void* (*)(const void* anim, int32_t playMode, float time);
 using LuaGc_t = int (*)(void* L, int what, int data);
 using SetGcBudget_t = void (*)(float sec);
+using LuaOpenLibs_t = void (*)(void* L);
+using LuaCFunction_t = int (*)(void* L);
+using LuaPushCClosure_t = void (*)(void* L, LuaCFunction_t fn, int n);
+using LuaSetField_t = void (*)(void* L, int idx, const char* k);
+using LuaPushNumber_t = void (*)(void* L, double n);
+using LuaPushBoolean_t = void (*)(void* L, int b);
+using LuaToNumber_t = double (*)(void* L, int idx);
+using LuaToBoolean_t = int (*)(void* L, int idx);
+
+constexpr int kLuaGlobalsIndex = -10002;
 
 HMODULE g_selfModule = nullptr;
 HMODULE g_realDInput8 = nullptr;
@@ -65,6 +74,17 @@ uint8_t* g_animRelayStubOverlay = nullptr;
 uint8_t* g_animRelayStubUI = nullptr;
 LuaGc_t g_luaGc = nullptr;
 SetGcBudget_t g_setGcBudget = nullptr;
+LuaOpenLibs_t g_origLuaOpenLibs = nullptr;
+uint8_t* g_luaOpenLibsTramp = nullptr;
+LuaPushCClosure_t g_luaPushCClosure = nullptr;
+LuaSetField_t g_luaSetField = nullptr;
+LuaPushNumber_t g_luaPushNumber = nullptr;
+LuaPushBoolean_t g_luaPushBoolean = nullptr;
+LuaToNumber_t g_luaToNumber = nullptr;
+LuaToBoolean_t g_luaToBoolean = nullptr;
+uint32_t g_cmdBuildOffset = 0xB8;
+uint32_t g_buildAltOffset = 0xB0;
+bool g_altRenderCheckVerified = false;
 double g_qpcInvFreq = 0.0;
 
 volatile LONG g_currentFps = -1;
@@ -175,6 +195,26 @@ uint8_t* FindPatternInText(uint8_t* start, size_t size, const uint8_t* sig, size
         }
     }
     return nullptr;
+}
+
+uint8_t* FindMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
+    if (!start || size < sigLen) return nullptr;
+    for (size_t off = 0; off <= size - sigLen; ++off) {
+        if (mask[0] == 'x' && start[off] != sig[0]) continue;
+        bool ok = true;
+        for (size_t j = 1; j < sigLen; ++j) {
+            if (mask[j] == 'x' && start[off + j] != sig[j]) { ok = false; break; }
+        }
+        if (ok) return start + off;
+    }
+    return nullptr;
+}
+
+uint8_t* ResolveRel32Call(uint8_t* callInstr) {
+    if (!callInstr || (callInstr[0] != 0xE8 && callInstr[0] != 0xE9)) return nullptr;
+    int32_t rel = 0;
+    memcpy(&rel, callInstr + 1, 4);
+    return callInstr + 5 + rel;
 }
 
 bool WriteCodeBytes(uint8_t* addr, const uint8_t* bytes, size_t len) {
@@ -559,9 +599,11 @@ static inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[
     return true;
 }
 
+constexpr uint32_t kMaxAnimElements = 512;
+
 struct AnimBufferSlot {
     AnimFrame frame{};
-    std::vector<AnimElement> elems;
+    AnimElement elems[kMaxAnimElements];
 };
 
 struct EntityAnimTrack {
@@ -578,16 +620,30 @@ struct EntityAnimTrack {
 
 constexpr size_t kTrackSlots = 8192;
 
+enum class AnimChannel : uint8_t { Main = 0, Overlay = 1, UI = 2 };
+
 struct ThreadLocalAnimState {
-    AnimBufferSlot slots[4];
-    uint32_t ring = 0;
+    // 3 completely independent fixed-array ring pools (zero heap realloc, zero cross-channel UAF):
+    // Overlay calls inside RenderFrame (0x1400F3980) can NEVER overwrite or free Main's live AnimFrame!
+    AnimBufferSlot mainSlots[16];
+    uint32_t mainRing = 0;
+    AnimBufferSlot overlaySlots[32];
+    uint32_t overlayRing = 0;
+    AnimBufferSlot uiSlots[16];
+    uint32_t uiRing = 0;
     std::vector<EntityAnimTrack> tracks;
     ThreadLocalAnimState() : tracks(kTrackSlots) {}
+
+    AnimBufferSlot& NextSlot(AnimChannel ch) {
+        if (ch == AnimChannel::Main) return mainSlots[(mainRing++) & 15u];
+        if (ch == AnimChannel::Overlay) return overlaySlots[(overlayRing++) & 31u];
+        return uiSlots[(uiRing++) & 15u];
+    }
 };
 
 thread_local uintptr_t g_tlsLastParentKey = 0;
 
-static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, bool isMainParent) {
+static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key, AnimChannel channel) {
     if (!animPtr || !g_origAnimGetFrame) {
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
     }
@@ -598,12 +654,15 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const auto* anim = static_cast<const Animation*>(animPtr);
     uint32_t nframes = anim->num_frames;
     float fps = anim->framerate;
-    if (nframes <= 1 || !anim->frames || fps <= 0.0f || fps > 240.0f) {
+    if (nframes <= 1 || !anim->frames || !std::isfinite(fps) || !std::isfinite(time) || fps <= 0.0f || fps > 240.0f) {
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
 
-    thread_local ThreadLocalAnimState tls;
-    if (isMainParent && key != 0) {
+    thread_local std::unique_ptr<ThreadLocalAnimState> tlsPtr;
+    if (!tlsPtr) tlsPtr.reset(new ThreadLocalAnimState());
+    ThreadLocalAnimState& tls = *tlsPtr;
+
+    if (channel == AnimChannel::Main && key != 0) {
         g_tlsLastParentKey = key;
     }
     if (key == 0) {
@@ -628,6 +687,9 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     } else {
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
+    if (!std::isfinite(curF)) {
+        return g_origAnimGetFrame(animPtr, playMode, time);
+    }
 
     LARGE_INTEGER nowLi{};
     QueryPerformanceCounter(&nowLi);
@@ -648,7 +710,8 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     tr.seen_qpc = nowQpc;
 
     auto discreteFrame = [&]() -> const void* {
-        uint32_t fi = static_cast<uint32_t>(curF + 0.001f);
+        float safeF = (curF >= 0.0f && std::isfinite(curF)) ? curF : 0.0f;
+        uint32_t fi = static_cast<uint32_t>(safeF + 0.001f);
         if (fi >= nframes) fi = (playMode == 1) ? (fi % nframes) : (nframes - 1);
         return &anim->frames[fi];
     };
@@ -690,22 +753,24 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
     float stepF = tr.curr_f - tr.prev_f;
     if (playMode == 1 && stepF < 0.0f) stepF += nf;
-    if (fabsf(stepF) < 0.001f) {
+    if (!std::isfinite(stepF) || fabsf(stepF) < 0.001f) {
         return discreteFrame();
     }
 
     float dtSinceTick = static_cast<float>(static_cast<double>(nowQpc - tr.tick_qpc) * g_qpcInvFreq);
     float alpha = (tr.tick_period > 1e-4f) ? (dtSinceTick / tr.tick_period) : 1.0f;
-    if (alpha < 0.0f) alpha = 0.0f;
+    if (!std::isfinite(alpha) || alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
 
     float fNow = tr.prev_f + stepF * alpha;
+    if (!std::isfinite(fNow)) return discreteFrame();
     uint32_t idx0 = 0, idx1 = 0;
     float frac = 0.0f;
 
     if (playMode == 1) {
-        while (fNow >= nf) fNow -= nf;
-        while (fNow < 0.0f) fNow += nf;
+        fNow = fmodf(fNow, nf);
+        if (fNow < 0.0f) fNow += nf;
+        if (!std::isfinite(fNow) || fNow < 0.0f) fNow = 0.0f;
         float fl = floorf(fNow);
         idx0 = static_cast<uint32_t>(fl) % nframes;
         idx1 = (idx0 + 1) % nframes;
@@ -719,23 +784,23 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         frac = fNow - fl;
     }
 
+    if (idx0 >= nframes) idx0 = nframes - 1;
+    if (idx1 >= nframes) idx1 = nframes - 1;
     if (frac <= 0.015f) return &anim->frames[idx0];
     if (frac >= 0.985f) return &anim->frames[idx1];
-    if (idx0 == idx1 || idx0 >= nframes || idx1 >= nframes) {
-        return &anim->frames[idx0 < nframes ? idx0 : 0];
+    if (idx0 == idx1) {
+        return &anim->frames[idx0];
     }
 
     const AnimFrame& f0 = anim->frames[idx0];
     const AnimFrame& f1 = anim->frames[idx1];
     uint32_t n0 = f0.num_elements, n1 = f1.num_elements;
-    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > 512) return &f0;
+    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > kMaxAnimElements) return &f0;
 
-    AnimBufferSlot& bufSlot = tls.slots[(tls.ring++) & 3];
-    if (bufSlot.elems.size() < n0) bufSlot.elems.resize(n0);
-
+    AnimBufferSlot& bufSlot = tls.NextSlot(channel);
     bufSlot.frame = f0;
-    bufSlot.frame.elements = bufSlot.elems.data();
-    memcpy(bufSlot.elems.data(), f0.elements, n0 * sizeof(AnimElement));
+    bufSlot.frame.elements = bufSlot.elems;
+    memcpy(bufSlot.elems, f0.elements, n0 * sizeof(AnimElement));
 
     uint32_t tweenedCount = 0;
     uint32_t pass2Count = 0;
@@ -813,18 +878,37 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     return &bufSlot.frame;
 }
 
-extern "C" const void* FastInterpGetFrameMain(const void* animPtr, int32_t playMode, float time, const void* persistentAnimNode) {
-    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), true);
+extern "C" const void* FastInterpGetFrameMain(const void* animPtr, int32_t playMode, float time, const void* animRenderCmd) {
+    if (!animRenderCmd) {
+        return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
+    }
+    const auto* cmd = static_cast<const uint8_t*>(animRenderCmd);
+    // Critical ALT_RENDERPATH safety bypass (exact match with Klei @ 0x1400F5775..0x1400F5786):
+    // ALT_RENDERPATH assets (Maxwell shadow_trap/shadow_pillar -> shadow_pillar_base_fx,
+    // Wormwood trap_vines, lunarhaildrop, wagboss_fissure) compute
+    //   frame_idx = (AnimFrame* - anim->frames) / 40
+    // inside RenderFrame (0x1400F3C59). They MUST receive a real pointer inside anim->frames[].
+    if (g_altRenderCheckVerified) {
+        const auto* buildPtr = *reinterpret_cast<const uint8_t* const*>(cmd + g_cmdBuildOffset);
+        if (buildPtr) {
+            const void* altMesh = *reinterpret_cast<const void* const*>(buildPtr + g_buildAltOffset);
+            if (altMesh != nullptr) {
+                return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
+            }
+        }
+    }
+    const void* persistentAnimNode = *reinterpret_cast<const void* const*>(cmd + 8);
+    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), AnimChannel::Main);
 }
 
 extern "C" const void* FastInterpGetFrameUI(const void* animPtr, int32_t playMode, float time, const void* persistentAnimNode) {
-    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), false);
+    return InterpGetFrameCore(animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode), AnimChannel::UI);
 }
 
 extern "C" const void* FastInterpGetFrameOverlay(const void* animPtr, int32_t playMode, float time, const void* overlayItem) {
     uintptr_t baseKey = (g_tlsLastParentKey != 0) ? g_tlsLastParentKey : reinterpret_cast<uintptr_t>(overlayItem);
     uintptr_t childKey = (baseKey ^ (reinterpret_cast<uintptr_t>(animPtr) * 0x9E3779B97F4A7C15ULL)) | 1ULL;
-    return InterpGetFrameCore(animPtr, playMode, time, childKey, false);
+    return InterpGetFrameCore(animPtr, playMode, time, childKey, AnimChannel::Overlay);
 }
 
 uint8_t* AllocNearExecutable(uint8_t* nearAddr, size_t size) {
@@ -897,11 +981,28 @@ void ApplySkeletalAnimTweenHooks(uint8_t* textStart, size_t textSize) {
     QueryPerformanceFrequency(&freq);
     g_qpcInvFreq = (freq.QuadPart > 0) ? (1.0 / static_cast<double>(freq.QuadPart)) : (1.0 / 10000000.0);
 
-    // 1. Main World AnimRenderer::Render (0x1400F4957): rbx is transient AnimRenderCommand, [rbx+8] is persistent AnimNode*!
+    // Verify ALT_RENDERPATH offset signature inside Main World AnimRenderer (0x1400F5775):
+    //   mov rcx, [rbx + 0xB8] ; mov r13, r15 ; cmp [rcx + 0xB0], r15 ; je ...
+    constexpr uint8_t kSigAltRender[] = {
+        0x48, 0x8B, 0x8B, 0xB8, 0x00, 0x00, 0x00,
+        0x4D, 0x8B, 0xEF,
+        0x4C, 0x39, 0xB9, 0xB0, 0x00, 0x00, 0x00,
+        0x74, 0x58
+    };
+    if (uint8_t* pAlt = FindPatternInText(textStart, textSize, kSigAltRender, sizeof(kSigAltRender))) {
+        memcpy(&g_cmdBuildOffset, pAlt + 3, 4);
+        memcpy(&g_buildAltOffset, pAlt + 13, 4);
+        g_altRenderCheckVerified = true;
+        LogMsg("Verified ALT_RENDERPATH guard @ %p (cmd+0x%X -> build+0x%X)",
+               static_cast<void*>(pAlt), g_cmdBuildOffset, g_buildAltOffset);
+    }
+
+    // 1. Main World AnimRenderer::Render (0x1400F4957): pass rbx (AnimRenderCommand*) directly
+    //    so FastInterpGetFrameMain can check Build->altRenderPath ([rbx+0xB8]+0xB0) AND read [rbx+8]!
     constexpr uint8_t kPreMain[]  = { 0x8B, 0x93, 0xC0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x8B, 0xB0, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, 0x93, 0xC4, 0x00, 0x00, 0x00, 0xE8 };
     constexpr uint8_t kPostMain[] = { 0x4C, 0x8B, 0xF0, 0x48, 0x89, 0x84, 0x24 };
     if (uint8_t* cs = FindMaskedCallsite(textStart, textSize, kPreMain, sizeof(kPreMain), kPostMain, sizeof(kPostMain))) {
-        InstallAnimCallsiteHook(cs, "Main World AnimRenderer", g_animRelayStubMain, reinterpret_cast<const void*>(&FastInterpGetFrameMain), true);
+        InstallAnimCallsiteHook(cs, "Main World AnimRenderer", g_animRelayStubMain, reinterpret_cast<const void*>(&FastInterpGetFrameMain), false);
     }
 
     // 2. Overlay / FollowSymbol AnimRenderer (0x1400F4493)
@@ -1071,12 +1172,153 @@ bool ApplyFpsPatch(int fps) {
     return true;
 }
 
+//------------------------------------------------------------------------------
+// 0ms Direct C++ <-> Lua VM Native Bridge (luaL_openlibs hook)
+// Eliminates Documents/OneDrive/WeGame/Steam Cloud path issues for F9/F10!
+//------------------------------------------------------------------------------
+int LuaHyperSmoothSetFps(void* L) {
+    if (!g_luaToNumber || !g_luaPushBoolean) return 0;
+    int fps = static_cast<int>(g_luaToNumber(L, 1));
+    bool ok = ApplyFpsPatch(fps);
+    g_luaPushBoolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+int LuaHyperSmoothSetSkeletal(void* L) {
+    if (!g_luaToBoolean || !g_luaPushBoolean) return 0;
+    LONG newVal = g_luaToBoolean(L, 1) ? 1 : 0;
+    LONG prev = InterlockedExchange(&g_skeletalTweenEnabled, newVal);
+    if (prev != newVal) {
+        LogMsg("Lua Bridge -> Skeletal 240fps=%ld", newVal);
+    }
+    g_luaPushBoolean(L, 1);
+    return 1;
+}
+
+int LuaHyperSmoothGetStatus(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange(&g_currentFps, 0, 0)));
+    g_luaPushBoolean(L, InterlockedCompareExchange(&g_skeletalTweenEnabled, 0, 0) != 0 ? 1 : 0);
+    return 2;
+}
+
+void RegisterHyperSmoothLuaApi(void* L) {
+    if (!L || !g_luaPushCClosure || !g_luaSetField) return;
+    auto reg = [&](const char* name, LuaCFunction_t fn) {
+        g_luaPushCClosure(L, fn, 0);
+        g_luaSetField(L, kLuaGlobalsIndex, name);
+    };
+    reg("HyperSmooth_SetFps", &LuaHyperSmoothSetFps);
+    reg("HyperSmooth_SetSkeletal", &LuaHyperSmoothSetSkeletal);
+    reg("HyperSmooth_GetStatus", &LuaHyperSmoothGetStatus);
+}
+
+void HookLuaOpenLibs(void* L) {
+    if (g_origLuaOpenLibs) {
+        g_origLuaOpenLibs(L);
+    }
+    RegisterHyperSmoothLuaApi(L);
+}
+
+void ApplyLuaBridgeHook(uint8_t* textStart, size_t textSize) {
+    constexpr uint8_t kSigOpenLibs[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
+        0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8B, 0xF9,
+        0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x85, 0xC0, 0x74, 0x35,
+        0x45, 0x33, 0xC0, 0x48, 0x8B, 0xD0, 0x48, 0x8B, 0xCF,
+        0xE8, 0x00, 0x00, 0x00, 0x00
+    };
+    constexpr char kMaskOpenLibs[] = "xxxxxxxxxxxxx????xxxxxx????xxxxxxxxxxxxxxx????";
+
+    constexpr uint8_t kSigSetField[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30,
+        0x4D, 0x8B, 0xD0, 0x48, 0x8B, 0xF1, 0xE8, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC9, 0xFF, 0x48, 0x8B, 0xD8, 0x49, 0x8B, 0xFA, 0x33, 0xC0, 0x49, 0x8B, 0xD2,
+        0xF2, 0xAE, 0x48, 0xF7, 0xD1, 0x4C, 0x8D, 0x41, 0xFF, 0x48, 0x8B, 0xCE, 0xE8, 0x00, 0x00, 0x00, 0x00,
+        0x4C, 0x8B, 0x4E, 0x10, 0x4C, 0x8D, 0x44, 0x24, 0x20, 0x49, 0x83, 0xE9, 0x10,
+        0x48, 0x8B, 0xD3, 0x48, 0x8B, 0xCE, 0x48, 0x89, 0x44, 0x24, 0x20,
+        0xC7, 0x44, 0x24, 0x28, 0x04, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00
+    };
+    constexpr char kMaskSetField[] = "xxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????";
+
+    constexpr uint8_t kSigPushNumber[] = {
+        0x48, 0x8B, 0x41, 0x10, 0xF2, 0x0F, 0x11, 0x08, 0xC7, 0x40, 0x08, 0x03, 0x00, 0x00, 0x00
+    };
+    constexpr uint8_t kSigPushBoolean[] = {
+        0x4C, 0x8B, 0x41, 0x10, 0x33, 0xC0, 0x85, 0xD2, 0x0F, 0x95, 0xC0,
+        0x41, 0xC7, 0x40, 0x08, 0x01, 0x00, 0x00, 0x00, 0x41, 0x89, 0x00
+    };
+    constexpr uint8_t kSigToNumber[] = {
+        0x48, 0x83, 0xEC, 0x38, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x83, 0x78, 0x08, 0x03, 0x74, 0x1B,
+        0x48, 0x8D, 0x54, 0x24, 0x20, 0x48, 0x8B, 0xC8, 0xE8, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x85, 0xC0, 0x75, 0x09, 0x66, 0x0F, 0x57, 0xC0, 0x48, 0x83, 0xC4, 0x38, 0xC3
+    };
+    constexpr char kMaskToNumber[] = "xxxxx????xxxxxxxxxxxxxxx????xxxxxxxxxxxxxx";
+    constexpr uint8_t kSigToBoolean[] = {
+        0x48, 0x83, 0xEC, 0x28, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x48, 0x08, 0x85, 0xC9, 0x74, 0x14,
+        0x83, 0xF9, 0x01, 0x75, 0x05, 0x83, 0x38, 0x00, 0x74, 0x0A, 0xB8, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x28, 0xC3, 0x33, 0xC0
+    };
+    constexpr char kMaskToBoolean[] = "xxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+    uint8_t* pOpenLibs = FindMaskedPatternInText(textStart, textSize, kSigOpenLibs, kMaskOpenLibs, sizeof(kSigOpenLibs));
+    uint8_t* pSetField = FindMaskedPatternInText(textStart, textSize, kSigSetField, kMaskSetField, sizeof(kSigSetField));
+    uint8_t* pPushNum  = FindPatternInText(textStart, textSize, kSigPushNumber, sizeof(kSigPushNumber));
+    uint8_t* pPushBool = FindPatternInText(textStart, textSize, kSigPushBoolean, sizeof(kSigPushBoolean));
+    uint8_t* pToNum    = FindMaskedPatternInText(textStart, textSize, kSigToNumber, kMaskToNumber, sizeof(kSigToNumber));
+    uint8_t* pToBool   = FindMaskedPatternInText(textStart, textSize, kSigToBoolean, kMaskToBoolean, sizeof(kSigToBoolean));
+    uint8_t* pPushC    = pOpenLibs ? ResolveRel32Call(pOpenLibs + 0x29) : nullptr;
+
+    if (!pOpenLibs || !pPushC || !pSetField || !pPushNum || !pPushBool || !pToNum || !pToBool) {
+        LogMsg("Lua Bridge skipped (AOB miss: open=%p pushC=%p setF=%p pNum=%p pBool=%p tNum=%p tBool=%p)",
+               pOpenLibs, pPushC, pSetField, pPushNum, pPushBool, pToNum, pToBool);
+        return;
+    }
+
+    g_luaPushCClosure = reinterpret_cast<LuaPushCClosure_t>(pPushC);
+    g_luaSetField     = reinterpret_cast<LuaSetField_t>(pSetField);
+    g_luaPushNumber   = reinterpret_cast<LuaPushNumber_t>(pPushNum);
+    g_luaPushBoolean  = reinterpret_cast<LuaPushBoolean_t>(pPushBool);
+    g_luaToNumber     = reinterpret_cast<LuaToNumber_t>(pToNum);
+    g_luaToBoolean    = reinterpret_cast<LuaToBoolean_t>(pToBool);
+
+    // 17-byte trampoline for luaL_openlibs (relocates mov rax, [rip+disp32] at +10/+13)
+    uint8_t* tramp = AllocNearExecutable(pOpenLibs, 64);
+    if (!tramp) return;
+    memcpy(tramp, pOpenLibs, 17);
+    int32_t origDisp = 0;
+    memcpy(&origDisp, pOpenLibs + 13, 4);
+    intptr_t absTarget = reinterpret_cast<intptr_t>(pOpenLibs + 17) + origDisp;
+    intptr_t newDisp = absTarget - reinterpret_cast<intptr_t>(tramp + 17);
+    if (newDisp < INT32_MIN || newDisp > INT32_MAX) return;
+    int32_t newDisp32 = static_cast<int32_t>(newDisp);
+    memcpy(tramp + 13, &newDisp32, 4);
+
+    uint8_t jmpBack[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    uint64_t resumeAddr = reinterpret_cast<uint64_t>(pOpenLibs + 17);
+    memcpy(jmpBack + 6, &resumeAddr, sizeof(resumeAddr));
+    memcpy(tramp + 17, jmpBack, 14);
+    FlushInstructionCache(GetCurrentProcess(), tramp, 31);
+    g_luaOpenLibsTramp = tramp;
+    g_origLuaOpenLibs = reinterpret_cast<LuaOpenLibs_t>(tramp);
+
+    uint8_t jmpHook[17] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0,0,0,0,0,0,0,0, 0x90, 0x90, 0x90 };
+    uint64_t hookTarget = reinterpret_cast<uint64_t>(&HookLuaOpenLibs);
+    memcpy(jmpHook + 6, &hookTarget, sizeof(hookTarget));
+    if (WriteCodeBytes(pOpenLibs, jmpHook, sizeof(jmpHook))) {
+        LogMsg("Hooked luaL_openlibs @ %p -> 0ms Direct Lua VM Bridge (HyperSmooth_SetFps/SetSkeletal/GetStatus)",
+               static_cast<void*>(pOpenLibs));
+    }
+}
+
 void EnsureDefaultIni() {
     if (GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
     FILE* f = _wfopen(g_iniPath.c_str(), L"w");
     if (!f) return;
     fprintf(f,
-        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.2.0)\n"
+        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.2.1)\n"
         "; Note: If you also use the Steam Workshop Companion Mod, in-game settings/hotkeys override these live.\n"
         "[FPS]\n"
         "target_fps=240\n"
@@ -1108,24 +1350,33 @@ uint64_t GetFileModTime(const std::wstring& path) {
 bool FindNewestModBridgeFile(std::wstring& outPath, uint64_t& outMtime) {
     wchar_t docsPath[MAX_PATH]{};
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, docsPath))) return false;
-    std::wstring root = std::wstring(docsPath) + L"\\Klei\\DoNotStarveTogether\\";
-    std::wstring search = root + L"*";
-
-    WIN32_FIND_DATAW fd{};
-    HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return false;
+    const wchar_t* roots[] = { L"\\Klei\\DoNotStarveTogether\\", L"\\Klei\\DoNotStarveTogetherRail\\" };
 
     uint64_t bestTime = 0;
     std::wstring bestPath;
-    do {
-        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-            wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-            std::wstring candidate = root + fd.cFileName + L"\\client_save\\dst_smooth_highfps_cfg";
-            uint64_t mt = GetFileModTime(candidate);
-            if (mt > bestTime) { bestTime = mt; bestPath = candidate; }
+    for (const wchar_t* relRoot : roots) {
+        std::wstring root = std::wstring(docsPath) + relRoot;
+        // Direct client_save (non-ID layouts)
+        {
+            std::wstring direct = root + L"client_save\\dst_smooth_highfps_cfg";
+            uint64_t mt = GetFileModTime(direct);
+            if (mt > bestTime) { bestTime = mt; bestPath = direct; }
         }
-    } while (FindNextFileW(hFind, &fd));
-    FindClose(hFind);
+        // Per-account <id>\client_save layouts
+        std::wstring search = root + L"*";
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+                std::wstring candidate = root + fd.cFileName + L"\\client_save\\dst_smooth_highfps_cfg";
+                uint64_t mt = GetFileModTime(candidate);
+                if (mt > bestTime) { bestTime = mt; bestPath = candidate; }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
 
     if (bestTime > 0) { outPath = bestPath; outMtime = bestTime; return true; }
     return false;
@@ -1225,8 +1476,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring exeStr(exePath);
-    if (exeStr.find(L"dontstarve_steam_x64.exe") == std::wstring::npos &&
-        exeStr.find(L"dontstarve_steam") == std::wstring::npos) {
+    if (exeStr.find(L"dontstarve_steam") == std::wstring::npos &&
+        exeStr.find(L"dontstarve_rail") == std::wstring::npos) {
         return 0;
     }
 
@@ -1239,7 +1490,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
     g_logPath = g_binDir + L"dst_fps_plugin.log";
 
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) fclose(f);
-    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.2.0 (Universal x86-64) loaded.");
+    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.2.1 (Universal x86-64) loaded.");
 
     EnsureDefaultIni();
 
@@ -1258,8 +1509,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
         g_timerBoosted = true;
         LogMsg("Enabled 1ms high-resolution Windows timer.");
     }
-    if (optPriority && SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
-        LogMsg("Boosted client process -> HIGH_PRIORITY_CLASS.");
+    // Use ABOVE_NORMAL (not HIGH) for client so 240Hz UI spinning never starves
+    // local dedicated server / DSA child worldgen processes on low-core CPUs!
+    if (optPriority && SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
+        LogMsg("Boosted client process -> ABOVE_NORMAL_PRIORITY_CLASS.");
     }
 
     uint8_t* textStart = nullptr;
@@ -1285,6 +1538,9 @@ DWORD WINAPI WorkerProc(LPVOID) {
             }
             ApplyFpsPatch(ReadIniInt(L"FPS", L"target_fps", 240));
         }
+
+        // Install Direct Lua VM Bridge AFTER g_patchAddr is initialized so HyperSmooth_SetFps works immediately
+        ApplyLuaBridgeHook(textStart, textSize);
     }
 
     if (optPrewarm) {

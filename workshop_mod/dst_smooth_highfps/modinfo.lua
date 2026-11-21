@@ -2,8 +2,8 @@ name = "HyperSmooth 240FPS & FastLoad (高刷骨骼补帧与极速加载)"
 description = [[
 纯客户端 240 帧骨骼动画补帧、全套高刷修复、反 GC 掉帧与全链路加载提速伴侣 / Client-Only 240FPS Skeletal Tweening, Full High-FPS Fixes, Anti-Stutter GC & Fast-Load Suite.
 
-核心功能 / Features (v2.2.0 终极天花板版):
-1. 【全实体真 240 帧骨骼补帧】配合 bin64/dinput8.dll，锁定底层持久化 AnimNode* 追踪全屏所有玩家、怪物、Boss（梦魇疯猪/巨鹿/龙蝇等）、制作/跳跃/攻击、特效层与 UI 三通道 2D 骨骼动画：连续浮点 QPC 亚刻插值 + 2D 极分解防扭曲 + 两段式换图补帧 + Boss 级大位移保护，局内按 F10 一键盲测开关！
+核心功能 / Features (v2.2.1 紧急兼容性与热键重构版):
+1. 【全实体真 240 帧骨骼补帧】配合 bin64/dinput8.dll，锁定底层持久化 AnimNode* 追踪全屏所有玩家、怪物、Boss（梦魇疯猪/巨鹿/龙蝇等）、制作/跳跃/攻击、特效层与 UI 三通道 2D 骨骼动画：连续浮点 QPC 亚刻插值 + 2D 极分解防扭曲 + 两段式换图补帧 + Boss 级大位移保护 + ALT_RENDERPATH 自动安全旁路（彻底修复老麦暗影陷阱/囚笼、植物人藤蔓陷阱、月雹等闪退），局内按 F10 一键盲测开关！
 2. 【反 GC 卡顿引擎级调度】原生插件接管 Simulation::CollectGarbage：按帧率动态缩放增量 GC 预算（240Hz 下每帧 <=0.35ms 尖峰、总吞吐反升 40%），并将原版 1.5x 突发全量卡顿阈值改为紧急安全兜底，彻底消除打 Boss/大型基地 60~200ms 瞬冻！
 3. 【2.5 倍极速解压与加载】原生插件内置 libdeflate v1.23 (运行时按 CPUID 自动调度 AVX-512/AVX2/SSE2) 与硬件 rep stosb 清零修复，进图资源解压实测提速 2.5 倍！
 4. 【全套原版高刷 Bug 修复】
@@ -11,15 +11,15 @@ description = [[
    - 制作栏/模组/服务器/聊天滚动列表 (TrueScrollList / ChatScrollList) 指数平滑修复（消除 4 倍过快）
    - 小地图缩放 (MapScreen) 帧率无关修复（消除 4 倍过快）
    - 建筑放置辅助圈 (DeployHelper) 时间化修复（消除 240Hz 闪烁）
-5. 【240Hz 零冗余 CPU/GC 优化】消除树冠/柱体 DistanceFade 每秒数千次 Vector3 垃圾分配；静止帧无损缓存鼠标拾取 (0ms 移动延迟)；悬停提示文本/颜色脏检查跳过 99% 无效重排（兼容 ShowMe/Insight）。
-6. 【联机上下洞穴零卸载秒切 & 网络等待清空】纯客户端保留地面/洞穴资源常驻内存（退回主菜单自动释放）；缓存未启用模组 modinfo；跳过热门模组榜与 MOTD 阻塞等待。
-7. 【实时帧率 HUD & 热键】右上角轻量 FPS/帧时间监控；F9 循环切帧，F10 实时开关 240 帧骨骼补帧。
+5. 【240Hz 零冗余 CPU/GC 优化】消除树冠/柱体 DistanceFade 每秒数千次 Vector3 垃圾分配；静止帧无损缓存鼠标拾取 (0ms 移动延迟)；100% 兼容 ShowMe（中文/原版）与 Insight 悬停详情。
+6. 【联机上下洞穴零卸载秒切 & 网络等待清空】纯客户端保留地面/洞穴资源常驻内存（自动旁路独行长路与本地主机，退回主菜单自动释放）；缓存未启用模组 modinfo；跳过热门模组榜与 MOTD 阻塞等待。
+7. 【0ms 直通内存热键 & 实时帧率 HUD】C++ 原生桥接直连游戏 Lua VM（无视文档/OneDrive/WeGame 路径差异）；F9 循环切帧，F10 实时开关 240 帧骨骼补帧，未装 dinput8.dll 自动提示。
 
 注意 / Note:
 100% 纯客户端优化，无需服务器安装，支持所有官方/公共联机房间。单装本 Mod 即可生效全部 Lua 优化；将配套开源 dinput8.dll 放入 bin64/ 目录即可解锁全部 C++ 引擎级特性。
 ]]
 author = "Hakimi Tech Lab"
-version = "2.2.0"
+version = "2.2.1"
 
 api_version = 10
 dst_compatible = true
