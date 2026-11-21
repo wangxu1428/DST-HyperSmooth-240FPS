@@ -1,0 +1,14 @@
+# Build artifacts & release archives
+native_plugin/obj/
+native_plugin/*.dll
+native_plugin/*.lib
+native_plugin/*.log
+release/
+
+# Local isolated benchmark runtime & vendored third-party tarballs
+bench_runtime/
+third_party/
+
+# Python caches
+**/__pycache__/
+*.pyc

@@ -1,0 +1,62 @@
+﻿$ErrorActionPreference = "Stop"
+
+$env:ZIG_GLOBAL_CACHE_DIR = "D:\环境\C++ 编译器\zig-cache"
+$env:ZIG_LOCAL_CACHE_DIR  = "D:\环境\C++ 编译器\zig-local-cache"
+$zig = "D:\环境\C++ 编译器\ziglang\zig.exe"
+
+$root = "C:\Users\Administrator\.gemini\antigravity\scratch\dst_hypercore_server"
+$np   = "$root\native_plugin"
+$ld   = "$root\third_party\libdeflate-1.23"
+$mi   = "$root\third_party\mimalloc-2.1.7"
+$obj  = "$np\obj"
+New-Item -ItemType Directory -Force -Path $obj | Out-Null
+
+$target = "x86_64-windows-gnu"
+$commonC = @("-target", $target, "-O3", "-march=x86_64", "-DNDEBUG")
+
+Write-Host "[1/4] Compiling libdeflate-1.23 (auto-CPUID AVX2/SSE2 zlib compressor)..."
+$ldFiles = @(
+    @{ src = "$ld\lib\utils.c";             out = "$obj\ld_utils.o" },
+    @{ src = "$ld\lib\x86\cpu_features.c";  out = "$obj\ld_cpu.o" },
+    @{ src = "$ld\lib\adler32.c";           out = "$obj\ld_adler32.o" },
+    @{ src = "$ld\lib\deflate_compress.c";  out = "$obj\ld_comp.o" },
+    @{ src = "$ld\lib\zlib_compress.c";     out = "$obj\ld_zcomp.o" }
+)
+foreach ($f in $ldFiles) {
+    if (-not (Test-Path $f.out)) {
+        & $zig cc @commonC "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI" "-I$ld" "-I$ld\lib" -c $f.src -o $f.out
+        if ($LASTEXITCODE -ne 0) { throw "Failed compiling $($f.src)" }
+    }
+}
+
+Write-Host "[2/4] Compiling mimalloc-2.1.7 (lockless static slab allocator)..."
+$miObj = "$obj\mimalloc_static.o"
+if (-not (Test-Path $miObj)) {
+    & $zig cc @commonC "-I$mi\include" "-DMI_STATIC_LIB=1" -c "$mi\src\static.c" -o $miObj
+    if ($LASTEXITCODE -ne 0) { throw "Failed compiling mimalloc static.c" }
+}
+
+Write-Host "[3/4] Assembling 297-export register-preserving IPHLPAPI thunks..."
+$thunkObj = "$obj\iphlpapi_thunks.o"
+& $zig cc -target $target -c "$np\iphlpapi_thunks.S" -o $thunkObj
+if ($LASTEXITCODE -ne 0) { throw "Failed assembling iphlpapi_thunks.S" }
+
+Write-Host "[4/4] Compiling & linking iphlpapi.dll (DST HyperCore Server Native Engine v1.0.0)..."
+$mainObj = "$obj\iphlpapi.o"
+& $zig c++ -target $target -std=c++20 -O3 -march=x86_64 -DNDEBUG `
+    "-I$np" "-I$ld" "-I$mi\include" `
+    -fno-exceptions -fno-rtti `
+    -c "$np\iphlpapi.cpp" -o $mainObj
+if ($LASTEXITCODE -ne 0) { throw "Failed compiling iphlpapi.cpp" }
+
+$outDll = "$np\iphlpapi.dll"
+& $zig c++ -target $target -shared -O3 -s `
+    -o $outDll `
+    $mainObj $thunkObj $miObj `
+    "$obj\ld_utils.o" "$obj\ld_cpu.o" "$obj\ld_adler32.o" "$obj\ld_comp.o" "$obj\ld_zcomp.o" `
+    "$np\iphlpapi.def" `
+    -lws2_32 -lwinmm -ladvapi32 -lbcrypt -lpsapi
+if ($LASTEXITCODE -ne 0) { throw "Failed linking iphlpapi.dll" }
+
+$info = Get-Item $outDll
+Write-Host "SUCCESS: Built $($info.FullName) ($($info.Length) bytes)"
