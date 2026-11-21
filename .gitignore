@@ -1,0 +1,21 @@
+# Build artifacts & compiled binaries (published via GitHub Releases)
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
+*.dll
+*.exe
+*.log
+*.ini
+
+# Third-party downloaded source & release archives
+third_party/
+release/
+
+# Local scratch scripts & OS junk
+dst_fps_test.py
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
