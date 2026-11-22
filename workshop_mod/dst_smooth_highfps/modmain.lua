@@ -3,14 +3,18 @@ local TheSim = GLOBAL.TheSim
 local TheInput = GLOBAL.TheInput
 local KnownModIndex = GLOBAL.KnownModIndex
 local Text = GLOBAL.require("widgets/text")
+local TEMPLATES = GLOBAL.require("widgets/redux/templates")
 local pcall = GLOBAL.pcall
 local rawget = GLOBAL.rawget
+local rawset = GLOBAL.rawset
 local getmetatable = GLOBAL.getmetatable
 local type = GLOBAL.type
 local pairs = GLOBAL.pairs
 local ipairs = GLOBAL.ipairs
 local math = GLOBAL.math
 local string = GLOBAL.string
+local table = GLOBAL.table
+local tonumber = GLOBAL.tonumber
 local tostring = GLOBAL.tostring
 
 local TARGET_FPS = GetModConfigData("target_fps")
@@ -33,21 +37,41 @@ local SKIP_MOTD_DELAY = GetModConfigData("skip_motd_delay")
 if SKIP_MOTD_DELAY == nil then SKIP_MOTD_DELAY = true end
 local SHOW_FPS_HUD = GetModConfigData("show_fps_hud")
 if SHOW_FPS_HUD == nil then SHOW_FPS_HUD = true end
+local SHOW_1PCT_LOW = GetModConfigData("show_1pct_low")
+if SHOW_1PCT_LOW == nil then SHOW_1PCT_LOW = true end
+local AUTO_60HZ_SIM = GetModConfigData("auto_60hz_sim")
+if AUTO_60HZ_SIM == nil then AUTO_60HZ_SIM = true end
+local HOTKEY_MODIFIER = GetModConfigData("hotkey_modifier")
+if HOTKEY_MODIFIER == nil then HOTKEY_MODIFIER = "ALT" end
 local HOTKEY_NAME = GetModConfigData("hotkey_cycle")
-if HOTKEY_NAME == nil then HOTKEY_NAME = "KEY_F9" end
+if HOTKEY_NAME == nil then HOTKEY_NAME = false end
 local HOTKEY_SKELETAL = GetModConfigData("hotkey_skeletal")
-if HOTKEY_SKELETAL == nil then HOTKEY_SKELETAL = "KEY_F10" end
+if HOTKEY_SKELETAL == nil then HOTKEY_SKELETAL = false end
 
 local CFG_FILENAME = "dst_smooth_highfps_cfg"
-local FPS_PRESETS = { 60, 120, 144, 240, 0 }
+local FPS_PRESETS = { 60, 120, 144, 165, 240, 360, 0 }
 local current_target_fps = TARGET_FPS
 local current_skeletal_tween = SKELETAL_TWEEN and true or false
+local current_show_fps_hud = SHOW_FPS_HUD and true or false
+local fps_hud_text = nil
+local hud_dirty_now = false
 
 local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
-local function SyncToNativePlugin()
+local function ApplyHudVisibility()
+    if fps_hud_text and fps_hud_text.inst and fps_hud_text.inst:IsValid() then
+        if current_show_fps_hud then
+            fps_hud_text:Show()
+            hud_dirty_now = true
+        else
+            fps_hud_text:Hide()
+        end
+    end
+end
+
+local function SyncToNativePlugin(save_persist)
     -- Primary path (v2.2.1+): 0ms direct C++ <-> Lua VM memory bridge (immune to
     -- Documents/OneDrive/WeGame/Steam Cloud path mismatches!)
     local fnFps = rawget(GLOBAL, "HyperSmooth_SetFps")
@@ -58,15 +82,45 @@ local function SyncToNativePlugin()
     if type(fnSkel) == "function" then
         pcall(fnSkel, current_skeletal_tween)
     end
-    -- Fallback persistence path for v2.2.0 DLLs and cross-restart config sync
-    if TheSim and TheSim.SetPersistentString then
-        local payload = string.format("fps=%d;skeletal=%d", current_target_fps, current_skeletal_tween and 1 or 0)
+    ApplyHudVisibility()
+    -- Persist user choices (and modinfo fingerprint mf/ms/mh so explicit modinfo changes win cleanly)
+    if save_persist ~= false and TheSim and TheSim.SetPersistentString then
+        local payload = string.format("fps=%d;skeletal=%d;hud=%d;mf=%d;ms=%d;mh=%d",
+            current_target_fps,
+            current_skeletal_tween and 1 or 0,
+            current_show_fps_hud and 1 or 0,
+            TARGET_FPS,
+            SKELETAL_TWEEN and 1 or 0,
+            SHOW_FPS_HUD and 1 or 0)
         TheSim:SetPersistentString(CFG_FILENAME, payload, false)
     end
 end
 
--- Sync immediately on mod load
-SyncToNativePlugin()
+-- Restore last in-game OptionsScreen choices unless user explicitly changed modinfo.lua config
+if TheSim and TheSim.GetPersistentString then
+    TheSim:GetPersistentString(CFG_FILENAME, function(load_success, str)
+        if load_success and type(str) == "string" and #str > 0 then
+            local sf = tonumber(str:match("fps=(%d+)"))
+            local ss = tonumber(str:match("skeletal=(%d+)"))
+            local sh = tonumber(str:match("hud=(%d+)"))
+            local mf = tonumber(str:match("mf=(%d+)"))
+            local ms = tonumber(str:match("ms=(%d+)"))
+            local mh = tonumber(str:match("mh=(%d+)"))
+            if sf ~= nil and mf == TARGET_FPS then
+                current_target_fps = sf
+            end
+            if ss ~= nil and ms == (SKELETAL_TWEEN and 1 or 0) then
+                current_skeletal_tween = (ss ~= 0)
+            end
+            if sh ~= nil and mh == (SHOW_FPS_HUD and 1 or 0) then
+                current_show_fps_hud = (sh ~= 0)
+            end
+        end
+        SyncToNativePlugin(true)
+    end)
+else
+    SyncToNativePlugin(true)
+end
 
 --------------------------------------------------------------------------------
 -- 1. Fast Mod Scan: cache parsed modinfo for disabled mods so switching menus
@@ -324,7 +378,24 @@ if SMOOTH_UI_240HZ then
         end
     end)
 
+    local _dbg_getinfo = (type(GLOBAL.debug) == "table" and type(GLOBAL.debug.getinfo) == "function") and GLOBAL.debug.getinfo or nil
+    local function IsVanillaComponentFn(fn, file_pat)
+        if fn == nil or _dbg_getinfo == nil then
+            return true
+        end
+        local info = _dbg_getinfo(fn, "S")
+        local src = info ~= nil and info.source or nil
+        if type(src) ~= "string" then
+            return true
+        end
+        return src:find(file_pat) ~= nil
+    end
+
     AddComponentPostInit("deployhelper", function(self)
+        if not IsVanillaComponentFn(self.OnWallUpdate, "components[/\\]deployhelper%.lua") then
+            -- Preserve third-party mod custom deployhelper:OnWallUpdate untouched
+            return
+        end
         self.OnWallUpdate = function(cmp, dt)
             local step = (dt and dt > 0 and dt < 0.25) and (dt * 60.0) or 1.0
             if cmp.delay ~= nil and cmp.delay > step then
@@ -341,10 +412,19 @@ end
 --    a) DistanceFade: inline scalar dot product (eliminates 240 Vector3 allocs/sec per tree/canopy).
 --    b) Input:OnUpdate: lossless stationary hit-test cache (0ms latency on mouse/camera move
 --       or UI screens; skips ~75% redundant 240Hz C++ GetEntitiesAtScreenPoint scans).
---    (v2.2.1: removed HoverText SetString wrapper for 100% ShowMe / Insight RPC compatibility.)
+--    (v2.2.1+: removed HoverText SetString wrapper for 100% ShowMe / Insight RPC compatibility.)
 --------------------------------------------------------------------------------
 if REDUCE_240HZ_CHURN then
+    local _dbg_getinfo_df = (type(GLOBAL.debug) == "table" and type(GLOBAL.debug.getinfo) == "function") and GLOBAL.debug.getinfo or nil
     AddComponentPostInit("distancefade", function(self)
+        if self.OnWallUpdate ~= nil and _dbg_getinfo_df ~= nil then
+            local info = _dbg_getinfo_df(self.OnWallUpdate, "S")
+            local src = info ~= nil and info.source or nil
+            if type(src) == "string" and src:find("components[/\\]distancefade%.lua") == nil then
+                -- Preserve third-party mod custom distancefade:OnWallUpdate untouched
+                return
+            end
+        end
         self.OnWallUpdate = function(cmp, dt)
             local player = GLOBAL.ThePlayer
             if not player then
@@ -418,13 +498,539 @@ if REDUCE_240HZ_CHURN then
 end
 
 --------------------------------------------------------------------------------
--- 8. Lightweight Zero-Churn FPS + FrameTime HUD & In-Game Hotkeys (F9 / F10)
+-- 8. Native ESC -> Settings -> Graphics Integration (v2.3.0)
+--    Directly revives & powers Klei's official "Refresh Rate" (刷新率) spinner
+--    in BOTH Windowed and Fullscreen modes (ZERO duplicate FPS UI!), safely maps
+--    Fullscreen hardware display Hz, fixes Klei's IsGraphicsDirty() refreshrate bug,
+--    and adds only the 2 truly new visual toggles (Skeletal 240fps + FPS HUD)
+--    into the empty right-column rows 6 & 7 below Dynamic Tree Shadows.
 --------------------------------------------------------------------------------
-local fps_hud_text = nil
+AddClassPostConstruct("screens/redux/optionsscreen", function(self)
+    if not self or not self.refreshRateSpinner or not self.options or not self.working then
+        return
+    end
+
+    local opt_str = GLOBAL.STRINGS and GLOBAL.STRINGS.UI and GLOBAL.STRINGS.UI.OPTIONS
+    local enabled_str = (opt_str and opt_str.ENABLED) or "Enabled"
+    local disabled_str = (opt_str and opt_str.DISABLED) or "Disabled"
+    local is_zh = (enabled_str ~= "Enabled")
+    local unlimited_label = is_zh and "无限制" or "Unlimited"
+    local has_dll = HasNativePlugin()
+
+    -- Helper: read real hardware monitor refresh rates for current display/resolution
+    local function GetHardwareRefreshRates(scr)
+        local rates = {}
+        local fe = GLOBAL.TheFrontEnd
+        local gOpts = fe and fe:GetGraphicsOptions()
+        if not gOpts then return rates end
+        local disp = scr.working.display or 0
+        local mode_idx = scr.working.mode_idx or 0
+        local ok, w, h = pcall(gOpts.GetDisplayMode, gOpts, disp, mode_idx)
+        if not ok or not w or not h then return rates end
+        local ok_n, num = pcall(gOpts.GetNumRefreshRates, gOpts, disp, w, h)
+        if not ok_n or not num then return rates end
+        local seen = {}
+        for i = 0, num - 1 do
+            local ok_r, hz = pcall(gOpts.GetRefreshRate, gOpts, disp, w, h, i)
+            if ok_r and hz and hz > 0 and not seen[hz] then
+                seen[hz] = true
+                rates[#rates + 1] = hz
+            end
+        end
+        table.sort(rates)
+        return rates
+    end
+
+    -- Helper: map logical target FPS (including 0=Unlimited or >panel Hz) to a guaranteed valid
+    -- Windows hardware display Hz so ChangeGraphicsMode NEVER falls back to 640x480 mode 0!
+    local function PickSafeHardwareHz(scr, target_fps)
+        local hw = GetHardwareRefreshRates(scr)
+        if #hw == 0 then
+            return scr._hc_hw_refreshrate or 60
+        end
+        if not target_fps or target_fps <= 0 then
+            return hw[#hw] -- Unlimited -> highest native monitor refresh rate
+        end
+        for _, hz in ipairs(hw) do
+            if hz == target_fps then return hz end
+        end
+        for _, hz in ipairs(hw) do
+            if hz >= target_fps then return hz end
+        end
+        return hw[#hw]
+    end
+
+    -- Helper: build unified refresh/FPS option list (real monitor Hz + standard presets + Unlimited)
+    local function BuildMergedRefreshOptions(scr, active_fps)
+        local set = {}
+        local nums = {}
+        local function add_num(v)
+            if type(v) == "number" and v > 0 and not set[v] then
+                set[v] = true
+                nums[#nums + 1] = v
+            end
+        end
+        for _, hz in ipairs(GetHardwareRefreshRates(scr)) do add_num(hz) end
+        for _, p in ipairs({ 60, 120, 144, 165, 240, 360 }) do add_num(p) end
+        if type(active_fps) == "number" and active_fps > 0 then add_num(active_fps) end
+        table.sort(nums)
+
+        local opts = {}
+        for _, v in ipairs(nums) do
+            opts[#opts + 1] = { text = string.format("%d", v), data = v }
+        end
+        opts[#opts + 1] = { text = unlimited_label, data = 0 }
+        return opts
+    end
+
+    self._hc_hw_refreshrate = self.options.refreshrate or 60
+    self.options.refreshrate = current_target_fps
+    self.working.refreshrate = current_target_fps
+    self.options.hc_skeletal = current_skeletal_tween
+    self.working.hc_skeletal = current_skeletal_tween
+    self.options.hc_show_hud = current_show_fps_hud
+    self.working.hc_show_hud = current_show_fps_hud
+
+    -- Update official Refresh Rate tooltip to reflect live HyperSmooth v2.4.0 RTSS control
+    if self.refreshRateSpinner.parent then
+        if is_zh then
+            self.refreshRateSpinner.parent.tooltip_text = has_dll
+                and "由 HyperSmooth v2.4.0 零争抢 RTSS 引擎实时接管：支持全屏/窗口自由切帧（60~360/无限制）并深度优化 1% Low 稳帧"
+                or "需安装配套 bin64/dinput8.dll 原生插件方可突破官方 60 帧上限与启用 RTSS 稳帧（当前仅控制全屏显示器模式）"
+        else
+            self.refreshRateSpinner.parent.tooltip_text = has_dll
+                and "Powered live by HyperSmooth v2.4.0 Zero-Contention RTSS Pacer: 60-360 FPS or Unlimited with 1% Low stabilization."
+                or "Install bin64/dinput8.dll companion plugin to unlock frame rate above 60 FPS & RTSS pacing."
+        end
+    end
+
+    -- 1. Keep official refreshRateSpinner ALWAYS enabled (even in Windowed / Borderless mode!)
+    local orig_UpdateResolutionsSpinner = self.UpdateResolutionsSpinner
+    self.UpdateResolutionsSpinner = function(scr, ...)
+        local r = orig_UpdateResolutionsSpinner(scr, ...)
+        if scr.refreshRateSpinner then
+            scr.refreshRateSpinner:Enable()
+        end
+        return r
+    end
+
+    -- 2. Populate official refreshRateSpinner with merged monitor Hz + high-FPS presets + Unlimited
+    self.UpdateRefreshRatesSpinner = function(scr)
+        local target = scr.working.refreshrate
+        if target == nil then target = current_target_fps end
+        local opts = BuildMergedRefreshOptions(scr, target)
+        scr.refreshRateSpinner:SetOptions(opts)
+        local selected = 1
+        for idx, item in ipairs(opts) do
+            if item.data == target then
+                selected = idx
+                break
+            end
+        end
+        scr.refreshRateSpinner:SetSelectedIndex(selected)
+        scr.working.refreshrate = opts[selected].data
+    end
+
+    -- 3. Fix Klei's IsGraphicsDirty() refreshrate bug while avoiding monitor flicker in Windowed mode
+    local orig_IsGraphicsDirty = self.IsGraphicsDirty
+    self.IsGraphicsDirty = function(scr, ...)
+        if orig_IsGraphicsDirty(scr, ...) then
+            return true
+        end
+        if scr.working.fullscreen then
+            return PickSafeHardwareHz(scr, scr.working.refreshrate) ~= PickSafeHardwareHz(scr, scr.options.refreshrate)
+        end
+        return false
+    end
+
+    -- 4. Guard ChangeGraphicsMode() so 0 (Unlimited) or >panel Hz safely selects highest valid monitor Hz
+    local orig_ChangeGraphicsMode = self.ChangeGraphicsMode
+    self.ChangeGraphicsMode = function(scr, ...)
+        local saved_fps = scr.working.refreshrate
+        scr.working.refreshrate = PickSafeHardwareHz(scr, saved_fps)
+        local r = orig_ChangeGraphicsMode(scr, ...)
+        scr.working.refreshrate = saved_fps
+        return r
+    end
+
+    -- 5. Add only the 2 truly new visual toggles into right-column empty rows 6 & 7 (below Dynamic Tree Shadows)
+    local function CreateNativeGraphicsSpinner(labeltext, spinnerdata, tooltip_text)
+        local w = TEMPLATES.LabelSpinner(labeltext, spinnerdata, 200, 220, 36, 5, nil, nil, -50, nil, nil, tooltip_text)
+        w.bg = w:AddChild(TEMPLATES.ListItemBackground(200 + 220 + 5 + 15, 36 + 5))
+        w.bg:SetPosition(-40, 0)
+        w.bg:MoveToBack()
+        return w.spinner
+    end
+
+    local function FindGraphicsTooltipWidgets(scr)
+        local root = scr.grid_graphics and scr.grid_graphics.parent
+        if not root or not root.children then return nil, nil end
+        local tip_txt, tip_div = nil, nil
+        for child in pairs(root.children) do
+            if child ~= scr.grid_graphics then
+                if child.SetString and child.EnableWordWrap then
+                    tip_txt = child
+                elseif child.SetTexture then
+                    tip_div = child
+                end
+            end
+        end
+        return tip_txt, tip_div
+    end
+
+    local function AttachTooltip(widget, tooltip, divider)
+        if not widget or not tooltip then return end
+        local function ongain()
+            if widget.tooltip_text ~= nil then
+                tooltip:SetString(widget.tooltip_text)
+                if divider then divider:Show() end
+            end
+        end
+        local function onlose()
+            if widget.parent and not widget.parent.focus then
+                tooltip:SetString("")
+                if divider then divider:Hide() end
+            end
+        end
+        if widget.bg then
+            widget.bg.ongainfocus = ongain
+            widget.bg.onlosefocus = onlose
+        end
+        if widget.spinner then
+            widget.spinner.ongainfocusfn = ongain
+            widget.spinner.onlosefocusfn = onlose
+        end
+    end
+
+    local function BindPendingHighlight(spinner)
+        if not spinner or not spinner.GetSelectedIndex then return end
+        spinner.default_index = spinner:GetSelectedIndex()
+        spinner:EnablePendingModificationBackground()
+        local orig_cb = spinner.OnChanged
+        spinner.OnChanged = function(sp, data)
+            if orig_cb then orig_cb(sp, data) end
+            spinner:SetHasModification(spinner:GetSelectedIndex() ~= spinner.default_index)
+        end
+    end
+
+    if self.grid_graphics and self.right_spinners_graphics and self.grid_graphics.num_rows
+        and (#self.right_spinners_graphics + 2) <= self.grid_graphics.num_rows then
+        local toggle_opts = {
+            { text = disabled_str, data = false },
+            { text = enabled_str, data = true },
+        }
+        local tip_txt, tip_div = FindGraphicsTooltipWidgets(self)
+
+        local skel_label = is_zh and "240帧骨骼补帧" or "240fps Skeletal"
+        local skel_tip = is_zh
+            and (has_dll and "开启全实体/特效/UI 真 240 帧骨骼动画亚刻插值（dinput8.dll 已直连，实时生效）"
+                         or "需安装 bin64/dinput8.dll 原生插件方可生效")
+            or (has_dll and "True 240fps 2D skeletal animation interpolation across World, Overlays & UI (dinput8.dll active)."
+                        or "Requires bin64/dinput8.dll native companion plugin.")
+        self.hcSkeletalSpinner = CreateNativeGraphicsSpinner(skel_label, toggle_opts, skel_tip)
+        self.hcSkeletalSpinner.OnChanged = function(_, data)
+            self.working.hc_skeletal = data
+            self:UpdateMenu()
+        end
+
+        local hud_label = is_zh and "帧率显示 HUD" or "FPS Overlay HUD"
+        local hud_tip = is_zh
+            and "在游戏画面右上角显示轻量级实时 FPS 与帧生成时间 (ms)"
+            or "Show lightweight real-time FPS and frame-time (ms) overlay in the top-right corner."
+        self.hcHudSpinner = CreateNativeGraphicsSpinner(hud_label, toggle_opts, hud_tip)
+        self.hcHudSpinner.OnChanged = function(_, data)
+            self.working.hc_show_hud = data
+            self:UpdateMenu()
+        end
+
+        local r1 = #self.right_spinners_graphics + 1
+        table.insert(self.right_spinners_graphics, self.hcSkeletalSpinner)
+        self.grid_graphics:AddItem(self.hcSkeletalSpinner.parent, 2, r1)
+        AttachTooltip(self.hcSkeletalSpinner.parent, tip_txt, tip_div)
+
+        local r2 = #self.right_spinners_graphics + 1
+        table.insert(self.right_spinners_graphics, self.hcHudSpinner)
+        self.grid_graphics:AddItem(self.hcHudSpinner.parent, 2, r2)
+        AttachTooltip(self.hcHudSpinner.parent, tip_txt, tip_div)
+
+        self.hcSkeletalSpinner:SetSelectedIndex(self.working.hc_skeletal and 2 or 1)
+        self.hcHudSpinner:SetSelectedIndex(self.working.hc_show_hud and 2 or 1)
+        BindPendingHighlight(self.hcSkeletalSpinner)
+        BindPendingHighlight(self.hcHudSpinner)
+    end
+
+    -- 6. Sync on InitializeSpinners (handles RevertChanges cleanly)
+    local orig_InitializeSpinners = self.InitializeSpinners
+    self.InitializeSpinners = function(scr, first, ...)
+        local r = orig_InitializeSpinners(scr, first, ...)
+        if scr.refreshRateSpinner then
+            scr.refreshRateSpinner:SetHasModification(false)
+        end
+        if scr.hcSkeletalSpinner then
+            scr.hcSkeletalSpinner:SetSelectedIndex(scr.working.hc_skeletal and 2 or 1)
+            scr.hcSkeletalSpinner:SetHasModification(false)
+        end
+        if scr.hcHudSpinner then
+            scr.hcHudSpinner:SetSelectedIndex(scr.working.hc_show_hud and 2 or 1)
+            scr.hcHudSpinner:SetHasModification(false)
+        end
+        return r
+    end
+
+    -- 7. Sync live engine & persist on Apply / Save
+    local orig_Apply = self.Apply
+    self.Apply = function(scr, ...)
+        local r = orig_Apply(scr, ...)
+        if scr.working.refreshrate ~= nil then
+            current_target_fps = scr.working.refreshrate
+        end
+        if scr.working.hc_skeletal ~= nil then
+            current_skeletal_tween = scr.working.hc_skeletal and true or false
+        end
+        if scr.working.hc_show_hud ~= nil then
+            current_show_fps_hud = scr.working.hc_show_hud and true or false
+        end
+        SyncToNativePlugin(true)
+        return r
+    end
+
+    local orig_Save = self.Save
+    self.Save = function(scr, cb, ...)
+        return orig_Save(scr, function(...)
+            if scr.refreshRateSpinner then
+                scr.refreshRateSpinner.default_index = scr.refreshRateSpinner:GetSelectedIndex()
+                scr.refreshRateSpinner:SetHasModification(false)
+            end
+            if scr.hcSkeletalSpinner then
+                scr.hcSkeletalSpinner.default_index = scr.hcSkeletalSpinner:GetSelectedIndex()
+                scr.hcSkeletalSpinner:SetHasModification(false)
+            end
+            if scr.hcHudSpinner then
+                scr.hcHudSpinner.default_index = scr.hcHudSpinner:GetSelectedIndex()
+                scr.hcHudSpinner:SetHasModification(false)
+            end
+            if cb then cb(...) end
+        end, ...)
+    end
+
+    -- Initialize official Refresh Rate spinner state right now (no false yellow highlight on open!)
+    self:UpdateResolutionsSpinner()
+    self:UpdateRefreshRatesSpinner()
+    self.refreshRateSpinner.default_index = self.refreshRateSpinner:GetSelectedIndex()
+    self.refreshRateSpinner:SetHasModification(false)
+    self:UpdateMenu()
+end)
+
+--------------------------------------------------------------------------------
+-- 9. Route B: Auto-Negotiated Opt-In 60Hz SimTick Handshake (v2.4.0)
+--    100% passive on ALL vanilla/public servers (dinput8.dll unconditionally
+--    resets Client SimTick to 30Hz on every VM/menu/server transition!).
+--    Activates 60Hz ONLY when connected to a DST HyperCore Server v1.2.0+
+--    with opt_sim_60hz enabled AND user has auto_60hz_sim = true.
+--------------------------------------------------------------------------------
 local toast_timer = 0
 local toast_msg = nil
-local hud_dirty_now = false
+local active_sim_tick_hz = 30
 
+local function TryActivate60HzSim(source_label)
+    if not AUTO_60HZ_SIM or active_sim_tick_hz == 60 then
+        return
+    end
+    local fnSetSim = rawget(GLOBAL, "HyperSmooth_SetSimTickRate")
+    if type(fnSetSim) ~= "function" then
+        return
+    end
+    local ok, applied = pcall(fnSetSim, 60)
+    if ok and applied then
+        active_sim_tick_hz = 60
+        -- Override GetTime / GetStaticTime dynamically so Lua never reads stale 1/30 upvalues
+        rawset(GLOBAL, "GetTime", function()
+            return TheSim:GetTick() * TheSim:GetTickTime()
+        end)
+        rawset(GLOBAL, "GetStaticTime", function()
+            return TheSim:GetStaticTick() * TheSim:GetTickTime()
+        end)
+        toast_msg = "HyperCore 60Hz SimTick ACTIVE"
+        toast_timer = 4.0
+        hud_dirty_now = true
+        if GLOBAL.print then
+            GLOBAL.print(string.format("[HyperSmooth v2.4.0] Auto-negotiated 60Hz SimTick via %s (GetTickTime=%.6f)",
+                tostring(source_label), TheSim:GetTickTime()))
+        end
+    end
+end
+
+-- Channel 1: ClientModRPC("HyperCoreProto", "SimTickRate") without duplicating slot id if co-loaded
+local function OnSimTickRateRpc(hz)
+    if hz == 60 then
+        TryActivate60HzSim("ClientModRPC")
+    end
+end
+if type(AddClientModRPCHandler) == "function" then
+    -- NOTE: Klei's GetClientModRPC(ns, name) does NOT nil-check CLIENT_MOD_RPC[ns]!
+    -- Always inspect GLOBAL.CLIENT_MOD_RPC directly before registering.
+    local rpc_tbl = rawget(GLOBAL, "CLIENT_MOD_RPC")
+    local rpc_ns = type(rpc_tbl) == "table" and rpc_tbl["HyperCoreProto"] or nil
+    local existing_rpc = type(rpc_ns) == "table" and rpc_ns["SimTickRate"] or nil
+    if existing_rpc == nil then
+        AddClientModRPCHandler("HyperCoreProto", "SimTickRate", OnSimTickRateRpc)
+    else
+        local handlers_tbl = rawget(GLOBAL, "CLIENT_MOD_RPC_HANDLERS")
+        local handlers_ns = type(handlers_tbl) == "table" and handlers_tbl["HyperCoreProto"] or nil
+        if type(handlers_ns) == "table" and existing_rpc.id ~= nil then
+            local prev_fn = handlers_ns[existing_rpc.id]
+            handlers_ns[existing_rpc.id] = function(hz, ...)
+                if type(prev_fn) == "function" then pcall(prev_fn, hz, ...) end
+                OnSimTickRateRpc(hz)
+            end
+        end
+    end
+end
+
+-- Channel 2: Replicated "hypercore_sim60" tag on world_network prefabs (zero RPC dependency!)
+for _, net_prefab in ipairs({ "forest_network", "cave_network", "lavaarena_network", "quagmire_network" }) do
+    AddPrefabPostInit(net_prefab, function(inst)
+        if not AUTO_60HZ_SIM then return end
+        if inst and inst.HasTag and inst:HasTag("hypercore_sim60") then
+            TryActivate60HzSim("WorldNetTag")
+        elseif inst and inst.DoTaskInTime then
+            inst:DoTaskInTime(0.25, function(net_inst)
+                if net_inst and net_inst:IsValid() and net_inst:HasTag("hypercore_sim60") then
+                    TryActivate60HzSim("WorldNetTag")
+                end
+            end)
+        end
+    end)
+end
+
+AddSimPostInit(function()
+    if not AUTO_60HZ_SIM then return end
+    local w = GLOBAL.TheWorld
+    if w ~= nil then
+        if (w.HasTag and w:HasTag("hypercore_sim60")) or (w.net and w.net.HasTag and w.net:HasTag("hypercore_sim60")) then
+            TryActivate60HzSim("SimPostInit")
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- 9b. 240Hz Immediate WASD RPC Dispatch (Lag Compensation OFF Zero-Wait Input)
+--     Vanilla PlayerController:DoDirectWalking only polls WASD inside OnUpdate
+--     (once per SimTick: 0-33.3ms stall on 30Hz servers, 0-16.7ms on 60Hz).
+--     When Lag Comp is OFF (self.locomotor == nil on remote client), dispatching
+--     RemoteDirectWalking / RemoteStopWalking directly on the 240Hz OnControl
+--     edge cuts 8-33ms of input wait with ZERO duplicate RPCs (self.remote_vector
+--     deduplicates) and 100% vanilla-server compatibility.
+--------------------------------------------------------------------------------
+if type(AddComponentPostInit) == "function" then
+    AddComponentPostInit("playercontroller", function(pc)
+        if type(pc) ~= "table" or type(pc.OnControl) ~= "function" then
+            return
+        end
+        local MOVE_UP    = rawget(GLOBAL, "CONTROL_MOVE_UP")
+        local MOVE_DOWN  = rawget(GLOBAL, "CONTROL_MOVE_DOWN")
+        local MOVE_LEFT  = rawget(GLOBAL, "CONTROL_MOVE_LEFT")
+        local MOVE_RIGHT = rawget(GLOBAL, "CONTROL_MOVE_RIGHT")
+        local CTRL_ATK   = rawget(GLOBAL, "CONTROL_CONTROLLER_ATTACK")
+        if not (MOVE_UP and MOVE_DOWN and MOVE_LEFT and MOVE_RIGHT) then
+            return
+        end
+
+        local orig_OnControl = pc.OnControl
+        pc.OnControl = function(self, control, down, analog, ...)
+            local ret = orig_OnControl(self, control, down, analog, ...)
+            if ret == true then
+                return ret
+            end
+            if control ~= MOVE_UP and control ~= MOVE_DOWN and control ~= MOVE_LEFT and control ~= MOVE_RIGHT then
+                return ret
+            end
+            -- Strictly remote client with Lag Compensation OFF (locomotor == nil)
+            if self.ismastersim or self.locomotor ~= nil then
+                return ret
+            end
+            if (GLOBAL.IsPaused and GLOBAL.IsPaused()) or self.handler == nil then
+                return ret
+            end
+            local inst = self.inst
+            if inst == nil or inst ~= GLOBAL.ThePlayer or (inst.IsValid and not inst:IsValid()) then
+                return ret
+            end
+            -- Preserve full analog stick precision for gamepads (handled natively in OnUpdate)
+            if TheInput.ControllerAttached and TheInput:ControllerAttached() then
+                return ret
+            end
+            local isenabled, ishudblocking = false, false
+            if self.IsEnabled then
+                isenabled, ishudblocking = self:IsEnabled()
+            end
+            if not isenabled and not ishudblocking then
+                return ret
+            end
+            if self.dragwalking or self.draggingonground then
+                return ret
+            end
+            if self.IsLocalOrRemoteHopping and self:IsLocalOrRemoteHopping() then
+                return ret
+            end
+            if self.recent_bufferedaction ~= nil and self.recent_bufferedaction.act ~= nil then
+                return ret
+            end
+            local bcu = inst.components and inst.components.boatcannonuser or nil
+            if (bcu ~= nil and bcu.GetCannon and bcu:GetCannon() ~= nil)
+                or (inst.HasTag and (inst:HasTag("steeringboat") or inst:HasTag("rotatingboat"))) then
+                return ret
+            end
+
+            local trigVal = (type(analog) == "number" and analog) or (down and 1 or 0)
+            local vR = (control == MOVE_RIGHT) and trigVal or (TheInput:GetAnalogControlValue(MOVE_RIGHT) or 0)
+            local vL = (control == MOVE_LEFT)  and trigVal or (TheInput:GetAnalogControlValue(MOVE_LEFT) or 0)
+            local vU = (control == MOVE_UP)    and trigVal or (TheInput:GetAnalogControlValue(MOVE_UP) or 0)
+            local vD = (control == MOVE_DOWN)  and trigVal or (TheInput:GetAnalogControlValue(MOVE_DOWN) or 0)
+            local xdir = vR - vL
+            local ydir = vU - vD
+            local deadzone = (GLOBAL.TUNING and GLOBAL.TUNING.CONTROLLER_DEADZONE_RADIUS) or 0.3
+
+            if math.abs(xdir) >= deadzone or math.abs(ydir) >= deadzone then
+                if self.IsBusy and self:IsBusy() then
+                    return ret
+                end
+                if self.controller_attack_override ~= nil then
+                    return ret
+                end
+                if CTRL_ATK and inst.sg ~= nil and inst.sg:HasStateTag("attack") and self:IsControlPressed(CTRL_ATK) then
+                    return ret
+                end
+                local cam = GLOBAL.TheCamera
+                if cam and cam.GetRightVec and cam.GetDownVec and type(self.RemoteDirectWalking) == "function" then
+                    local dir = (cam:GetRightVec() * xdir - cam:GetDownVec() * ydir):GetNormalized()
+                    if dir.x == dir.x and dir.z == dir.z then
+                        if inst.ClearBufferedAction then inst:ClearBufferedAction() end
+                        if self.CooldownRemoteController then self:CooldownRemoteController() end
+                        if not self.directwalking then
+                            self.time_direct_walking = 0
+                            self.directwalking = true
+                            self.dragwalking = false
+                            self.predictwalking = false
+                        end
+                        self:RemoteDirectWalking(dir.x, dir.z)
+                    end
+                end
+            elseif self.directwalking and type(self.RemoteStopWalking) == "function" then
+                self.directwalking = false
+                self.dragwalking = false
+                self.predictwalking = false
+                if self.CooldownRemoteController then self:CooldownRemoteController() end
+                self:RemoteStopWalking()
+            end
+            return ret
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- 10. Lightweight Zero-Churn FPS + 1% Low + P99 HUD & Optional Custom Hotkeys
+--------------------------------------------------------------------------------
 local function FormatTargetLabel(fps)
     if fps == 0 then
         return "UNLIMITED"
@@ -432,7 +1038,23 @@ local function FormatTargetLabel(fps)
     return tostring(fps) .. " FPS"
 end
 
+local function IsModifierPressed()
+    if HOTKEY_MODIFIER == "NONE" or not HOTKEY_MODIFIER then
+        return true
+    elseif HOTKEY_MODIFIER == "ALT" then
+        return TheInput:IsKeyDown(GLOBAL.KEY_ALT) or TheInput:IsKeyDown(GLOBAL.KEY_LALT) or TheInput:IsKeyDown(GLOBAL.KEY_RALT)
+    elseif HOTKEY_MODIFIER == "CTRL" then
+        return TheInput:IsKeyDown(GLOBAL.KEY_CTRL) or TheInput:IsKeyDown(GLOBAL.KEY_LCTRL) or TheInput:IsKeyDown(GLOBAL.KEY_RCTRL)
+    elseif HOTKEY_MODIFIER == "SHIFT" then
+        return TheInput:IsKeyDown(GLOBAL.KEY_SHIFT) or TheInput:IsKeyDown(GLOBAL.KEY_LSHIFT) or TheInput:IsKeyDown(GLOBAL.KEY_RSHIFT)
+    end
+    return true
+end
+
 local function CanTriggerInGameHotkey()
+    if not IsModifierPressed() then
+        return false
+    end
     local player = GLOBAL.ThePlayer
     local fe = GLOBAL.TheFrontEnd
     if not player or not fe then
@@ -452,17 +1074,17 @@ end
 
 AddClassPostConstruct("screens/playerhud", function(self)
     -- Re-sync on entering world so any session reload matches active config immediately
-    SyncToNativePlugin()
+    SyncToNativePlugin(false)
 
     local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 24, ""))
     txt:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
     txt:SetVAnchor(GLOBAL.ANCHOR_TOP)
-    txt:SetRegionSize(680, 32)
+    txt:SetRegionSize(860, 32)
     txt:SetHAlign(GLOBAL.ANCHOR_RIGHT)
-    txt:SetPosition(-356, -24, 0)
+    txt:SetPosition(-446, -24, 0)
     txt:SetColour(0.55, 1.0, 0.65, 0.92)
     txt:SetClickable(false)
-    if not SHOW_FPS_HUD then
+    if not current_show_fps_hud then
         txt:Hide()
     end
     fps_hud_text = txt
@@ -486,7 +1108,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
         end
         if toast_timer > 0 then
             toast_timer = toast_timer - (dt or 0)
-            if toast_timer <= 0 and not SHOW_FPS_HUD then
+            if toast_timer <= 0 and not current_show_fps_hud then
                 fps_hud_text:Hide()
             end
         end
@@ -499,20 +1121,41 @@ AddClassPostConstruct("screens/playerhud", function(self)
             end
             hud_dirty_now = false
 
+            -- Prefer zero-allocation C++ 512-frame RTSS ring telemetry when available
+            local fnStats = rawget(GLOBAL, "HyperSmooth_GetFrameStats")
+            local disp_fps = last_real_fps
+            local metric_str = nil
+            local color_metric = last_real_fps
+
+            if SHOW_1PCT_LOW and type(fnStats) == "function" then
+                local ok, avg, low1, p99, _, _, simhz = pcall(fnStats)
+                if ok and type(avg) == "number" and avg > 1.0 and type(low1) == "number" and low1 > 1.0 then
+                    disp_fps = avg
+                    color_metric = low1
+                    local badge = (simhz == 60) and " [60Hz]" or ""
+                    metric_str = string.format("%.0f FPS | 1%%L %.0f (%.1fms)%s", avg, low1, p99 or last_ms, badge)
+                end
+            end
+            if not metric_str then
+                local badge = (active_sim_tick_hz == 60) and " [60Hz]" or ""
+                metric_str = string.format("%.0f FPS (%.1fms)%s", disp_fps, last_ms, badge)
+            end
+
             if toast_timer > 0 and toast_msg then
-                if not SHOW_FPS_HUD then
+                if not current_show_fps_hud then
                     fps_hud_text:Show()
                     fps_hud_text:SetString(toast_msg)
                 else
-                    fps_hud_text:SetString(string.format("%.0f FPS (%.1fms) | %s", last_real_fps, last_ms, toast_msg))
+                    fps_hud_text:SetString(metric_str .. " | " .. toast_msg)
                 end
-            elseif SHOW_FPS_HUD then
-                fps_hud_text:SetString(string.format("%.0f FPS (%.1fms)", last_real_fps, last_ms))
+            elseif current_show_fps_hud then
+                fps_hud_text:Show()
+                fps_hud_text:SetString(metric_str)
             end
 
-            if last_real_fps >= 110 then
+            if color_metric >= 95 or (disp_fps >= 110 and color_metric >= disp_fps * 0.72) then
                 fps_hud_text:SetColour(0.45, 1.0, 0.65, 0.92)
-            elseif last_real_fps >= 58 then
+            elseif color_metric >= 52 then
                 fps_hud_text:SetColour(1.0, 0.92, 0.45, 0.92)
             else
                 fps_hud_text:SetColour(1.0, 0.45, 0.45, 0.92)
@@ -521,7 +1164,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
     end
 end)
 
--- F9: Cycle Target FPS (60 -> 120 -> 144 -> 240 -> UNLIMITED)
+-- Optional Custom Hotkey 1: Cycle Target FPS (60 -> 120 -> 144 -> 165 -> 240 -> 360 -> UNLIMITED)
 if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
     local key_code = GLOBAL[HOTKEY_NAME]
     TheInput:AddKeyUpHandler(key_code, function()
@@ -536,7 +1179,7 @@ if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
             end
         end
         current_target_fps = FPS_PRESETS[next_idx]
-        SyncToNativePlugin()
+        SyncToNativePlugin(true)
         if HasNativePlugin() then
             toast_msg = "Target -> " .. FormatTargetLabel(current_target_fps)
         else
@@ -547,7 +1190,7 @@ if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
     end)
 end
 
--- F10: Live Toggle True 240fps 2D Skeletal Animation Tweening (A/B Comparison)
+-- Optional Custom Hotkey 2: Live Toggle True 240fps 2D Skeletal Animation Tweening (A/B Comparison)
 if HOTKEY_SKELETAL and GLOBAL[HOTKEY_SKELETAL] then
     local skel_key = GLOBAL[HOTKEY_SKELETAL]
     TheInput:AddKeyUpHandler(skel_key, function()
@@ -555,7 +1198,7 @@ if HOTKEY_SKELETAL and GLOBAL[HOTKEY_SKELETAL] then
             return
         end
         current_skeletal_tween = not current_skeletal_tween
-        SyncToNativePlugin()
+        SyncToNativePlugin(true)
         if HasNativePlugin() then
             toast_msg = "Skeletal 240fps -> " .. (current_skeletal_tween and "ON" or "OFF")
         else
