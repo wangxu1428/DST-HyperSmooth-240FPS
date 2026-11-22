@@ -18,8 +18,40 @@ local table = GLOBAL.table
 local tonumber = GLOBAL.tonumber
 local tostring = GLOBAL.tostring
 
+if type(Asset) == "function" then
+    Assets = {
+        Asset("SHADER", "shaders/hs_kawase_down.ksh"),
+        Asset("SHADER", "shaders/hs_kawase_up.ksh"),
+        Asset("SHADER", "shaders/hs_postprocess_bloom.ksh"),
+        Asset("SHADER", "shaders/hs_visual_final.ksh"),
+    }
+end
+
 local TARGET_FPS = GetModConfigData("target_fps")
 if type(TARGET_FPS) ~= "number" then TARGET_FPS = 240 end
+local VISUAL_PRESET = GetModConfigData("visual_preset")
+if type(VISUAL_PRESET) ~= "number" then VISUAL_PRESET = 0 end
+if VISUAL_PRESET < 0 or VISUAL_PRESET > 3 then VISUAL_PRESET = 0 end
+
+-- Player-First: 7 independent per-effect toggles (ALL default OFF -> 100% Vanilla Pure out of the box!)
+local CFG_VIS_AF16       = GetModConfigData("visual_af16") == true
+local CFG_VIS_LIGHTMAP   = GetModConfigData("visual_full_lightmap") == true
+local CFG_VIS_CAS        = GetModConfigData("visual_cas") == true
+local CFG_VIS_AO         = GetModConfigData("visual_contact_ao") == true
+local CFG_VIS_ENV        = GetModConfigData("visual_calm_env") == true
+local CFG_VIS_SOFT_BLOOM = GetModConfigData("visual_soft_bloom") == true
+local CFG_VIS_TONE       = GetModConfigData("visual_storybook_tone") == true
+local CFG_VIS_MASK = (CFG_VIS_AF16 and 1 or 0)
+    + (CFG_VIS_LIGHTMAP and 2 or 0)
+    + (CFG_VIS_CAS and 4 or 0)
+    + (CFG_VIS_AO and 8 or 0)
+    + (CFG_VIS_ENV and 16 or 0)
+    + (CFG_VIS_SOFT_BLOOM and 32 or 0)
+    + (CFG_VIS_TONE and 64 or 0)
+if VISUAL_PRESET == 0 and CFG_VIS_MASK > 0 then
+    VISUAL_PRESET = 3 -- User enabled individual switches in Mod Config -> honor Custom mode directly!
+end
+
 local SKELETAL_TWEEN = GetModConfigData("skeletal_tween")
 if SKELETAL_TWEEN == nil then SKELETAL_TWEEN = true end
 local SMOOTH_CAMERA = GetModConfigData("smooth_camera")
@@ -46,10 +78,140 @@ if AUTO_60HZ_SIM == nil then AUTO_60HZ_SIM = true end
 local CFG_FILENAME = "dst_smooth_highfps_cfg"
 local FPS_PRESETS = { 60, 120, 144, 165, 240, 360, 0 }
 local current_target_fps = TARGET_FPS
+local current_visual_preset = VISUAL_PRESET
+local custom_vis_flags = {
+    af16       = CFG_VIS_AF16,
+    full_lm    = CFG_VIS_LIGHTMAP,
+    cas        = CFG_VIS_CAS,
+    ao         = CFG_VIS_AO,
+    env        = CFG_VIS_ENV,
+    soft_bloom = CFG_VIS_SOFT_BLOOM,
+    tone       = CFG_VIS_TONE,
+}
 local current_skeletal_tween = SKELETAL_TWEEN and true or false
 local current_show_fps_hud = SHOW_FPS_HUD and true or false
 local fps_hud_text = nil
 local hud_dirty_now = false
+local visual_bench_timer = 0
+local visual_bench_pinned = false
+
+local visual_shaders_ready = false
+local user_bloom_enabled = false
+local orig_SetBloomEnabled = nil
+local hd2d_smooth_wetness = 0.0
+
+-- Player-First Presets (0 = 100% Vanilla Pure default; 1 = Eye-Care HD; 2 = Soft Storybook; 3 = Custom)
+local VISUAL_PRESET_FLAGS = {
+    [0] = { af16 = false, full_lm = false, cas = false, ao = false, env = false, soft_bloom = false, tone = false },
+    [1] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = false, soft_bloom = true,  tone = false },
+    [2] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = true,  soft_bloom = true,  tone = true  },
+}
+
+local function GetActiveVisualFlags()
+    if current_visual_preset == 3 then
+        return custom_vis_flags
+    end
+    return VISUAL_PRESET_FLAGS[current_visual_preset] or VISUAL_PRESET_FLAGS[0]
+end
+
+local function EncodeCustomVisMask(fl)
+    return (fl.af16 and 1 or 0)
+        + (fl.full_lm and 2 or 0)
+        + (fl.cas and 4 or 0)
+        + (fl.ao and 8 or 0)
+        + (fl.env and 16 or 0)
+        + (fl.soft_bloom and 32 or 0)
+        + (fl.tone and 64 or 0)
+end
+
+local function DecodeCustomVisMask(m)
+    if type(m) ~= "number" then return end
+    local function has_bit(val, b)
+        return math.floor(val / b) % 2 == 1
+    end
+    custom_vis_flags.af16       = has_bit(m, 1)
+    custom_vis_flags.full_lm    = has_bit(m, 2)
+    custom_vis_flags.cas        = has_bit(m, 4)
+    custom_vis_flags.ao         = has_bit(m, 8)
+    custom_vis_flags.env        = has_bit(m, 16)
+    custom_vis_flags.soft_bloom = has_bit(m, 32)
+    custom_vis_flags.tone       = has_bit(m, 64)
+end
+
+-- Zero-allocation independent World Shader uniform sync:
+--   params[1] = contactAoStr (ANIM only: gentle base Contact AO + white-glare soft shoulder)
+--   params[2] = calmEnvStr   (OCEAN_COMB + GROUND only: whisper coastal blend + matte rain darkening)
+-- When both are 0.0 -> bit-for-bit identical vanilla fragment output!
+local function PushHd2dEnvToNative(dt_step)
+    local fnHd2d = rawget(GLOBAL, "HyperSmooth_SetHd2d")
+    if type(fnHd2d) ~= "function" then
+        return
+    end
+    local fl = GetActiveVisualFlags()
+    local ao_str  = fl.ao  and (fl.tone and 1.10 or 1.0) or 0.0
+    local env_str = fl.env and 1.0 or 0.0
+    if ao_str <= 0.001 and env_str <= 0.001 then
+        pcall(fnHd2d, 0.0, 0.0, 0.0, 0.70, 0.707, 0.707, 0.0, -1.0, 1.0, 0.94, 0.82, 0.0)
+        return
+    end
+
+    local target_wet = 0.0
+    if env_str > 0.001 then
+        local world = rawget(GLOBAL, "TheWorld")
+        local state = world and world.state or nil
+        local is_cave = world ~= nil and world.HasTag ~= nil and world:HasTag("cave") or false
+        if not is_cave and state then
+            if state.israining then
+                local rate = type(state.precipitationrate) == "number" and state.precipitationrate or 0.6
+                target_wet = math.min(1.0, math.max(0.35, rate))
+            elseif type(state.wetness) == "number" and state.wetness > 5 then
+                target_wet = math.min(1.0, state.wetness / 60.0)
+            end
+        end
+    end
+    local step = (type(dt_step) == "number" and dt_step > 0) and math.min(1.0, dt_step * 0.45) or 1.0
+    hd2d_smooth_wetness = hd2d_smooth_wetness + (target_wet - hd2d_smooth_wetness) * step
+
+    pcall(fnHd2d, ao_str, env_str, 0.0, 0.70, 0.707, 0.707, 0.0, -1.0, 1.0, 0.94, 0.82, hd2d_smooth_wetness)
+end
+
+local function ApplyVisualPostProcess()
+    local pp = rawget(GLOBAL, "PostProcessor")
+    local ppe = rawget(GLOBAL, "PostProcessorEffects")
+    local uv = rawget(GLOBAL, "UniformVariables")
+    if not (visual_shaders_ready and pp and ppe and uv) then
+        return
+    end
+    local fl = GetActiveVisualFlags()
+
+    local bloom_str   = fl.tone and 0.82 or 0.68
+    local bloom_knee  = fl.tone and 0.50 or 0.55
+    local bloom_chr   = fl.tone and 0.14 or 0.10
+    local bloom_prot  = 0.85 -- strong highlight protection: keeps white faces & marble crisp even if Bloom ON
+    local cas_val     = fl.cas  and (fl.tone and 0.28 or 0.24) or 0.0
+    local grade_val   = fl.tone and 0.35 or 0.0
+    local dither_val  = fl.cas  and 1.5  or 0.0
+    local vig_val     = fl.tone and 0.06 or 0.0
+    local use_final   = fl.cas or fl.tone
+
+    if uv.HS_BLOOM_PARAMS then
+        pcall(pp.SetUniformVariable, pp, uv.HS_BLOOM_PARAMS, bloom_str, bloom_knee, bloom_chr, bloom_prot)
+    end
+    if uv.HS_VISUAL_PARAMS then
+        pcall(pp.SetUniformVariable, pp, uv.HS_VISUAL_PARAMS, cas_val, grade_val, dither_val, vig_val)
+    end
+
+    -- Mutual exclusion: never forces Bloom ON if player disabled game Bloom; restores vanilla Bloom when OFF!
+    if ppe.Bloom ~= nil and ppe.HS_Bloom ~= nil then
+        local use_hs_bloom = fl.soft_bloom and user_bloom_enabled
+        local use_vanilla_bloom = (not fl.soft_bloom) and user_bloom_enabled
+        pcall(pp.EnablePostProcessEffect, pp, ppe.Bloom, use_vanilla_bloom)
+        pcall(pp.EnablePostProcessEffect, pp, ppe.HS_Bloom, use_hs_bloom)
+    end
+    if ppe.HS_VisualFinal ~= nil then
+        pcall(pp.EnablePostProcessEffect, pp, ppe.HS_VisualFinal, use_final)
+    end
+end
 
 local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
@@ -77,16 +239,27 @@ local function SyncToNativePlugin(save_persist)
     if type(fnSkel) == "function" then
         pcall(fnSkel, current_skeletal_tween)
     end
+    local fnVis = rawget(GLOBAL, "HyperSmooth_SetVisual")
+    if type(fnVis) == "function" then
+        local fl = GetActiveVisualFlags()
+        pcall(fnVis, fl.af16 and 16 or 1, fl.full_lm)
+    end
+    PushHd2dEnvToNative(0)
+    ApplyVisualPostProcess()
     ApplyHudVisibility()
-    -- Persist user choices (and modinfo fingerprint mf/ms/mh so explicit modinfo changes win cleanly)
+    -- Persist user choices (and modinfo fingerprints mf/ms/mh/mvp/mvm so explicit modinfo changes win cleanly)
     if save_persist ~= false and TheSim and TheSim.SetPersistentString then
-        local payload = string.format("fps=%d;skeletal=%d;hud=%d;mf=%d;ms=%d;mh=%d",
+        local payload = string.format("fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d",
             current_target_fps,
             current_skeletal_tween and 1 or 0,
             current_show_fps_hud and 1 or 0,
+            current_visual_preset,
+            EncodeCustomVisMask(custom_vis_flags),
             TARGET_FPS,
             SKELETAL_TWEEN and 1 or 0,
-            SHOW_FPS_HUD and 1 or 0)
+            SHOW_FPS_HUD and 1 or 0,
+            VISUAL_PRESET,
+            CFG_VIS_MASK)
         TheSim:SetPersistentString(CFG_FILENAME, payload, false)
     end
 end
@@ -98,9 +271,13 @@ if TheSim and TheSim.GetPersistentString then
             local sf = tonumber(str:match("fps=(%d+)"))
             local ss = tonumber(str:match("skeletal=(%d+)"))
             local sh = tonumber(str:match("hud=(%d+)"))
+            local svp = tonumber(str:match("vp=(%d+)"))
+            local svm = tonumber(str:match("vm=(%d+)"))
             local mf = tonumber(str:match("mf=(%d+)"))
             local ms = tonumber(str:match("ms=(%d+)"))
             local mh = tonumber(str:match("mh=(%d+)"))
+            local mvp = tonumber(str:match("mvp=(%d+)"))
+            local mvm = tonumber(str:match("mvm=(%d+)"))
             if sf ~= nil and mf == TARGET_FPS then
                 current_target_fps = sf
             end
@@ -110,12 +287,249 @@ if TheSim and TheSim.GetPersistentString then
             if sh ~= nil and mh == (SHOW_FPS_HUD and 1 or 0) then
                 current_show_fps_hud = (sh ~= 0)
             end
+            if svp ~= nil and svp >= 0 and svp <= 3 and mvp == VISUAL_PRESET and mvm == CFG_VIS_MASK then
+                current_visual_preset = svp
+                if svm ~= nil then
+                    DecodeCustomVisMask(svm)
+                end
+            end
         end
         SyncToNativePlugin(true)
     end)
 else
     SyncToNativePlugin(true)
 end
+
+--------------------------------------------------------------------------------
+-- 0. Player-First Opt-In Visual Fidelity Pipeline (v2.5.1-remaster)
+--    - Default state is 100% Vanilla Pure (ZERO forced post-processing, ZERO visual burden!)
+--    - Every effect is independently toggleable (Mod Config or live c_hsopt)
+--    - Disabling restores 100% vanilla rendering cleanly
+--------------------------------------------------------------------------------
+local function ResolveModShaderPath(rel)
+    local rfp = rawget(GLOBAL, "resolvefilepath")
+    if type(rfp) == "function" then
+        local ok, resolved = pcall(rfp, rel)
+        if ok and type(resolved) == "string" and #resolved > 0 then
+            return resolved
+        end
+    end
+    return (MODROOT or "") .. rel
+end
+
+if type(AddModShadersInit) == "function" and type(AddModShadersSortAndEnable) == "function" then
+    AddModShadersInit(function()
+        local net = rawget(GLOBAL, "TheNet")
+        if net and net.IsDedicated and net:IsDedicated() then return end
+        local pp = rawget(GLOBAL, "PostProcessor")
+        local ppe = rawget(GLOBAL, "PostProcessorEffects")
+        local se = rawget(GLOBAL, "SamplerEffects")
+        local uv = rawget(GLOBAL, "UniformVariables")
+        local SS = rawget(GLOBAL, "SamplerSizes")
+        local SCM = rawget(GLOBAL, "SamplerColourMode")
+        local SEB = rawget(GLOBAL, "SamplerEffectBase")
+        local FM = rawget(GLOBAL, "FILTER_MODE")
+        local MFM = rawget(GLOBAL, "MIP_FILTER_MODE")
+        local WM = rawget(GLOBAL, "WRAP_MODE")
+        if not (pp and ppe and se and uv and SS and SCM and SEB and FM and MFM and WM) then
+            return
+        end
+
+        local ok_build = pcall(function()
+            local sh_down  = ResolveModShaderPath("shaders/hs_kawase_down.ksh")
+            local sh_up    = ResolveModShaderPath("shaders/hs_kawase_up.ksh")
+            local sh_bloom = ResolveModShaderPath("shaders/hs_postprocess_bloom.ksh")
+            local sh_final = ResolveModShaderPath("shaders/hs_visual_final.ksh")
+
+            -- Player-First: only upgrade BloomSampler to 0.5x when user explicitly enabled Soft Bloom!
+            local init_fl = GetActiveVisualFlags()
+            if init_fl.soft_bloom then
+                pp:SetBloomSamplerParams(SS.Relative, 0.5, 0.5, SCM.RGB)
+            end
+
+            uv.HS_BLOOM_PARAMS  = pp:AddUniformVariable("HS_BLOOM_PARAMS", 4)
+            uv.HS_VISUAL_PARAMS = pp:AddUniformVariable("HS_VISUAL_PARAMS", 4)
+
+            se.HS_KawaseDown1 = pp:AddSamplerEffect(sh_down, SS.Relative, 0.5, 0.5, SCM.RGB, SEB.BloomSampler)
+            pp:SetEffectUniformVariables(se.HS_KawaseDown1, uv.SAMPLER_PARAMS)
+            pp:SetSamplerEffectState(se.HS_KawaseDown1, WM.CLAMP_TO_EDGE)
+            pp:SetSamplerEffectFilter(se.HS_KawaseDown1, FM.LINEAR, FM.LINEAR, MFM.NONE)
+
+            se.HS_KawaseDown2 = pp:AddSamplerEffect(sh_down, SS.Relative, 0.25, 0.25, SCM.RGB, SEB.Shader, se.HS_KawaseDown1)
+            pp:SetEffectUniformVariables(se.HS_KawaseDown2, uv.SAMPLER_PARAMS)
+            pp:SetSamplerEffectState(se.HS_KawaseDown2, WM.CLAMP_TO_EDGE)
+            pp:SetSamplerEffectFilter(se.HS_KawaseDown2, FM.LINEAR, FM.LINEAR, MFM.NONE)
+
+            se.HS_KawaseDown3 = pp:AddSamplerEffect(sh_down, SS.Relative, 0.125, 0.125, SCM.RGB, SEB.Shader, se.HS_KawaseDown2)
+            pp:SetEffectUniformVariables(se.HS_KawaseDown3, uv.SAMPLER_PARAMS)
+            pp:SetSamplerEffectState(se.HS_KawaseDown3, WM.CLAMP_TO_EDGE)
+            pp:SetSamplerEffectFilter(se.HS_KawaseDown3, FM.LINEAR, FM.LINEAR, MFM.NONE)
+
+            se.HS_KawaseUp = pp:AddSamplerEffect(sh_up, SS.Relative, 0.5, 0.5, SCM.RGB, SEB.Shader, se.HS_KawaseDown1)
+            pp:AddSampler(se.HS_KawaseUp, SEB.Shader, se.HS_KawaseDown2)
+            pp:AddSampler(se.HS_KawaseUp, SEB.Shader, se.HS_KawaseDown3)
+            pp:SetEffectUniformVariables(se.HS_KawaseUp, uv.SAMPLER_PARAMS)
+            pp:SetSamplerEffectState(se.HS_KawaseUp, WM.CLAMP_TO_EDGE)
+            pp:SetSamplerEffectFilter(se.HS_KawaseUp, FM.LINEAR, FM.LINEAR, MFM.NONE)
+
+            ppe.HS_Bloom = pp:AddPostProcessEffect(sh_bloom)
+            pp:AddSampler(ppe.HS_Bloom, SEB.Shader, se.HS_KawaseUp)
+            pp:SetEffectUniformVariables(ppe.HS_Bloom, uv.HS_BLOOM_PARAMS)
+
+            ppe.HS_VisualFinal = pp:AddPostProcessEffect(sh_final)
+            pp:SetEffectUniformVariables(ppe.HS_VisualFinal, uv.HS_VISUAL_PARAMS)
+
+            visual_shaders_ready = true
+        end)
+
+        if not ok_build then
+            visual_shaders_ready = false
+        end
+    end)
+
+    AddModShadersSortAndEnable(function()
+        if not visual_shaders_ready then return end
+        local pp = rawget(GLOBAL, "PostProcessor")
+        local ppe = rawget(GLOBAL, "PostProcessorEffects")
+        if not (pp and ppe) then return end
+
+        pcall(function()
+            if ppe.HS_Bloom and ppe.Bloom then
+                pp:SetPostProcessEffectAfter(ppe.HS_Bloom, ppe.Bloom)
+            end
+            local tail_anchor = ppe.MoonPulseGrading or ppe.MoonPulse or ppe.Lunacy or ppe.ColourCube
+            if ppe.HS_VisualFinal and tail_anchor then
+                pp:SetPostProcessEffectAfter(ppe.HS_VisualFinal, tail_anchor)
+            end
+
+            -- Sync with vanilla Graphics -> Bloom toggle so both stay strictly mutually exclusive
+            local mt = getmetatable(pp)
+            local idx = mt and mt.__index
+            if type(idx) == "table" and type(idx.SetBloomEnabled) == "function" and not idx._hs_bloom_hooked then
+                idx._hs_bloom_hooked = true
+                orig_SetBloomEnabled = idx.SetBloomEnabled
+                if type(idx.IsBloomEnabled) == "function" then
+                    local ok_b, cur_b = pcall(idx.IsBloomEnabled, pp)
+                    if ok_b and cur_b ~= nil then
+                        user_bloom_enabled = cur_b and true or false
+                    end
+                end
+                idx.SetBloomEnabled = function(self, enabled)
+                    user_bloom_enabled = enabled and true or false
+                    if orig_SetBloomEnabled then
+                        orig_SetBloomEnabled(self, user_bloom_enabled)
+                    end
+                    ApplyVisualPostProcess()
+                end
+            end
+
+            ApplyVisualPostProcess()
+        end)
+    end)
+end
+
+-- Diagnostic & live per-effect console helpers:
+--   c_hsvisual()                  - print active toggles + live GPU/VRAM telemetry
+--   c_hsopt("cas"|"ao"|"env"|"af16"|"lightmap"|"bloom"|"tone"|"off", [true|false])
+--   c_hsbench([true|false])       - pin/unpin compact HUD benchmark strip
+local function PrintVisualReport()
+    local names = { [0] = "Vanilla(0)", [1] = "EyeCareHD(1)", [2] = "SoftStorybook(2)", [3] = "Custom(3)" }
+    local fl = GetActiveVisualFlags()
+    local fnV = rawget(GLOBAL, "HyperSmooth_GetVisualStats")
+    local fnP = rawget(GLOBAL, "HyperSmooth_GetVisualPerf")
+    local line1 = string.format(
+        "[HyperSmooth Visual] mode=%s | flags(af16=%s lm=%s cas=%s ao=%s env=%s softBloom=%s tone=%s) | gameBloom=%s",
+        names[current_visual_preset] or tostring(current_visual_preset),
+        tostring(fl.af16), tostring(fl.full_lm), tostring(fl.cas), tostring(fl.ao),
+        tostring(fl.env), tostring(fl.soft_bloom), tostring(fl.tone), tostring(user_bloom_enabled))
+    if type(fnV) == "function" then
+        local ok, af, hw, hits, lmp, lms = pcall(fnV)
+        if ok then
+            line1 = line1 .. string.format(" | AF=%dx (hw=%.0fx hits=%d) LM=%.1fx", af or 1, hw or 1, hits or 0, lms or 0.5)
+        end
+    end
+    if type(fnP) == "function" then
+        local ok, hdAct, progs, mStr, wMs, pMs, bMs, gMs, vCur, vPk, vBud = pcall(fnP)
+        if ok then
+            GLOBAL.print(line1)
+            GLOBAL.print(string.format(
+                "[HyperSmooth Perf] world_progs=%d (active_str=%.2f) | Busy=%.2fms (World=%.2fms Post=%.2fms GpuDrain=%.2fms) | VRAM=%.0fMB (Peak=%.0fMB / Budget=%.0fMB)",
+                progs or 0, mStr or 0,
+                bMs or 0, wMs or 0, pMs or 0, gMs or 0, vCur or 0, vPk or 0, vBud or 0))
+            return
+        end
+    end
+    GLOBAL.print(line1 .. " (no dinput8.dll bridge)")
+end
+
+rawset(GLOBAL, "c_hsvisual", PrintVisualReport)
+
+local OPT_ALIASES = {
+    af16 = "af16", af = "af16",
+    lightmap = "full_lm", lm = "full_lm", full_lm = "full_lm",
+    cas = "cas", sharpen = "cas",
+    ao = "ao", contact_ao = "ao",
+    env = "env", calm_env = "env",
+    bloom = "soft_bloom", soft_bloom = "soft_bloom",
+    tone = "tone", storybook = "tone",
+}
+
+rawset(GLOBAL, "c_hsopt", function(key, val)
+    if type(key) ~= "string" then
+        GLOBAL.print("[HyperSmooth] Usage: c_hsopt('af16'|'lightmap'|'cas'|'ao'|'env'|'bloom'|'tone'|'off', true|false)")
+        PrintVisualReport()
+        return
+    end
+    local k = key:lower()
+    if k == "off" or k == "vanilla" or k == "reset" then
+        current_visual_preset = 0
+        visual_bench_timer = 12.0
+        SyncToNativePlugin(true)
+        hud_dirty_now = true
+        PrintVisualReport()
+        return
+    end
+    local field = OPT_ALIASES[k]
+    if not field then
+        GLOBAL.print("[HyperSmooth] Unknown option '" .. tostring(key) .. "'. Valid: af16, lightmap, cas, ao, env, bloom, tone, off")
+        return
+    end
+    -- Snapshot current effective flags into custom_vis_flags before flipping the chosen single switch!
+    local cur = GetActiveVisualFlags()
+    if current_visual_preset ~= 3 then
+        custom_vis_flags.af16       = cur.af16
+        custom_vis_flags.full_lm    = cur.full_lm
+        custom_vis_flags.cas        = cur.cas
+        custom_vis_flags.ao         = cur.ao
+        custom_vis_flags.env        = cur.env
+        custom_vis_flags.soft_bloom = cur.soft_bloom
+        custom_vis_flags.tone       = cur.tone
+    end
+    if val == nil then
+        custom_vis_flags[field] = not custom_vis_flags[field]
+    else
+        custom_vis_flags[field] = (val == true or val == 1)
+    end
+    if EncodeCustomVisMask(custom_vis_flags) == 0 then
+        current_visual_preset = 0
+    else
+        current_visual_preset = 3
+    end
+    visual_bench_timer = 12.0
+    SyncToNativePlugin(true)
+    hud_dirty_now = true
+    PrintVisualReport()
+end)
+
+rawset(GLOBAL, "c_hsbench", function(on)
+    if on == nil then
+        visual_bench_pinned = not visual_bench_pinned
+    else
+        visual_bench_pinned = on and true or false
+    end
+    hud_dirty_now = true
+    GLOBAL.print("[HyperSmooth] HUD GPU/VRAM benchmark strip -> " .. (visual_bench_pinned and "PINNED ON" or "AUTO"))
+end)
 
 --------------------------------------------------------------------------------
 -- 1. Fast Mod Scan: cache parsed modinfo for disabled mods so switching menus
@@ -692,6 +1106,8 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
     self.working.hc_skeletal = current_skeletal_tween
     self.options.hc_show_hud = current_show_fps_hud
     self.working.hc_show_hud = current_show_fps_hud
+    self.options.hc_visual = current_visual_preset
+    self.working.hc_visual = current_visual_preset
 
     -- Update official Refresh Rate tooltip to reflect live HyperSmooth v2.4.0 RTSS control
     if self.refreshRateSpinner.parent then
@@ -815,8 +1231,12 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
         end
     end
 
-    if self.grid_graphics and self.right_spinners_graphics and self.grid_graphics.num_rows
-        and (#self.right_spinners_graphics + 2) <= self.grid_graphics.num_rows then
+    -- Real Klei Grid uses `.rows` (not `.num_rows`, which only FillGrid sets!).
+    -- Right column has 5 stock items + 3 HyperSmooth spinners = exact 8 rows (zero overflow!).
+    local grid = self.grid_graphics
+    local grid_rows = grid and (grid.rows or grid.num_rows) or 0
+    if grid and self.right_spinners_graphics and grid_rows > 0
+        and (#self.right_spinners_graphics + 2) <= grid_rows then
         local toggle_opts = {
             { text = disabled_str, data = false },
             { text = enabled_str, data = true },
@@ -847,18 +1267,53 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
 
         local r1 = #self.right_spinners_graphics + 1
         table.insert(self.right_spinners_graphics, self.hcSkeletalSpinner)
-        self.grid_graphics:AddItem(self.hcSkeletalSpinner.parent, 2, r1)
+        grid:AddItem(self.hcSkeletalSpinner.parent, 2, r1)
         AttachTooltip(self.hcSkeletalSpinner.parent, tip_txt, tip_div)
 
         local r2 = #self.right_spinners_graphics + 1
         table.insert(self.right_spinners_graphics, self.hcHudSpinner)
-        self.grid_graphics:AddItem(self.hcHudSpinner.parent, 2, r2)
+        grid:AddItem(self.hcHudSpinner.parent, 2, r2)
         AttachTooltip(self.hcHudSpinner.parent, tip_txt, tip_div)
 
         self.hcSkeletalSpinner:SetSelectedIndex(self.working.hc_skeletal and 2 or 1)
         self.hcHudSpinner:SetSelectedIndex(self.working.hc_show_hud and 2 or 1)
         BindPendingHighlight(self.hcSkeletalSpinner)
         BindPendingHighlight(self.hcHudSpinner)
+
+        -- Right-column row 8: Player-First Visual Fidelity Preset (Default: Vanilla Pure)
+        if (#self.right_spinners_graphics + 1) <= grid_rows then
+            local vis_opts = is_zh and {
+                { text = "原版纯净", data = 0 },
+                { text = "护眼高清", data = 1 },
+                { text = "柔和绘本", data = 2 },
+            } or {
+                { text = "Vanilla", data = 0 },
+                { text = "Eye-Care HD", data = 1 },
+                { text = "Storybook", data = 2 },
+            }
+            if EncodeCustomVisMask(custom_vis_flags) > 0 or self.working.hc_visual == 3 then
+                vis_opts[#vis_opts + 1] = is_zh and { text = "自定义", data = 3 } or { text = "Custom", data = 3 }
+            end
+            local vis_label = is_zh and "画质增强" or "Visual Fidelity"
+            local vis_tip = is_zh
+                and (has_dll and "玩家优先原则：默认原版纯净，不强迫后处理；关闭后完整恢复原版。护眼高清（16×AF + 1.0×光照 + 轻度保真锐化 + 温和接地阴影，关泛光全效）；亦可在模组配置页或控制台 c_hsopt 逐项独立开关"
+                             or "默认原版纯净，关闭即完整恢复原版；启用后提供轻度保真微锐化与暗夜防色带（搭配 bin64/dinput8.dll 解锁 16×AF、全分辨率光照与温和接地阴影）")
+                or (has_dll and "Player-First: Vanilla Pure by default; disabling restores 100% stock visuals. Eye-Care HD works with Bloom OFF; individual toggles available in Mod Config or c_hsopt()."
+                            or "Vanilla Pure by default. Eye-Care CAS + anti-banding (install bin64/dinput8.dll for 16x AF, 1.0x LightMap & Contact AO).")
+            self.hcVisualSpinner = CreateNativeGraphicsSpinner(vis_label, vis_opts, vis_tip)
+            self.hcVisualSpinner.OnChanged = function(_, data)
+                self.working.hc_visual = data
+                self:UpdateMenu()
+            end
+            local r3 = #self.right_spinners_graphics + 1
+            table.insert(self.right_spinners_graphics, self.hcVisualSpinner)
+            grid:AddItem(self.hcVisualSpinner.parent, 2, r3)
+            AttachTooltip(self.hcVisualSpinner.parent, tip_txt, tip_div)
+            local vidx = (self.working.hc_visual or 0) + 1
+            if vidx < 1 or vidx > #vis_opts then vidx = 1 end
+            self.hcVisualSpinner:SetSelectedIndex(vidx)
+            BindPendingHighlight(self.hcVisualSpinner)
+        end
     end
 
     -- 6. Sync on InitializeSpinners (handles RevertChanges cleanly)
@@ -876,6 +1331,14 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
             scr.hcHudSpinner:SetSelectedIndex(scr.working.hc_show_hud and 2 or 1)
             scr.hcHudSpinner:SetHasModification(false)
         end
+        if scr.hcVisualSpinner then
+            local opts = scr.hcVisualSpinner.options
+            local max_i = (type(opts) == "table" and #opts) or 3
+            local vidx = (scr.working.hc_visual or 0) + 1
+            if vidx < 1 or vidx > max_i then vidx = 1 end
+            scr.hcVisualSpinner:SetSelectedIndex(vidx)
+            scr.hcVisualSpinner:SetHasModification(false)
+        end
         return r
     end
 
@@ -891,6 +1354,12 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
         end
         if scr.working.hc_show_hud ~= nil then
             current_show_fps_hud = scr.working.hc_show_hud and true or false
+        end
+        if scr.working.hc_visual ~= nil then
+            if scr.working.hc_visual ~= current_visual_preset then
+                visual_bench_timer = 15.0
+            end
+            current_visual_preset = scr.working.hc_visual
         end
         SyncToNativePlugin(true)
         return r
@@ -910,6 +1379,10 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
             if scr.hcHudSpinner then
                 scr.hcHudSpinner.default_index = scr.hcHudSpinner:GetSelectedIndex()
                 scr.hcHudSpinner:SetHasModification(false)
+            end
+            if scr.hcVisualSpinner then
+                scr.hcVisualSpinner.default_index = scr.hcVisualSpinner:GetSelectedIndex()
+                scr.hcVisualSpinner:SetHasModification(false)
             end
             if cb then cb(...) end
         end, ...)
@@ -1162,12 +1635,12 @@ AddClassPostConstruct("screens/playerhud", function(self)
     -- Re-sync on entering world so any session reload matches active config immediately
     SyncToNativePlugin(false)
 
-    local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 24, ""))
+    local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 22, ""))
     txt:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
     txt:SetVAnchor(GLOBAL.ANCHOR_TOP)
-    txt:SetRegionSize(860, 32)
+    txt:SetRegionSize(1160, 30)
     txt:SetHAlign(GLOBAL.ANCHOR_RIGHT)
-    txt:SetPosition(-446, -24, 0)
+    txt:SetPosition(-735, -18, 0) -- right edge @ -155px: completely clear of the Day Clock!
     txt:SetColour(0.55, 1.0, 0.65, 0.92)
     txt:SetClickable(false)
     if not current_show_fps_hud then
@@ -1177,6 +1650,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
 
     local accum_time = 0
     local accum_frames = 0
+    local hd2d_accum = 0
     local last_real_fps = 0
     local last_ms = 0
     local old_OnUpdate = self.OnUpdate
@@ -1184,6 +1658,13 @@ AddClassPostConstruct("screens/playerhud", function(self)
     self.OnUpdate = function(hud, dt)
         if old_OnUpdate then
             old_OnUpdate(hud, dt)
+        end
+        if dt and dt > 0 and dt < 1.0 then
+            hd2d_accum = hd2d_accum + dt
+            if hd2d_accum >= 0.10 then
+                PushHd2dEnvToNative(hd2d_accum)
+                hd2d_accum = 0
+            end
         end
         if not (fps_hud_text and fps_hud_text.inst and fps_hud_text.inst:IsValid()) then
             return
@@ -1197,6 +1678,9 @@ AddClassPostConstruct("screens/playerhud", function(self)
             if toast_timer <= 0 and not current_show_fps_hud then
                 fps_hud_text:Hide()
             end
+        end
+        if visual_bench_timer > 0 then
+            visual_bench_timer = visual_bench_timer - (dt or 0)
         end
         if hud_dirty_now or accum_time >= 0.25 then
             if accum_time > 0 and accum_frames > 0 then
@@ -1225,6 +1709,23 @@ AddClassPostConstruct("screens/playerhud", function(self)
             if not metric_str then
                 local badge = (active_sim_tick_hz == 60) and " [60Hz]" or ""
                 metric_str = string.format("%.0f FPS (%.1fms)%s", disp_fps, last_ms, badge)
+            end
+
+            -- Append compact GPU/Busy/VRAM telemetry for 12s after visual switch or when pinned via c_hsbench()
+            if visual_bench_timer > 0 or visual_bench_pinned then
+                local fnPerf = rawget(GLOBAL, "HyperSmooth_GetVisualPerf")
+                if type(fnPerf) == "function" then
+                    local okP, _, _, _, wMs, _, bMs, _, vCur = pcall(fnPerf)
+                    if okP then
+                        local mode_tags = { [0] = "Vanilla", [1] = "EyeHD", [2] = "Storybook", [3] = "Custom" }
+                        local tag = mode_tags[current_visual_preset] or "Vanilla"
+                        local vram_part = (type(vCur) == "number" and vCur > 0.5)
+                            and string.format(" %.0fMB", vCur) or ""
+                        metric_str = metric_str .. string.format(
+                            " | %s %.1fms (W%.1f)%s",
+                            tag, bMs or 0, wMs or 0, vram_part)
+                    end
+                end
             end
 
             if toast_timer > 0 and toast_msg then
@@ -1286,6 +1787,22 @@ local HOTKEY_ACTIONS = {
         SyncToNativePlugin(true)
         toast_msg = "FPS HUD -> " .. (current_show_fps_hud and "ON" or "OFF")
         toast_timer = 2.0
+        hud_dirty_now = true
+    end,
+    hotkey_visual = function()
+        local has_custom = EncodeCustomVisMask(custom_vis_flags) > 0
+        local cycle_n = has_custom and 4 or 3
+        current_visual_preset = (current_visual_preset + 1) % cycle_n
+        visual_bench_timer = 12.0
+        SyncToNativePlugin(true)
+        local labels = {
+            [0] = "Visual -> Vanilla (OFF)",
+            [1] = "Visual -> Eye-Care HD",
+            [2] = "Visual -> Soft Storybook",
+            [3] = "Visual -> Custom",
+        }
+        toast_msg = labels[current_visual_preset] or ("Visual -> " .. tostring(current_visual_preset))
+        toast_timer = 2.5
         hud_dirty_now = true
     end,
 }

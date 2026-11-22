@@ -54,37 +54,65 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.4.1", "Expected modinfo version 2.4.1, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.5.0", "Expected modinfo version 2.5.0, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do
         local opt = bare_env.configuration_options[i]
         cfg_map[opt.name] = opt
     end
+    assert(cfg_map.visual_preset ~= nil and cfg_map.visual_preset.default == 0, "Player-First violated: visual_preset default must be 0 (Vanilla Pure)!")
+    for _, k in ipairs({"visual_af16", "visual_full_lightmap", "visual_cas", "visual_contact_ao", "visual_calm_env", "visual_soft_bloom", "visual_storybook_tone"}) do
+        assert(cfg_map[k] ~= nil and cfg_map[k].default == false, "Player-First violated: " .. k .. " must exist and default to false!")
+    end
     assert(cfg_map.show_1pct_low ~= nil and cfg_map.show_1pct_low.default == true, "Missing show_1pct_low")
     assert(cfg_map.auto_60hz_sim ~= nil and cfg_map.auto_60hz_sim.default == true, "Missing auto_60hz_sim")
     assert(cfg_map.hotkey_cycle ~= nil and cfg_map.hotkey_cycle.default == "KEY_DISABLED", "Missing hotkey_cycle")
     assert(cfg_map.hotkey_skeletal ~= nil and cfg_map.hotkey_skeletal.default == "KEY_DISABLED", "Missing hotkey_skeletal")
     assert(cfg_map.hotkey_hud ~= nil and cfg_map.hotkey_hud.default == "KEY_DISABLED", "Missing hotkey_hud")
+    assert(cfg_map.hotkey_visual ~= nil and cfg_map.hotkey_visual.default == "KEY_DISABLED", "Missing hotkey_visual")
     assert(bare_env.keys ~= nil and #bare_env.keys >= 90, "Expected >=90 bindable keys, got " .. tostring(bare_env.keys and #bare_env.keys))
     local extra_ok = { KEY_DISABLED = true, KEY_QUOTE = true, KEY_BACKQUOTE = true, ["\238\132\130"] = true, ["\238\132\131"] = true, ["\238\132\132"] = true }
     for i = 1, #bare_env.keys do
         local kname = bare_env.keys[i].data
         assert(extra_ok[kname] or G[kname] ~= nil, "Invalid Klei KEY constant in modinfo.lua: " .. tostring(kname))
     end
-    print("[CLIENT_V24_TEST] 1. Bare-sandbox modinfo.lua PASS (v2.4.1, " .. tostring(#bare_env.configuration_options) .. " opts, " .. tostring(#bare_env.keys) .. " valid Klei KEY/Mouse bindings)")
+    print("[CLIENT_V24_TEST] 1. Bare-sandbox modinfo.lua PASS (v2.5.0, Player-First Vanilla default + 7 independent switches, " .. tostring(#bare_env.configuration_options) .. " opts)")
 
     -- =========================================================================
-    -- TEST 2: modmain.lua Full Behavioral Suite (OptionsScreen + 1% Low HUD + Route B)
+    -- TEST 2: modmain.lua Full Behavioral Suite (OptionsScreen + 1% Low HUD + HD-2D World Shaders + Route B)
     -- =========================================================================
     local function RunModMainScenario(cfg_overrides, expect_60hz, trigger_mode)
-        local hooks = { class = {}, comp = {}, prefab = {}, sim = {}, rpc = {} }
+        local hooks = { class = {}, comp = {}, prefab = {}, sim = {}, rpc = {}, sh_init = {}, sh_sort = {} }
         local native_fps = 240
         local native_skel = true
         local native_sim_hz = 30
+        local native_af = 1
+        local native_full_lm = false
+        local native_hd2d = nil
         local mock_tick = 120
         local mock_rpc_table = {}
         local mock_rpc_handlers = {}
+        local pp_enabled = {}
+        local pp_uniforms = {}
+        local pp_bloom_params = nil
+        local pp_next_id = 100
+        local pp_bloom_flag = true
+        local pp_mt = { __index = {} }
+        function pp_mt.__index:SetBloomSamplerParams(sm, w, h, cm) pp_bloom_params = {sm, w, h, cm} end
+        function pp_mt.__index:AddUniformVariable(name, cnt) pp_next_id = pp_next_id + 1; return pp_next_id end
+        function pp_mt.__index:AddSamplerEffect(sh, sm, w, h, cm, b, bid) pp_next_id = pp_next_id + 1; return pp_next_id end
+        function pp_mt.__index:AddPostProcessEffect(sh) pp_next_id = pp_next_id + 1; return pp_next_id end
+        function pp_mt.__index:AddSampler() end
+        function pp_mt.__index:SetEffectUniformVariables() end
+        function pp_mt.__index:SetSamplerEffectState() end
+        function pp_mt.__index:SetSamplerEffectFilter() end
+        function pp_mt.__index:SetPostProcessEffectAfter() end
+        function pp_mt.__index:SetUniformVariable(id, a, b, c, d) pp_uniforms[id] = {a, b, c, d} end
+        function pp_mt.__index:EnablePostProcessEffect(id, en) pp_enabled[id] = en and true or false end
+        function pp_mt.__index:SetBloomEnabled(en) pp_bloom_flag = en and true or false; pp_enabled[1] = pp_bloom_flag end
+        function pp_mt.__index:IsBloomEnabled() return pp_bloom_flag end
+        local mock_pp = setmetatable({}, pp_mt)
 
         local fakeG = {
             pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
@@ -100,8 +128,30 @@ AddSimPostInit(function()
             STRINGS = { UI = { OPTIONS = { ENABLED = "启用", DISABLED = "禁用" } } },
             CLIENT_MOD_RPC = mock_rpc_table,
             CLIENT_MOD_RPC_HANDLERS = mock_rpc_handlers,
+            PostProcessor = mock_pp,
+            PostProcessorEffects = { ZoomBlur = 0, Bloom = 1, ColourCube = 2, MoonPulseGrading = 3 },
+            SamplerEffects = {},
+            UniformVariables = { SAMPLER_PARAMS = 10 },
+            SamplerSizes = { Relative = 0, Static = 1 },
+            SamplerColourMode = { RGBA = 0, RGB = 1 },
+            SamplerEffectBase = { PostProcessSampler = 0, BloomSampler = 1, Shader = 2, Texture = 3, Smoke = 4 },
+            FILTER_MODE = { POINT = 0, LINEAR = 1, ANISOTROPIC = 2, NONE = 3 },
+            MIP_FILTER_MODE = { NONE = 0, POINT = 1, LINEAR = 2 },
+            WRAP_MODE = { WRAP = 0, CLAMP = 1, MIRROR = 2, CLAMP_TO_EDGE = 3 },
+            resolvefilepath = function(rel) return "../mods/dst_smooth_highfps/" .. rel end,
+            TheWorld = {
+                state = { time = 0.68, phase = "dusk", isfullmoon = false, israining = true, precipitationrate = 0.8, season = "autumn" },
+                HasTag = function() return false end,
+            },
             HyperSmooth_SetFps = function(v) native_fps = v; return true end,
             HyperSmooth_SetSkeletal = function(v) native_skel = v; return true end,
+            HyperSmooth_SetVisual = function(af, flm) native_af = af; native_full_lm = flm; return true end,
+            HyperSmooth_GetVisualStats = function() return native_af, 16, 42, true, native_full_lm and 1.0 or 0.5 end,
+            HyperSmooth_SetHd2d = function(...) native_hd2d = {...}; return true end,
+            HyperSmooth_GetVisualPerf = function()
+                local mStr = (native_hd2d and native_hd2d[1]) or 0.0
+                return true, 10, mStr, 1.5, 0.3, 2.2, 0.4, 445, 452, 7200
+            end,
             HyperSmooth_GetFrameStats = function() return 239.8, 226.4, 4.21, 0.04, 15, native_sim_hz end,
             HyperSmooth_SetSimTickRate = function(hz)
                 if hz == 30 or hz == 60 then native_sim_hz = hz; return true end
@@ -211,11 +261,15 @@ AddSimPostInit(function()
 
         local env = {
             GLOBAL = fakeG,
+            MODROOT = "../mods/dst_smooth_highfps/",
+            Asset = function(t, f) return { type = t, file = f } end,
             GetModConfigData = function(k) return cfg_overrides[k] end,
             AddClassPostConstruct = function(cls, fn) hooks.class[cls] = fn end,
             AddComponentPostInit = function(c, fn) hooks.comp[c] = fn end,
             AddPrefabPostInit = function(p, fn) hooks.prefab[p] = fn end,
             AddSimPostInit = function(fn) hooks.sim[#hooks.sim + 1] = fn end,
+            AddModShadersInit = function(fn) hooks.sh_init[#hooks.sh_init + 1] = fn end,
+            AddModShadersSortAndEnable = function(fn) hooks.sh_sort[#hooks.sh_sort + 1] = fn end,
             GetClientModRPC = function(ns, name)
                 -- Mirrors Klei scripts/networkclientrpc.lua:1977 (throws if ns unregistered!)
                 return mock_rpc_table[ns][name]
@@ -231,6 +285,33 @@ AddSimPostInit(function()
         assert(fn_main ~= nil, "Failed loading modmain.lua: " .. tostring(err_main))
         setfenv(fn_main, env)
         fn_main()
+
+        -- Verify Player-First Default: 100% Vanilla Pure (0 forced post-process, 0 BloomSampler resize, 0 world shaders!)
+        assert(type(env.Assets) == "table" and #env.Assets == 4, "Expected 4 SHADER Assets")
+        assert(#hooks.sh_init == 1 and #hooks.sh_sort == 1, "Expected ModShadersInit & Sort hooks")
+        hooks.sh_init[1]()
+        hooks.sh_sort[1]()
+        assert(pp_bloom_params == nil, "Player-First violated: BloomSampler must NOT be touched when default Vanilla Pure!")
+        assert(fakeG.PostProcessorEffects.HS_Bloom ~= nil and fakeG.PostProcessorEffects.HS_VisualFinal ~= nil, "Visual shaders missing")
+        assert(pp_enabled[1] == true and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == false, "Default Vanilla must keep stock Bloom untouched")
+        assert(pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == false, "Default Vanilla must NOT enable HS_VisualFinal!")
+        assert(native_af == 1 and native_full_lm == false, "Default Vanilla must keep AF=1x & FullLM=false")
+        assert(native_hd2d ~= nil and math.abs(native_hd2d[1]) < 1e-4 and math.abs(native_hd2d[2]) < 1e-4, "Default Vanilla must keep ao=0 & env=0")
+
+        -- Verify independent per-effect toggling via c_hsopt() without affecting other toggles!
+        fakeG.c_hsopt("ao", true)
+        assert(math.abs(native_hd2d[1] - 1.0) < 1e-4 and math.abs(native_hd2d[2]) < 1e-4, "c_hsopt('ao') should enable ONLY ao")
+        assert(native_af == 1 and native_full_lm == false and pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == false, "c_hsopt('ao') leaked into other toggles!")
+        fakeG.c_hsopt("env", true)
+        assert(math.abs(native_hd2d[2] - 1.0) < 1e-4 and native_hd2d[12] > 0.5, "c_hsopt('env') should enable calmEnv + rainWetness")
+        fakeG.c_hsopt("cas", true)
+        assert(pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == true, "c_hsopt('cas') should enable HS_VisualFinal")
+        local vu = pp_uniforms[fakeG.UniformVariables.HS_VISUAL_PARAMS]
+        assert(vu ~= nil and math.abs(vu[1] - 0.24) < 1e-3 and math.abs(vu[2]) < 1e-4 and math.abs(vu[4]) < 1e-4, "c_hsopt('cas') params wrong")
+        -- Disabling via c_hsopt("off") must 100% restore Vanilla Pure!
+        fakeG.c_hsopt("off")
+        assert(native_af == 1 and native_full_lm == false and math.abs(native_hd2d[1]) < 1e-4 and math.abs(native_hd2d[2]) < 1e-4, "c_hsopt('off') failed to restore native Vanilla")
+        assert(pp_enabled[1] == true and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == false and pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == false, "c_hsopt('off') failed to restore post-process Vanilla")
 
         -- Ensure co-loading NEVER creates duplicate slot id=2!
         assert(mock_rpc_table["HyperCoreProto"]["SimTickRate"].id == 1, "RPC slot duplicated!")
@@ -278,11 +359,22 @@ AddSimPostInit(function()
         function rr_sp:Enable() self.enabled = true end
         function rr_sp:SetHasModification(v) self.has_mod = v end
         local applied_hw_hz = nil
+        local scr_grid_coords = {}
+        for r = 1, 8 do scr_grid_coords[r] = { nil, nil } end
         local scr = {
             refreshRateSpinner = rr_sp,
             options = { refreshrate = 60, fullscreen = true, display = 0, mode_idx = 0 },
             working = { refreshrate = 60, fullscreen = true, display = 0, mode_idx = 0 },
-            grid_graphics = { num_rows = 8, items = {}, AddItem = function(g, it, c, r) g.items[r] = it end },
+            -- Real Klei Grid uses `.rows` + `.cols` + `.items_by_coords` (NO `.num_rows`!)
+            grid_graphics = {
+                rows = 8, cols = 2, items_by_coords = scr_grid_coords, items = {},
+                AddItem = function(g, it, c, r)
+                    assert(r <= g.rows and c <= g.cols, "Grid:AddItem out of bounds r=" .. tostring(r) .. " rows=" .. tostring(g.rows))
+                    assert(g.items_by_coords[r] ~= nil, "Grid:AddItem missing items_by_coords[" .. tostring(r) .. "]")
+                    g.items_by_coords[r][c] = it
+                    g.items[r] = it
+                end,
+            },
             right_spinners_graphics = { 1, 2, 3, 4, 5 },
             UpdateResolutionsSpinner = function() end,
             UpdateRefreshRatesSpinner = function() end,
@@ -295,14 +387,33 @@ AddSimPostInit(function()
         }
         hooks.class["screens/redux/optionsscreen"](scr)
         assert(rr_sp.enabled == true, "refreshRateSpinner not enabled")
-        assert(scr.hcSkeletalSpinner ~= nil and scr.hcHudSpinner ~= nil, "Right-column toggles missing")
-        assert(#scr.right_spinners_graphics == 7, "Expected exactly 7 right-column spinners")
-        -- Pick Unlimited (0) in Fullscreen -> ChangeGraphicsMode MUST pass safe hardware 144Hz (NOT 0!)
+        assert(scr.hcSkeletalSpinner ~= nil and scr.hcHudSpinner ~= nil and scr.hcVisualSpinner ~= nil, "Right-column toggles missing")
+        assert(scr.grid_graphics.rows == 8 and #scr.right_spinners_graphics == 8, "Expected exact 8 right-column spinners (rows 6-8)")
+        -- Test Eye-Care HD (1) with game Bloom OFF (99% of DST players!): HS_Bloom MUST stay OFF, while AF/LM/CAS/AO work!
+        mock_pp:SetBloomEnabled(false)
         scr.working.refreshrate = 0
+        scr.working.hc_visual = 1
         scr:ChangeGraphicsMode()
         assert(applied_hw_hz == 144, "PickSafeHardwareHz failed: got " .. tostring(applied_hw_hz))
         scr:Apply()
         assert(native_fps == 0, "Apply failed to push Unlimited (0) to C++ bridge")
+        assert(native_af == 16 and native_full_lm == true and math.abs(native_hd2d[1] - 1.0) < 1e-4 and math.abs(native_hd2d[2]) < 1e-4, "Eye-Care HD preset flags wrong")
+        assert(pp_enabled[1] == false and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == false and pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == true, "Eye-Care HD must respect game Bloom OFF")
+        hud:OnUpdate(0.30)
+        assert(hud_child.str:find("EyeHD 2%.2ms") ~= nil and hud_child.str:find("445MB") ~= nil,
+               "HUD missing compact EyeHD/Busy/VRAM telemetry: " .. tostring(hud_child.str))
+        -- Test Soft Storybook (2) with game Bloom ON -> highlight-protected Soft Bloom active
+        mock_pp:SetBloomEnabled(true)
+        scr.working.hc_visual = 2
+        scr:Apply()
+        assert(math.abs(native_hd2d[1] - 1.10) < 1e-4 and math.abs(native_hd2d[2] - 1.0) < 1e-4, "Soft Storybook world flags wrong")
+        assert(pp_enabled[1] == false and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == true and pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == true, "Soft Storybook post flags wrong")
+        -- Turn back to Vanilla Pure (0) -> 100% complete restore!
+        scr.working.hc_visual = 0
+        scr:Apply()
+        assert(native_af == 1 and native_full_lm == false and math.abs(native_hd2d[1]) < 1e-4 and math.abs(native_hd2d[2]) < 1e-4, "Vanilla restore failed")
+        assert(pp_enabled[1] == true and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == false and pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == false, "Vanilla post restore failed")
+        fakeG.c_hsvisual()
 
         -- Test 240Hz Immediate WASD RPC Dispatch (Lag Comp OFF only!)
         if trigger_mode == "VANILLA" then
@@ -431,6 +542,8 @@ AddSimPostInit(function()
             setmetatable(sim_obj, { __index = fresh_idx })
             local env2 = {
                 GLOBAL = fakeG2,
+                MODROOT = "../mods/dst_smooth_highfps/",
+                Asset = function(t, f) return { type = t, file = f } end,
                 GetModConfigData = function(k)
                     if k == "target_fps" then return 240 end
                     return k == "keep_shard_assets" and true or false
@@ -439,6 +552,8 @@ AddSimPostInit(function()
                 AddComponentPostInit = function() end,
                 AddPrefabPostInit = function() end,
                 AddSimPostInit = function() end,
+                AddModShadersInit = function() end,
+                AddModShadersSortAndEnable = function() end,
                 AddClientModRPCHandler = function() end,
             }
             local fn_m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
@@ -597,7 +712,7 @@ def main():
     exe = os.path.join(BIN64, "dontstarve_dedicated_server_nullrenderer_x64.exe")
     proc = subprocess.run(
         [exe, "-persistent_storage_root", STORAGE, "-conf_dir", "DoNotStarveTogether",
-         "-cluster", "BenchCluster", "-shard", "Master", "-offline"],
+         "-cluster", "BenchCluster", "-shard", "Master", "-offline", "-port", "11015"],
         cwd=BIN64, capture_output=True, text=True, timeout=60
     )
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")

@@ -244,11 +244,62 @@ if dst_exe.exists():
                    0x48, 0x8B, 0x4F, 0x08, 0xE8]),
             bytes([0x48, 0x8B, 0x0F, 0x48, 0x8B, 0x5C, 0x24, 0x30, 0x48, 0x83, 0xC4, 0x20, 0x5F, 0xE9])
         )),
+        ("Visual T1: LightMap::InitRenderTarget (0.5f)", find_exact(bytes([
+            0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x80, 0x79, 0x14, 0x00,
+            0x48, 0x8B, 0xD9, 0x74, 0x08, 0xB0, 0x01, 0x48, 0x83, 0xC4, 0x40, 0x5B, 0xC3,
+            0x48, 0x8B, 0x09, 0xF3, 0x0F, 0x10, 0x0D
+        ]))),
+        ("Visual Perf: GameRender (WorldRender ms)", find_masked(bytes([
+            0x48, 0x89, 0x54, 0x24, 0x10, 0x56, 0x41, 0x56, 0x48, 0x81, 0xEC, 0x58, 0x02, 0x00, 0x00,
+            0x48, 0x8B, 0xF1, 0x48, 0x8B, 0x89, 0x70, 0x01, 0x00, 0x00, 0x4C, 0x8B, 0xF2,
+            0x48, 0x81, 0xC2, 0x88, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0, 0x48, 0x8B, 0x4E, 0x48
+        ]), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxx")),
+        ("Visual Perf: PostProcessor::Render (Post ms)", find_masked(bytes([
+            0x4C, 0x8B, 0xDC, 0x45, 0x89, 0x43, 0x18, 0x49, 0x89, 0x53, 0x10, 0x56, 0x41, 0x54, 0x41, 0x55,
+            0x48, 0x83, 0xEC, 0x70, 0x80, 0x3A, 0x00, 0x41, 0x8B, 0xF0, 0x4C, 0x8B, 0xEA, 0x4C, 0x8B, 0xE1,
+            0x0F, 0x84, 0, 0, 0, 0, 0x48, 0x8B, 0x42, 0x38, 0x48, 0x2B, 0x42, 0x30
+        ]), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxx")),
     ]
     for name, hits in checks:
         assert len(hits) == 1, f"AOB {name} expected 1 unique match, got {len(hits)}: {[hex(h) for h in hits]}"
         print(f"  [AOB OK] {name:46s} -> {hex(hits[0])}")
+    # Verify libGLESv2.dll IAT ordinals for AF + HD-2D World Shaders (@109, @99, @90, @131, @32)
+    exe_pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    gles_ords = set()
+    for imp in exe_pe.DIRECTORY_ENTRY_IMPORT:
+        if imp.dll.decode().lower() == "libglesv2.dll":
+            for entry in imp.imports:
+                if entry.ordinal is not None:
+                    gles_ords.add(entry.ordinal)
+    for req_ord, req_name in [(109, "glTexParameteri"), (99, "glShaderSource"), (90, "glLinkProgram"), (131, "glUseProgram"), (32, "glDeleteProgram")]:
+        assert req_ord in gles_ords, f"Missing libGLESv2.dll IAT ordinal @{req_ord} ({req_name})!"
+    print("  [IAT OK] libGLESv2.dll ordinals @109/@99/@90/@131/@32 all verified in EXE IAT")
     exe_pe.close()
-    print(f"[PASS] 3. All {len(checks)}/{len(checks)} client AOB signatures uniquely verified against live dontstarve_steam_x64.exe!")
+    # Verify ANGLE 1.0 libGLESv2.dll AF cap unlock AOB uniqueness
+    gles_path = dst_exe.parent / "libGLESv2.dll"
+    if gles_path.exists():
+        gl_pe = pefile.PE(str(gles_path), fast_load=True)
+        gl_sec = [s for s in gl_pe.sections if s.Name.rstrip(b"\x00") == b".text"][0]
+        gl_text = gl_sec.get_data()
+        gl_base = gl_pe.OPTIONAL_HEADER.ImageBase + gl_sec.VirtualAddress
+        sig_af = bytes([
+            0x88, 0x86, 0xE1, 0x08, 0x00, 0x00,
+            0x66, 0x44, 0x89, 0xA6, 0xE2, 0x08, 0x00, 0x00,
+            0x45, 0x33, 0xED, 0x41, 0x8B, 0xC5,
+            0x44, 0x38, 0xAE, 0xD6, 0x08, 0x00, 0x00,
+            0xB9, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x45, 0xC1,
+            0x89, 0x86, 0xE4, 0x08, 0x00, 0x00
+        ])
+        af_hits = []
+        p0 = 0
+        while True:
+            k = gl_text.find(sig_af, p0)
+            if k == -1: break
+            af_hits.append(gl_base + k)
+            p0 = k + 1
+        assert len(af_hits) == 1, f"ANGLE AF unlock AOB expected 1 match, got {len(af_hits)}"
+        print(f"  [AOB OK] {'Visual T1: ANGLE 1.0 AF Cap Unlock (0x8E3)':46s} -> {hex(af_hits[0])}")
+        gl_pe.close()
+    print(f"[PASS] 3. All {len(checks)+1}/{len(checks)+1} client + ANGLE AOB signatures uniquely verified!")
 else:
     print("[SKIP] 3. DST client exe not found at default path")

@@ -27,6 +27,7 @@
 #include <shlobj.h>
 #include <tlhelp32.h>
 #include <mmsystem.h>
+#include <dxgi1_4.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <atomic>
@@ -72,6 +73,19 @@ using TrackLuaMem_t = void (*)(void* ud, uint32_t osize, uint32_t nsize);
 using CreateWaitableTimerExW_t = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
 using EglGetCurrentContext_t = void* (WINAPI*)();
 using GlFinish_t = void (WINAPI*)();
+using GlTexParameteri_t = void (WINAPI*)(uint32_t target, uint32_t pname, int32_t param);
+using GlTexParameterf_t = void (WINAPI*)(uint32_t target, uint32_t pname, float param);
+using GlGetFloatv_t = void (WINAPI*)(uint32_t pname, float* params);
+using GlGetString_t = const char* (WINAPI*)(uint32_t name);
+using GlShaderSource_t = void (WINAPI*)(uint32_t shader, int32_t count, const char* const* string, const int32_t* length);
+using GlLinkProgram_t = void (WINAPI*)(uint32_t program);
+using GlUseProgram_t = void (WINAPI*)(uint32_t program);
+using GlDeleteProgram_t = void (WINAPI*)(uint32_t program);
+using GlGetUniformLocation_t = int32_t (WINAPI*)(uint32_t program, const char* name);
+using GlUniform4fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* value);
+using GameRender_t = void (*)(void* self, void* renderData);
+using PostProcessorRender_t = void (*)(void* pp, void* renderData, uint32_t primaryTexHandle);
+using CreateDXGIFactory1_t = HRESULT (WINAPI*)(REFIID riid, void** ppFactory);
 using ClientSpatialQuery_t = void (*)(void* grid, const float* posXZ, float radius, void* visitor);
 using ClientSpatialVisitor_t = uint8_t (*)(void* visitor, void* elem);
 using ProcessAsyncTexQueue_t = void (*)(void* loader);
@@ -103,6 +117,72 @@ std::atomic<bool> g_optRakNetZeroStall{true};
 std::atomic<bool> g_optLowLatencyGpuSync{true};
 std::atomic<bool> g_optFastSpatialQuery{true};
 std::atomic<bool> g_optTexTimeSlice{true};
+std::atomic<int>  g_visualAnisoLevel{1};
+std::atomic<bool> g_visualFullresLightmap{false};
+GlTexParameteri_t g_origGlTexParameteri = nullptr;
+GlTexParameterf_t g_fnGlTexParameterf   = nullptr;
+GlGetFloatv_t     g_fnGlGetFloatv       = nullptr;
+GlGetString_t     g_fnGlGetString       = nullptr;
+std::atomic<int>  g_afCapsProbeState{0}; // 0=unprobed, 1=ready(supported), -1=unsupported
+std::atomic<float> g_hwMaxAniso{1.0f};
+bool              g_angleAfUnlocked = false;
+bool              g_afIatHooked     = false;
+bool              g_lightmapPatched = false;
+volatile float*   g_lightmapScaleSlot = nullptr;
+volatile LONG64   g_afAppliedHits = 0;
+volatile LONG64   g_afTrilinearUpgrades = 0;
+
+// Visual Fidelity Calm World Shaders (Player-First Default OFF: params={contactAo, calmEnv, 0, sunElev})
+struct Hd2dUniformState {
+    float params[4]; // (contactAoStr, calmEnvStr, reserved, sunElev)
+    float sun[4];    // (sunWorldX, sunWorldZ, camViewX, camViewZ)
+    float tint[4];   // (tintR, tintG, tintB, rainWetness)
+};
+struct Hd2dProgSlot {
+    bool     checked;
+    bool     hasAny;
+    int32_t  locParams;
+    int32_t  locSun;
+    int32_t  locTint;
+    uint32_t lastGen;
+};
+constexpr uint32_t kMaxHd2dProgs = 4096u;
+SRWLOCK               g_hd2dStateLock = SRWLOCK_INIT;
+Hd2dUniformState      g_hd2dState = {
+    { 0.0f, 0.0f, 0.0f, 0.70f },
+    { 0.707f, 0.707f, 0.0f, -1.0f },
+    { 1.0f, 0.94f, 0.82f, 0.0f }
+};
+std::atomic<uint32_t> g_hd2dStateGen{1};
+std::atomic<bool>     g_optHd2dWorldShaders{true};
+std::atomic<float>    g_hd2dMasterStr{0.0f};
+std::atomic<uint32_t> g_hd2dShadersInjected{0};
+std::atomic<uint32_t> g_hd2dProgsLinked{0};
+Hd2dProgSlot          g_hd2dProgs[kMaxHd2dProgs]{};
+GlShaderSource_t      g_origGlShaderSource = nullptr;
+GlLinkProgram_t       g_origGlLinkProgram = nullptr;
+GlUseProgram_t        g_origGlUseProgram = nullptr;
+GlDeleteProgram_t     g_origGlDeleteProgram = nullptr;
+GlGetUniformLocation_t g_fnGlGetUniformLocation = nullptr;
+GlUniform4fv_t        g_fnGlUniform4fv = nullptr;
+bool                  g_hd2dIatHooked = false;
+bool                  g_renderPerfHooked = false;
+GameRender_t          g_origGameRender = nullptr;
+PostProcessorRender_t g_origPostProcessorRender = nullptr;
+std::atomic<float>    g_emaWorldRenderUs{0.0f};
+std::atomic<float>    g_emaPostProcUs{0.0f};
+std::atomic<float>    g_emaFrameBusyUs{0.0f};
+std::atomic<float>    g_emaGpuDrainUs{0.0f};
+std::atomic<float>    g_processVramMb{0.0f};
+std::atomic<float>    g_processVramBudgetMb{0.0f};
+std::atomic<float>    g_peakVramMb{0.0f};
+
+static inline void UpdateAtomicEma(std::atomic<float>& slot, float sample, float alpha) {
+    if (!(sample >= 0.0f) || sample > 500000.0f) return;
+    float prev = slot.load(std::memory_order_relaxed);
+    float next = (prev <= 0.001f) ? sample : (prev * (1.0f - alpha) + sample * alpha);
+    slot.store(next, std::memory_order_relaxed);
+}
 ClientSpatialQuery_t   g_origClientSpatialQuery[kClientSpatialSlots]{};
 ClientSpatialVisitor_t g_clientSpatialVisitor[kClientSpatialSlots]{};
 ProcessAsyncTexQueue_t g_origProcessAsyncTexQueue = nullptr;
@@ -2431,8 +2511,10 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                 if (tls.gpuSyncCooldown > 0) {
                     --tls.gpuSyncCooldown;
                 } else if (remUs > 1100.0 && tls.HasGlSync() && tls.pEglGetCurrentContext() != nullptr) {
+                    const int64_t tGpu0 = nowQpc;
                     tls.pGlFinish();
                     nowQpc = NowQpc();
+                    UpdateAtomicEma(g_emaGpuDrainUs, static_cast<float>((nowQpc - tGpu0) * g_qpcToUs), 0.06f);
                     remUs = static_cast<double>(tls.nextDeadlineQpc - nowQpc) * g_qpcToUs;
                     InterlockedIncrement64(&g_gpuSyncDrains);
                     if (remUs < 150.0) {
@@ -2440,6 +2522,9 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                         InterlockedIncrement64(&g_gpuSyncSkips);
                     }
                 }
+            }
+            if (baseStart > 0 && nowQpc >= baseStart) {
+                UpdateAtomicEma(g_emaFrameBusyUs, static_cast<float>((nowQpc - baseStart) * g_qpcToUs), 0.06f);
             }
 
             if (remUs > tls.spinMarginUs + 450.0) {
@@ -2504,6 +2589,9 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
             tls.nextDeadlineQpc = 0;
         }
     } else {
+        if (fl && fl->startQpc > 0 && nowQpc >= fl->startQpc) {
+            UpdateAtomicEma(g_emaFrameBusyUs, static_cast<float>((nowQpc - fl->startQpc) * g_qpcToUs), 0.06f);
+        }
         tls.nextDeadlineQpc = 0;
     }
 
@@ -3188,6 +3276,776 @@ void PrepareTexStreamTimeSliceHook(std::vector<PendingCodePatch>& patches, uint8
     QueueRel32NearRelayHook(patches, cs2, reinterpret_cast<const void*>(&HookProcessAsyncTextureQueue), msg2);
 }
 
+//------------------------------------------------------------------------------
+// Visual Fidelity Tier-1 Native Engine (v2.5.0-alpha):
+//   V1. Unlock ANGLE 1.0.0.2249 hardware Anisotropic Filtering (0x8E3 cap bit)
+//       + PE IAT hook on libGLESv2!glTexParameteri -> true 16x AF + trilinear
+//       exclusively on mipmapped GL_TEXTURE_2D world/terrain/entity atlases
+//       (0% impact on UI/LUT/FBO textures; 0 GL errors on older GPUs).
+//   V2. Full-Resolution LightMap (0.5x -> 1.0x native screen resolution) via
+//       single-instruction RIP-relative float slot (never mutates shared 0.5f!).
+//------------------------------------------------------------------------------
+static uint8_t* AllocNearReadWriteData(uint8_t* nearAddr, size_t size) {
+    uintptr_t base = reinterpret_cast<uintptr_t>(nearAddr) & ~static_cast<uintptr_t>(0xFFFF);
+    constexpr uintptr_t kStep = 0x10000;
+    constexpr uintptr_t kMaxDist = 0x60000000;
+    for (uintptr_t delta = kStep; delta < kMaxDist; delta += kStep) {
+        if (base > delta) {
+            void* p = VirtualAlloc(reinterpret_cast<void*>(base - delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (p) return static_cast<uint8_t*>(p);
+        }
+        void* p = VirtualAlloc(reinterpret_cast<void*>(base + delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (p) return static_cast<uint8_t*>(p);
+    }
+    return nullptr;
+}
+
+static bool GetModuleTextSection(HMODULE mod, uint8_t*& outStart, size_t& outSize) {
+    if (!mod) return false;
+    auto* base = reinterpret_cast<uint8_t*>(mod);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (memcmp(sec->Name, ".text", 5) == 0) {
+            outStart = base + sec->VirtualAddress;
+            outSize = sec->Misc.VirtualSize;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void** FindExeIatSlot(const char* dllName, uint16_t ordinal, const char* funcName) {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    if (!exe) return nullptr;
+    auto* base = reinterpret_cast<uint8_t*>(exe);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size) return nullptr;
+
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; desc->Name != 0; ++desc) {
+        const char* curDll = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(curDll, dllName) != 0) continue;
+        const DWORD origRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+        if (!origRva || !desc->FirstThunk) continue;
+        auto* origThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + origRva);
+        auto* iatThunk  = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
+        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL64(origThunk->u1.Ordinal)) {
+                if (ordinal != 0 && IMAGE_ORDINAL64(origThunk->u1.Ordinal) == ordinal) {
+                    return reinterpret_cast<void**>(&iatThunk->u1.Function);
+                }
+            } else if (funcName) {
+                auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+                if (strcmp(reinterpret_cast<const char*>(ibn->Name), funcName) == 0) {
+                    return reinterpret_cast<void**>(&iatThunk->u1.Function);
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void ProbeAnisoCapsOnGlThread() {
+    if (g_afCapsProbeState.load(std::memory_order_acquire) != 0) return;
+    if (!g_fnGlGetString || !g_fnGlGetFloatv || !g_fnGlTexParameterf) {
+        g_afCapsProbeState.store(-1, std::memory_order_release);
+        return;
+    }
+    const char* exts = g_fnGlGetString(0x1F03u); // GL_EXTENSIONS
+    if (!exts || !strstr(exts, "GL_EXT_texture_filter_anisotropic")) {
+        g_afCapsProbeState.store(-1, std::memory_order_release);
+        return;
+    }
+    float maxAf = 1.0f;
+    g_fnGlGetFloatv(0x84FFu, &maxAf); // GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+    if (!(maxAf > 1.0f) || maxAf > 64.0f) {
+        g_afCapsProbeState.store(-1, std::memory_order_release);
+        return;
+    }
+    g_hwMaxAniso.store(maxAf, std::memory_order_release);
+    g_afCapsProbeState.store(1, std::memory_order_release);
+    LogMsg("[VISUAL] GL_EXT_texture_filter_anisotropic active on GPU (hwMax=%.0fx)", static_cast<double>(maxAf));
+}
+
+void WINAPI HookGlTexParameteri(uint32_t target, uint32_t pname, int32_t param) {
+    // Strictly target mipmapped GL_TEXTURE_2D (terrain/entity/tree atlases);
+    // leaves ColourCube LUTs (POINT), UI sprites (no-mip LINEAR) and FBOs untouched!
+    constexpr uint32_t kGlTexture2D = 0x0DE1u;
+    constexpr uint32_t kGlTextureMinFilter = 0x2801u;
+    constexpr int32_t  kGlLinearMipmapNearest = 0x2701;
+    constexpr int32_t  kGlLinearMipmapLinear  = 0x2703;
+    constexpr uint32_t kGlTextureMaxAnisotropyExt = 0x84FEu;
+
+    int32_t effectiveParam = param;
+    const bool isMipLinear = (target == kGlTexture2D) && (pname == kGlTextureMinFilter) &&
+                             (param == kGlLinearMipmapNearest || param == kGlLinearMipmapLinear);
+    const int desiredAf = g_visualAnisoLevel.load(std::memory_order_relaxed);
+    if (isMipLinear && desiredAf > 1 && param == kGlLinearMipmapNearest) {
+        effectiveParam = kGlLinearMipmapLinear;
+        InterlockedIncrement64(&g_afTrilinearUpgrades);
+    }
+
+    if (g_origGlTexParameteri) {
+        g_origGlTexParameteri(target, pname, effectiveParam);
+    }
+
+    if (isMipLinear && g_fnGlTexParameterf) {
+        if (g_afCapsProbeState.load(std::memory_order_acquire) == 0) {
+            ProbeAnisoCapsOnGlThread();
+        }
+        if (g_afCapsProbeState.load(std::memory_order_acquire) == 1) {
+            const float hwMax = g_hwMaxAniso.load(std::memory_order_relaxed);
+            const float level = (desiredAf > 1) ? std::min(static_cast<float>(desiredAf), hwMax) : 1.0f;
+            g_fnGlTexParameterf(kGlTexture2D, kGlTextureMaxAnisotropyExt, level);
+            if (level > 1.0f) {
+                InterlockedIncrement64(&g_afAppliedHits);
+            }
+        }
+    }
+}
+
+static void PrepareVisualFidelityHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    // V1a: Unlock ANGLE 1.0.0.2249 hardcoded mSupportsTextureFilterAnisotropy = false (+0x8E3)
+    //      inside libGLESv2.dll Context::initCaps so D3D9 SetSamplerState(D3DSAMP_MAXANISOTROPY) activates!
+    HMODULE hGles = GetModuleHandleW(L"libGLESv2.dll");
+    if (hGles) {
+        g_fnGlTexParameterf = reinterpret_cast<GlTexParameterf_t>(GetProcAddress(hGles, "glTexParameterf"));
+        g_fnGlGetFloatv     = reinterpret_cast<GlGetFloatv_t>(GetProcAddress(hGles, "glGetFloatv"));
+        g_fnGlGetString     = reinterpret_cast<GlGetString_t>(GetProcAddress(hGles, "glGetString"));
+
+        uint8_t* glText = nullptr;
+        size_t glTextSz = 0;
+        if (GetModuleTextSection(hGles, glText, glTextSz)) {
+            // Unique 38-byte signature in ANGLE 1.0.0.2249 libGLESv2.dll Context::initCaps:
+            //   +0:  mov [rsi+0x8e1], al
+            //   +6:  mov word ptr [rsi+0x8e2], r12w  (hardcodes 0x8e2=0 & 0x8e3=0!)
+            //   +14: xor r13d, r13d ; mov eax, r13d
+            constexpr uint8_t kSigAngleCaps[] = {
+                0x88, 0x86, 0xE1, 0x08, 0x00, 0x00,
+                0x66, 0x44, 0x89, 0xA6, 0xE2, 0x08, 0x00, 0x00,
+                0x45, 0x33, 0xED,
+                0x41, 0x8B, 0xC5,
+                0x44, 0x38, 0xAE, 0xD6, 0x08, 0x00, 0x00,
+                0xB9, 0x02, 0x00, 0x00, 0x00,
+                0x0F, 0x45, 0xC1,
+                0x89, 0x86, 0xE4, 0x08, 0x00, 0x00
+            };
+            uint8_t* hit = FindUniquePatternInText(glText, glTextSz, kSigAngleCaps, sizeof(kSigAngleCaps));
+            if (hit) {
+                uint8_t* patchSite = hit + 6; // exact 14 bytes: mov [rsi+0x8e2],r12w + xor r13d,r13d + mov eax,r13d
+                uint8_t* stub = AllocNearExecutable(patchSite, 64);
+                if (stub) {
+                    const uint64_t retVa = reinterpret_cast<uint64_t>(patchSite + 14);
+                    const float oneF = 1.0f;
+                    uint8_t code[53] = {
+                        0x44, 0x88, 0xA6, 0xE2, 0x08, 0x00, 0x00,       // mov byte ptr [rsi+0x8e2], r12b (0)
+                        0xF3, 0x0F, 0x10, 0x86, 0xBC, 0x08, 0x00, 0x00, // movss xmm0, [rsi+0x8bc] (hwMaxAniso)
+                        0x0F, 0x2E, 0x05, 0x1B, 0x00, 0x00, 0x00,       // ucomiss xmm0, [rip+0x1B] (1.0f @ +49)
+                        0x0F, 0x97, 0x86, 0xE3, 0x08, 0x00, 0x00,       // seta byte ptr [rsi+0x8e3]
+                        0x45, 0x33, 0xED, 0x41, 0x8B, 0xC5,             // xor r13d,r13d ; mov eax,r13d
+                        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,             // jmp [rip+0] -> retVa
+                        0,0,0,0,0,0,0,0,
+                        0,0,0,0                                         // float 1.0f @ offset 49
+                    };
+                    memcpy(code + 41, &retVa, 8);
+                    memcpy(code + 49, &oneF, 4);
+                    memcpy(stub, code, sizeof(code));
+                    FinalizeExecPageWX(stub, sizeof(code));
+
+                    PendingCodePatch p{};
+                    p.addr = patchSite;
+                    p.len = 14;
+                    p.ownedExecPage = stub;
+                    uint8_t jmp[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+                    uint64_t dst = reinterpret_cast<uint64_t>(stub);
+                    memcpy(jmp + 6, &dst, 8);
+                    memcpy(p.bytes, jmp, 14);
+                    char msg[192];
+                    snprintf(msg, sizeof(msg), "[VISUAL] Unlocked ANGLE 1.0 hardware AF cap @ %p (W^X RX stub)", static_cast<void*>(patchSite));
+                    p.logMsg = msg;
+                    patches.push_back(std::move(p));
+                    g_angleAfUnlocked = true;
+                }
+            } else {
+                LogMsg("[VISUAL] ANGLE AF cap unlock skipped (libGLESv2 AOB miss; fail-closed)");
+            }
+        }
+    }
+
+    // V2: Full-Resolution LightMap (0.5x -> 1.0x) inside LightMap::InitRenderTarget (unique 1-match AOB)
+    //     Redirects ONLY this instruction's RIP-relative float to a private non-executable RW float slot
+    //     so the 170 other sites sharing .rdata 0.5f are 100% untouched!
+    constexpr uint8_t kSigLightMapInit[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x80, 0x79, 0x14, 0x00,
+        0x48, 0x8B, 0xD9, 0x74, 0x08, 0xB0, 0x01, 0x48, 0x83, 0xC4, 0x40, 0x5B, 0xC3,
+        0x48, 0x8B, 0x09, 0xF3, 0x0F, 0x10, 0x0D
+    };
+    uint8_t* lmFn = FindUniquePatternInText(textStart, textSize, kSigLightMapInit, sizeof(kSigLightMapInit));
+    if (lmFn && memcmp(lmFn + sizeof(kSigLightMapInit) + 4, "\x66\x0F\xEF\xC0", 4) == 0) {
+        uint8_t* dispAddr = lmFn + sizeof(kSigLightMapInit);
+        uint8_t* nextIp = dispAddr + 4;
+        int32_t origDisp = 0;
+        memcpy(&origDisp, dispAddr, 4);
+        const float* origScalePtr = reinterpret_cast<const float*>(nextIp + origDisp);
+        if (fabsf(*origScalePtr - 0.5f) < 1e-5f) {
+            uint8_t* rwPage = AllocNearReadWriteData(nextIp, 4096);
+            if (rwPage) {
+                intptr_t newDisp = reinterpret_cast<intptr_t>(rwPage) - reinterpret_cast<intptr_t>(nextIp);
+                if (newDisp >= INT32_MIN && newDisp <= INT32_MAX) {
+                    auto* slot = reinterpret_cast<volatile float*>(rwPage);
+                    *slot = g_visualFullresLightmap.load(std::memory_order_relaxed) ? 1.0f : 0.5f;
+                    g_lightmapScaleSlot = slot;
+
+                    PendingCodePatch p{};
+                    p.addr = dispAddr;
+                    p.len = 4;
+                    int32_t d32 = static_cast<int32_t>(newDisp);
+                    memcpy(p.bytes, &d32, 4);
+                    char msg[224];
+                    snprintf(msg, sizeof(msg),
+                             "[VISUAL] Patched LightMap::InitRenderTarget @ %p -> Full-Res %.1fx (private RW slot %p)",
+                             static_cast<void*>(lmFn), static_cast<double>(*slot), static_cast<void*>(rwPage));
+                    p.logMsg = msg;
+                    patches.push_back(std::move(p));
+                    g_lightmapPatched = true;
+                } else {
+                    VirtualFree(rwPage, 0, MEM_RELEASE);
+                }
+            }
+        } else {
+            LogMsg("[VISUAL] Full-Res LightMap skipped (expected 0.5f, got %.3f; fail-closed)", static_cast<double>(*origScalePtr));
+        }
+    } else {
+        LogMsg("[VISUAL] Full-Res LightMap skipped (AOB miss; fail-closed)");
+    }
+}
+
+//------------------------------------------------------------------------------
+// Visual Fidelity HD-2D World Shaders (v2.5.0-hd2d) & Render Performance Telemetry:
+//   - Zero-Extra-Pass GLSL ES 1.00 injection via libGLESv2.dll PE IAT hooks
+//     (@99 glShaderSource, @90 glLinkProgram, @131 glUseProgram, @32 glDeleteProgram).
+//   - Targets strictly 10 World Pixel Shaders (ZERO UI, Bloom, Minimap, Font, Waterfall!):
+//       1) OCEAN_COMB (ocean_combined.ksh): 3-wave chain-rule micro-normals, directional
+//          sun/moon wave diffuse + specular sparkles, coastal scatter, campfire reflections.
+//       2) OCEAN_DEC  (ocean.ksh): 0-tap soft-knee specular headroom lift (0.50 -> ~0.88).
+//       3) GROUND     (ground.ksh, ground_underground.ksh): world-space turf stroke relief,
+//          campfire/torch normal-mapping, rain wetness darkening + specular sheen.
+//       4) ANIM       (anim*.ksh 6 world variants): 0-tap ground contact AO, crown height
+//          lift, quad-coherent screen-space directional Rim Light + firelight glow.
+//   - Strictly NO fake Z-buffer DoF (PrimaryRT uses unsampleable Depth Renderbuffer).
+//   - Live World Render / PostProcess / Busy / GPU Drain ms + DXGI VRAM telemetry.
+//------------------------------------------------------------------------------
+static uint8_t* FindUniqueMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
+    if (!start || size < sigLen) return nullptr;
+    uint8_t* hit = nullptr;
+    for (size_t off = 0; off <= size - sigLen; ++off) {
+        if (mask[0] == 'x' && start[off] != sig[0]) continue;
+        bool ok = true;
+        for (size_t j = 1; j < sigLen; ++j) {
+            if (mask[j] == 'x' && start[off + j] != sig[j]) { ok = false; break; }
+        }
+        if (ok) {
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = start + off;
+        }
+    }
+    return hit;
+}
+
+static size_t FindPrecisionEndOffset(const std::string& src) {
+    size_t p = src.find("precision mediump float;");
+    if (p == std::string::npos) return 0;
+    size_t e = src.find("#endif", p);
+    if (e == std::string::npos) return 0;
+    size_t nl = src.find('\n', e);
+    return (nl == std::string::npos) ? (e + 6) : (nl + 1);
+}
+
+static bool TransformHd2dShaderSource(const std::string& src, std::string& outSrc, const char*& outTag) {
+    outTag = nullptr;
+    if (src.find("gl_FragColor") == std::string::npos) return false;
+    if (src.find("HS_HD2D_PARAMS") != std::string::npos) return false;
+
+    static constexpr const char* kUniformDecls =
+        "\nuniform vec4 HS_HD2D_PARAMS;\n"
+        "uniform vec4 HS_HD2D_SUN;\n"
+        "uniform vec4 HS_HD2D_TINT;\n";
+
+    // 1. OCEAN_COMB (ocean_combined.ksh): calm vanilla dark-ink water + whisper-soft shoreline transition (0 extra taps)
+    if (src.find("OCEAN_UV0_PARAMS") != std::string::npos &&
+        src.find("LIGHTMAP_TEXTURE") != std::string::npos &&
+        src.find("gl_FragColor = vec4( colour.rgb, alpha );") != std::string::npos) {
+        static constexpr const char* kLmCall = "colour.rgb *= CalculateLightingContribution();";
+        static constexpr const char* kEncLine = "float encoding_factor = 2.0;";
+        size_t posLm = src.find(kLmCall);
+        size_t posEnc = src.find(kEncLine);
+        if (posLm != std::string::npos && posEnc != std::string::npos && posEnc > posLm) {
+            std::string s = src;
+            size_t uOff = FindPrecisionEndOffset(s);
+            s.insert(uOff, kUniformDecls);
+            posLm = s.find(kLmCall);
+            s.replace(posLm, strlen(kLmCall), "vec3 hs_lm_c = CalculateLightingContribution();\n\tcolour.rgb *= hs_lm_c;");
+            posEnc = s.find(kEncLine);
+            static constexpr const char* kOceanBody =
+                "\tif (HS_HD2D_PARAMS.y > 0.001) {\n"
+                "\t\tfloat hs_s = min(HS_HD2D_PARAMS.y, 1.25);\n"
+                "\t\tfloat hs_lmLuma = dot(hs_lm_c, vec3(0.299, 0.587, 0.114));\n"
+                "\t\tfloat hs_shallow = clamp(1.0 - noise_opacity, 0.0, 1.0);\n"
+                "\t\tvec3 hs_coastal = vec3(0.008, 0.022, 0.026) * (hs_shallow * 0.85 * hs_s * hs_lmLuma);\n"
+                "\t\tcolour.rgb += hs_coastal;\n"
+                "\t}\n\t";
+            s.insert(posEnc, kOceanBody);
+            outSrc = std::move(s);
+            outTag = "OCEAN_COMB";
+            return true;
+        }
+    }
+
+    // 2. GROUND (ground.ksh, ground_underground.ksh): 100% dry matte hand-drawn parchment on clear days;
+    //    subtle matte rain-dampening ONLY while raining (0 extra taps, zero ink-line emboss!)
+    if (src.find("NOISE_REPEAT_SIZE") != std::string::npos &&
+        src.find("BASE_TEXTURE") != std::string::npos &&
+        src.find("NOISE_TEXTURE") != std::string::npos &&
+        src.find("base_colour.rgb *= CalculateLightingContribution();") != std::string::npos) {
+        static constexpr const char* kLmLine = "base_colour.rgb *= CalculateLightingContribution();";
+        std::string s = src;
+        size_t uOff = FindPrecisionEndOffset(s);
+        s.insert(uOff, kUniformDecls);
+        size_t posL = s.find(kLmLine);
+        if (posL != std::string::npos) {
+            static constexpr const char* kGroundBody =
+                "base_colour.rgb *= CalculateLightingContribution();\n"
+                "\tif (HS_HD2D_PARAMS.y > 0.001 && HS_HD2D_TINT.a > 0.005) {\n"
+                "\t\tfloat hs_wet = clamp(HS_HD2D_TINT.a * min(HS_HD2D_PARAMS.y, 1.2), 0.0, 1.0);\n"
+                "\t\tfloat hs_edge = smoothstep(0.15, 0.85, base_colour.a);\n"
+                "\t\tbase_colour.rgb *= mix(1.0, 1.0 - 0.09 * hs_wet, hs_edge);\n"
+                "\t}";
+            s.replace(posL, strlen(kLmLine), kGroundBody);
+            outSrc = std::move(s);
+            outTag = "GROUND";
+            return true;
+        }
+    }
+
+    // 3. ANIM (anim, anim_skinned, anim_fade, anim_haunted, anim_fade_haunted, anim_holo;
+    //    strictly excludes BLOOM & UI_CC shaders!):
+    //    Calm ground Contact AO (~13% at base y=0..0.45, ink-protected) + eye-comfort soft highlight
+    //    shoulder (>0.86) preventing white-face/marble glare. 0 extra taps, 0 dFdx/dFdy artifacts!
+    static constexpr const char* kAnimAnchor =
+        "gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );";
+    if (src.find(kAnimAnchor) != std::string::npos &&
+        src.find("OCEAN_BLEND_PARAMS") != std::string::npos &&
+        src.find("UI_CC") != std::string::npos &&
+        src.find("#define BLOOM\r") == std::string::npos &&
+        src.find("#define BLOOM\n") == std::string::npos &&
+        src.find("#define UI_CC\r") == std::string::npos &&
+        src.find("#define UI_CC\n") == std::string::npos) {
+        std::string s = src;
+        size_t uOff = FindPrecisionEndOffset(s);
+        s.insert(uOff, kUniformDecls);
+        size_t pos = s.find(kAnimAnchor);
+        if (pos != std::string::npos) {
+            static constexpr const char* kAnimBody =
+                "\n\t\tif (HS_HD2D_PARAMS.x > 0.001) {\n"
+                "\t\t\tfloat hs_s = min(HS_HD2D_PARAMS.x, 1.15);\n"
+                "\t\t\tfloat hs_a = gl_FragColor.a;\n"
+                "\t\t\tfloat hs_effMask = step(0.08, hs_a) * (1.0 - smoothstep(0.05, 0.35, LIGHT_OVERRIDE));\n"
+                "\t\t\tfloat hs_aSafe = max(hs_a, 0.001);\n"
+                "\t\t\tvec3 hs_col = gl_FragColor.rgb / hs_aSafe;\n"
+                "\t\t\tfloat hs_luma = dot(hs_col, vec3(0.299, 0.587, 0.114));\n"
+                "\t\t\tfloat hs_ink = smoothstep(0.05, 0.22, hs_luma);\n"
+                "\t\t\tfloat hs_y = max(PS_POS.y, 0.0);\n"
+                "\t\t\tfloat hs_ao = mix(1.0 - 0.13 * hs_s, 1.0, smoothstep(0.0, 0.45, hs_y));\n"
+                "\t\t\tvec3 hs_res = hs_col * mix(1.0, hs_ao, hs_ink);\n"
+                "\t\t\tvec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
+                "\t\t\ths_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
+                "\t\t\tgl_FragColor.rgb = mix(gl_FragColor.rgb, min(max(hs_res, vec3(0.0)) * hs_a, vec3(hs_a)), hs_effMask);\n"
+                "\t\t}";
+            s.insert(pos + strlen(kAnimAnchor), kAnimBody);
+            outSrc = std::move(s);
+            outTag = "ANIM";
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char* const* string, const int32_t* length) {
+    if (!g_origGlShaderSource) return;
+    if (g_optHd2dWorldShaders.load(std::memory_order_relaxed) && count > 0 && string != nullptr) {
+        std::string combined;
+        for (int32_t i = 0; i < count; ++i) {
+            if (!string[i]) continue;
+            if (length && length[i] >= 0) {
+                combined.append(string[i], static_cast<size_t>(length[i]));
+            } else {
+                combined.append(string[i]);
+            }
+        }
+        std::string transformed;
+        const char* tag = nullptr;
+        if (TransformHd2dShaderSource(combined, transformed, tag)) {
+            const char* ptr = transformed.c_str();
+            const int32_t len = static_cast<int32_t>(transformed.size());
+            g_origGlShaderSource(shader, 1, &ptr, &len);
+            const uint32_t n = g_hd2dShadersInjected.fetch_add(1, std::memory_order_relaxed) + 1;
+            LogMsg("[VISUAL][HD2D] Injected world shader #%u (%s, shader=%u, %zu -> %zu bytes)",
+                   n, tag ? tag : "?", shader, combined.size(), transformed.size());
+            return;
+        }
+    }
+    g_origGlShaderSource(shader, count, string, length);
+}
+
+static void WINAPI HookGlLinkProgram(uint32_t program) {
+    if (g_origGlLinkProgram) {
+        g_origGlLinkProgram(program);
+    }
+    if (program < kMaxHd2dProgs && g_fnGlGetUniformLocation) {
+        Hd2dProgSlot& slot = g_hd2dProgs[program];
+        const bool wasLinked = slot.hasAny;
+        slot.checked   = true;
+        slot.locParams = g_fnGlGetUniformLocation(program, "HS_HD2D_PARAMS");
+        slot.locSun    = g_fnGlGetUniformLocation(program, "HS_HD2D_SUN");
+        slot.locTint   = g_fnGlGetUniformLocation(program, "HS_HD2D_TINT");
+        slot.hasAny    = (slot.locParams >= 0 || slot.locSun >= 0 || slot.locTint >= 0);
+        slot.lastGen   = 0;
+        if (slot.hasAny && !wasLinked) {
+            const uint32_t total = g_hd2dProgsLinked.fetch_add(1, std::memory_order_relaxed) + 1;
+            LogMsg("[VISUAL][HD2D] Linked HD-2D program #%u (prog=%u, locs=%d/%d/%d)",
+                   total, program, slot.locParams, slot.locSun, slot.locTint);
+        }
+    }
+}
+
+static void WINAPI HookGlUseProgram(uint32_t program) {
+    if (g_origGlUseProgram) {
+        g_origGlUseProgram(program);
+    }
+    if (program > 0 && program < kMaxHd2dProgs && g_fnGlUniform4fv) {
+        Hd2dProgSlot& slot = g_hd2dProgs[program];
+        if (slot.hasAny) {
+            const uint32_t curGen = g_hd2dStateGen.load(std::memory_order_acquire);
+            if (slot.lastGen != curGen) {
+                Hd2dUniformState st{};
+                AcquireSRWLockShared(&g_hd2dStateLock);
+                st = g_hd2dState;
+                ReleaseSRWLockShared(&g_hd2dStateLock);
+                if (slot.locParams >= 0) g_fnGlUniform4fv(slot.locParams, 1, st.params);
+                if (slot.locSun >= 0)    g_fnGlUniform4fv(slot.locSun,    1, st.sun);
+                if (slot.locTint >= 0)   g_fnGlUniform4fv(slot.locTint,   1, st.tint);
+                slot.lastGen = curGen;
+            }
+        }
+    }
+}
+
+static void WINAPI HookGlDeleteProgram(uint32_t program) {
+    if (program < kMaxHd2dProgs) {
+        Hd2dProgSlot& slot = g_hd2dProgs[program];
+        if (slot.hasAny) {
+            uint32_t cur = g_hd2dProgsLinked.load(std::memory_order_relaxed);
+            while (cur > 0 && !g_hd2dProgsLinked.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) {}
+        }
+        slot = {};
+    }
+    if (g_origGlDeleteProgram) {
+        g_origGlDeleteProgram(program);
+    }
+}
+
+static thread_local double g_tlsLastPostProcUs = 0.0;
+
+static void HookGameRender(void* self, void* renderData) {
+    g_tlsLastPostProcUs = 0.0;
+    const int64_t t0 = NowQpc();
+    if (g_origGameRender) {
+        g_origGameRender(self, renderData);
+    }
+    const double totalGameUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
+    const double worldUs = std::max(0.0, totalGameUs - g_tlsLastPostProcUs);
+    UpdateAtomicEma(g_emaWorldRenderUs, static_cast<float>(worldUs), 0.06f);
+}
+
+static void HookPostProcessorRender(void* pp, void* renderData, uint32_t primaryTexHandle) {
+    const int64_t t0 = NowQpc();
+    if (g_origPostProcessorRender) {
+        g_origPostProcessorRender(pp, renderData, primaryTexHandle);
+    }
+    const double postUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
+    g_tlsLastPostProcUs = postUs;
+    UpdateAtomicEma(g_emaPostProcUs, static_cast<float>(postUs), 0.06f);
+}
+
+static bool QueuePrologueTrampolineHook(
+    std::vector<PendingCodePatch>& patches, uint8_t* fnAddr, size_t stealLen,
+    const void* hookFn, void*& outOrigFn, const char* logText) {
+    if (!fnAddr || stealLen < 14 || stealLen > 32) return false;
+    uint8_t* tramp = AllocNearExecutable(fnAddr, 64);
+    if (!tramp) return false;
+    memcpy(tramp, fnAddr, stealLen);
+    uint8_t jmpBack[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    const uint64_t resumeVa = reinterpret_cast<uint64_t>(fnAddr + stealLen);
+    memcpy(jmpBack + 6, &resumeVa, 8);
+    memcpy(tramp + stealLen, jmpBack, 14);
+    FinalizeExecPageWX(tramp, stealLen + 14);
+    outOrigFn = reinterpret_cast<void*>(tramp);
+
+    PendingCodePatch p{};
+    p.addr = fnAddr;
+    p.len = stealLen;
+    p.ownedExecPage = tramp;
+    memset(p.bytes, 0x90, stealLen);
+    uint8_t jmpHook[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    const uint64_t dst = reinterpret_cast<uint64_t>(hookFn);
+    memcpy(jmpHook + 6, &dst, 8);
+    memcpy(p.bytes, jmpHook, 14);
+    p.logMsg = logText;
+    patches.push_back(std::move(p));
+    return true;
+}
+
+static void PrepareRenderPerfHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    // 1. GameRender (unique 1-match masked AOB @ 0x140018890) -> World RenderThread ms telemetry
+    constexpr uint8_t kSigGameRender[] = {
+        0x48, 0x89, 0x54, 0x24, 0x10, 0x56, 0x41, 0x56, 0x48, 0x81, 0xEC, 0x58, 0x02, 0x00, 0x00,
+        0x48, 0x8B, 0xF1, 0x48, 0x8B, 0x89, 0x70, 0x01, 0x00, 0x00, 0x4C, 0x8B, 0xF2,
+        0x48, 0x81, 0xC2, 0x88, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0, 0x48, 0x8B, 0x4E, 0x48
+    };
+    constexpr char kMaskGameRender[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxx";
+
+    // 2. PostProcessor::Render (unique 1-match masked AOB @ 0x14001FB50) -> PostProcess ms telemetry
+    constexpr uint8_t kSigPostProcRender[] = {
+        0x4C, 0x8B, 0xDC, 0x45, 0x89, 0x43, 0x18, 0x49, 0x89, 0x53, 0x10, 0x56, 0x41, 0x54, 0x41, 0x55,
+        0x48, 0x83, 0xEC, 0x70, 0x80, 0x3A, 0x00, 0x41, 0x8B, 0xF0, 0x4C, 0x8B, 0xEA, 0x4C, 0x8B, 0xE1,
+        0x0F, 0x84, 0, 0, 0, 0, 0x48, 0x8B, 0x42, 0x38, 0x48, 0x2B, 0x42, 0x30
+    };
+    constexpr char kMaskPostProcRender[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxx";
+
+    uint8_t* fnGR = FindUniqueMaskedPatternInText(textStart, textSize, kSigGameRender, kMaskGameRender, sizeof(kSigGameRender));
+    uint8_t* fnPP = FindUniqueMaskedPatternInText(textStart, textSize, kSigPostProcRender, kMaskPostProcRender, sizeof(kSigPostProcRender));
+    if (!fnGR || !fnPP) {
+        LogMsg("[VISUAL][PERF] Render telemetry hooks skipped (Fail-Closed AOB miss: gr=%p pp=%p)",
+               static_cast<void*>(fnGR), static_cast<void*>(fnPP));
+        return;
+    }
+
+    void* origGR = nullptr;
+    void* origPP = nullptr;
+    char msgGR[224], msgPP[224];
+    snprintf(msgGR, sizeof(msgGR), "[VISUAL][PERF] Hooked GameRender @ %p -> Live WorldRender ms telemetry", static_cast<void*>(fnGR));
+    snprintf(msgPP, sizeof(msgPP), "[VISUAL][PERF] Hooked PostProcessor::Render @ %p -> Live PostProcess ms telemetry", static_cast<void*>(fnPP));
+
+    const bool okGR = QueuePrologueTrampolineHook(patches, fnGR, 15, reinterpret_cast<const void*>(&HookGameRender), origGR, msgGR);
+    const bool okPP = QueuePrologueTrampolineHook(patches, fnPP, 16, reinterpret_cast<const void*>(&HookPostProcessorRender), origPP, msgPP);
+    if (!okGR || !okPP) {
+        LogMsg("[VISUAL][PERF] Render telemetry hooks skipped (trampoline alloc failed)");
+        return;
+    }
+    g_origGameRender          = reinterpret_cast<GameRender_t>(origGR);
+    g_origPostProcessorRender = reinterpret_cast<PostProcessorRender_t>(origPP);
+    g_renderPerfHooked = true;
+}
+
+// Background-only DXGI Local VRAM Telemetry (runs 1x/sec on WorkerProc; 0 GameThread/RenderThread overhead)
+static void SampleProcessVramDXGI() {
+    static constexpr GUID kIidDxgiFactory1 = { 0x770aae78, 0xf26f, 0x4dba, { 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87 } };
+    static constexpr GUID kIidDxgiAdapter3 = { 0x645967a4, 0x1392, 0x4310, { 0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd } };
+    static bool s_inited = false;
+    static IDXGIFactory1* s_factory = nullptr;
+    if (!s_inited) {
+        s_inited = true;
+        HMODULE hDxgi = LoadLibraryW(L"dxgi.dll");
+        if (hDxgi) {
+            auto fnCreate = reinterpret_cast<CreateDXGIFactory1_t>(GetProcAddress(hDxgi, "CreateDXGIFactory1"));
+            if (fnCreate) {
+                void* pFac = nullptr;
+                if (SUCCEEDED(fnCreate(kIidDxgiFactory1, &pFac)) && pFac) {
+                    s_factory = static_cast<IDXGIFactory1*>(pFac);
+                }
+            }
+        }
+    }
+    if (!s_factory) return;
+
+    UINT64 bestUsage = 0;
+    UINT64 bestBudget = 0;
+    for (UINT idx = 0; idx < 8; ++idx) {
+        IDXGIAdapter1* adp1 = nullptr;
+        if (FAILED(s_factory->EnumAdapters1(idx, &adp1)) || !adp1) break;
+        void* pAdp3 = nullptr;
+        if (SUCCEEDED(adp1->QueryInterface(kIidDxgiAdapter3, &pAdp3)) && pAdp3) {
+            auto* adp3 = static_cast<IDXGIAdapter3*>(pAdp3);
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(adp3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+                if (info.CurrentUsage > bestUsage || (bestUsage == 0 && info.Budget > bestBudget)) {
+                    bestUsage = info.CurrentUsage;
+                    bestBudget = info.Budget;
+                }
+            }
+            adp3->Release();
+        }
+        adp1->Release();
+    }
+    if (bestUsage > 0 || bestBudget > 0) {
+        const float curMb = static_cast<float>(static_cast<double>(bestUsage) / (1024.0 * 1024.0));
+        const float budMb = static_cast<float>(static_cast<double>(bestBudget) / (1024.0 * 1024.0));
+        g_processVramMb.store(curMb, std::memory_order_relaxed);
+        g_processVramBudgetMb.store(budMb, std::memory_order_relaxed);
+        float pk = g_peakVramMb.load(std::memory_order_relaxed);
+        if (curMb > pk) g_peakVramMb.store(curMb, std::memory_order_relaxed);
+    }
+}
+
+static bool PatchExeIatEntry(const char* dllName, uint16_t ordinal, const char* funcName, void* hookFn, void*& outOrig) {
+    void** iatSlot = FindExeIatSlot(dllName, ordinal, funcName);
+    if (!iatSlot || !*iatSlot) return false;
+    outOrig = *iatSlot;
+    std::atomic_thread_fence(std::memory_order_release);
+    DWORD oldProt = 0;
+    if (!VirtualProtect(iatSlot, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
+    *iatSlot = hookFn;
+    DWORD dummy = 0;
+    VirtualProtect(iatSlot, sizeof(void*), oldProt, &dummy);
+    return true;
+}
+
+static void InstallGlIatHooks() {
+    HMODULE hGles = GetModuleHandleW(L"libGLESv2.dll");
+    if (hGles) {
+        g_fnGlGetUniformLocation = reinterpret_cast<GlGetUniformLocation_t>(GetProcAddress(hGles, "glGetUniformLocation"));
+        g_fnGlUniform4fv         = reinterpret_cast<GlUniform4fv_t>(GetProcAddress(hGles, "glUniform4fv"));
+    }
+
+    void* origTex = nullptr;
+    if (PatchExeIatEntry("libGLESv2.dll", 109, "glTexParameteri", reinterpret_cast<void*>(&HookGlTexParameteri), origTex)) {
+        g_origGlTexParameteri = reinterpret_cast<GlTexParameteri_t>(origTex);
+        g_afIatHooked = true;
+        LogMsg("[VISUAL] Hooked libGLESv2!glTexParameteri (@109) IAT -> 16x AF + Trilinear (target=%dx)",
+               g_visualAnisoLevel.load(std::memory_order_relaxed));
+    } else {
+        LogMsg("[VISUAL] glTexParameteri (@109) IAT hook skipped (slot not found)");
+    }
+
+    if (g_optHd2dWorldShaders.load(std::memory_order_relaxed)) {
+        void* origSrc = nullptr;
+        void* origLnk = nullptr;
+        void* origUse = nullptr;
+        void* origDel = nullptr;
+        bool okSrc = PatchExeIatEntry("libGLESv2.dll", 99,  "glShaderSource",  reinterpret_cast<void*>(&HookGlShaderSource),  origSrc);
+        bool okLnk = PatchExeIatEntry("libGLESv2.dll", 90,  "glLinkProgram",   reinterpret_cast<void*>(&HookGlLinkProgram),   origLnk);
+        bool okUse = PatchExeIatEntry("libGLESv2.dll", 131, "glUseProgram",    reinterpret_cast<void*>(&HookGlUseProgram),    origUse);
+        bool okDel = PatchExeIatEntry("libGLESv2.dll", 32,  "glDeleteProgram", reinterpret_cast<void*>(&HookGlDeleteProgram), origDel);
+        if (okSrc) g_origGlShaderSource  = reinterpret_cast<GlShaderSource_t>(origSrc);
+        if (okLnk) g_origGlLinkProgram   = reinterpret_cast<GlLinkProgram_t>(origLnk);
+        if (okUse) g_origGlUseProgram    = reinterpret_cast<GlUseProgram_t>(origUse);
+        if (okDel) g_origGlDeleteProgram = reinterpret_cast<GlDeleteProgram_t>(origDel);
+        g_hd2dIatHooked = (okSrc && okLnk && okUse && okDel && g_fnGlGetUniformLocation && g_fnGlUniform4fv);
+        LogMsg("[VISUAL][HD2D] libGLESv2 IAT hooks (src=%d lnk=%d use=%d del=%d loc=%d uni=%d) -> active=%d",
+               okSrc ? 1 : 0, okLnk ? 1 : 0, okUse ? 1 : 0, okDel ? 1 : 0,
+               g_fnGlGetUniformLocation ? 1 : 0, g_fnGlUniform4fv ? 1 : 0, g_hd2dIatHooked ? 1 : 0);
+    }
+}
+
+int LuaHyperSmoothSetVisual(void* L) {
+    if (!g_luaToNumber || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    int aniso = static_cast<int>(g_luaToNumber(L, 1));
+    if (aniso < 1) aniso = 1;
+    if (aniso > 16) aniso = 16;
+    bool fullLm = g_luaToBoolean ? (g_luaToBoolean(L, 2) != 0) : (aniso > 1);
+    int prevAf = g_visualAnisoLevel.exchange(aniso, std::memory_order_relaxed);
+    bool prevLm = g_visualFullresLightmap.exchange(fullLm, std::memory_order_relaxed);
+    if (g_lightmapScaleSlot) {
+        *g_lightmapScaleSlot = fullLm ? 1.0f : 0.5f;
+    }
+    if (prevAf != aniso || prevLm != fullLm) {
+        LogMsg("[VISUAL] Lua Bridge -> AF=%dx, FullResLightmap=%d", aniso, fullLm ? 1 : 0);
+    }
+    g_luaPushBoolean(L, 1);
+    return 1;
+}
+
+int LuaHyperSmoothGetVisualStats(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    g_luaPushNumber(L, static_cast<double>(g_visualAnisoLevel.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_hwMaxAniso.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_afAppliedHits, 0, 0)));
+    g_luaPushBoolean(L, g_lightmapPatched ? 1 : 0);
+    g_luaPushNumber(L, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5);
+    return 5;
+}
+
+int LuaHyperSmoothSetHd2d(void* L) {
+    if (!g_luaToNumber || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    auto clampF = [](float v, float lo, float hi) {
+        if (!(v >= lo)) return lo;
+        if (v > hi) return hi;
+        return v;
+    };
+    Hd2dUniformState next{};
+    next.params[0] = clampF(static_cast<float>(g_luaToNumber(L, 1)), 0.0f, 1.5f);  // contactAoStr (ANIM)
+    next.params[1] = clampF(static_cast<float>(g_luaToNumber(L, 2)), 0.0f, 1.5f);  // calmEnvStr (OCEAN/GROUND)
+    next.params[2] = clampF(static_cast<float>(g_luaToNumber(L, 3)), -1.0f, 1.0f); // reserved
+    next.params[3] = clampF(static_cast<float>(g_luaToNumber(L, 4)), 0.05f, 1.0f); // sunElev
+    next.sun[0]    = clampF(static_cast<float>(g_luaToNumber(L, 5)), -1.0f, 1.0f); // sunWorldX
+    next.sun[1]    = clampF(static_cast<float>(g_luaToNumber(L, 6)), -1.0f, 1.0f); // sunWorldZ
+    next.sun[2]    = clampF(static_cast<float>(g_luaToNumber(L, 7)), -1.0f, 1.0f); // camViewX
+    next.sun[3]    = clampF(static_cast<float>(g_luaToNumber(L, 8)), -1.0f, 1.0f); // camViewZ
+    next.tint[0]   = clampF(static_cast<float>(g_luaToNumber(L, 9)),  0.0f, 2.0f); // tintR
+    next.tint[1]   = clampF(static_cast<float>(g_luaToNumber(L, 10)), 0.0f, 2.0f); // tintG
+    next.tint[2]   = clampF(static_cast<float>(g_luaToNumber(L, 11)), 0.0f, 2.0f); // tintB
+    next.tint[3]   = clampF(static_cast<float>(g_luaToNumber(L, 12)), 0.0f, 1.0f); // rainWetness
+
+    bool changed = false;
+    AcquireSRWLockExclusive(&g_hd2dStateLock);
+    for (int i = 0; i < 4; ++i) {
+        if (fabsf(g_hd2dState.params[i] - next.params[i]) > 1e-4f ||
+            fabsf(g_hd2dState.sun[i]    - next.sun[i])    > 1e-4f ||
+            fabsf(g_hd2dState.tint[i]   - next.tint[i])   > 1e-4f) {
+            changed = true;
+            break;
+        }
+    }
+    if (changed) {
+        g_hd2dState = next;
+    }
+    ReleaseSRWLockExclusive(&g_hd2dStateLock);
+
+    if (changed) {
+        g_hd2dMasterStr.store(std::max(next.params[0], next.params[1]), std::memory_order_relaxed);
+        g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+    }
+    g_luaPushBoolean(L, g_hd2dIatHooked ? 1 : 0);
+    return 1;
+}
+
+int LuaHyperSmoothGetVisualPerf(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    const bool active = g_hd2dIatHooked && g_hd2dProgsLinked.load(std::memory_order_relaxed) > 0;
+    g_luaPushBoolean(L, active ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_hd2dProgsLinked.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_hd2dMasterStr.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_emaWorldRenderUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(g_emaPostProcUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(g_emaFrameBusyUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(g_emaGpuDrainUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(g_processVramMb.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_peakVramMb.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_processVramBudgetMb.load(std::memory_order_relaxed)));
+    return 10;
+}
+
 int LuaHyperSmoothGetStatus(void* L) {
     if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
     g_luaPushNumber(L, static_cast<double>(g_currentFps.load(std::memory_order_relaxed)));
@@ -3224,7 +4082,7 @@ int LuaHyperSmoothGetSimTickRate(void* L) {
 
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.4.1");
+    g_luaPushString(L, "DST-HyperSmooth/2.5.0");
     return 1;
 }
 
@@ -3241,6 +4099,10 @@ void RegisterHyperSmoothLuaApi(void* L) {
     reg("HyperSmooth_GetFrameStats", &LuaHyperSmoothGetFrameStats);
     reg("HyperSmooth_SetSimTickRate", &LuaHyperSmoothSetSimTickRate);
     reg("HyperSmooth_GetSimTickRate", &LuaHyperSmoothGetSimTickRate);
+    reg("HyperSmooth_SetVisual", &LuaHyperSmoothSetVisual);
+    reg("HyperSmooth_GetVisualStats", &LuaHyperSmoothGetVisualStats);
+    reg("HyperSmooth_SetHd2d", &LuaHyperSmoothSetHd2d);
+    reg("HyperSmooth_GetVisualPerf", &LuaHyperSmoothGetVisualPerf);
     if (g_luaPushString) {
         reg("HyperSmooth_Version", &LuaHyperSmoothVersion);
     }
@@ -3255,6 +4117,16 @@ void HookLuaOpenLibs(void* L) {
     g_vmBaseWorldPos.store(InterlockedCompareExchange64(&g_worldPosInterpCount, 0, 0), std::memory_order_relaxed);
     g_vmBaseSpatialQueries.store(InterlockedCompareExchange64(&g_clientSpatialQueries, 0, 0), std::memory_order_relaxed);
     SetClientSimTickRate(30);
+    // Player-First safety: reset world-shader strengths to 0.0 (Vanilla Pure) on fresh Lua VM
+    // so disabling the Workshop Mod never leaks world-shader state!
+    {
+        AcquireSRWLockExclusive(&g_hd2dStateLock);
+        g_hd2dState.params[0] = 0.0f;
+        g_hd2dState.params[1] = 0.0f;
+        ReleaseSRWLockExclusive(&g_hd2dStateLock);
+        g_hd2dMasterStr.store(0.0f, std::memory_order_relaxed);
+        g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+    }
     if (g_origLuaOpenLibs) {
         g_origLuaOpenLibs(L);
     }
@@ -3373,7 +4245,7 @@ void EnsureDefaultIni() {
     FILE* f = _wfopen(g_iniPath.c_str(), L"w");
     if (!f) return;
     fprintf(f,
-        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.4.0)\n"
+        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.5.0)\n"
         "; Note: If you also use the Steam Workshop Companion Mod, in-game ESC->Settings->Graphics overrides these live.\n"
         "[FPS]\n"
         "target_fps=240\n"
@@ -3394,7 +4266,13 @@ void EnsureDefaultIni() {
         "low_latency_gpu_sync=1\n"
         "smooth_lua_gc=1\n"
         "fast_spatial_query=1\n"
-        "timeslice_tex_upload=1\n");
+        "timeslice_tex_upload=1\n"
+        "\n"
+        "[VISUAL]\n"
+        "; Player-First Default: 100%% Vanilla Pure (all visual enhancements strictly opt-in)\n"
+        "anisotropic_filter=1\n"
+        "fullres_lightmap=0\n"
+        "hd2d_world_shaders=1\n");
     fclose(f);
 }
 
@@ -3528,7 +4406,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) fclose(f);
     ReleaseSRWLockExclusive(&g_logLock);
 
-    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.4.1 (RTSS Pacer + mimalloc + Boss Anti-Hitch + Firefly Spatial Matcher) loaded.");
+    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.5.0 (RTSS Pacer + mimalloc + Boss Anti-Hitch + Player-First Eye-Care Visual Fidelity) loaded.");
 
     // Initialize QPC frequency scale BEFORE installing any timing/pacer/GC/anim hooks
     {
@@ -3557,6 +4435,11 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optSmoothGc = ReadIniInt(L"OPTIMIZE", L"smooth_lua_gc", 1) != 0;
     bool optFastSpatial = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1) != 0;
     bool optTexTimeSlice = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1) != 0;
+    int  optAniso = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
+    if (optAniso < 1) optAniso = 1;
+    if (optAniso > 16) optAniso = 16;
+    bool optFullresLm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0) != 0;
+    bool optHd2dWorld = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1) != 0;
     int initFps = ReadIniInt(L"FPS", L"target_fps", 240);
     if (initFps < 0) initFps = 0;
     if (initFps > 1000) initFps = 1000;
@@ -3569,6 +4452,13 @@ DWORD WINAPI WorkerProc(LPVOID) {
     g_optLowLatencyGpuSync.store(optLowLatGpu, std::memory_order_relaxed);
     g_optFastSpatialQuery.store(optFastSpatial, std::memory_order_relaxed);
     g_optTexTimeSlice.store(optTexTimeSlice, std::memory_order_relaxed);
+    g_visualAnisoLevel.store(optAniso, std::memory_order_relaxed);
+    g_visualFullresLightmap.store(optFullresLm, std::memory_order_relaxed);
+    g_optHd2dWorldShaders.store(optHd2dWorld, std::memory_order_release);
+
+    // Install libGLESv2 PE IAT hooks FIRST (at ~t=+1ms, BEFORE AOB scan) so glShaderSource
+    // / glLinkProgram / glUseProgram are guaranteed live before DST compiles shaders.zip!
+    InstallGlIatHooks();
 
     if (optTimer && timeBeginPeriod(1) == TIMERR_NOERROR) {
         g_timerBoosted = true;
@@ -3585,8 +4475,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
     if (GetTextSection(textStart, textSize)) {
         // Phase 1: Read-only AOB scanning & W^X trampoline preparation (0 threads suspended)
         std::vector<PendingCodePatch> patches;
-        patches.reserve(24);
+        patches.reserve(38);
 
+        PrepareVisualFidelityHooks(patches, textStart, textSize);
+        PrepareRenderPerfHooks(patches, textStart, textSize);
         if (optMimallocLua) PrepareClientMimallocHook(patches, textStart, textSize);
         if (optFastVec) PrepareVectorMemsetPatch(patches, textStart, textSize);
         if (optLibdeflate) PrepareLibdeflateUnzHook(patches, textStart, textSize);
@@ -3674,6 +4566,11 @@ DWORD WINAPI WorkerProc(LPVOID) {
         Sleep(500);
         ++tickCounter;
 
+        // Sample active GPU process VRAM usage 1x/sec purely on background WorkerProc (0 Render/Game thread cost)
+        if (tickCounter % 2 == 0) {
+            SampleProcessVramDXGI();
+        }
+
         // Clean production summary once after entering active 3D gameplay (zero continuous log spam!)
         if (!loggedInitialSummary && (tickCounter % 6 == 0) && g_inGameplay.load(std::memory_order_acquire) != 0) {
             LONG64 bytes = InterlockedCompareExchange64(&g_libdeflateBytes, 0, 0);
@@ -3693,12 +4590,27 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 LONG64 spC = InterlockedCompareExchange64(&g_clientSpatialCells, 0, 0);
                 LONG64 texUp = InterlockedCompareExchange64(&g_texUploadsTotal, 0, 0);
                 LONG64 texSl = InterlockedCompareExchange64(&g_texUploadSlices, 0, 0);
+                LONG64 afHits = InterlockedCompareExchange64(&g_afAppliedHits, 0, 0);
+                LONG64 afTri  = InterlockedCompareExchange64(&g_afTrilinearUpgrades, 0, 0);
                 double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
                 g_frameRing.ComputeStats(avgFps, low1Fps, p99Ms, jitterMs);
-                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | pos240=%lld (byp=%lld) | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
+                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | pos240=%lld (byp=%lld) | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
                        avgFps, low1Fps, p99Ms, jitterMs, g_clientSimTickRate.load(std::memory_order_relaxed),
                        hits, static_cast<double>(bytes) / (1024.0 * 1024.0), interp, bones, p2, shed,
-                       posInterp, posBypass, spQ, spC, texUp, texSl, gcFull, gcDef, miAlloc);
+                       posInterp, posBypass, spQ, spC, texUp, texSl,
+                       g_visualAnisoLevel.load(std::memory_order_relaxed),
+                       static_cast<double>(g_hwMaxAniso.load(std::memory_order_relaxed)),
+                       afHits, afTri, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5,
+                       g_hd2dShadersInjected.load(std::memory_order_relaxed),
+                       g_hd2dProgsLinked.load(std::memory_order_relaxed),
+                       static_cast<double>(g_hd2dMasterStr.load(std::memory_order_relaxed)),
+                       static_cast<double>(g_emaFrameBusyUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWorldRenderUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaPostProcUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaGpuDrainUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_processVramMb.load(std::memory_order_relaxed)),
+                       static_cast<double>(g_peakVramMb.load(std::memory_order_relaxed)),
+                       gcFull, gcDef, miAlloc);
             }
         }
 
@@ -3741,13 +4653,22 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 int gsync = ReadIniInt(L"OPTIMIZE", L"low_latency_gpu_sync", 1);
                 int spq = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1);
                 int texs = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1);
+                int af = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
+                if (af < 1) af = 1;
+                if (af > 16) af = 16;
+                int flm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0);
+                int hd2d = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1);
                 g_skeletalTweenEnabled.store(skel ? 1 : 0, std::memory_order_relaxed);
                 g_worldPosInterpEnabled.store(wpos ? 1 : 0, std::memory_order_relaxed);
                 g_optLowLatencyGpuSync.store(gsync != 0, std::memory_order_relaxed);
                 g_optFastSpatialQuery.store(spq != 0, std::memory_order_relaxed);
                 g_optTexTimeSlice.store(texs != 0, std::memory_order_relaxed);
-                LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, WorldPos240=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d",
-                       fps, skel ? 1 : 0, wpos ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0);
+                g_visualAnisoLevel.store(af, std::memory_order_relaxed);
+                g_visualFullresLightmap.store(flm != 0, std::memory_order_relaxed);
+                g_optHd2dWorldShaders.store(hd2d != 0, std::memory_order_relaxed);
+                if (g_lightmapScaleSlot) *g_lightmapScaleSlot = (flm != 0) ? 1.0f : 0.5f;
+                LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, WorldPos240=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d, AF=%dx, FullLM=%d, HD2D=%d",
+                       fps, skel ? 1 : 0, wpos ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0, af, flm ? 1 : 0, hd2d ? 1 : 0);
                 ApplyFpsPatch(fps);
             }
         }

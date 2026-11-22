@@ -1,7 +1,19 @@
-# DST HyperSmooth 240FPS & FastLoad (v2.4.1 · RTSS Frame Pacer + Boss Anti-Hitch + Any-Key Binding + Dual-Side 60Hz Ready)
+# DST HyperSmooth 240FPS & FastLoad (v2.5.0 · RTSS Frame Pacer + Boss Anti-Hitch + Player-First Eye-Care Visual Fidelity + Dual-Side 60Hz Ready)
 
-> **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼与位移补帧、零争抢 RTSS 级 1% Low 稳帧引擎、Boss 并发防卡顿、真·全按键自由录制绑定与可选双端 60Hz 逻辑刻伴侣**  
-> **Client-Only 240FPS Skeletal & World-Pos Tweening, Zero-Contention RTSS Frame Pacer, Boss-Swarm Anti-Hitch, Interactive Any-Key Binding UI & Auto-Negotiated 60Hz SimTick for Don't Starve Together (64-bit)**
+> **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼与位移补帧、零争抢 RTSS 级 1% Low 稳帧引擎、Boss 并发防卡顿、全按键自由录制绑定、玩家优先护眼画质精修与可选双端 60Hz 逻辑刻伴侣**  
+> **Client-Only 240FPS Skeletal & World-Pos Tweening, Zero-Contention RTSS Frame Pacer, Boss-Swarm Anti-Hitch, Player-First Eye-Care Visual Fidelity, Interactive Any-Key Binding UI & Auto-Negotiated 60Hz SimTick for Don't Starve Together (64-bit)**
+
+### v2.5.0 玩家优先护眼画质精修（默认原版纯净 · 7 项独立开关） / Player-First Eye-Care Visual Fidelity
+- **严格遵守「玩家优先五铁律」**：
+  - **默认 100% 原版纯净**（所有画质增强均默认关闭，零额外视觉负担、绝不强迫开启任何后处理、连 `BloomSampler` 都不提前改写）。
+  - **7 项效果全部独立开关**：在 Mod 配置页与局内控制台 `c_hsopt("af16"|"lightmap"|"cas"|"ao"|"env"|"bloom"|"tone"|"off", true/false)` 均可逐项独立启停，亦可在 **`ESC -> 设置 -> 画面 -> 画质增强`** 一键在「原版纯净 / 护眼高清 / 柔和绘本 / 自定义」间 0ms 同屏对比；**关闭后 100% 完整恢复原版表现**。
+- **尊重 99% 饥荒玩家关闭「泛光 / 失真 / 摇晃 / 闪烁」的真实护眼习惯（关泛光同样全效）**：
+  - **`16× 硬件各向异性过滤 + 三线性`**：解除 ANGLE 1.0 硬编码 AF 上限（`libGLESv2.dll` + `@109 glTexParameteri`），斜视角地皮与建筑贴图干爽锐利、零偏色零闪烁。
+  - **`全分辨率 1.0× 光照图`**：将 `LightMap::InitRenderTarget` 局部重定位至私有只读数据槽（不污染其余 170 处 `0.5f`），消除篝火与黄昏光圈方块锯齿。
+  - **`极轻度保真微锐化（CAS 0.24，邻域防白边）+ 暗夜 IGN 8-bit 防色带`**：去 2K 轻微双线性发虚，保留手绘黑描边干净利落，暗夜渐变更顺滑护眼。
+  - **`温和实体接地阴影 + 高亮柔肩防爆白`**：零额外纹理采样（`@99/@90/@131/@32` 精准注入 9 个世界着色器，严禁触碰 UI/字体/小地图），类似原版「树荫」哲学，仅在树干与双脚贴地处添加柔和落地阴影并压制白脸/大理石刺眼过曝。
+  - **`护眼防过曝柔光 Bloom`**：仅在玩家主动开启游戏「泛光」时替代原版 0.25× 刺眼泛光（`screen_protect=0.85` 防白脸糊五官）；游戏泛光关闭时零开销。
+  - **零额外显存 & 实测 240FPS 几乎零损耗**：内置 `GameRender / PostProcessor::Render` 毫秒与后台 DXGI VRAM 遥测（`c_hsvisual()` / `c_hsbench()`），RTX 4060 2K 240Hz 实测 `Busy 2.5ms`、`1%L 231+`、`VRAM 零增长`；并修复右上角 HUD 文字左移避让时钟表盘。
 
 ### v2.4.1 社区反馈专项修复 & 真·全按键自由录制 / Community Hotfix & True Any-Key Binding
 - **彻底修复萤火虫光效连成直线（及全游戏多粒子同名骨骼动画防拉线）**：针对 `fireflies.zip`、`swarm_loop` 等同帧包含多个同名 `(layer, symbol)` 光点/火花/孢子的骨骼动画，升级为 **最近邻空间距离匹配 + `usedF1` 互斥占位 + `<=48px` 粒子防拉线熔断**（唯一键角色/Boss 骨骼仍保持 $O(1)$ 直连），彻底杜绝消失光点被跨群拉成直线！
@@ -105,7 +117,7 @@
 - **方式 B（本地解压安装）**：将压缩包中的 `mods/dst_smooth_highfps` 文件夹复制到游戏根目录的 `mods/` 下（例如 `...\Steam\steamapps\common\Don't Starve Together\mods\dst_smooth_highfps`），进入游戏在「客户端模组」中勾选启用。
 
 ### 第二步：安装原生引擎伴侣插件（解锁 240 帧、RTSS 稳帧、mimalloc、骨骼补帧与 2.5 倍加载）
-1. 前往本仓库 **[Releases 页面](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)** 下载最新版 `DST_HyperSmooth_v2.4.0_Release.zip`（或单独下载 `dinput8.dll`）。
+1. 前往本仓库 **[Releases 页面](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)** 下载最新版 `DST_HyperSmooth_v2.5.0_Release.zip`（或单独下载 `dinput8.dll`）。
 2. 将压缩包中的 `bin64/dinput8.dll` 复制到游戏根目录的 **`bin64/`** 文件夹内（与 `dontstarve_steam_x64.exe` 同目录）。
 3. 正常从 Steam 启动 64 位《饥荒联机版》即可自动生效！
 4. 首次启动后，插件会在 `bin64/` 下自动生成配置文件 `dst_fps.ini` 和运行日志 `dst_fps_plugin.log`（仅在加载完成时输出一条精简汇总，无持续刷屏）。
