@@ -88,7 +88,7 @@ end
 
 local _hcVersion = rawget(G, "HyperCore_Version")
 local has_native = (type(_hcVersion) == "function")
-print(string.format("[HyperCore Server] Loaded v1.2.0 | NativeDLL=%s | SimTick=%dHz | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
+print(string.format("[HyperCore Server] Loaded v1.2.1 | NativeDLL=%s | SimTick=%dHz | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
     has_native and _hcVersion() or "none",
     active_sim_hz,
     tostring(OPT_FAST_DUMPER), tostring(OPT_MERM_RETARGET), tostring(OPT_STAGGERED_WAKE),
@@ -225,6 +225,9 @@ if OPT_STAGGERED_WAKE then
             inst.OnEntityWake = function(self, ...)
                 if orig_wake ~= nil then
                     orig_wake(self, ...)
+                end
+                if G.POPULATING then
+                    return
                 end
                 -- Never delay mobs already in active combat
                 if self.components.combat ~= nil and self.components.combat.target ~= nil then
@@ -366,8 +369,42 @@ if OPT_LAZY_PERISHABLE then
     AddComponentPostInit("perishable", function(self, inst)
         if not (G.TheWorld and G.TheWorld.ismastersim) then return end
 
+        -- Pure side-effect-free decay estimator (safe inside GetPercent / OnSave / POPULATING)
+        local function ComputeLazyDelta()
+            StepEnvIntegral()
+            local local_mult = self.localPerishMultiplyer or 1.0
+            local owner_mult = self._hc_lazy_owner_mult or 1.0
+            local delta_decay = 0
+            if not self._hc_lazy_is_indoor then
+                local dg = self._hc_lazy_is_frozen
+                    and (EnvIntegral.frozen_mult_int - (self._hc_lazy_snap_frozen or EnvIntegral.frozen_mult_int))
+                    or  (EnvIntegral.normal_ground - (self._hc_lazy_snap_ground or EnvIntegral.normal_ground))
+                delta_decay = dg * owner_mult * local_mult
+                local dacid = EnvIntegral.acid_extra_pct - (self._hc_lazy_snap_acid or EnvIntegral.acid_extra_pct)
+                if dacid > 0 and self.perishtime ~= nil and self.perishtime > 0 then
+                    delta_decay = delta_decay + self.perishtime * dacid
+                end
+            else
+                local di = self._hc_lazy_is_frozen
+                    and (EnvIntegral.frozen_mult_int - (self._hc_lazy_snap_frozen or EnvIntegral.frozen_mult_int))
+                    or  (EnvIntegral.normal_indoor - (self._hc_lazy_snap_indoor or EnvIntegral.normal_indoor))
+                delta_decay = di * owner_mult * local_mult
+            end
+            return delta_decay
+        end
+
+        local function ComputeLazyRemaining()
+            if self.perishremainingtime == nil then return nil end
+            local delta_decay = ComputeLazyDelta()
+            local max_t = self.perishtime or self.perishremainingtime
+            return math.min(max_t, self.perishremainingtime - delta_decay)
+        end
+
         local function EnterLazyMode()
-            if self._hc_lazy_active or self.updatetask == nil then return end
+            -- CRITICAL SAVE-SAFETY INVARIANT:
+            -- NEVER enter lazy mode during PopulateWorld (G.POPULATING == true), because
+            -- SpawnSaveRecord calls Transform:SetPosition() -> OnEntitySleep() BEFORE SetPersistData()!
+            if G.POPULATING or self._hc_lazy_active or self.updatetask == nil then return end
             if not IsEligibleForLazyPerish(self, inst) then return end
             StepEnvIntegral()
             local owner = inst.components.inventoryitem ~= nil and inst.components.inventoryitem.owner or nil
@@ -402,41 +439,41 @@ if OPT_LAZY_PERISHABLE then
 
         local function SyncLazyMode(resume_task)
             if not self._hc_lazy_active then return end
-            StepEnvIntegral()
+            local delta_decay = ComputeLazyDelta()
             self._hc_lazy_active = nil
             HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
             HC_LUA_STATS.perish_syncs = HC_LUA_STATS.perish_syncs + 1
 
-            local local_mult = self.localPerishMultiplyer or 1.0
-            local owner_mult = self._hc_lazy_owner_mult or 1.0
-            local delta_decay = 0
-
-            if not self._hc_lazy_is_indoor then
-                local dg = self._hc_lazy_is_frozen
-                    and (EnvIntegral.frozen_mult_int - self._hc_lazy_snap_frozen)
-                    or  (EnvIntegral.normal_ground - self._hc_lazy_snap_ground)
-                delta_decay = dg * owner_mult * local_mult
-                local dacid = EnvIntegral.acid_extra_pct - self._hc_lazy_snap_acid
-                if dacid > 0 and self.perishtime ~= nil and self.perishtime > 0 then
-                    delta_decay = delta_decay + self.perishtime * dacid
-                end
-            else
-                local di = self._hc_lazy_is_frozen
-                    and (EnvIntegral.frozen_mult_int - self._hc_lazy_snap_frozen)
-                    or  (EnvIntegral.normal_indoor - self._hc_lazy_snap_indoor)
-                delta_decay = di * owner_mult * local_mult
-            end
-
+            local expired = false
             if self.perishremainingtime ~= nil and delta_decay ~= 0 then
                 local old_val = self.perishremainingtime
-                self.perishremainingtime = math.min(self.perishtime or old_val, old_val - delta_decay)
+                local raw_rem = math.min(self.perishtime or old_val, old_val - delta_decay)
+                if raw_rem <= 0 then
+                    expired = true
+                    self.perishremainingtime = 0
+                else
+                    self.perishremainingtime = raw_rem
+                end
                 if math.floor(old_val * 100) ~= math.floor(self.perishremainingtime * 100) then
                     inst:PushEvent("perishchange", { percent = self:GetPercent() })
                 end
+            elseif self.perishremainingtime ~= nil and self.perishremainingtime <= 0 then
+                expired = true
+                self.perishremainingtime = 0
             end
 
-            if self.perishremainingtime ~= nil and self.perishremainingtime <= 0 then
-                self:Perish()
+            if expired then
+                if G.POPULATING then
+                    -- Never remove an entity synchronously during PopulateWorld; spoil 1 tick after load
+                    self.perishremainingtime = 0.01
+                    inst:DoTaskInTime(0, function()
+                        if inst:IsValid() and self.perishremainingtime ~= nil and self.perishremainingtime <= 0.01 then
+                            self:Perish()
+                        end
+                    end)
+                else
+                    self:Perish()
+                end
                 return
             end
 
@@ -472,19 +509,15 @@ if OPT_LAZY_PERISHABLE then
             return _origStopPerishing(self)
         end
 
+        -- 100% PURE READ-ONLY GetPercent(): ZERO state mutation, ZERO Perish(), ZERO inst:Remove()!
+        -- Prevents crash when Perishable's `onpercent` setter calls GetPercent() inside OnLoad/SetPersistData,
+        -- and keeps ShowMe/Insight/UI queries O(1) & side-effect-free.
         local _origGetPercent = self.GetPercent
         function self:GetPercent()
-            if self._hc_lazy_active then
-                -- Sync without restarting task so ShowMe/Insight queries stay O(1) & 100% accurate
-                SyncLazyMode(false)
-                if inst:IsValid() and self.perishremainingtime ~= nil and self.perishremainingtime > 0 then
-                    -- Re-snapshot fresh baseline cleanly without spawning periodic timer
-                    self._hc_lazy_active = true
-                    self._hc_lazy_snap_ground = EnvIntegral.normal_ground
-                    self._hc_lazy_snap_indoor = EnvIntegral.normal_indoor
-                    self._hc_lazy_snap_frozen = EnvIntegral.frozen_mult_int
-                    self._hc_lazy_snap_acid   = EnvIntegral.acid_extra_pct
-                    HC_LUA_STATS.perish_paused_now = HC_LUA_STATS.perish_paused_now + 1
+            if self._hc_lazy_active and self.perishremainingtime ~= nil and self.perishtime ~= nil and self.perishtime > 0 then
+                local rem = ComputeLazyRemaining()
+                if rem ~= nil then
+                    return math.min(1, math.max(0, rem / self.perishtime))
                 end
             end
             return _origGetPercent(self)
@@ -494,7 +527,10 @@ if OPT_LAZY_PERISHABLE then
             local _orig = self[mname]
             if _orig ~= nil then
                 self[mname] = function(s, ...)
-                    if s._hc_lazy_active then SyncLazyMode(true) end
+                    if s._hc_lazy_active then
+                        SyncLazyMode(true)
+                        if not inst:IsValid() then return end
+                    end
                     return _orig(s, ...)
                 end
             end
@@ -504,31 +540,49 @@ if OPT_LAZY_PERISHABLE then
         function self:LongUpdate(dt)
             if self._hc_lazy_active then
                 SyncLazyMode(true)
+                if not inst:IsValid() then return end
             end
             return _origLongUpdate(self, dt)
         end
 
+        -- 100% SIDE-EFFECT-FREE OnSave():
+        -- NEVER calls Perish() / inst:Remove() / SpawnPrefab() during world serialization,
+        -- NEVER writes negative `time`, and NEVER writes `paused=true` for lazy-paused items!
         local _origOnSave = self.OnSave
         function self:OnSave()
-            local was_lazy = self._hc_lazy_active == true
-            if was_lazy then
-                SyncLazyMode(false)
-            end
             local data = _origOnSave(self)
-            -- CRITICAL ZERO LOCK-IN: never write paused=true into vanilla save for lazy-paused items!
-            if was_lazy and data ~= nil then
-                data.paused = nil
-                -- Re-enter lazy snapshot cleanly after save completes
-                if inst:IsValid() and self.perishremainingtime ~= nil and self.perishremainingtime > 0 then
-                    self._hc_lazy_active = true
-                    self._hc_lazy_snap_ground = EnvIntegral.normal_ground
-                    self._hc_lazy_snap_indoor = EnvIntegral.normal_indoor
-                    self._hc_lazy_snap_frozen = EnvIntegral.frozen_mult_int
-                    self._hc_lazy_snap_acid   = EnvIntegral.acid_extra_pct
-                    HC_LUA_STATS.perish_paused_now = HC_LUA_STATS.perish_paused_now + 1
+            if self._hc_lazy_active then
+                local rem = ComputeLazyRemaining()
+                if data == nil then data = {} end
+                data.paused = nil -- ZERO LOCK-IN: never persist lazy pause as vanilla paused=true
+                if rem ~= nil and rem <= 0 then
+                    data.time = 0.01
+                    inst:DoTaskInTime(0, function()
+                        if inst:IsValid() and self._hc_lazy_active then
+                            SyncLazyMode(true)
+                        end
+                    end)
+                elseif rem ~= nil then
+                    data.time = rem
                 end
+            elseif data ~= nil and data.time ~= nil and data.time < 0 then
+                data.time = 0.01
             end
             return data
+        end
+
+        -- Defensive OnLoad(): clears any lazy flag and rescues legacy saves containing negative `data.time`
+        -- so Perishable:OnLoad -> stackable:OnLoad NEVER crashes on world startup!
+        local _origOnLoad = self.OnLoad
+        function self:OnLoad(data, ...)
+            if self._hc_lazy_active then
+                self._hc_lazy_active = nil
+                HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
+            end
+            if data ~= nil and data.time ~= nil and data.time <= 0 then
+                data.time = 0.01
+            end
+            return _origOnLoad(self, data, ...)
         end
 
         local _origOnRemove = self.OnRemoveEntity
@@ -540,22 +594,30 @@ if OPT_LAZY_PERISHABLE then
             if _origOnRemove ~= nil then return _origOnRemove(self) end
         end
 
-        -- Hook ground sleep / wake transitions
+        -- Hook ground sleep / wake transitions (strictly skipped during PopulateWorld)
         local orig_sleep = inst.OnEntitySleep
         inst.OnEntitySleep = function(ent, ...)
             if orig_sleep ~= nil then orig_sleep(ent, ...) end
-            EnterLazyMode()
+            if not G.POPULATING then
+                EnterLazyMode()
+            end
         end
         local orig_wake = inst.OnEntityWake
         inst.OnEntityWake = function(ent, ...)
             if orig_wake ~= nil then orig_wake(ent, ...) end
-            SyncLazyMode(true)
+            if not G.POPULATING then
+                SyncLazyMode(true)
+            end
         end
 
-        -- Hook inventory put-in / drop transitions
-        inst:ListenForEvent("ondropped", function() SyncLazyMode(true) end)
+        -- Hook inventory put-in / drop transitions (strictly skipped during PopulateWorld)
+        inst:ListenForEvent("ondropped", function()
+            if not G.POPULATING then SyncLazyMode(true) end
+        end)
         inst:ListenForEvent("onputininventory", function(_, owner)
+            if G.POPULATING then return end
             SyncLazyMode(true)
+            if not inst:IsValid() then return end
             if owner ~= nil and not owner:HasTag("player") and owner.components.container ~= nil and not owner.components.container:IsOpen() then
                 inst:DoTaskInTime(0, function()
                     if inst:IsValid() and owner:IsValid() and owner.components.container ~= nil and not owner.components.container:IsOpen() then
@@ -567,7 +629,7 @@ if OPT_LAZY_PERISHABLE then
 
         -- Also pause existing sleeping/closed-container items shortly after spawn/load
         inst:DoTaskInTime(0.5 + math.random() * 0.5, function()
-            if not inst:IsValid() then return end
+            if G.POPULATING or not inst:IsValid() then return end
             local owner = inst.components.inventoryitem ~= nil and inst.components.inventoryitem.owner or nil
             if (owner == nil and inst:IsAsleep()) or
                (owner ~= nil and not owner:HasTag("player") and owner.components.container ~= nil and not owner.components.container:IsOpen()) then
@@ -583,8 +645,16 @@ if OPT_LAZY_PERISHABLE then
 
         local _origOpen = self.Open
         function self:Open(doer, ...)
+            -- Snapshot slots BEFORE syncing because Perish() -> GiveItem(goop, slot) may mutate self.slots!
+            local to_sync = {}
             for _, item in pairs(self.slots) do
                 if item ~= nil and item.components.perishable ~= nil and item.components.perishable._HC_SyncLazy ~= nil then
+                    to_sync[#to_sync + 1] = item
+                end
+            end
+            for i = 1, #to_sync do
+                local item = to_sync[i]
+                if item:IsValid() and item.components.perishable ~= nil and item.components.perishable._HC_SyncLazy ~= nil then
                     item.components.perishable._HC_SyncLazy(true)
                 end
             end
@@ -627,7 +697,7 @@ if OPT_OFFLINE_AUTOSTACK then
         pinecone = true, acorn = true, twiggy_nut = true, seeds = true,
     }
     local function TryAutoStackOnSleep(inst)
-        if not (inst:IsValid() and inst:IsAsleep()) then return end
+        if G.POPULATING or not (inst:IsValid() and inst:IsAsleep()) then return end
         local inv = inst.components.inventoryitem
         local stk = inst.components.stackable
         if inv == nil or inv.owner ~= nil or stk == nil or stk:IsFull() then return end
@@ -658,6 +728,7 @@ if OPT_OFFLINE_AUTOSTACK then
             local orig_sleep = inst.OnEntitySleep
             inst.OnEntitySleep = function(ent, ...)
                 if orig_sleep ~= nil then orig_sleep(ent, ...) end
+                if G.POPULATING then return end
                 if ent._hc_stack_task ~= nil then ent._hc_stack_task:Cancel() end
                 ent._hc_stack_task = ent:DoTaskInTime(180 + math.random() * 20, TryAutoStackOnSleep)
             end

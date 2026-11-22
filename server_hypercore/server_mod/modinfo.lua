@@ -1,7 +1,11 @@
 name = "HyperCore Server (服务端深度性能优化引擎)"
 description = [[
-《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.2.0 安全加固 & 双端 60Hz 真逻辑刻版）。
+《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.2.1 存档安全热修 & 双端 60Hz 真逻辑刻版）。
 单装本 Mod 即可生效全部 Lua 级手术优化；配合开源原生引擎插件 bin64/iphlpapi.dll（可前往 GitHub Release 下载）更可解锁无锁 mimalloc 内存池、空间网格零拷贝、压力驱动自适应 GC、C++ 原生极速存档序列化与 SIMD 压缩！
+
+【v1.2.1 P0 存档安全紧急热修（强烈建议立即更新）】
+- 彻底根治旧版 v1.2.0 开启「白名单惰性腐烂精确积分 (opt_lazy_perishable)」时，在存档保存阶段对已过期休眠食物写入负值 perishremainingtime 导致重载世界时在 POPULATING 期中途销毁实体并触发 inventoryitem_replica.lua:225 (classified 为 nil) 专服无法启动的严重隐患！
+- 全面改为 100% 零副作用只读 GetPercent() 与零副作用 OnSave()（过期实体统一以安全正值 0.01 落盘，真正腐烂推迟至存盘后异步结算），为全部休眠/唤醒/容器事件加装 GLOBAL.POPULATING 防护锁，并在 Perishable:OnLoad 内置向后兼容自愈——无需手动修改存档文件，更新本版即可直接无损救活受 v1.2.0 影响的旧存档！
 
 【v1.2.0 新特性 · 双端自协商真 60Hz 逻辑刻 & 0ms 零停顿网络发包】
 - 新增可选开关「60Hz 极速逻辑刻模式」（默认关闭保持 100% 纯原版 30Hz 兼容，客户端无需安装任何文件）；
@@ -27,7 +31,7 @@ description = [[
 注意：默认 30Hz 模式下 100% 纯服务端生效，客户端无需下载；随时取消勾选即可无损退回原版，零存档残留！
 ]]
 author = "Hakimi Tech Lab"
-version = "1.2.0"
+version = "1.2.1"
 forumthread = ""
 api_version = 10
 

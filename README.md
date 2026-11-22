@@ -1,12 +1,19 @@
-# DST HyperCore Server v1.2.0 — Ceiling-Tier Dedicated Server Optimization Suite + Opt-In 60Hz SimTick
+# DST HyperCore Server v1.2.1 — Ceiling-Tier Dedicated Server Optimization Suite + Opt-In 60Hz SimTick
 
-> **《饥荒联机版》服务端天花板级「C++ 原生引擎外置插件 (`bin64/iphlpapi.dll`) + 零分歧纯服务端 Lua Mod」双轨优化套件（现已支持可选双端 60Hz 逻辑刻！）**  
-> **Ceiling-Tier Server-Only Optimization Suite for Don't Starve Together 64-bit (`bin64/iphlpapi.dll` Native Engine + Zero-Divergence Server Mod + Opt-In Dual-Side 60Hz SimTick)**
+> **《饥荒联机版》服务端天花板级「C++ 原生引擎外置插件 (`bin64/iphlpapi.dll`) + 零分歧纯服务端 Lua Mod」双轨优化套件（v1.2.1 P0 存档安全热修 + 可选双端 60Hz 逻辑刻！）**  
+> **Ceiling-Tier Server-Only Optimization Suite for Don't Starve Together 64-bit (`bin64/iphlpapi.dll` Native Engine + Zero-Divergence Server Mod + P0 Save-Safety Hotfix + Opt-In Dual-Side 60Hz SimTick)**
 >
 > - **100% Server-Only by Default / 默认纯服务端生效**：默认 `30Hz` 模式下客户端无需安装任何文件 / Zero client downloads required in default 30Hz mode.
 > - **Opt-In Dual-Side 60Hz SimTick / 可选真 60Hz 双端高刷**：在 Mod 配置开启 `opt_sim_60hz`（或 `dst_hypercore.ini` 设置 `sim_tick_rate=60`）后，自动向 `DST HyperSmooth v2.4.0+` 客户端广播 `hypercore_sim60` 标签与 `HyperCoreProto` RPC，双端无缝切换 **真 60Hz 物理与走位响应**，且严格保持 **1.000× 原版真实流速**（实测 `120 ticks / 2.000s = 60.00 Hz`，腐烂速率精确到小数点后 6 位）！
 > - **Zero Save Lock-In / 零存档锁死**：随时删除插件与 Mod（哪怕在 60Hz 下保存的存档！），纯原版 30Hz 秒读档无残留 / Remove anytime; 100% vanilla 30Hz save-compatible.
-> - **Red-Team Hardened / 双轮红队安全加固**：经红队代码审计、C++ 6 项专项攻击回归、7 轮孤立真专服基准与 60Hz 实测全绿验证。
+> - **Red-Team Hardened / 双轮红队安全加固**：经红队代码审计、C++ 6 项专项攻击回归、7 轮孤立真专服基准、5 项惰性腐烂存档红线回归与 60Hz 实测全绿验证。
+
+### v1.2.1 P0 存档安全紧急热修 / Critical Save-Safety Hotfix
+- **彻底修复 `opt_lazy_perishable` 存档读档崩溃隐患（`inventoryitem_replica.lua:225: attempt to index field 'classified'`）**：
+  - 根因：旧版 `v1.2.0` 中 `Perishable:OnSave()` 同步结算导致将已过期休眠食物的负值 `time` 写入快照，而读档 `POPULATING` 阶段 `SetPosition -> OnEntitySleep` 与 `Perishable:OnLoad -> GetPercent() -> Perish() -> inst:Remove()` 联动在 `SetPersistData` 中途删除实体，引发紧随其后的 `stackable:OnLoad` 崩溃。
+  - 修复：将 `GetPercent()` 与 `OnSave()` 重写为 **100% 零副作用纯计算**（过期条目安全钳制为 `time = 0.01`、`paused = nil` 落盘，过期结算推迟至 `DoTaskInTime(0)`）；为全部惰性休眠/唤醒/拾取/丢弃/错峰唤醒/杂物堆叠钩子加装 `GLOBAL.POPULATING` 防护锁，全部可变方法补齐 `inst:IsValid()` 守卫。
+  - **旧存档自动无损自愈**：`Perishable:OnLoad` 自动清理残留惰性状态并将历史 `data.time <= 0` 的快照条目安全拉回 `0.01` 交由游戏首帧正常腐烂——**无需修改硬盘存档，升级 `v1.2.1` 即可直接救活受 `v1.2.0` 影响的既有存档**！
+  - 新增真实专服 5 项红线回归脚本 [`tools/test_perish_savesafety.py`](server_hypercore/tools/test_perish_savesafety.py)（5/5 `ALL_PASS`），并在 50 天真实多周目联机档上实机救档验证通过。
 
 ### v1.2.0 可选真 60Hz 逻辑刻引擎 & RakNet 零停顿网络发包 / Opt-In True 60Hz SimTick & RakNet Zero-Stall
 - **独占 `Simulation::Update` 固定步长常数 + 4/4 子系统时钟同步安全切频（Fail-Closed 验值）**：经全可执行文件 XREF 证明，`0x140458D08` (`float`)、`0x140459860` (`double`) 以及 4 处二次 `mTick*(1/30)` 子系统（`AnimShader` / `PathFinder` / `Spatial` / `SimTimeDiff`）独占服务于固定步长逻辑；切换至 `1/60` 时，克雷原生调度器（`scheduler.lua`、`stategraph.lua`）自动按 `GetTickTime()` 换算秒数，`FRAMES = 1/30` 保持恒定，实现 **双倍逻辑精度 + 精确 1.000× 真实游戏速度**。
@@ -76,7 +83,7 @@
 1. **安装服务端 Mod / Install Server Mod**：
    - 在 Steam 创意工坊订阅 **HyperCore Server (服务端深度性能优化引擎)** 并加入服务端 `modoverrides.lua`（或将 `mods/hypercore_server/` 复制到专服 `mods/` 目录）。
 2. **安装原生引擎伴侣插件 / Install Native Engine (`bin64/iphlpapi.dll`)**：
-   - 从 GitHub Releases 下载 `DST_HyperCore_Server_v1.2.0_Release.zip`，将 `bin64/iphlpapi.dll` 与 `bin64/dst_hypercore.ini` 放入专服 `bin64/` 目录（与 `dontstarve_dedicated_server_nullrenderer_x64.exe` 同目录）。
+   - 从 GitHub Releases 下载 `DST_HyperCore_Server_v1.2.1_Release.zip`，将 `bin64/iphlpapi.dll` 与 `bin64/dst_hypercore.ini` 放入专服 `bin64/` 目录（与 `dontstarve_dedicated_server_nullrenderer_x64.exe` 同目录）。
 3. **验证生效 / Verify**：
    - 查看 `bin64/dst_hypercore_Master.log`（或 `dst_hypercore_Caves.log`）确认全部 Hook `-> OK` 且跳板已锁定 W^X (`PAGE_EXECUTE_READ`)，并在服务端控制台执行 `c_hyperstats()`。
 4. **无损卸载 / Clean Uninstall**：
