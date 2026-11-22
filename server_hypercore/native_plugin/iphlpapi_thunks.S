@@ -1,11 +1,16 @@
 .intel_syntax noprefix
 .extern g_iphlp_ptrs
+.extern g_iphlp_fail_ret
 .extern hc_iphlp_resolve
 
 .text
 .p2align 4
+.globl hc_iphlp_lazy_common
+.seh_proc hc_iphlp_lazy_common
 hc_iphlp_lazy_common:
     sub rsp, 0x88
+    .seh_stackalloc 0x88
+    .seh_endprologue
     mov [rsp+0x20], rcx
     mov [rsp+0x28], rdx
     mov [rsp+0x30], r8
@@ -14,6 +19,7 @@ hc_iphlp_lazy_common:
     movdqu [rsp+0x50], xmm1
     movdqu [rsp+0x60], xmm2
     movdqu [rsp+0x70], xmm3
+    mov [rsp+0x80], r10
     mov ecx, r10d
     call hc_iphlp_resolve
     mov rcx, [rsp+0x20]
@@ -24,13 +30,16 @@ hc_iphlp_lazy_common:
     movdqu xmm1, [rsp+0x50]
     movdqu xmm2, [rsp+0x60]
     movdqu xmm3, [rsp+0x70]
+    mov r10, [rsp+0x80]
     add rsp, 0x88
     test rax, rax
     jz .Lfail_ret
     jmp rax
 .Lfail_ret:
-    mov eax, 127
+    lea r11, [rip + g_iphlp_fail_ret]
+    mov rax, [r11 + r10*8]
     ret
+.seh_endproc
 
 .globl hc_iphlp_thunk_0
 hc_iphlp_thunk_0:

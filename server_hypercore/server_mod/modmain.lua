@@ -1,5 +1,5 @@
 -- =============================================================================
--- DST HyperCore Server v1.0.0 — Layer 2 (Zero-Divergence) & Layer 3 (Opt-In)
+-- DST HyperCore Server v1.2.0 — Layer 2 (Zero-Divergence), Layer 3 & 60Hz SimTick
 -- =============================================================================
 -- Runs strictly on server master simulation (TheNet:GetIsServer() / IsMasterSim).
 -- Safe to install or uninstall at any time: zero save-format lock-in.
@@ -18,11 +18,13 @@ local OPT_STAGGERED_WAKE    = GetModConfigData("opt_staggered_wake")
 local OPT_LAZY_PERISHABLE   = GetModConfigData("opt_lazy_perishable")
 local OPT_OFFLINE_AUTOSTACK = GetModConfigData("opt_offline_autostack")
 local OPT_WILD_BEEFALO_CAP  = GetModConfigData("opt_wild_beefalo_cap") or 0
+local OPT_SIM_60HZ          = GetModConfigData("opt_sim_60hz") == true
 
 -- Internal Lua telemetry counters
 local HC_LUA_STATS = {
     merm_retarget_shortcircuits = 0,
     merm_retarget_filtered_calls = 0,
+    merm_retarget_mod_preserved = 0,
     staggered_wakes = 0,
     perish_paused_now = 0,
     perish_syncs = 0,
@@ -30,13 +32,65 @@ local HC_LUA_STATS = {
     beefalo_cap_blocks = 0,
     fastdump_hits = 0,
     fastdump_fallbacks = 0,
+    sim_tick_rate = 30,
 }
 rawset(G, "HyperCoreLuaStats", HC_LUA_STATS)
 
+-- Register shared RPC namespace (id=1) without duplicating slot if client mod co-loaded in same VM
+-- NOTE: Klei's GetClientModRPC(ns, name) does NOT nil-check CLIENT_MOD_RPC[ns]; inspect table directly!
+local _hc_rpc_tbl = rawget(G, "CLIENT_MOD_RPC")
+local _hc_rpc_ns = type(_hc_rpc_tbl) == "table" and _hc_rpc_tbl["HyperCoreProto"] or nil
+if type(_hc_rpc_ns) ~= "table" or _hc_rpc_ns["SimTickRate"] == nil then
+    AddClientModRPCHandler("HyperCoreProto", "SimTickRate", function() end)
+end
+
+-- Dynamic GetTime / GetStaticTime wrapper so 60Hz SimTick never reads a stale boot-time upvalue.
+-- Supports BOTH Dedicated Server (iphlpapi.dll -> HyperCore_*) AND No-Caves Local Host (dinput8.dll -> HyperSmooth_*).
+local _hcGetSimTick = rawget(G, "HyperCore_GetSimTickRate") or rawget(G, "HyperSmooth_GetSimTickRate")
+local _hcSetSimTick = rawget(G, "HyperCore_SetSimTickRate") or rawget(G, "HyperSmooth_SetSimTickRate")
+local active_sim_hz = (type(_hcGetSimTick) == "function") and _hcGetSimTick() or 30
+if OPT_SIM_60HZ and type(_hcSetSimTick) == "function" then
+    if _hcSetSimTick(60) then
+        active_sim_hz = 60
+    end
+end
+HC_LUA_STATS.sim_tick_rate = active_sim_hz
+
+if active_sim_hz == 60 then
+    rawset(G, "GetTime", function()
+        return G.TheSim:GetTick() * G.TheSim:GetTickTime()
+    end)
+    rawset(G, "GetStaticTime", function()
+        return G.TheSim:GetStaticTick() * G.TheSim:GetTickTime()
+    end)
+    -- Replicate "hypercore_sim60" tag on ALL world_network prefabs (surface/caves/events)
+    -- AND send ClientModRPC on player join for 100% reliable client auto-negotiation!
+    for _, net_prefab in ipairs({ "forest_network", "cave_network", "lavaarena_network", "quagmire_network", "world" }) do
+        AddPrefabPostInit(net_prefab, function(inst)
+            inst:AddTag("hypercore_sim60")
+        end)
+    end
+    AddSimPostInit(function()
+        local w = G.TheWorld
+        if w ~= nil and w.ismastersim then
+            w:AddTag("hypercore_sim60")
+            if w.net ~= nil then
+                w.net:AddTag("hypercore_sim60")
+            end
+            w:ListenForEvent("ms_playerjoined", function(_, player)
+                if player ~= nil and player.userid ~= nil then
+                    SendModRPCToClient(GetClientModRPC("HyperCoreProto", "SimTickRate"), player.userid, 60)
+                end
+            end)
+        end
+    end)
+end
+
 local _hcVersion = rawget(G, "HyperCore_Version")
 local has_native = (type(_hcVersion) == "function")
-print(string.format("[HyperCore Server] Loaded v1.0.0 | NativeDLL=%s | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
+print(string.format("[HyperCore Server] Loaded v1.2.0 | NativeDLL=%s | SimTick=%dHz | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
     has_native and _hcVersion() or "none",
+    active_sim_hz,
     tostring(OPT_FAST_DUMPER), tostring(OPT_MERM_RETARGET), tostring(OPT_STAGGERED_WAKE),
     tostring(OPT_LAZY_PERISHABLE), tostring(OPT_OFFLINE_AUTOSTACK), OPT_WILD_BEEFALO_CAP))
 
@@ -55,8 +109,8 @@ if OPT_FAST_DUMPER and type(_nativeFastDumpFn) == "function" then
                 HC_LUA_STATS.fastdump_hits = HC_LUA_STATS.fastdump_hits + 1
                 return dumped
             end
-            -- On corrupt_number or unsupported type (function/userdata/depth>128),
-            -- fall back cleanly to vanilla DataDumper for exact error diagnostics.
+            -- On cycle/node-cap/OOM/corrupt_number or unsupported type (function/userdata/depth>128),
+            -- fall back cleanly to vanilla DataDumper for exact vanilla semantics & error diagnostics.
             HC_LUA_STATS.fastdump_fallbacks = HC_LUA_STATS.fastdump_fallbacks + 1
         end
         return _origDataDumper(value, varname, fastmode, ident)
@@ -122,12 +176,31 @@ if OPT_MERM_RETARGET then
         end
     end
 
+    local _dbg_getinfo = (type(G.debug) == "table" and type(G.debug.getinfo) == "function") and G.debug.getinfo or nil
+    local function IsVanillaMermRetarget(fn)
+        if _dbg_getinfo == nil then
+            return true
+        end
+        local info = _dbg_getinfo(fn, "S")
+        local src = info ~= nil and info.source or nil
+        if type(src) ~= "string" then
+            return true
+        end
+        -- Match vanilla scripts/prefabs/merm.lua (forward or backslash)
+        return src:find("prefabs[/\\]merm%.lua") ~= nil
+    end
+
     for _, prefab in ipairs(MERM_PREFABS) do
         AddPrefabPostInit(prefab, function(inst)
             if not (G.TheWorld and G.TheWorld.ismastersim) then return end
             local combat = inst.components.combat
             if combat ~= nil and combat.targetfn ~= nil and not inst.mummy then
-                combat.targetfn = MakeFastMermRetarget(combat.targetfn)
+                if IsVanillaMermRetarget(combat.targetfn) then
+                    combat.targetfn = MakeFastMermRetarget(combat.targetfn)
+                else
+                    -- Preserve third-party mod custom targetfn untouched
+                    HC_LUA_STATS.merm_retarget_mod_preserved = HC_LUA_STATS.merm_retarget_mod_preserved + 1
+                end
             end
         end)
     end
@@ -317,7 +390,7 @@ if OPT_LAZY_PERISHABLE then
             self.updatetask:Cancel()
             self.updatetask = nil
             self._hc_lazy_active = true
-            self._hc_lazy_owner = owner
+            self._hc_lazy_is_indoor = (owner ~= nil)
             self._hc_lazy_owner_mult = ComputeOwnerMult(inst, owner)
             self._hc_lazy_is_frozen = inst:HasTag("frozen")
             self._hc_lazy_snap_ground = EnvIntegral.normal_ground
@@ -335,11 +408,10 @@ if OPT_LAZY_PERISHABLE then
             HC_LUA_STATS.perish_syncs = HC_LUA_STATS.perish_syncs + 1
 
             local local_mult = self.localPerishMultiplyer or 1.0
-            local owner = self._hc_lazy_owner
             local owner_mult = self._hc_lazy_owner_mult or 1.0
             local delta_decay = 0
 
-            if owner == nil then
+            if not self._hc_lazy_is_indoor then
                 local dg = self._hc_lazy_is_frozen
                     and (EnvIntegral.frozen_mult_int - self._hc_lazy_snap_frozen)
                     or  (EnvIntegral.normal_ground - self._hc_lazy_snap_ground)
@@ -605,14 +677,34 @@ end
 -- [L3-OptIn-2] Wild Beefalo Soft Carrying-Capacity (NEVER deletes any beefalo!)
 -- =============================================================================
 if OPT_WILD_BEEFALO_CAP > 0 then
-    local wild_beefalo_count = 0
+    local tracked_beefalos = {}
     AddPrefabPostInit("beefalo", function(inst)
         if not (G.TheWorld and G.TheWorld.ismastersim) then return end
-        wild_beefalo_count = wild_beefalo_count + 1
+        tracked_beefalos[inst] = true
         inst:ListenForEvent("onremove", function()
-            wild_beefalo_count = math.max(0, wild_beefalo_count - 1)
+            tracked_beefalos[inst] = nil
         end)
     end)
+
+    local function CountWildBeefalo()
+        local count = 0
+        for b in pairs(tracked_beefalos) do
+            if b:IsValid() then
+                local dom = b.components.domesticatable
+                local ride = b.components.rideable
+                local is_player_managed =
+                    (dom ~= nil and dom.IsDomesticated ~= nil and dom:IsDomesticated()) or
+                    (dom ~= nil and dom.GetDomestication ~= nil and dom:GetDomestication() > 0.1) or
+                    (ride ~= nil and ride.IsSaddled ~= nil and ride:IsSaddled())
+                if not is_player_managed then
+                    count = count + 1
+                end
+            else
+                tracked_beefalos[b] = nil
+            end
+        end
+        return count
+    end
 
     AddPrefabPostInit("beefaloherd", function(inst)
         if not (G.TheWorld and G.TheWorld.ismastersim) then return end
@@ -620,7 +712,7 @@ if OPT_WILD_BEEFALO_CAP > 0 then
         if ps ~= nil and ps.spawntest ~= nil then
             local orig_test = ps.spawntest
             ps:SetSpawnTestFn(function(herd_inst)
-                if wild_beefalo_count >= OPT_WILD_BEEFALO_CAP then
+                if CountWildBeefalo() >= OPT_WILD_BEEFALO_CAP then
                     HC_LUA_STATS.beefalo_cap_blocks = HC_LUA_STATS.beefalo_cap_blocks + 1
                     return false
                 end
@@ -634,7 +726,7 @@ end
 -- Console X-Ray Readout: c_hyperstats()
 -- =============================================================================
 rawset(G, "c_hyperstats", function()
-    print("=== DST HyperCore Server v1.0.0 X-Ray Stats ===")
+    print(string.format("=== DST HyperCore Server v1.2.0 X-Ray Stats (SimTick=%dHz) ===", HC_LUA_STATS.sim_tick_rate))
     local _getStats = rawget(G, "HyperCore_GetStats")
     if type(_getStats) == "function" then
         local s = _getStats()

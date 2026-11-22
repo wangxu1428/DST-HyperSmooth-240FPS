@@ -3,6 +3,8 @@ native_plugin/obj/
 native_plugin/*.dll
 native_plugin/*.lib
 native_plugin/*.log
+*.exe
+*.pdb
 release/
 
 # Local isolated benchmark runtime & vendored third-party tarballs

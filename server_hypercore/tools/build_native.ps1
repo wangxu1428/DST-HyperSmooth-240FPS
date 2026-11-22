@@ -1,10 +1,18 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$env:ZIG_GLOBAL_CACHE_DIR = "D:\环境\C++ 编译器\zig-cache"
-$env:ZIG_LOCAL_CACHE_DIR  = "D:\环境\C++ 编译器\zig-local-cache"
-$zig = "D:\环境\C++ 编译器\ziglang\zig.exe"
+if (-not $env:ZIG_GLOBAL_CACHE_DIR -and (Test-Path "D:\环境\C++ 编译器")) {
+    $env:ZIG_GLOBAL_CACHE_DIR = "D:\环境\C++ 编译器\zig-cache"
+    $env:ZIG_LOCAL_CACHE_DIR  = "D:\环境\C++ 编译器\zig-local-cache"
+}
+$zig = $env:ZIG_EXE
+if (-not $zig) {
+    $cmd = Get-Command zig -ErrorAction SilentlyContinue
+    if ($cmd) { $zig = $cmd.Source }
+    elseif (Test-Path "D:\环境\C++ 编译器\ziglang\zig.exe") { $zig = "D:\环境\C++ 编译器\ziglang\zig.exe" }
+    else { throw "zig compiler not found. Set ZIG_EXE or add zig to PATH." }
+}
 
-$root = "C:\Users\Administrator\.gemini\antigravity\scratch\dst_hypercore_server"
+$root = (Resolve-Path "$PSScriptRoot\..").Path
 $np   = "$root\native_plugin"
 $ld   = "$root\third_party\libdeflate-1.23"
 $mi   = "$root\third_party\mimalloc-2.1.7"
@@ -36,14 +44,15 @@ if (-not (Test-Path $miObj)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed compiling mimalloc static.c" }
 }
 
-Write-Host "[3/4] Assembling 297-export register-preserving IPHLPAPI thunks..."
+Write-Host "[3/4] Assembling 297-export SEH-compliant IPHLPAPI thunks..."
 $thunkObj = "$obj\iphlpapi_thunks.o"
 & $zig cc -target $target -c "$np\iphlpapi_thunks.S" -o $thunkObj
 if ($LASTEXITCODE -ne 0) { throw "Failed assembling iphlpapi_thunks.S" }
 
-Write-Host "[4/4] Compiling & linking iphlpapi.dll (DST HyperCore Server Native Engine v1.0.0)..."
+Write-Host "[4/4] Compiling & linking iphlpapi.dll (DST HyperCore Server Native Engine v1.2.0)..."
 $mainObj = "$obj\iphlpapi.o"
 & $zig c++ -target $target -std=c++20 -O3 -march=x86_64 -DNDEBUG `
+    -Wall -Wextra -Wno-unused-parameter `
     "-I$np" "-I$ld" "-I$mi\include" `
     -fno-exceptions -fno-rtti `
     -c "$np\iphlpapi.cpp" -o $mainObj

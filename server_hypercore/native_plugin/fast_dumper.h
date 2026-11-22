@@ -1,9 +1,12 @@
 #pragma once
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 
 // Minimal Lua 5.1.4 ABI constants (verified against dontstarve_dedicated_server_nullrenderer_x64.exe)
 static constexpr int HC_LUA_TNIL          = 0;
@@ -26,6 +29,7 @@ struct LuaApiTable {
     double      (*tonumber)(void* L, int idx) = nullptr;
     int         (*toboolean)(void* L, int idx) = nullptr;
     const char* (*tolstring)(void* L, int idx, size_t* len) = nullptr;
+    const void* (*topointer)(void* L, int idx) = nullptr;
     void        (*pushnil)(void* L) = nullptr;
     void        (*pushnumber)(void* L, double n) = nullptr;
     void        (*pushlstring)(void* L, const char* s, size_t l) = nullptr;
@@ -40,7 +44,7 @@ struct LuaApiTable {
 
     bool ReadyForFastDump() const {
         return checkstack && gettop && settop && type && tonumber && toboolean &&
-               tolstring && pushnil && pushlstring && pushstring && pushboolean && next;
+               tolstring && topointer && pushnil && pushlstring && pushstring && pushboolean && next;
     }
     bool ReadyForRegister() const {
         return pushcclosure && setfield && createtable && pushnumber && pushstring && pushboolean;
@@ -49,39 +53,93 @@ struct LuaApiTable {
 
 namespace fast_dumper {
 
+static constexpr size_t   kMaxDumpBytes     = 256ULL * 1024ULL * 1024ULL; // 256 MB hard safety cap
+static constexpr size_t   kShrinkKeepBytes  = 4ULL * 1024ULL * 1024ULL;   // release spike buffers > 4 MB
+static constexpr uint32_t kMaxDumpNodes     = 2500000u;                   // stops exponential shared DAGs in O(1)
+static constexpr int      kMaxDumpDepth     = 128;
+
 enum class Status {
     Ok = 0,
     FallbackNeeded = 1,
     CorruptNumber = 2,
 };
 
+// Memory-safe growable buffer: EVERY mutation verifies capacity & returns bool.
+// Under OOM, overflow, or > kMaxDumpBytes, it sets oom=true and NEVER writes out of bounds.
 struct GrowBuf {
     char*  data = nullptr;
     size_t len  = 0;
     size_t cap  = 0;
+    size_t maxBytes = kMaxDumpBytes;
+    bool   oom  = false;
 
-    void Reserve(size_t want) {
-        if (want <= cap) return;
-        size_t ncap = cap ? cap * 2 : 65536;
-        while (ncap < want) ncap *= 2;
+    bool Reserve(size_t want) {
+        if (oom) return false;
+        if (want > maxBytes) {
+            oom = true;
+            return false;
+        }
+        if (want <= cap) return true;
+        size_t ncap = cap ? cap : 65536;
+        while (ncap < want) {
+            if (ncap > maxBytes / 2) {
+                ncap = maxBytes;
+                break;
+            }
+            ncap *= 2;
+        }
+        if (ncap < want) {
+            oom = true;
+            return false;
+        }
         char* p = static_cast<char*>(std::realloc(data, ncap));
-        if (p) {
-            data = p;
-            cap = ncap;
+        if (!p) {
+            oom = true;
+            return false;
+        }
+        data = p;
+        cap = ncap;
+        return true;
+    }
+
+    void Clear() {
+        len = 0;
+        oom = false;
+    }
+
+    void ShrinkIfLarge(size_t keepLimit = kShrinkKeepBytes) {
+        len = 0;
+        oom = false;
+        if (cap > keepLimit) {
+            std::free(data);
+            data = nullptr;
+            cap = 0;
         }
     }
-    void Clear() { len = 0; }
-    void PushChar(char c) {
-        if (len + 1 > cap) Reserve(len + 1);
+
+    bool PushChar(char c) {
+        if (oom || len >= maxBytes) {
+            oom = true;
+            return false;
+        }
+        if (len + 1 > cap && !Reserve(len + 1)) return false;
         data[len++] = c;
+        return true;
     }
-    void Append(const char* s, size_t n) {
-        if (n == 0) return;
-        if (len + n > cap) Reserve(len + n);
+
+    bool Append(const char* s, size_t n) {
+        if (n == 0) return !oom;
+        if (oom || n > maxBytes - len) {
+            oom = true;
+            return false;
+        }
+        if (len + n > cap && !Reserve(len + n)) return false;
         std::memcpy(data + len, s, n);
         len += n;
+        return true;
     }
-    void AppendLit(const char* s) { Append(s, std::strlen(s)); }
+
+    bool AppendLit(const char* s) { return Append(s, std::strlen(s)); }
     ~GrowBuf() { std::free(data); }
 };
 
@@ -127,27 +185,33 @@ inline bool IsPlainLuaIdent(const char* s, size_t n) {
     return !IsLuaReserved(s, n);
 }
 
-inline void AppendQuotedString(GrowBuf& out, const char* s, size_t n) {
-    out.Reserve(out.len + n + 4);
-    out.PushChar('"');
+inline bool AppendQuotedString(GrowBuf& out, const char* s, size_t n) {
+    if (n > out.maxBytes || out.len > out.maxBytes - n - 4) {
+        out.oom = true;
+        return false;
+    }
+    if (!out.Reserve(out.len + n + 4)) return false;
+    if (!out.PushChar('"')) return false;
     const char* seg = s;
     for (size_t i = 0; i < n; ++i) {
         unsigned char c = static_cast<unsigned char>(s[i]);
         if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\0') {
-            if (s + i > seg) out.Append(seg, static_cast<size_t>((s + i) - seg));
-            if (c == '"')       out.Append("\\\"", 2);
-            else if (c == '\\') out.Append("\\\\", 2);
-            else if (c == '\n') out.Append("\\n", 2);
-            else if (c == '\r') out.Append("\\r", 2);
+            if (s + i > seg && !out.Append(seg, static_cast<size_t>((s + i) - seg))) return false;
+            bool ok = true;
+            if (c == '"')       ok = out.Append("\\\"", 2);
+            else if (c == '\\') ok = out.Append("\\\\", 2);
+            else if (c == '\n') ok = out.Append("\\n", 2);
+            else if (c == '\r') ok = out.Append("\\r", 2);
             else {
                 // Escape NUL as \000 so following digits cannot be swallowed by Lua lexer
-                out.Append("\\000", 4);
+                ok = out.Append("\\000", 4);
             }
+            if (!ok) return false;
             seg = s + i + 1;
         }
     }
-    if (s + n > seg) out.Append(seg, static_cast<size_t>((s + n) - seg));
-    out.PushChar('"');
+    if (s + n > seg && !out.Append(seg, static_cast<size_t>((s + n) - seg))) return false;
+    return out.PushChar('"');
 }
 
 inline Status AppendNumber(GrowBuf& out, double d) {
@@ -155,9 +219,7 @@ inline Status AppendNumber(GrowBuf& out, double d) {
         return Status::CorruptNumber;
     }
     if (d == 0.0) {
-        // Normalize -0.0 and 0.0 cleanly (avoid "-0" edge noise while matching numeric value)
-        out.PushChar('0');
-        return Status::Ok;
+        return out.PushChar('0') ? Status::Ok : Status::FallbackNeeded;
     }
     // Fast exact integer path (covers GUIDs, counts, ticks, coordinates, etc.)
     if (d >= -9007199254740992.0 && d <= 9007199254740992.0) {
@@ -171,46 +233,68 @@ inline Status AppendNumber(GrowBuf& out, double d) {
                 u /= 10;
             } while (u != 0);
             if (iv < 0) *--p = '-';
-            out.Append(p, static_cast<size_t>((tmp + sizeof(tmp)) - p));
-            return Status::Ok;
+            return out.Append(p, static_cast<size_t>((tmp + sizeof(tmp)) - p))
+                ? Status::Ok : Status::FallbackNeeded;
         }
     }
-    // Exact Lua 5.1 LUA_NUMBER_FMT ("%.14g")
-    char tmp[48];
-    int written = std::snprintf(tmp, sizeof(tmp), "%.14g", d);
-    if (written <= 0 || written >= static_cast<int>(sizeof(tmp))) {
+    // Locale-independent C++17 std::to_chars (immune to LC_NUMERIC comma decimal separator!)
+    // Exact 14-digit general format parity with Lua 5.1 LUA_NUMBER_FMT ("%.14g").
+    char tmp[64];
+    auto res = std::to_chars(tmp, tmp + sizeof(tmp), d, std::chars_format::general, 14);
+    if (res.ec != std::errc{}) {
         return Status::FallbackNeeded;
     }
-    out.Append(tmp, static_cast<size_t>(written));
-    return Status::Ok;
+    return out.Append(tmp, static_cast<size_t>(res.ptr - tmp))
+        ? Status::Ok : Status::FallbackNeeded;
 }
 
-inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, int depth) {
-    if (depth > 128) return Status::FallbackNeeded;
+struct DumpCtx {
+    std::unordered_set<const void*> activeTables;
+    uint32_t visitedNodes = 0;
+    uint32_t maxNodes = kMaxDumpNodes;
+    const char* failReason = nullptr;
+};
+
+inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, DumpCtx& ctx, int depth) {
+    if (out.oom) { ctx.failReason = "buffer_limit_exceeded"; return Status::FallbackNeeded; }
+    if (depth > kMaxDumpDepth) { ctx.failReason = "depth_limit"; return Status::FallbackNeeded; }
+    if (++ctx.visitedNodes > ctx.maxNodes) { ctx.failReason = "node_limit_exceeded"; return Status::FallbackNeeded; }
 
     int t = api.type(L, idx);
     switch (t) {
         case HC_LUA_TNIL:
-            out.Append("nil", 3);
-            return Status::Ok;
+            return out.Append("nil", 3) ? Status::Ok : Status::FallbackNeeded;
         case HC_LUA_TBOOLEAN:
-            if (api.toboolean(L, idx)) out.Append("true", 4);
-            else                       out.Append("false", 5);
-            return Status::Ok;
-        case HC_LUA_TNUMBER:
-            return AppendNumber(out, api.tonumber(L, idx));
+            return (api.toboolean(L, idx) ? out.Append("true", 4) : out.Append("false", 5))
+                ? Status::Ok : Status::FallbackNeeded;
+        case HC_LUA_TNUMBER: {
+            Status ns = AppendNumber(out, api.tonumber(L, idx));
+            if (ns == Status::CorruptNumber) ctx.failReason = "corrupt_number";
+            return ns;
+        }
         case HC_LUA_TSTRING: {
             size_t slen = 0;
             const char* s = api.tolstring(L, idx, &slen);
             if (!s) return Status::FallbackNeeded;
-            AppendQuotedString(out, s, slen);
-            return Status::Ok;
+            return AppendQuotedString(out, s, slen) ? Status::Ok : Status::FallbackNeeded;
         }
         case HC_LUA_TTABLE: {
-            if (!api.checkstack(L, 4)) return Status::FallbackNeeded;
-            // Convert negative index to absolute before pushing keys
+            if (!api.checkstack(L, 4)) { ctx.failReason = "stack_limit"; return Status::FallbackNeeded; }
             int abs_idx = (idx < 0 && idx > HC_LUA_GLOBALSINDEX) ? (api.gettop(L) + idx + 1) : idx;
-            out.PushChar('{');
+
+            // O(1) active-path cycle detection (catches single- and multi-branch cycles instantly!)
+            const void* tptr = api.topointer(L, abs_idx);
+            if (!tptr || !ctx.activeTables.insert(tptr).second) {
+                ctx.failReason = "cycle_detected";
+                return Status::FallbackNeeded;
+            }
+            struct ActiveGuard {
+                std::unordered_set<const void*>& set;
+                const void* ptr;
+                ~ActiveGuard() { set.erase(ptr); }
+            } guard{ctx.activeTables, tptr};
+
+            if (!out.PushChar('{')) return Status::FallbackNeeded;
             int64_t numidx = 1;
             bool has_elem = false;
 
@@ -226,13 +310,15 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
                         numidx++;
                         emit_key = false;
                     } else {
-                        out.PushChar('[');
-                        Status ks = AppendNumber(out, kd);
-                        if (ks != Status::Ok) {
+                        if (!out.PushChar('[')) {
                             api.settop(L, api.gettop(L) - 2);
-                            return ks;
+                            return Status::FallbackNeeded;
                         }
-                        out.Append("]=", 2);
+                        Status ks = AppendNumber(out, kd);
+                        if (ks != Status::Ok || !out.Append("]=", 2)) {
+                            api.settop(L, api.gettop(L) - 2);
+                            return (ks != Status::Ok) ? ks : Status::FallbackNeeded;
+                        }
                         emit_key = false;
                     }
                 } else if (kt == HC_LUA_TSTRING) {
@@ -242,18 +328,23 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
                         api.settop(L, api.gettop(L) - 2);
                         return Status::FallbackNeeded;
                     }
+                    bool ok = true;
                     if (IsPlainLuaIdent(ks, klen)) {
-                        out.Append(ks, klen);
-                        out.PushChar('=');
+                        ok = out.Append(ks, klen) && out.PushChar('=');
                     } else {
-                        out.PushChar('[');
-                        AppendQuotedString(out, ks, klen);
-                        out.Append("]=", 2);
+                        ok = out.PushChar('[') && AppendQuotedString(out, ks, klen) && out.Append("]=", 2);
+                    }
+                    if (!ok) {
+                        api.settop(L, api.gettop(L) - 2);
+                        return Status::FallbackNeeded;
                     }
                     emit_key = false;
                 } else if (kt == HC_LUA_TBOOLEAN) {
-                    if (api.toboolean(L, -2)) out.Append("[true]=", 7);
-                    else                      out.Append("[false]=", 8);
+                    bool ok = api.toboolean(L, -2) ? out.Append("[true]=", 7) : out.Append("[false]=", 8);
+                    if (!ok) {
+                        api.settop(L, api.gettop(L) - 2);
+                        return Status::FallbackNeeded;
+                    }
                     emit_key = false;
                 }
 
@@ -263,12 +354,15 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
                     return Status::FallbackNeeded;
                 }
 
-                Status vs = DumpValue(L, api, -1, out, depth + 1);
+                Status vs = DumpValue(L, api, -1, out, ctx, depth + 1);
                 if (vs != Status::Ok) {
                     api.settop(L, api.gettop(L) - 2);
                     return vs;
                 }
-                out.PushChar(',');
+                if (!out.PushChar(',')) {
+                    api.settop(L, api.gettop(L) - 2);
+                    return Status::FallbackNeeded;
+                }
                 has_elem = true;
 
                 // Pop value, keep key for next lua_next
@@ -278,8 +372,7 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
             if (has_elem && out.len > 0 && out.data[out.len - 1] == ',') {
                 out.len--;
             }
-            out.PushChar('}');
-            return Status::Ok;
+            return out.PushChar('}') ? Status::Ok : Status::FallbackNeeded;
         }
         default:
             // function / userdata / thread / lightuserdata -> let vanilla DataDumper handle it
@@ -287,17 +380,31 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
     }
 }
 
-inline Status DumpRoot(void* L, const LuaApiTable& api, int val_idx, const char* varname, size_t varlen, GrowBuf& out) {
+inline Status DumpRoot(void* L, const LuaApiTable& api, int val_idx, const char* varname, size_t varlen, GrowBuf& out, const char** outReason = nullptr) {
     out.Clear();
+    bool ok = true;
     if (!varname) {
-        out.Append("return ", 7);
+        ok = out.Append("return ", 7);
     } else if (IsPlainLuaIdent(varname, varlen)) {
-        out.Append(varname, varlen);
-        out.Append(" = ", 3);
+        ok = out.Append(varname, varlen) && out.Append(" = ", 3);
     } else {
-        out.Append(varname, varlen);
+        ok = out.Append(varname, varlen);
     }
-    return DumpValue(L, api, val_idx, out, 0);
+    if (!ok) {
+        if (outReason) *outReason = out.oom ? "buffer_limit_exceeded" : "fallback";
+        return Status::FallbackNeeded;
+    }
+    DumpCtx ctx;
+    ctx.activeTables.reserve(64);
+    Status st = DumpValue(L, api, val_idx, out, ctx, 0);
+    if (outReason) {
+        if (st == Status::Ok) *outReason = nullptr;
+        else if (ctx.failReason) *outReason = ctx.failReason;
+        else if (st == Status::CorruptNumber) *outReason = "corrupt_number";
+        else if (out.oom) *outReason = "buffer_limit_exceeded";
+        else *outReason = "fallback";
+    }
+    return st;
 }
 
 } // namespace fast_dumper

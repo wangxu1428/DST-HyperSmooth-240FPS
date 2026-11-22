@@ -1,15 +1,19 @@
 // =============================================================================
-// DST HyperCore Server Native Engine v1.0.0 (IPHLPAPI.DLL x64 Proxy)
+// DST HyperCore Server Native Engine v1.2.0 (IPHLPAPI.DLL x64 Proxy)
 // =============================================================================
 // First-principles, hermetic-ABI native optimization & profiling engine for
 // Don't Starve Together Dedicated Server (dontstarve_dedicated_server_nullrenderer_x64.exe).
 //
-// Design Axioms:
-//   1. Measure First: Built-in microsecond QPC Profiler for every hot subsystem.
-//   2. Zero-Divergence: 100% byte-compatible saves & identical gameplay semantics.
-//   3. Hermetic ABI: Only cuts self-contained boundaries (lua_newstate alloc,
-//      read-only FindEntities SpatialGrid::Query, RFC1950 compress2, 30Hz GC).
-//   4. Zero Lock-In: Pure pass-through in client/other processes; safe uninstall.
+// Security Hardening (v1.1.0):
+//   - Lock-free LoadLibraryW proxy resolution (eliminates AB-BA Loader Lock cycle)
+//   - Full x64 SEH .pdata/.xdata unwind info + per-API fail return contract
+//   - Module Pinning (GET_MODULE_HANDLE_EX_FLAG_PIN) + lpvReserved-compliant DllMain
+//   - W^X compliant trampoline slab (PAGE_EXECUTE_READ after init), ordered publish,
+//     paired rollback on partial hook failure, independent SpatialGrid/Visitor AOB checks
+//   - Memory-safe FastDataDumper (O(1) active-table cycle detection, DAG node cap,
+//     checked GrowBuf realloc + 256MB cap + post-dump shrink, locale-independent to_chars)
+//   - Finite/clamped SpatialGrid::Query bounds (exact math.huge/Inf/NaN vanilla parity)
+//   - Per-shard log isolation (Master/Caves), SO_EXCLUSIVEADDRUSE + SRWLOCK telemetry
 // =============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -17,6 +21,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <mmsystem.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -34,35 +39,59 @@
 #include "mimalloc.h"
 
 // =============================================================================
-// 297-Export Transparent System32\iphlpapi.dll Proxy (Loader-Lock-Safe Lazy Init)
+// 297-Export Transparent System32\iphlpapi.dll Proxy (Lock-Free Lazy Resolution)
 // =============================================================================
+// Never holds any user lock across LoadLibraryW, making AB-BA Loader Lock cycles
+// and same-thread DllMain re-entrancy deadlocks mathematically impossible.
 extern "C" {
 void* g_iphlp_ptrs[kIphlpExportCount] = {nullptr};
 
-static HMODULE   g_realIphlp = nullptr;
-static INIT_ONCE g_iphlpInitOnce = INIT_ONCE_STATIC_INIT;
+static std::atomic<HMODULE> g_realIphlp{nullptr};
 
-static BOOL CALLBACK LoadRealIphlpCallback(PINIT_ONCE, PVOID, PVOID*) {
+static HMODULE LoadRealIphlpLockFree() {
+    HMODULE h = g_realIphlp.load(std::memory_order_acquire);
+    if (h) return h;
+
     wchar_t sysDir[MAX_PATH] = {};
     UINT len = GetSystemDirectoryW(sysDir, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH - 16) return FALSE;
-    std::wstring path(sysDir, len);
-    path += L"\\iphlpapi.dll";
-    g_realIphlp = LoadLibraryW(path.c_str());
-    return g_realIphlp != nullptr ? TRUE : FALSE;
+    if (len == 0 || len >= MAX_PATH - 16) return nullptr;
+    wchar_t path[MAX_PATH] = {};
+    std::memcpy(path, sysDir, len * sizeof(wchar_t));
+    static constexpr wchar_t kSuffix[] = L"\\iphlpapi.dll";
+    std::memcpy(path + len, kSuffix, sizeof(kSuffix));
+
+    // NT LdrpLoaderLock internally serializes and supports recursion on the same thread.
+    HMODULE loaded = LoadLibraryW(path);
+    if (!loaded) return nullptr;
+
+    HMODULE expected = nullptr;
+    if (!g_realIphlp.compare_exchange_strong(expected, loaded, std::memory_order_acq_rel)) {
+        // Another thread raced and published first; do NOT call FreeLibrary here
+        // because we may be executing inside another DLL's DllMain.
+        return expected;
+    }
+    return loaded;
 }
 
 void* hc_iphlp_resolve(uint32_t idx) {
-    if (idx >= kIphlpExportCount) return nullptr;
+    if (idx >= kIphlpExportCount) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
     void* cached = InterlockedCompareExchangePointer(&g_iphlp_ptrs[idx], nullptr, nullptr);
     if (cached) return cached;
 
-    InitOnceExecuteOnce(&g_iphlpInitOnce, LoadRealIphlpCallback, nullptr, nullptr);
-    if (!g_realIphlp) return nullptr;
+    HMODULE hReal = LoadRealIphlpLockFree();
+    if (!hReal) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
 
-    void* fn = reinterpret_cast<void*>(GetProcAddress(g_realIphlp, kIphlpExportNames[idx]));
+    void* fn = reinterpret_cast<void*>(GetProcAddress(hReal, kIphlpExportNames[idx]));
     if (fn) {
         InterlockedExchangePointer(&g_iphlp_ptrs[idx], fn);
+    } else {
+        SetLastError(ERROR_PROC_NOT_FOUND);
     }
     return fn;
 }
@@ -89,6 +118,8 @@ struct Config {
     float  gc_busy_min_ms          = 0.4f;
     int    gc_emergency_add_mb     = 256;
     int    log_interval_ticks      = 300; // log summary every 10s (300 ticks) when profiler active
+    int    sim_tick_rate           = 30;  // 30 (stock vanilla) or 60 (opt-in HyperCore/HyperSmooth dual-side 60Hz)
+    bool   enable_raknet_instant_wake = true; // 0ms event-driven RakNet UDP wakeup (eliminates 10ms WaitOnEvent stall)
 };
 
 Config       g_cfg;
@@ -100,9 +131,28 @@ CRITICAL_SECTION g_logCs;
 bool         g_logCsInit = false;
 bool         g_isServerProcess = false;
 bool         g_timerBoosted = false;
+int64_t      g_qpcFreq = 10000000;
 double       g_qpcToUs = 0.0;
 HANDLE       g_httpThread = nullptr;
 std::atomic<bool> g_stopHttp{false};
+float*       g_simTickFloatPtr = nullptr;
+double*      g_simTickDoublePtr = nullptr;
+float*       g_simAnimShaderTickPtr = nullptr;
+float*       g_simPathfinderTickPtr = nullptr;
+float*       g_simSpatialTickPtr = nullptr;
+float*       g_simTimeDiffTickPtr = nullptr;
+float*       g_netTickScalePtr = nullptr;
+void**       g_netMgrGlobalPtr = nullptr;
+std::atomic<int> g_activeSimTickRate{30};
+std::atomic<bool> g_netTickSynced60{false};
+
+using SetNetworkTickRate_t     = void (*)(void* netMgr, uint32_t tickRate);
+using ServerFrameLimiterWait_t = void (*)(void* fl, uint8_t bSleep);
+using CreateWaitableTimerExW_t = HANDLE (WINAPI*)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+constexpr DWORD kCreateWaitableTimerHighRes = 0x00000002u;
+
+SetNetworkTickRate_t     g_fnSetNetTickRate           = nullptr;
+ServerFrameLimiterWait_t g_origServerFrameLimiterWait = nullptr;
 
 void LogMsg(const char* fmt, ...) {
     if (!g_logCsInit) return;
@@ -172,6 +222,8 @@ void LoadIniConfig() {
         else if (std::strcmp(k, "gc_busy_min_ms") == 0)          g_cfg.gc_busy_min_ms = static_cast<float>(std::atof(v));
         else if (std::strcmp(k, "gc_emergency_add_mb") == 0)     g_cfg.gc_emergency_add_mb = std::clamp(std::atoi(v), 64, 2048);
         else if (std::strcmp(k, "log_interval_ticks") == 0)      g_cfg.log_interval_ticks = std::max(0, std::atoi(v));
+        else if (std::strcmp(k, "sim_tick_rate") == 0)           g_cfg.sim_tick_rate = (std::atoi(v) == 60) ? 60 : 30;
+        else if (std::strcmp(k, "enable_raknet_instant_wake") == 0) g_cfg.enable_raknet_instant_wake = std::atoi(v) != 0;
     }
     std::fclose(f);
 }
@@ -217,7 +269,8 @@ struct Telemetry {
     std::atomic<uint64_t> serialize_world_calls{0};
     std::atomic<uint64_t> serialize_world_us_sum{0};
 
-    // Ring buffer of recent tick durations (us) for P95/P99 calculation
+    // Ring buffer of recent tick durations (us) for P95/P99 calculation (SRWLOCK-protected)
+    mutable SRWLOCK tick_ring_lock = SRWLOCK_INIT;
     uint32_t tick_ring[kTickRingSize] = {};
     uint32_t tick_ring_pos = 0;
     uint32_t tick_ring_filled = 0;
@@ -235,14 +288,28 @@ struct Telemetry {
         fastdump_calls = 0; fastdump_us_sum = 0; fastdump_bytes_sum = 0; fastdump_fallbacks = 0;
         deflate_calls = 0; deflate_us_sum = 0; deflate_in_bytes = 0; deflate_out_bytes = 0;
         serialize_world_calls = 0; serialize_world_us_sum = 0;
+        AcquireSRWLockExclusive(&tick_ring_lock);
         tick_ring_pos = 0; tick_ring_filled = 0;
+        ReleaseSRWLockExclusive(&tick_ring_lock);
+    }
+
+    void PushTickSample(uint32_t us) {
+        AcquireSRWLockExclusive(&tick_ring_lock);
+        tick_ring[tick_ring_pos] = us;
+        tick_ring_pos = (tick_ring_pos + 1) % kTickRingSize;
+        if (tick_ring_filled < kTickRingSize) tick_ring_filled++;
+        ReleaseSRWLockExclusive(&tick_ring_lock);
     }
 
     void ComputePercentiles(double& out_avg, double& out_p95, double& out_p99) const {
-        uint32_t n = std::min<uint32_t>(tick_ring_filled, kTickRingSize);
-        if (n == 0) { out_avg = out_p95 = out_p99 = 0.0; return; }
         uint32_t tmp[kTickRingSize];
-        std::memcpy(tmp, tick_ring, n * sizeof(uint32_t));
+        uint32_t n = 0;
+        AcquireSRWLockShared(&tick_ring_lock);
+        n = std::min<uint32_t>(tick_ring_filled, kTickRingSize);
+        if (n > 0) std::memcpy(tmp, tick_ring, n * sizeof(uint32_t));
+        ReleaseSRWLockShared(&tick_ring_lock);
+
+        if (n == 0) { out_avg = out_p95 = out_p99 = 0.0; return; }
         std::sort(tmp, tmp + n);
         uint64_t sum = 0;
         for (uint32_t i = 0; i < n; ++i) sum += tmp[i];
@@ -358,19 +425,47 @@ struct RelocItem {
     size_t dispOff; // 1 for E8, 3 for 7-byte RIP-relative
 };
 
-void* InstallHook(uint8_t* target, void* detour, size_t stolenLen,
-                  const RelocItem* relocs = nullptr, size_t relocCount = 0) {
-    if (!target || !detour || stolenLen < 14 || !g_trampSlab) return nullptr;
-    size_t needed = stolenLen + 14 + 16;
-    if (g_trampUsed + needed > kTrampSlabSize) return nullptr;
+bool VerifyAobAt(const uint8_t* addr, const int16_t* pat, size_t len) {
+    if (!addr || !g_textStart) return false;
+    if (addr < g_textStart || static_cast<size_t>(addr - g_textStart) + len > g_textSize) return false;
+    for (size_t k = 0; k < len; ++k) {
+        if (pat[k] >= 0 && addr[k] != static_cast<uint8_t>(pat[k])) return false;
+    }
+    return true;
+}
 
+bool RestoreHookBytes(uint8_t* target, const uint8_t* savedBytes, size_t len) {
+    if (!target || !savedBytes || len == 0) return false;
+    DWORD oldProt = 0;
+    if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    std::memcpy(target, savedBytes, len);
+    DWORD dummy = 0;
+    VirtualProtect(target, len, oldProt, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), target, len);
+    return true;
+}
+
+// Strict ordered install:
+//   1. Build trampoline + relocate RIP-relative instructions
+//   2. FlushInstructionCache(tramp)
+//   3. Publish *outOrigPtr = tramp with release fence BEFORE modifying target
+//   4. Patch target entry -> FlushInstructionCache(target) -> restore page protection
+bool InstallHookOrdered(uint8_t* target, void* detour, size_t stolenLen, void** outOrigPtr,
+                        const RelocItem* relocs = nullptr, size_t relocCount = 0,
+                        uint8_t* outSavedPrologue = nullptr) {
+    if (!target || !detour || !outOrigPtr || stolenLen < 14 || !g_trampSlab) return false;
+    size_t needed = stolenLen + 14 + 16;
+    if (g_trampUsed + needed > kTrampSlabSize) return false;
+
+    const size_t prevUsed = g_trampUsed;
     uint8_t* tramp = g_trampSlab + g_trampUsed;
-    // Align next slot to 16 bytes
     g_trampUsed = (g_trampUsed + stolenLen + 14 + 15) & ~size_t(15);
 
     std::memcpy(tramp, target, stolenLen);
+    if (outSavedPrologue) {
+        std::memcpy(outSavedPrologue, target, stolenLen);
+    }
 
-    // Fix up any relocated RIP-relative / E8 call instructions inside stolen bytes
     for (size_t i = 0; i < relocCount; ++i) {
         const RelocItem& r = relocs[i];
         int32_t oldDisp = 0;
@@ -379,24 +474,43 @@ void* InstallHook(uint8_t* target, void* detour, size_t stolenLen,
         intptr_t newDisp64 = absTarget - reinterpret_cast<intptr_t>(tramp + r.offset + r.insnLen);
         if (newDisp64 < INT32_MIN || newDisp64 > INT32_MAX) {
             LogMsg("[HOOK] Reloc out of range for target %p!", target);
-            return nullptr;
+            g_trampUsed = prevUsed;
+            return false;
         }
         int32_t newDisp = static_cast<int32_t>(newDisp64);
         std::memcpy(tramp + r.offset + r.dispOff, &newDisp, 4);
     }
 
     WriteAbsJmp14(tramp + stolenLen, target + stolenLen);
+    FlushInstructionCache(GetCurrentProcess(), tramp, stolenLen + 14);
+
+    // Publish trampoline pointer BEFORE target entry becomes live
+    *outOrigPtr = tramp;
+    std::atomic_thread_fence(std::memory_order_release);
 
     DWORD oldProt = 0;
     if (!VirtualProtect(target, stolenLen, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        return nullptr;
+        *outOrigPtr = nullptr;
+        g_trampUsed = prevUsed;
+        return false;
     }
     WriteAbsJmp14(target, detour);
     for (size_t i = 14; i < stolenLen; ++i) target[i] = 0x90;
-    VirtualProtect(target, stolenLen, oldProt, &oldProt);
+    DWORD dummy = 0;
+    if (!VirtualProtect(target, stolenLen, oldProt, &dummy)) {
+        LogMsg("[HOOK] WARN: VirtualProtect restore failed for target %p", target);
+    }
     FlushInstructionCache(GetCurrentProcess(), target, stolenLen);
-    FlushInstructionCache(GetCurrentProcess(), tramp, stolenLen + 14);
-    return tramp;
+    return true;
+}
+
+void FinalizeTrampolineSlabWX() {
+    if (!g_trampSlab) return;
+    DWORD oldProt = 0;
+    if (VirtualProtect(g_trampSlab, kTrampSlabSize, PAGE_EXECUTE_READ, &oldProt)) {
+        LogMsg("[HOOK] Locked trampoline slab W^X -> PAGE_EXECUTE_READ (%zu/%zu bytes used)",
+               g_trampUsed, kTrampSlabSize);
+    }
 }
 
 // =============================================================================
@@ -439,23 +553,31 @@ Compress2_t        g_origCompress2         = nullptr;
 // Module 1: Hermetic lua_newstate -> Lockless mimalloc (Zero Ring-0 Syscalls!)
 // =============================================================================
 void* HyperSimLuaAlloc(void* ud, void* ptr, size_t osize, size_t nsize) {
-    // Preserve optional Klei debug allocation tracker if explicitly enabled in Simulation
-    if (ud && g_trackLuaMem && reinterpret_cast<const uint8_t*>(ud)[0x119] != 0) {
-        g_trackLuaMem(ud, static_cast<uint32_t>(osize), static_cast<uint32_t>(nsize));
-    }
+    auto trackMem = [&]() {
+        if (ud && g_trackLuaMem && reinterpret_cast<const uint8_t*>(ud)[0x119] != 0) {
+            g_trackLuaMem(ud, static_cast<uint32_t>(osize), static_cast<uint32_t>(nsize));
+        }
+    };
     if (nsize == 0) {
         if (ptr) {
             mi_free(ptr);
             g_stats.mi_frees.fetch_add(1, std::memory_order_relaxed);
+            trackMem();
         }
         return nullptr;
     }
+    void* out = nullptr;
     if (!ptr) {
-        g_stats.mi_allocs.fetch_add(1, std::memory_order_relaxed);
-        return mi_malloc(nsize);
+        out = mi_malloc(nsize);
+        if (out) g_stats.mi_allocs.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        out = mi_realloc(ptr, nsize);
+        if (out) g_stats.mi_reallocs.fetch_add(1, std::memory_order_relaxed);
     }
-    g_stats.mi_reallocs.fetch_add(1, std::memory_order_relaxed);
-    return mi_realloc(ptr, nsize);
+    if (out) {
+        trackMem();
+    }
+    return out;
 }
 
 void* HyperWgLuaAlloc(void* /*ud*/, void* ptr, size_t /*osize*/, size_t nsize) {
@@ -539,19 +661,41 @@ void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* vi
     const auto* cells_end   = *reinterpret_cast<const SpatialCell* const*>(gbytes + 0x10);
     const float cell_size   = *reinterpret_cast<const float*>(gbytes + 0x38);
 
-    if (!cells_begin || cells_begin >= cells_end || cell_size <= 0.0f) {
+    if (!cells_begin || cells_begin >= cells_end || !std::isfinite(cell_size) || cell_size <= 0.0f) {
+        return;
+    }
+
+    const float x = posXZ[0];
+    const float z = posXZ[1];
+    // Guard against math.huge / Inf / NaN / extreme radii (prevents float->int32_t UB!)
+    // Exact vanilla parity: fall back cleanly to Klei's original SpatialGrid::Query.
+    if (!std::isfinite(x) || !std::isfinite(z) || !std::isfinite(radius) ||
+        radius < 0.0f || radius > 100000.0f) {
+        g_origSpatialGridQuery(grid, posXZ, radius, visitor);
         return;
     }
 
     g_stats.spatial_zerocopy_hits.fetch_add(1, std::memory_order_relaxed);
 
-    const float x = posXZ[0];
-    const float z = posXZ[1];
-    const float inv_cs = 1.0f / cell_size;
-    const int32_t min_cx = static_cast<int32_t>(std::floor((x - radius) * inv_cs));
-    const int32_t max_cx = static_cast<int32_t>(std::floor((x + radius) * inv_cs));
-    const int32_t min_cz = static_cast<int32_t>(std::floor((z - radius) * inv_cs));
-    const int32_t max_cz = static_cast<int32_t>(std::floor((z + radius) * inv_cs));
+    const double inv_cs = 1.0 / static_cast<double>(cell_size);
+    const double d_min_cx = std::floor((static_cast<double>(x) - static_cast<double>(radius)) * inv_cs);
+    const double d_max_cx = std::floor((static_cast<double>(x) + static_cast<double>(radius)) * inv_cs);
+    const double d_min_cz = std::floor((static_cast<double>(z) - static_cast<double>(radius)) * inv_cs);
+    const double d_max_cz = std::floor((static_cast<double>(z) + static_cast<double>(radius)) * inv_cs);
+
+    const double grid_lo_x = static_cast<double>(cells_begin->cx);
+    const double grid_hi_x = static_cast<double>((cells_end - 1)->cx);
+    if (d_max_cx < grid_lo_x || d_min_cx > grid_hi_x) return;
+
+    auto clamp_i32 = [](double v) -> int32_t {
+        if (v < -1000000000.0) return -1000000000;
+        if (v >  1000000000.0) return  1000000000;
+        return static_cast<int32_t>(v);
+    };
+    const int32_t min_cx = clamp_i32(std::max(d_min_cx, grid_lo_x));
+    const int32_t max_cx = clamp_i32(std::min(d_max_cx, grid_hi_x));
+    const int32_t min_cz = clamp_i32(d_min_cz);
+    const int32_t max_cz = clamp_i32(d_max_cz);
 
     if (min_cx > max_cx || min_cz > max_cz) return;
 
@@ -667,26 +811,39 @@ void HookCollectGarbage(void* sim) {
         g_stats.gc_last_kb.store(postKb, std::memory_order_relaxed);
     }
 
-    // Pressure-driven 30Hz Adaptive GC:
-    // - Never waste CPU re-marking static world tables on calm, low-pressure ticks!
-    // - Throttle sharply (0.35ms) on busy combat/boss ticks (>14ms non-GC) to protect p99/overruns.
-    // - Ramp smoothly (0.85ms -> 2.5ms) ONLY when live garbage pressure grows (+32MB..+96MB above
-    //   post-cycle working set) AND tick slack is available.
+    // Pressure-driven 30Hz Adaptive GC (respects gc_spare_target_ms & prevents busy-tick starvation):
+    // - Computes actual tick headroom: spareMs = max(0, gc_spare_target_ms - nonGcMs).
+    // - Low pressure (<32MB excess): 0.55ms (45% lighter than vanilla 1.0ms, zero idle table re-marking).
+    // - Moderate/High pressure (>=32MB..>=96MB): smoothly ramps up to 2.5ms using up to 25% of
+    //   available tick headroom even on 14~22ms combat ticks, preventing STW memory cliffs.
+    // - Saturated ticks (spareMs < 4.0ms): clamps down to gc_busy_min_ms (0.4ms) to avoid overruns.
+    const bool is60Hz = (g_activeSimTickRate.load(std::memory_order_relaxed) == 60);
     const double nonGcMs = g_stats.last_tick_non_gc_ms;
+    const double effectiveTargetMs = is60Hz
+        ? std::min<double>(13.5, static_cast<double>(g_cfg.gc_spare_target_ms) * 0.5)
+        : static_cast<double>(g_cfg.gc_spare_target_ms);
+    const double spareMs = std::max(0.0, effectiveTargetMs - nonGcMs);
     const double excessMb = (curKb > s_liveSetKb)
         ? (static_cast<double>(curKb - s_liveSetKb) / 1024.0)
         : 0.0;
 
-    float budgetMs = 0.55f;
-    if (nonGcMs >= 14.0) {
-        budgetMs = g_cfg.gc_busy_min_ms; // 0.35-0.40ms: protect hot ticks from overruns
+    const float idleBaseMs = is60Hz ? 0.30f : 0.55f;
+    const float busyMinMs  = is60Hz ? std::min(g_cfg.gc_busy_min_ms, 0.25f) : g_cfg.gc_busy_min_ms;
+    float budgetMs = idleBaseMs;
+    if (spareMs < (is60Hz ? 2.5 : 4.0)) {
+        budgetMs = busyMinMs;
     } else if (excessMb >= 96.0) {
-        budgetMs = std::min<float>(2.5f, g_cfg.gc_calm_max_ms);
+        const double allowed = std::min<double>(g_cfg.gc_calm_max_ms, std::max(is60Hz ? 0.6 : 1.0, spareMs * 0.25));
+        budgetMs = static_cast<float>(std::min(is60Hz ? 1.5 : 2.5, allowed));
     } else if (excessMb >= 32.0) {
         const double frac = (excessMb - 32.0) / 64.0;
-        budgetMs = static_cast<float>(0.85 + frac * 1.15); // 0.85ms .. 2.0ms
+        const double want = (is60Hz ? 0.45 : 0.85) + frac * (is60Hz ? 0.65 : 1.15);
+        const double capBySpare = std::max<double>(busyMinMs, spareMs * 0.20);
+        budgetMs = static_cast<float>(std::min(want, capBySpare));
+    } else if (nonGcMs >= (is60Hz ? 9.5 : 18.0)) {
+        budgetMs = busyMinMs;
     } else {
-        budgetMs = 0.55f; // Low garbage pressure: 45% lighter than vanilla's fixed 1.0ms!
+        budgetMs = idleBaseMs;
     }
 
     g_stats.gc_last_budget_us.store(static_cast<int32_t>(budgetMs * 1000.0f), std::memory_order_relaxed);
@@ -779,20 +936,23 @@ int Lua_HyperCore_FastDump(void* L) {
         varname = g_lua.tolstring(L, 2, &varlen);
     }
 
-    auto st = fast_dumper::DumpRoot(L, g_lua, 1, varname, varlen, tl_dumpBuf);
+    const char* failReason = nullptr;
+    auto st = fast_dumper::DumpRoot(L, g_lua, 1, varname, varlen, tl_dumpBuf, &failReason);
     const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
 
-    if (st == fast_dumper::Status::Ok && tl_dumpBuf.data) {
+    if (st == fast_dumper::Status::Ok && !tl_dumpBuf.oom && tl_dumpBuf.data) {
         g_stats.fastdump_calls.fetch_add(1, std::memory_order_relaxed);
         g_stats.fastdump_us_sum.fetch_add(us, std::memory_order_relaxed);
         g_stats.fastdump_bytes_sum.fetch_add(tl_dumpBuf.len, std::memory_order_relaxed);
         g_lua.pushlstring(L, tl_dumpBuf.data, tl_dumpBuf.len);
+        tl_dumpBuf.ShrinkIfLarge();
         return 1;
     }
 
+    tl_dumpBuf.ShrinkIfLarge();
     g_stats.fastdump_fallbacks.fetch_add(1, std::memory_order_relaxed);
     g_lua.pushnil(L);
-    g_lua.pushstring(L, st == fast_dumper::Status::CorruptNumber ? "corrupt_number" : "fallback");
+    g_lua.pushstring(L, failReason ? failReason : (st == fast_dumper::Status::CorruptNumber ? "corrupt_number" : "fallback"));
     return 2;
 }
 
@@ -847,6 +1007,7 @@ int Lua_HyperCore_GetStats(void* L) {
     setBool("opt_adaptive_gc",      g_cfg.enable_adaptive_gc);
     setBool("opt_libdeflate",       g_cfg.enable_libdeflate);
     setBool("opt_fast_dumper",      g_cfg.enable_fast_dumper);
+    setNum("sim_tick_rate",         static_cast<double>(g_activeSimTickRate.load(std::memory_order_relaxed)));
     return 1;
 }
 
@@ -855,8 +1016,183 @@ int Lua_HyperCore_ResetStats(void* /*L*/) {
     return 0;
 }
 
+bool PatchFloatProtected(float* ptr, float val) {
+    if (!ptr) return false;
+    DWORD oldProt = 0, dummy = 0;
+    if (!VirtualProtect(ptr, sizeof(float), PAGE_READWRITE, &oldProt)) return false;
+    *ptr = val;
+    VirtualProtect(ptr, sizeof(float), oldProt, &dummy);
+    return true;
+}
+
+void SyncServerNetworkTickRateForSimHz(int hz) {
+    if (!g_netMgrGlobalPtr || !g_fnSetNetTickRate) return;
+    auto* netMgr = static_cast<uint8_t*>(*g_netMgrGlobalPtr);
+    if (!netMgr) return;
+    void* replicaMgr = *reinterpret_cast<void**>(netMgr + 0x288);
+    if (!replicaMgr) return;
+
+    uint32_t curRate = *reinterpret_cast<uint32_t*>(netMgr + 0xD8);
+    uint32_t desiredRate = curRate;
+    if (hz == 60) {
+        // Default 15Hz -> upgrade to native 60Hz (U=60(1)) so server snapshots match 60Hz SimTick
+        // AND joining clients automatically disable RakNet download throttling (1000/60 <= 16.67ms -> D=0)!
+        // Respect explicit admin cluster.ini overrides (e.g., 20/30/60).
+        desiredRate = (curRate == 0 || curRate == 15) ? 60u : curRate;
+        g_netTickSynced60.store(true, std::memory_order_release);
+    } else {
+        if (desiredRate == 0) desiredRate = 15u;
+        g_netTickSynced60.store(false, std::memory_order_release);
+    }
+    g_fnSetNetTickRate(netMgr, desiredRate);
+    uint8_t ticksPerSnap = *(static_cast<uint8_t*>(replicaMgr) + 0x89D);
+    LogMsg("[SIMTICK] Synced Server NetworkTickRate -> U=%u(%u) for %dHz SimTick",
+           desiredRate, static_cast<unsigned>(ticksPerSnap), hz);
+}
+
+bool ApplySimTickRate(int hz) {
+    if (hz != 30 && hz != 60) return false;
+    if (!g_simTickFloatPtr || !g_simTickDoublePtr) return false;
+    if (g_activeSimTickRate.load(std::memory_order_acquire) == hz) {
+        if (hz == 60 && !g_netTickSynced60.load(std::memory_order_acquire)) {
+            SyncServerNetworkTickRateForSimHz(60);
+        }
+        return true;
+    }
+
+    const float newF = 1.0f / static_cast<float>(hz);
+    const double newD = 1.0 / static_cast<double>(hz);
+
+    if (!PatchFloatProtected(g_simTickFloatPtr, newF)) return false;
+
+    DWORD oldD = 0, dummy = 0;
+    if (!VirtualProtect(g_simTickDoublePtr, sizeof(double), PAGE_READWRITE, &oldD)) return false;
+    *g_simTickDoublePtr = newD;
+    VirtualProtect(g_simTickDoublePtr, sizeof(double), oldD, &dummy);
+
+    // Patch ALL secondary exclusive mTick*(1/30) subsystems (AnimRenderer, PathFinder, EntityMgr, LightWatcher/Charlie)
+    int extras = 0;
+    if (PatchFloatProtected(g_simAnimShaderTickPtr, newF)) ++extras;
+    if (PatchFloatProtected(g_simPathfinderTickPtr, newF)) ++extras;
+    if (PatchFloatProtected(g_simSpatialTickPtr, newF))    ++extras;
+    if (PatchFloatProtected(g_simTimeDiffTickPtr, newF))   ++extras;
+
+    // Patch SetNetworkTickRate 30.5f -> 60.5f so ticksPerSnapshot divides 60Hz cleanly!
+    bool netScaleOk = PatchFloatProtected(g_netTickScalePtr, (hz == 60) ? 60.499998f : 30.499998f);
+
+    g_activeSimTickRate.store(hz, std::memory_order_release);
+    LogMsg("[SIMTICK] Server Simulation tick rate -> %d Hz (dt=%.6fs, subsys=%d/4, netScale=%s)",
+           hz, newD, extras, netScaleOk ? "OK" : "SKIP");
+
+    SyncServerNetworkTickRateForSimHz(hz);
+    return true;
+}
+
+// High-Resolution 120Hz Waitable-Timer Server Frame Pacer in 60Hz SimTick mode:
+// Eliminates 60fps Sleep(1) vs 60Hz SimTick beat-frequency aliasing (0/2/0/2 bursts -> exact 1/0/1/0)!
+struct ServerFrameLimiterObj {
+    int64_t startQpc;
+    float   targetSec;
+};
+
+struct ServerPacerTls {
+    HANDLE  hTimer = nullptr;
+    bool    checked = false;
+    int64_t nextDeadlineQpc = 0;
+    double  spinMarginUs = 850.0;
+
+    HANDLE GetTimer() {
+        if (!checked) {
+            checked = true;
+            if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+                auto pCreateEx = reinterpret_cast<CreateWaitableTimerExW_t>(
+                    GetProcAddress(k32, "CreateWaitableTimerExW"));
+                if (pCreateEx) {
+                    hTimer = pCreateEx(nullptr, nullptr, kCreateWaitableTimerHighRes, TIMER_ALL_ACCESS);
+                }
+            }
+        }
+        return hTimer;
+    }
+};
+
+void HookServerFrameLimiterWait(void* flPtr, uint8_t bSleep) {
+    if (g_activeSimTickRate.load(std::memory_order_relaxed) != 60) {
+        if (g_origServerFrameLimiterWait) g_origServerFrameLimiterWait(flPtr, bSleep);
+        return;
+    }
+
+    thread_local ServerPacerTls tls;
+    auto* fl = static_cast<ServerFrameLimiterObj*>(flPtr);
+    // 120Hz outer loop (8.333ms = exact 2x Nyquist oversampling of 60Hz SimTick)
+    const int64_t targetTicks = static_cast<int64_t>(static_cast<double>(g_qpcFreq) / 120.0 + 0.5);
+    int64_t nowQpc = NowQpc();
+    const int64_t baseStart = (fl && fl->startQpc > 0 && fl->startQpc <= nowQpc) ? fl->startQpc : nowQpc;
+
+    if (tls.nextDeadlineQpc == 0) {
+        tls.nextDeadlineQpc = baseStart + targetTicks;
+    } else {
+        tls.nextDeadlineQpc += targetTicks;
+    }
+    if (nowQpc >= tls.nextDeadlineQpc) {
+        tls.nextDeadlineQpc = nowQpc;
+    } else if ((tls.nextDeadlineQpc - nowQpc) > (targetTicks + (targetTicks >> 1))) {
+        tls.nextDeadlineQpc = nowQpc + targetTicks;
+    }
+
+    double remUs = static_cast<double>(tls.nextDeadlineQpc - nowQpc) * g_qpcToUs;
+    if (remUs > tls.spinMarginUs + 450.0) {
+        HANDLE hTimer = tls.GetTimer();
+        if (hTimer) {
+            while (remUs > tls.spinMarginUs + 450.0) {
+                double wantSleepUs = remUs - tls.spinMarginUs;
+                if (wantSleepUs < 450.0) break;
+                if (wantSleepUs > 15000.0) wantSleepUs = 15000.0;
+                LARGE_INTEGER due{};
+                due.QuadPart = -static_cast<LONGLONG>(wantSleepUs * 10.0);
+                int64_t t0 = nowQpc;
+                if (SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE)) {
+                    WaitForSingleObject(hTimer, 30);
+                } else {
+                    Sleep(1);
+                }
+                int64_t wakeQpc = NowQpc();
+                double overshootUs = static_cast<double>(wakeQpc - t0) * g_qpcToUs - wantSleepUs;
+                if (overshootUs > -50.0 && overshootUs < 4000.0) {
+                    double targetMargin = std::max(450.0, overshootUs * 1.40 + 250.0);
+                    tls.spinMarginUs = tls.spinMarginUs * 0.88 + targetMargin * 0.12;
+                    tls.spinMarginUs = std::clamp(tls.spinMarginUs, 450.0, 1850.0);
+                }
+                nowQpc = wakeQpc;
+                remUs = static_cast<double>(tls.nextDeadlineQpc - nowQpc) * g_qpcToUs;
+            }
+        } else {
+            while (remUs > 2000.0) {
+                Sleep(1);
+                nowQpc = NowQpc();
+                remUs = static_cast<double>(tls.nextDeadlineQpc - nowQpc) * g_qpcToUs;
+            }
+        }
+    }
+    while ((nowQpc = NowQpc()) < tls.nextDeadlineQpc) {
+        _mm_pause();
+    }
+}
+
+int Lua_HyperCore_GetSimTickRate(void* L) {
+    g_lua.pushnumber(L, static_cast<double>(g_activeSimTickRate.load(std::memory_order_acquire)));
+    return 1;
+}
+
+int Lua_HyperCore_SetSimTickRate(void* L) {
+    int hz = (g_lua.gettop(L) >= 1) ? static_cast<int>(g_lua.tonumber(L, 1)) : 30;
+    bool ok = ApplySimTickRate(hz);
+    g_lua.pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
 int Lua_HyperCore_Version(void* L) {
-    g_lua.pushstring(L, "DST-HyperCore-Server/1.0.0");
+    g_lua.pushstring(L, "DST-HyperCore-Server/1.2.0");
     return 1;
 }
 
@@ -866,11 +1202,14 @@ void RegisterHyperCoreLuaGlobals(void* L) {
         g_lua.pushcclosure(L, fn, 0);
         g_lua.setfield(L, HC_LUA_GLOBALSINDEX, name);
     };
-    regFn("HyperCore_FastDump",   &Lua_HyperCore_FastDump);
-    regFn("HyperCore_GetStats",   &Lua_HyperCore_GetStats);
-    regFn("HyperCore_ResetStats", &Lua_HyperCore_ResetStats);
-    regFn("HyperCore_Version",    &Lua_HyperCore_Version);
-    LogMsg("[LUA] Registered HyperCore native APIs into Lua VM %p", L);
+    regFn("HyperCore_FastDump",       &Lua_HyperCore_FastDump);
+    regFn("HyperCore_GetStats",       &Lua_HyperCore_GetStats);
+    regFn("HyperCore_ResetStats",     &Lua_HyperCore_ResetStats);
+    regFn("HyperCore_Version",        &Lua_HyperCore_Version);
+    regFn("HyperCore_GetSimTickRate", &Lua_HyperCore_GetSimTickRate);
+    regFn("HyperCore_SetSimTickRate", &Lua_HyperCore_SetSimTickRate);
+    LogMsg("[LUA] Registered HyperCore native APIs into Lua VM %p (sim_tick=%dHz)",
+           L, g_activeSimTickRate.load(std::memory_order_relaxed));
 }
 
 void HookLuaOpenLibs(void* L) {
@@ -914,7 +1253,30 @@ void LogTelemetrySummary(const char* tag) {
            g_stats.deflate_out_bytes.load() / (1024.0 * 1024.0));
 }
 
+DWORD WINAPI HttpMetricsThread(LPVOID);
+
+std::atomic<bool> g_runtimeInitDone{false};
+
+// Runs ONCE on first Simulation::Update tick — completely OUTSIDE DllMain / Loader Lock!
+void InitRuntimeServicesOnce() {
+    if (g_runtimeInitDone.exchange(true, std::memory_order_acq_rel)) return;
+    if (g_cfg.enable_timer_boost) {
+        if (timeBeginPeriod(1) == TIMERR_NOERROR) g_timerBoosted = true;
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    }
+    if (g_cfg.enable_http_metrics) {
+        g_httpThread = CreateThread(nullptr, 0, HttpMetricsThread, nullptr, 0, nullptr);
+    }
+}
+
 uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
+    if (!g_runtimeInitDone.load(std::memory_order_relaxed)) {
+        InitRuntimeServicesOnce();
+    }
+    if (g_activeSimTickRate.load(std::memory_order_relaxed) == 60 &&
+        !g_netTickSynced60.load(std::memory_order_relaxed)) {
+        SyncServerNetworkTickRateForSimHz(60);
+    }
     g_stats.cur_tick_gc_us = 0;
     const int64_t t0 = NowQpc();
     const uint8_t ret = g_origSimUpdate(sim, dt, flag);
@@ -927,15 +1289,14 @@ uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
 
     const uint64_t ticks = g_stats.ticks_total.fetch_add(1, std::memory_order_relaxed) + 1;
     g_stats.tick_us_sum.fetch_add(totalUs, std::memory_order_relaxed);
-    if (totalUs > 33333) {
+    const uint64_t budgetLimitUs = (g_activeSimTickRate.load(std::memory_order_relaxed) == 60) ? 16667ULL : 33333ULL;
+    if (totalUs > budgetLimitUs) {
         g_stats.tick_overrun_count.fetch_add(1, std::memory_order_relaxed);
     }
     uint64_t prevMax = g_stats.tick_us_max.load(std::memory_order_relaxed);
     while (totalUs > prevMax && !g_stats.tick_us_max.compare_exchange_weak(prevMax, totalUs)) {}
 
-    g_stats.tick_ring[g_stats.tick_ring_pos] = static_cast<uint32_t>(std::min<uint64_t>(totalUs, UINT32_MAX));
-    g_stats.tick_ring_pos = (g_stats.tick_ring_pos + 1) % kTickRingSize;
-    if (g_stats.tick_ring_filled < kTickRingSize) g_stats.tick_ring_filled++;
+    g_stats.PushTickSample(static_cast<uint32_t>(std::min<uint64_t>(totalUs, UINT32_MAX)));
 
     if (g_cfg.enable_profiler && g_cfg.log_interval_ticks > 0 &&
         (ticks % static_cast<uint64_t>(g_cfg.log_interval_ticks) == 0)) {
@@ -982,7 +1343,8 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
     if (srv == INVALID_SOCKET) { WSACleanup(); return 0; }
 
     int opt = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+    // Exclusive port binding prevents Master & Caves shards from hijacking each other's port
+    setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -990,6 +1352,7 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
     addr.sin_port = htons(static_cast<u_short>(g_cfg.http_port));
 
     if (bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(srv, 4) != 0) {
+        LogMsg("[HTTP] Port %d already bound by another shard/process; endpoint disabled on this shard.", g_cfg.http_port);
         closesocket(srv);
         WSACleanup();
         return 0;
@@ -1006,15 +1369,26 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
 
         SOCKET cli = accept(srv, nullptr, nullptr);
         if (cli == INVALID_SOCKET) continue;
+
+        // Bound recv/send timeout so idle or malicious local connections can never hang this thread
+        DWORD ioTimeoutMs = 2000;
+        setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs), sizeof(ioTimeoutMs));
+        setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&ioTimeoutMs), sizeof(ioTimeoutMs));
+
         char req[512];
-        recv(cli, req, sizeof(req) - 1, 0);
+        int rlen = recv(cli, req, sizeof(req) - 1, 0);
+        if (rlen <= 0) {
+            closesocket(cli);
+            continue;
+        }
 
         double avg = 0, p95 = 0, p99 = 0;
         g_stats.ComputePercentiles(avg, p95, p99);
 
         char body[1024];
         int blen = std::snprintf(body, sizeof(body),
-            "{\"version\":\"DST-HyperCore-Server/1.0.0\","
+            "{\"version\":\"DST-HyperCore-Server/1.2.0\","
+            "\"sim_tick_rate\":%d,"
             "\"ticks\":%llu,\"tick_avg_us\":%.1f,\"tick_p95_us\":%.1f,\"tick_p99_us\":%.1f,"
             "\"tick_max_us\":%llu,\"tick_overruns\":%llu,"
             "\"gc_calls\":%llu,\"gc_us_sum\":%llu,\"gc_max_us\":%llu,\"gc_full\":%llu,\"gc_kb\":%d,"
@@ -1022,6 +1396,7 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
             "\"spatial_queries\":%llu,\"spatial_zerocopy\":%llu,\"spatial_cells\":%llu,"
             "\"fastdump_calls\":%llu,\"fastdump_us_sum\":%llu,\"fastdump_bytes\":%llu,"
             "\"deflate_calls\":%llu,\"deflate_us_sum\":%llu,\"deflate_in\":%llu,\"deflate_out\":%llu}",
+            g_activeSimTickRate.load(std::memory_order_relaxed),
             static_cast<unsigned long long>(g_stats.ticks_total.load()), avg, p95, p99,
             static_cast<unsigned long long>(g_stats.tick_us_max.load()),
             static_cast<unsigned long long>(g_stats.tick_overrun_count.load()),
@@ -1042,14 +1417,18 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
             static_cast<unsigned long long>(g_stats.deflate_us_sum.load()),
             static_cast<unsigned long long>(g_stats.deflate_in_bytes.load()),
             static_cast<unsigned long long>(g_stats.deflate_out_bytes.load()));
+        if (blen < 0) blen = 0;
+        else if (blen >= static_cast<int>(sizeof(body))) blen = static_cast<int>(sizeof(body)) - 1;
 
         char hdr[256];
         int hlen = std::snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+            "Content-Length: %d\r\nConnection: close\r\n\r\n",
             blen);
+        if (hlen < 0) hlen = 0;
+        else if (hlen >= static_cast<int>(sizeof(hdr))) hlen = static_cast<int>(sizeof(hdr)) - 1;
         send(cli, hdr, hlen, 0);
-        send(cli, body, blen, 0);
+        if (blen > 0) send(cli, body, blen, 0);
         closesocket(cli);
     }
 
@@ -1191,17 +1570,119 @@ constexpr int16_t kAobLuaSetField[] = {
     0xFF, 0x48, 0x8B, 0xCE, 0xE8, -1, -1, -1, -1, 0x4C, 0x8B, 0x4E, 0x10, 0x4C, 0x8D, 0x44, 0x24,
     0x20, 0x49, 0x83, 0xE9, 0x10, 0x48, 0x8B, 0xD3, 0x48, 0x8B
 };
+constexpr int16_t kAobLuaToPointer[] = {
+    0x48, 0x83, 0xEC, 0x28, 0x44, 0x8B, 0xD2, 0x4C, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1, 0x44,
+    0x8B, 0x48, 0x08, 0x41, 0x83, 0xE9, 0x02, 0x74, 0x1F, 0x41, 0x83, 0xE9, 0x03, 0x74, 0x3D,
+    0x41, 0x83, 0xE9, 0x01, 0x74, 0x37, 0x41, 0x83, 0xE9, 0x01, 0x74, 0x0D
+};
+constexpr int16_t kAobSpatialGridQueryPrologue[] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x50, 0x10, 0x53, 0x55, 0x56, 0x57, 0x41, 0x55, 0x41, 0x56,
+    0x41, 0x57, 0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00, 0x44, 0x0F, 0x29, 0x54, 0x24, 0x70,
+    0x0F, 0x29, 0x70, 0xB8, 0x44, 0x0F, 0x28, 0xD2
+};
+constexpr int16_t kAobEntityVisitor[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x20, 0x48, 0x89, 0x54, 0x24, 0x10,
+    0x57, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xF6, 0x48, 0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x89, 0x74,
+    0x24, 0x40
+};
 constexpr int16_t kAobLuaNext[] = {
     0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1, 0x4C, 0x8B,
     0x43, 0x10, 0x48, 0x8B, 0x10, 0x49, 0x83, 0xE8, 0x10, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1, 0x85, 0xC0, 0x74
 };
+// Exclusive Simulation::Update fixed-timestep loader (verified unique 1-match on Server & Client!)
+constexpr int16_t kAobSimUpdateTick[] = {
+    0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1, 0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1,
+    0x48, 0x8D, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x59, 0xC6, 0x44, 0x0F, 0x2F, 0xD0,
+    0xF3, 0x0F, 0x11, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x77, 0x08, 0x48, 0x8D, 0x84, 0x24, 0xA8,
+    0x00, 0x00, 0x00, 0x80, 0x7B, 0x48, 0x00, 0xF3, 0x44, 0x0F, 0x10, 0x43, 0x44, 0xF3, 0x44, 0x0F,
+    0x59, 0x00, 0x75, 0x0C, 0x80, 0x7B, 0x49, 0x00, 0x75, 0x06, 0x80, 0x7B, 0x4A, 0x00, 0x74, 0x0B,
+    0x80, 0x7B, 0x4E, 0x00, 0x75, 0x05, 0x40, 0xB7, 0x01, 0xEB, 0x03, 0x40, 0x32, 0xFF, 0xF2, 0x44,
+    0x0F, 0x10, 0x1D, -1, -1, -1, -1
+};
+// Exclusive secondary mTick*(1/30) subsystems & SetNetworkTickRate + Server FrameLimiter::Wait (verified unique!)
+constexpr int16_t kAobAnimShaderTick[] = {
+    0x66, 0x0F, 0xEF, 0xF6, 0x48, 0x8B, 0x51, 0x28, 0x48, 0x8D, 0x8C, 0x24, 0x30, 0x02, 0x00, 0x00,
+    0x8B, 0x82, 0x90, 0x00, 0x00, 0x00, 0xF3, 0x48, 0x0F, 0x2A, 0xF0,
+    0x48, 0x8D, 0x84, 0x24, 0xC0, 0x01, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x28,
+    0xC7, 0x44, 0x24, 0x20, 0x04, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,
+    0xF3, 0x0F, 0x58, 0xB2, 0x94, 0x00, 0x00, 0x00
+};
+constexpr int16_t kAobPathfinderTick[] = {
+    0x49, 0x8B, 0x4D, 0x18, 0x66, 0x0F, 0xEF, 0xC0, 0x48, 0x8B, 0x91, 0xF0, 0x00, 0x00, 0x00,
+    0x8B, 0x82, 0x90, 0x00, 0x00, 0x00, 0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x59, 0x05, -1, -1, -1, -1, 0xF3, 0x0F, 0x58, 0x82, 0x94, 0x00, 0x00, 0x00
+};
+constexpr int16_t kAobSpatialTick[] = {
+    0x41, 0x8B, 0x80, 0x90, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0xEA, 0x4C, 0x8B, 0xE1, 0x49, 0x8B, 0xF1,
+    0xF3, 0x48, 0x0F, 0x2A, 0xC0, 0xB8, 0x89, 0x88, 0x88, 0x88,
+    0xF3, 0x0F, 0x59, 0x05, -1, -1, -1, -1, 0xF3, 0x41, 0x0F, 0x58, 0x80, 0x94, 0x00, 0x00, 0x00
+};
+constexpr int16_t kAobSimTimeDiffTick[] = {
+    0x8B, 0x41, 0x08, 0x66, 0x0F, 0xEF, 0xC0, 0x2B, 0x42, 0x08, 0xF3, 0x48, 0x0F, 0x2A, 0xC0,
+    0xF3, 0x0F, 0x59, 0x05, -1, -1, -1, -1, 0xF3, 0x0F, 0x58, 0x41, 0x0C, 0xF3, 0x0F, 0x5C, 0x42, 0x0C, 0xC3
+};
+constexpr int16_t kAobSetNetTickRate[] = {
+    0x89, 0x54, 0x24, 0x10, 0x4C, 0x8B, 0xDC, 0x53, 0x55, 0x41, 0x54, 0x48, 0x83, 0xEC, 0x50,
+    0x48, 0x8B, 0xE9, 0x41, 0xBC, 0x0A, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x74, 0x2B
+};
+constexpr int16_t kAobNetTickScale[] = {
+    0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1, 0xE8, -1, -1, -1, -1,
+    0x48, 0x8B, 0x8D, 0x88, 0x02, 0x00, 0x00, 0x33, 0xD2, 0xF3, 0x48, 0x0F, 0x2C, 0xC0,
+    0x41, 0xF7, 0xF4, 0x85, 0xD2, 0x49, 0x8B, 0xD6, 0x0F, 0x44, 0xF0, 0xE8, -1, -1, -1, -1,
+    0x48, 0x8B, 0x8D, 0x88, 0x02, 0x00, 0x00, 0x40, 0x0F, 0xB6, 0xD6, 0xE8, -1, -1, -1, -1,
+    0x48, 0x8B, 0x8D, 0x88, 0x02, 0x00, 0x00, 0x48, 0x8B, 0xD7, 0xE8, -1, -1, -1, -1
+};
+constexpr int16_t kAobSimUpdateNetMgr[] = {
+    0x48, 0x8B, 0x0D, -1, -1, -1, -1, 0xE8, -1, -1, -1, -1, 0x84, 0xC0, 0x74, 0x0A,
+    0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1, 0xEB, 0x08, 0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,
+    0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1
+};
+constexpr int16_t kAobServerFrameLimiterWait[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x50,
+    0x0F, 0x29, 0x74, 0x24, 0x40, 0x0F, 0x29, 0x7C, 0x24, 0x30,
+    0x0F, 0x57, 0xFF, 0x0F, 0xB6, 0xDA, 0x48, 0x8B, 0xF9, 0x44, 0x0F, 0x29, 0x44, 0x24, 0x20,
+    0xF3, 0x44, 0x0F, 0x10, 0x05, -1, -1, -1, -1
+};
+// Verified unique 1-match RakNet SendBuffered & SendBufferedList SetEvent guard AOBs
+// Vanilla RakNet skips quitAndDataEvents.SetEvent() when priority != IMMEDIATE_PRIORITY (0),
+// causing all HIGH/MEDIUM priority world snapshots & RPCs to stall 0-10ms in WaitOnEvent(10).
+constexpr int16_t kAobRakNetSendBufWake[] = {
+    0x45, 0x85, 0xF6, 0x75, 0x0C, 0x48, 0x8D, 0x8D, 0xD0, 0x06, 0x00, 0x00, 0xE8, -1, -1, -1, -1
+};
+constexpr int16_t kAobRakNetSendBufListWake[] = {
+    0x85, 0xFF, 0x75, 0x0C, 0x49, 0x8D, 0x8D, 0xD0, 0x06, 0x00, 0x00, 0xE8, -1, -1, -1, -1
+};
 
 #define FIND_AOB(arr) FindUniqueAob(arr, sizeof(arr) / sizeof(arr[0]), #arr)
+
+std::wstring DetectShardLogSuffix() {
+    const wchar_t* cmd = GetCommandLineW();
+    if (cmd) {
+        const wchar_t* p = std::wcsstr(cmd, L"-shard");
+        if (p) {
+            p += 6;
+            while (*p == L' ' || *p == L'\t' || *p == L'"') ++p;
+            std::wstring shard;
+            while (*p && *p != L' ' && *p != L'\t' && *p != L'"' && shard.size() < 32) {
+                wchar_t c = *p++;
+                if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                    (c >= L'0' && c <= L'9') || c == L'_' || c == L'-') {
+                    shard.push_back(c);
+                }
+            }
+            if (!shard.empty()) return L"_" + shard;
+        }
+    }
+    wchar_t pidBuf[32];
+    std::swprintf(pidBuf, 32, L"_pid%lu", static_cast<unsigned long>(GetCurrentProcessId()));
+    return pidBuf;
+}
 
 void InitServerHooks() {
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
-    g_qpcToUs = 1000000.0 / static_cast<double>(freq.QuadPart);
+    g_qpcFreq = (freq.QuadPart > 0) ? freq.QuadPart : 10000000LL;
+    g_qpcToUs = 1000000.0 / static_cast<double>(g_qpcFreq);
 
     InitializeCriticalSection(&g_logCs);
     g_logCsInit = true;
@@ -1212,22 +1693,18 @@ void InitServerHooks() {
     size_t sl = mp.find_last_of(L"\\/");
     g_binDir  = (sl != std::wstring::npos) ? mp.substr(0, sl + 1) : L"";
     g_iniPath = g_binDir + L"dst_hypercore.ini";
-    g_logPath = g_binDir + L"dst_hypercore.log";
+    g_logPath = g_binDir + L"dst_hypercore" + DetectShardLogSuffix() + L".log";
 
-    // Truncate old log cleanly on new server boot
+    // Truncate only this shard's dedicated log cleanly on new server boot
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) std::fclose(f);
 
     LoadIniConfig();
-    LogMsg("=== DST HyperCore Server Native Engine v1.0.0 Boot ===");
-    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_dumper=%d http=%d",
+    LogMsg("=== DST HyperCore Server Native Engine v1.2.0 Boot (PID=%lu) ===",
+           static_cast<unsigned long>(GetCurrentProcessId()));
+    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_dumper=%d sim_tick=%dHz http=%d",
            g_cfg.enable_profiler, g_cfg.enable_mimalloc, g_cfg.enable_spatial_zerocopy,
            g_cfg.enable_adaptive_gc, g_cfg.enable_libdeflate, g_cfg.libdeflate_level,
-           g_cfg.enable_fast_dumper, g_cfg.enable_http_metrics);
-
-    if (g_cfg.enable_timer_boost) {
-        if (timeBeginPeriod(1) == TIMERR_NOERROR) g_timerBoosted = true;
-        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-    }
+           g_cfg.enable_fast_dumper, g_cfg.sim_tick_rate, g_cfg.enable_http_metrics);
 
     if (!InitTextSection() || !InitTrampolineSlab()) {
         LogMsg("[ERROR] Failed to initialize .text scanner or near-module trampoline slab!");
@@ -1243,6 +1720,7 @@ void InitServerHooks() {
     g_lua.tonumber     = reinterpret_cast<decltype(g_lua.tonumber)>(FIND_AOB(kAobLuaToNumber));
     g_lua.toboolean    = reinterpret_cast<decltype(g_lua.toboolean)>(FIND_AOB(kAobLuaToBoolean));
     g_lua.tolstring    = reinterpret_cast<decltype(g_lua.tolstring)>(FIND_AOB(kAobLuaToLString));
+    g_lua.topointer    = reinterpret_cast<decltype(g_lua.topointer)>(FIND_AOB(kAobLuaToPointer));
     g_lua.pushnil      = reinterpret_cast<decltype(g_lua.pushnil)>(FIND_AOB(kAobLuaPushNil));
     g_lua.pushnumber   = reinterpret_cast<decltype(g_lua.pushnumber)>(FIND_AOB(kAobLuaPushNumber));
     g_lua.pushlstring  = reinterpret_cast<decltype(g_lua.pushlstring)>(FIND_AOB(kAobLuaPushLString));
@@ -1262,118 +1740,205 @@ void InitServerHooks() {
     g_wgLuaAllocAddr  = FIND_AOB(kAobWgLuaAlloc);
     g_trackLuaMem     = reinterpret_cast<TrackLuaMem_t>(FIND_AOB(kAobTrackLuaMem));
     if (uint8_t* pNewState = FIND_AOB(kAobLuaNewState)) {
-        g_origLuaNewState = reinterpret_cast<LuaNewState_t>(
-            InstallHook(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 15));
+        bool ok = InstallHookOrdered(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 15,
+                                     reinterpret_cast<void**>(&g_origLuaNewState));
         LogMsg("[HOOK] lua_newstate @ %p -> %s (simAlloc=%p wgAlloc=%p)",
-               pNewState, g_origLuaNewState ? "OK" : "FAIL", g_simLuaAllocAddr, g_wgLuaAllocAddr);
+               pNewState, ok ? "OK" : "FAIL", g_simLuaAllocAddr, g_wgLuaAllocAddr);
     }
 
     // 2. Hook luaL_openlibs -> auto-register HyperCore_* Lua APIs before any script/mod runs
     if (uint8_t* pOpenLibs = FIND_AOB(kAobLuaOpenLibs)) {
         const RelocItem rel = {10, 7, 3}; // mov rax, [rip + disp32] at +10
-        g_origLuaOpenLibs = reinterpret_cast<LuaOpenLibs_t>(
-            InstallHook(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 17, &rel, 1));
-        LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, g_origLuaOpenLibs ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 17,
+                                     reinterpret_cast<void**>(&g_origLuaOpenLibs), &rel, 1);
+        LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
     }
 
-    // 3. Hook Simulation::Update (Profiler + Adaptive GC feedback)
+    // 3. Hook Simulation::Update (Profiler + Adaptive GC feedback + outside-DllMain runtime init)
     if (uint8_t* pSimUpd = FIND_AOB(kAobSimUpdate)) {
         const RelocItem rel = {11, 5, 1}; // call __chkstk at +11
-        g_origSimUpdate = reinterpret_cast<SimUpdate_t>(
-            InstallHook(pSimUpd, reinterpret_cast<void*>(&HookSimUpdate), 19, &rel, 1));
-        LogMsg("[HOOK] Simulation::Update @ %p -> %s", pSimUpd, g_origSimUpdate ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pSimUpd, reinterpret_cast<void*>(&HookSimUpdate), 19,
+                                     reinterpret_cast<void**>(&g_origSimUpdate), &rel, 1);
+        LogMsg("[HOOK] Simulation::Update @ %p -> %s", pSimUpd, ok ? "OK" : "FAIL");
     }
 
-    // 4. Hook Simulation::CollectGarbage (30Hz Adaptive Slack GC + Profiler)
+    // 4. Hook Simulation::CollectGarbage (30Hz Pressure-Driven Adaptive GC + Profiler)
     if (uint8_t* pGC = FIND_AOB(kAobCollectGarbage)) {
         g_setGcBudget = reinterpret_cast<SetGcBudget_t>(ResolveRel32Call(pGC + 0x8B));
-        g_origCollectGarbage = reinterpret_cast<CollectGarbage_t>(
-            InstallHook(pGC, reinterpret_cast<void*>(&HookCollectGarbage), 16));
+        bool ok = InstallHookOrdered(pGC, reinterpret_cast<void*>(&HookCollectGarbage), 16,
+                                     reinterpret_cast<void**>(&g_origCollectGarbage));
         LogMsg("[HOOK] Simulation::CollectGarbage @ %p (SetGcBudget=%p) -> %s",
-               pGC, g_setGcBudget, g_origCollectGarbage ? "OK" : "FAIL");
+               pGC, g_setGcBudget, ok ? "OK" : "FAIL");
     }
 
-    // 5. Hook EntityManager::FindEntities + SpatialGrid::Query<FindEntitiesVisitor> (Zero-Copy!)
+    // 5. Paired, Fail-Closed, Independently AOB-Verified SpatialGrid::Query Hook with Rollback!
     if (uint8_t* pEMFind = FIND_AOB(kAobEntityMgrFind)) {
         uint8_t* pSpatialQuery = ResolveRel32Call(pEMFind + 0x10F);
         uint8_t* pVisitor = pSpatialQuery ? ResolveRel32Call(pSpatialQuery + 0x239) : nullptr;
-        g_entityVisitor = reinterpret_cast<EntityVisitor_t>(pVisitor);
-        g_origEntityMgrFind = reinterpret_cast<EntityMgrFind_t>(
-            InstallHook(pEMFind, reinterpret_cast<void*>(&HookEntityMgrFindEntities), 20));
-        if (pSpatialQuery && g_entityVisitor) {
-            g_origSpatialGridQuery = reinterpret_cast<SpatialGridQuery_t>(
-                InstallHook(pSpatialQuery, reinterpret_cast<void*>(&HookSpatialGridQuery), 17));
+        const bool sqOk = VerifyAobAt(pSpatialQuery, kAobSpatialGridQueryPrologue,
+                                      sizeof(kAobSpatialGridQueryPrologue) / sizeof(kAobSpatialGridQueryPrologue[0]));
+        const bool evOk = VerifyAobAt(pVisitor, kAobEntityVisitor,
+                                      sizeof(kAobEntityVisitor) / sizeof(kAobEntityVisitor[0]));
+        if (sqOk && evOk) {
+            g_entityVisitor = reinterpret_cast<EntityVisitor_t>(pVisitor);
+            uint8_t savedEM[20] = {};
+            bool ok1 = InstallHookOrdered(pEMFind, reinterpret_cast<void*>(&HookEntityMgrFindEntities), 20,
+                                          reinterpret_cast<void**>(&g_origEntityMgrFind), nullptr, 0, savedEM);
+            bool ok2 = false;
+            if (ok1) {
+                ok2 = InstallHookOrdered(pSpatialQuery, reinterpret_cast<void*>(&HookSpatialGridQuery), 17,
+                                         reinterpret_cast<void**>(&g_origSpatialGridQuery));
+                if (!ok2) {
+                    // Paired rollback: never leave partial EntityManager hook installed
+                    RestoreHookBytes(pEMFind, savedEM, 20);
+                    g_origEntityMgrFind = nullptr;
+                }
+            }
+            LogMsg("[HOOK] SpatialGrid::Query @ %p (Visitor=%p, AOB=VERIFIED) -> %s",
+                   pSpatialQuery, pVisitor, (ok1 && ok2) ? "OK" : "FAIL (rolled back)");
+        } else {
+            LogMsg("[HOOK] SpatialGrid::Query skipped (Fail-Closed AOB verify: sq=%d ev=%d)", sqOk, evOk);
         }
-        LogMsg("[HOOK] SpatialGrid::Query @ %p (Visitor=%p) -> %s",
-               pSpatialQuery, pVisitor, (g_origEntityMgrFind && g_origSpatialGridQuery) ? "OK" : "FAIL");
     }
 
     // 6. Profiler hooks for Sim::FindEntities, Sim::FindEntities_Registered, SerializeWorldSession
     if (uint8_t* pFE = FIND_AOB(kAobSimFindEnts)) {
-        g_origSimFindEnts = reinterpret_cast<LuaCFuncObj_t>(
-            InstallHook(pFE, reinterpret_cast<void*>(&HookSimFindEntities), 15));
-        LogMsg("[HOOK] Sim::FindEntities @ %p -> %s", pFE, g_origSimFindEnts ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pFE, reinterpret_cast<void*>(&HookSimFindEntities), 15,
+                                     reinterpret_cast<void**>(&g_origSimFindEnts));
+        LogMsg("[HOOK] Sim::FindEntities @ %p -> %s", pFE, ok ? "OK" : "FAIL");
     }
     if (uint8_t* pFEReg = FIND_AOB(kAobSimFindEntsReg)) {
-        g_origSimFindEntsReg = reinterpret_cast<LuaCFuncObj_t>(
-            InstallHook(pFEReg, reinterpret_cast<void*>(&HookSimFindEntitiesReg), 18));
-        LogMsg("[HOOK] Sim::FindEntities_Registered @ %p -> %s", pFEReg, g_origSimFindEntsReg ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pFEReg, reinterpret_cast<void*>(&HookSimFindEntitiesReg), 18,
+                                     reinterpret_cast<void**>(&g_origSimFindEntsReg));
+        LogMsg("[HOOK] Sim::FindEntities_Registered @ %p -> %s", pFEReg, ok ? "OK" : "FAIL");
     }
     if (uint8_t* pSer = FIND_AOB(kAobSerializeWorld)) {
-        g_origSerializeWorld = reinterpret_cast<LuaCFuncObj_t>(
-            InstallHook(pSer, reinterpret_cast<void*>(&HookSerializeWorldSession), 16));
-        LogMsg("[HOOK] SerializeWorldSession @ %p -> %s", pSer, g_origSerializeWorld ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pSer, reinterpret_cast<void*>(&HookSerializeWorldSession), 16,
+                                     reinterpret_cast<void**>(&g_origSerializeWorld));
+        LogMsg("[HOOK] SerializeWorldSession @ %p -> %s", pSer, ok ? "OK" : "FAIL");
     }
 
     // 7. Hook zlib compress2 -> SIMD libdeflate
     if (uint8_t* pComp2 = FIND_AOB(kAobCompress2)) {
-        g_origCompress2 = reinterpret_cast<Compress2_t>(
-            InstallHook(pComp2, reinterpret_cast<void*>(&HookCompress2), 17));
-        LogMsg("[HOOK] zlib::compress2 @ %p -> %s", pComp2, g_origCompress2 ? "OK" : "FAIL");
+        bool ok = InstallHookOrdered(pComp2, reinterpret_cast<void*>(&HookCompress2), 17,
+                                     reinterpret_cast<void**>(&g_origCompress2));
+        LogMsg("[HOOK] zlib::compress2 @ %p -> %s", pComp2, ok ? "OK" : "FAIL");
     }
 
-    // Optional read-only HTTP metrics thread (ONLY if explicitly enabled in INI)
-    if (g_cfg.enable_http_metrics) {
-        g_httpThread = CreateThread(nullptr, 0, HttpMetricsThread, nullptr, 0, nullptr);
+    // 8. Hook Server FrameLimiter::Wait -> 120Hz Waitable Timer in 60Hz SimTick mode (eliminates 0/2 beat aliasing)
+    if (uint8_t* pFlWait = FIND_AOB(kAobServerFrameLimiterWait)) {
+        bool ok = InstallHookOrdered(pFlWait, reinterpret_cast<void*>(&HookServerFrameLimiterWait), 15,
+                                     reinterpret_cast<void**>(&g_origServerFrameLimiterWait));
+        LogMsg("[HOOK] Server FrameLimiter::Wait @ %p -> %s", pFlWait, ok ? "OK" : "FAIL");
     }
+
+    // 9. Resolve exclusive Simulation fixed-timestep + secondary 1/30 + NetworkTickRate pointers (Fail-Closed verify)
+    auto resolveCheckedFloat = [](uint8_t* site, size_t dispOff, size_t nextIpOff, float expected, float tol) -> float* {
+        if (!site) return nullptr;
+        int32_t disp = 0;
+        std::memcpy(&disp, site + dispOff, 4);
+        auto* p = reinterpret_cast<float*>(site + nextIpOff + disp);
+        return (std::fabs(*p - expected) < tol) ? p : nullptr;
+    };
+    g_simAnimShaderTickPtr = resolveCheckedFloat(FIND_AOB(kAobAnimShaderTick),  52, 56, 1.0f / 30.0f, 1e-5f);
+    g_simPathfinderTickPtr = resolveCheckedFloat(FIND_AOB(kAobPathfinderTick),  30, 34, 1.0f / 30.0f, 1e-5f);
+    g_simSpatialTickPtr    = resolveCheckedFloat(FIND_AOB(kAobSpatialTick),     30, 34, 1.0f / 30.0f, 1e-5f);
+    g_simTimeDiffTickPtr   = resolveCheckedFloat(FIND_AOB(kAobSimTimeDiffTick), 19, 23, 1.0f / 30.0f, 1e-5f);
+    g_netTickScalePtr      = resolveCheckedFloat(FIND_AOB(kAobNetTickScale),     4,  8, 30.5f,        0.01f);
+    g_fnSetNetTickRate     = reinterpret_cast<SetNetworkTickRate_t>(FIND_AOB(kAobSetNetTickRate));
+    if (uint8_t* pNetRef = FIND_AOB(kAobSimUpdateNetMgr)) {
+        int32_t disp = 0;
+        std::memcpy(&disp, pNetRef + 3, 4);
+        g_netMgrGlobalPtr = reinterpret_cast<void**>(pNetRef + 7 + disp);
+    }
+
+    if (uint8_t* pTickLoad = FIND_AOB(kAobSimUpdateTick)) {
+        int32_t dispF = 0, dispD = 0;
+        std::memcpy(&dispF, pTickLoad + 12, 4);
+        std::memcpy(&dispD, pTickLoad + 99, 4);
+        auto* pf = reinterpret_cast<float*>(pTickLoad + 16 + dispF);
+        auto* pd = reinterpret_cast<double*>(pTickLoad + 103 + dispD);
+        if (std::fabs(*pf - (1.0f / 30.0f)) < 1e-5f && std::fabs(*pd - (1.0 / 30.0)) < 1e-5) {
+            g_simTickFloatPtr = pf;
+            g_simTickDoublePtr = pd;
+            LogMsg("[SIMTICK] Verified exclusive Server tick constants @ f=%p d=%p sub=(%d%d%d%d) netScale=%p netMgr=%p setNet=%p",
+                   static_cast<void*>(pf), static_cast<void*>(pd),
+                   g_simAnimShaderTickPtr != nullptr, g_simPathfinderTickPtr != nullptr,
+                   g_simSpatialTickPtr != nullptr, g_simTimeDiffTickPtr != nullptr,
+                   static_cast<void*>(g_netTickScalePtr), static_cast<void*>(g_netMgrGlobalPtr),
+                   reinterpret_cast<void*>(g_fnSetNetTickRate));
+            if (g_cfg.sim_tick_rate == 60) {
+                ApplySimTickRate(60);
+            }
+        } else {
+            LogMsg("[SIMTICK] Skipped (Fail-Closed value check: f=%.6f d=%.6f)", *pf, *pd);
+        }
+    }
+
+    // 10. RakNet Event-Driven Zero-Stall Wakeup (eliminates 0-10ms Server snapshot WaitOnEvent stall, 0% idle CPU)
+    if (g_cfg.enable_raknet_instant_wake) {
+        uint8_t* pWake1 = FIND_AOB(kAobRakNetSendBufWake);
+        uint8_t* pWake2 = FIND_AOB(kAobRakNetSendBufListWake);
+        uint8_t* setEv1 = pWake1 ? ResolveRel32Call(pWake1 + 12) : nullptr;
+        uint8_t* setEv2 = pWake2 ? ResolveRel32Call(pWake2 + 11) : nullptr;
+        if (pWake1 && pWake2 && setEv1 && setEv1 == setEv2) {
+            constexpr uint8_t kNop2[2]  = { 0x90, 0x90 };
+            constexpr uint8_t kOrig2[2] = { 0x75, 0x0C };
+            bool ok1 = RestoreHookBytes(pWake1 + 3, kNop2, 2);
+            bool ok2 = false;
+            if (ok1) {
+                ok2 = RestoreHookBytes(pWake2 + 2, kNop2, 2);
+                if (!ok2) {
+                    // Paired rollback: never leave partial RakNet patch installed
+                    RestoreHookBytes(pWake1 + 3, kOrig2, 2);
+                }
+            }
+            LogMsg("[NET] RakNet Zero-Stall Event Wakeup @ (%p, %p, SetEvent=%p) -> %s",
+                   pWake1 + 3, pWake2 + 2, setEv1, (ok1 && ok2) ? "OK (0ms snapshot dispatch)" : "FAIL (rolled back)");
+        } else {
+            LogMsg("[NET] RakNet Zero-Stall skipped (Fail-Closed cross-check: p1=%p p2=%p ev1=%p ev2=%p)",
+                   pWake1, pWake2, setEv1, setEv2);
+        }
+    }
+
+    // Lock trampoline slab to PAGE_EXECUTE_READ (100% W^X compliant, zero permanent RWX pages!)
+    FinalizeTrampolineSlabWX();
 }
 
 bool IsDedicatedServerHost() {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     const wchar_t* base = std::wcsrchr(exePath, L'\\');
+    const wchar_t* base2 = std::wcsrchr(exePath, L'/');
+    if (base2 && (!base || base2 > base)) base = base2;
     base = base ? (base + 1) : exePath;
     return _wcsicmp(base, L"dontstarve_dedicated_server_nullrenderer_x64.exe") == 0;
 }
 
 } // namespace
 
-BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_selfMod = hinst;
         DisableThreadLibraryCalls(hinst);
         if (IsDedicatedServerHost()) {
+            // Pin module permanently in process address space so runtime FreeLibrary
+            // can NEVER unmap hooked trampolines, Lua C closures, or mimalloc allocators.
+            HMODULE pinned = nullptr;
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(&DllMain), &pinned);
             g_isServerProcess = true;
             InitServerHooks();
         }
     } else if (reason == DLL_PROCESS_DETACH) {
-        if (g_isServerProcess) {
-            g_stopHttp.store(true);
-            if (g_httpThread) {
-                WaitForSingleObject(g_httpThread, 500);
-                CloseHandle(g_httpThread);
-                g_httpThread = nullptr;
-            }
-            LogTelemetrySummary("FINAL");
-            if (g_timerBoosted) {
-                timeEndPeriod(1);
-                g_timerBoosted = false;
-            }
-            if (g_logCsInit) {
-                DeleteCriticalSection(&g_logCs);
-                g_logCsInit = false;
-            }
+        // Strict Win32 DllMain contract: on process termination (lpReserved != nullptr),
+        // other threads have already been forcefully terminated by the kernel;
+        // NEVER acquire locks, wait on threads, or call WinMM/WinSock/FreeLibrary here!
+        if (lpReserved != nullptr) {
+            return TRUE;
         }
+        g_stopHttp.store(true);
     }
     return TRUE;
 }

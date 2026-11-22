@@ -240,8 +240,40 @@ local function VerifyFastDumperEquivalence()
     assert(r_inf == nil and e_inf == "corrupt_number", "[BENCH] FastDump Inf guard failed: " .. tostring(e_inf))
     local cyc = {}; cyc.self = cyc
     local r_cyc, e_cyc = _fd(cyc, nil)
-    assert(r_cyc == nil and (e_cyc == "depth_limit" or e_cyc == "fallback"), "[BENCH] FastDump cycle depth guard failed: " .. tostring(e_cyc))
-    print("[BENCH_EQUIV] FastDump Round-Trip + Edge Keys + NaN/Inf/Cycle Guards: PASS")
+    assert(r_cyc == nil and e_cyc == "cycle_detected", "[BENCH] FastDump single cycle guard failed: " .. tostring(e_cyc))
+
+    -- Red-team VETO-SERVER-01: multi-branch cycle {a=c, b=c} (would blow up 2^128 without visited set!)
+    local mcyc = {}; mcyc.a = mcyc; mcyc.b = mcyc
+    local t_mcyc = os.clock()
+    local r_mcyc, e_mcyc = _fd(mcyc, nil)
+    assert(r_mcyc == nil and e_mcyc == "cycle_detected" and (os.clock() - t_mcyc) < 0.05,
+        "[BENCH] FastDump multi-branch cycle guard failed: " .. tostring(e_mcyc))
+
+    -- Red-team exponential non-cyclic shared DAG (2^24 = 16.7M leaves -> must abort via node_limit_exceeded!)
+    local dag = { 1 }
+    for i = 1, 24 do
+        dag = { dag, dag }
+    end
+    local r_dag, e_dag = _fd(dag, nil)
+    assert(r_dag == nil and (e_dag == "node_limit_exceeded" or e_dag == "buffer_limit_exceeded"),
+        "[BENCH] FastDump exponential DAG guard failed: " .. tostring(e_dag))
+
+    -- Red-team NEW-03: SpatialGrid exact vanilla parity on edge & whole-world radii:
+    --   1) radius = 5000 (whole-world finite scan) -> must return > 10,000 entities
+    --   2) radius = math.huge -> delegates to vanilla (0x140114970 cvttss2si returns 0 in vanilla; 100% parity, no hang/UB)
+    --   3) radius = -5 -> returns 0 entities
+    local world_ents = G.TheSim:FindEntities(0, 0, 0, 5000)
+    assert(type(world_ents) == "table" and #world_ents > 10000,
+        "[BENCH] SpatialGrid FindEntities(5000) FAILED! got count=" .. tostring(type(world_ents) == "table" and #world_ents or "nil"))
+    local huge_ents = G.TheSim:FindEntities(0, 0, 0, math.huge)
+    assert(type(huge_ents) == "table" and #huge_ents == 0,
+        "[BENCH] SpatialGrid FindEntities(math.huge) parity mismatch! got count=" .. tostring(type(huge_ents) == "table" and #huge_ents or "nil"))
+    local neg_ents = G.TheSim:FindEntities(0, 0, 0, -5)
+    assert(type(neg_ents) == "table" and #neg_ents == 0,
+        "[BENCH] SpatialGrid FindEntities(-5) failed! got count=" .. tostring(type(neg_ents) == "table" and #neg_ents or "nil"))
+
+    print(string.format("[BENCH_EQUIV] FastDump Round-Trip + MultiBranchCycle(%s) + ExpDAG(%s) + SpatialGrid(r=5000:%d, r=huge:%d, r=-5:%d): PASS",
+        tostring(e_mcyc), tostring(e_dag), #world_ents, #huge_ents, #neg_ents))
 end
 
 AddSimPostInit(function()
@@ -412,9 +444,9 @@ def restore_base_world(enable_hypercore_mod: bool):
 def write_native_config(install_dll: bool, cfg: dict):
     dll_dst = os.path.join(BIN64, "iphlpapi.dll")
     ini_dst = os.path.join(BIN64, "dst_hypercore.ini")
-    log_dst = os.path.join(BIN64, "dst_hypercore.log")
-    if os.path.exists(log_dst):
-        os.remove(log_dst)
+    for fn in os.listdir(BIN64):
+        if fn.startswith("dst_hypercore") and fn.endswith(".log"):
+            os.remove(os.path.join(BIN64, fn))
     if install_dll:
         shutil.copy2(os.path.join(ROOT, "native_plugin", "iphlpapi.dll"), dll_dst)
         open(ini_dst, "w", encoding="utf-8").write("\n".join(f"{k} = {v}" for k, v in cfg.items()) + "\n")
@@ -465,11 +497,13 @@ def run_server(label: str, timeout_s: int = 120):
     for l in out_lines:
         if any(k in l for k in ["[BENCH", "[HyperCore", "LUA ERROR", "ASSERT", "stack traceback", "=== DST HyperCore"]):
             print("  |", l, flush=True)
-    log_dst = os.path.join(BIN64, "dst_hypercore.log")
+    log_dst = os.path.join(BIN64, "dst_hypercore_Master.log")
     if os.path.exists(log_dst):
+        print(f"  [DLL_LOG] Per-shard log verified: {os.path.basename(log_dst)}", flush=True)
         for l in open(log_dst, "r", encoding="utf-8", errors="replace"):
-            if any(k in l for k in ["[FINAL]", "FAIL", "ERROR", "WARNING"]):
+            if any(k in l for k in ["[FINAL]", "FAIL", "ERROR", "WARNING", "W^X", "AOB verified"]):
                 print("  [DLL]", l.strip(), flush=True)
+    assert not os.path.exists(os.path.join(BIN64, "dst_hypercore.log")), "Legacy shared dst_hypercore.log should not exist!"
     if proc.returncode != 0:
         print("  --- LAST 25 STDOUT LINES ON NON-ZERO EXIT ---", flush=True)
         for l in out_lines[-25:]:
