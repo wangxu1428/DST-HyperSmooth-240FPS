@@ -1648,29 +1648,37 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
         if (useHash) {
             const uint32_t h = ((lhash * 2654435761u) ^ shash) & kHashMask;
-            bool dupKey = false;
+            uint32_t cnt0LS = 0, cnt0Exact = 0;
             if (f0BucketCnt[h] > 1) {
-                uint32_t exactF0 = 0;
                 for (uint32_t k = 0; k < n0; ++k) {
-                    if (f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) {
-                        if (++exactF0 > 1) { dupKey = true; break; }
+                    const AnimElement& ek = f0.elements[k];
+                    if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
+                        ++cnt0LS;
+                        if (ek.frame_num == fnum) ++cnt0Exact;
                     }
                 }
+            } else {
+                cnt0LS = 1;
+                cnt0Exact = 1;
             }
 
-            int32_t firstJ = -1;
-            uint32_t cnt1 = 0;
+            int32_t firstJ = -1, exactJ = -1;
+            uint32_t cnt1LS = 0, cnt1Exact = 0;
             for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
                 const AnimElement& e1 = f1.elements[j];
                 if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
                     if (firstJ < 0) firstJ = j;
-                    if (++cnt1 > 1) { dupKey = true; break; }
+                    ++cnt1LS;
+                    if (e1.frame_num == fnum) {
+                        if (exactJ < 0) exactJ = j;
+                        ++cnt1Exact;
+                    }
                 }
             }
 
             if (firstJ >= 0) {
-                if (!dupKey) {
-                    // Fast O(1) unique 1-to-1 bone match (supports full 420px Boss sweeps)
+                if (cnt0LS == 1 && cnt1LS == 1) {
+                    // Fast O(1) unique (layer, symbol) 1-to-1 bone match (full 420px Boss sweep range)
                     const AnimElement& e1 = f1.elements[firstJ];
                     if (e1.frame_num == fnum) {
                         match = &e1;
@@ -1678,17 +1686,24 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                         match = &e1;
                         isPass2 = true;
                     }
+                } else if (cnt0Exact == 1 && cnt1Exact == 1 && !isUsedF1(static_cast<uint32_t>(exactJ))) {
+                    // Unique (layer, symbol, frame_num) inside shared-symbol rig (e.g. evergreen tree
+                    // pieces fn=15/16/17/18 or co-located trunk fn=0/1): exact 1-to-1 match, never swap!
+                    markUsedF1(static_cast<uint32_t>(exactJ));
+                    match = &f1.elements[exactJ];
                 } else {
-                    // Multi-instance duplicate-key bucket (fireflies/sparks/spores/petals):
-                    // Nearest-neighbor spatial match with exclusive claim & <=48px anti-streak guard
+                    // Multi-instance duplicate-key particle/rig bucket (fireflies/sparks/snow/spores):
+                    // Decode FP16 HalfToFloat(m[4..5]) for true Euclidean nearest-neighbor matching!
+                    const float tx0 = HalfToFloat(e0.m[4]);
+                    const float ty0 = HalfToFloat(e0.m[5]);
                     int32_t bestJ = -1;
                     float bestScore = 1e30f;
                     for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
                         if (isUsedF1(static_cast<uint32_t>(j))) continue;
                         const AnimElement& e1 = f1.elements[j];
                         if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                            const float dx = e1.m[4] - e0.m[4];
-                            const float dy = e1.m[5] - e0.m[5];
+                            const float dx = HalfToFloat(e1.m[4]) - tx0;
+                            const float dy = HalfToFloat(e1.m[5]) - ty0;
                             const float d2 = dx * dx + dy * dy;
                             if (d2 <= kDupMaxDistSq) {
                                 const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);
@@ -1712,24 +1727,29 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                 }
             }
         } else {
-            bool dupKey = false;
+            uint32_t cnt0LS = 0, cnt0Exact = 0;
             for (uint32_t k = 0; k < n0; ++k) {
-                if (k != i && f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) {
-                    dupKey = true;
-                    break;
+                const AnimElement& ek = f0.elements[k];
+                if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
+                    ++cnt0LS;
+                    if (ek.frame_num == fnum) ++cnt0Exact;
                 }
             }
-            int32_t firstJ = -1;
-            uint32_t cnt1 = 0;
+            int32_t firstJ = -1, exactJ = -1;
+            uint32_t cnt1LS = 0, cnt1Exact = 0;
             for (uint32_t j = 0; j < n1; ++j) {
                 const AnimElement& e1 = f1.elements[j];
                 if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
                     if (firstJ < 0) firstJ = static_cast<int32_t>(j);
-                    if (++cnt1 > 1) { dupKey = true; break; }
+                    ++cnt1LS;
+                    if (e1.frame_num == fnum) {
+                        if (exactJ < 0) exactJ = static_cast<int32_t>(j);
+                        ++cnt1Exact;
+                    }
                 }
             }
             if (firstJ >= 0) {
-                if (!dupKey) {
+                if (cnt0LS == 1 && cnt1LS == 1) {
                     const AnimElement& e1 = f1.elements[firstJ];
                     if (e1.frame_num == fnum) {
                         match = &e1;
@@ -1737,15 +1757,20 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                         match = &e1;
                         isPass2 = true;
                     }
+                } else if (cnt0Exact == 1 && cnt1Exact == 1 && !isUsedF1(static_cast<uint32_t>(exactJ))) {
+                    markUsedF1(static_cast<uint32_t>(exactJ));
+                    match = &f1.elements[exactJ];
                 } else {
+                    const float tx0 = HalfToFloat(e0.m[4]);
+                    const float ty0 = HalfToFloat(e0.m[5]);
                     int32_t bestJ = -1;
                     float bestScore = 1e30f;
                     for (uint32_t j = 0; j < n1; ++j) {
                         if (isUsedF1(j)) continue;
                         const AnimElement& e1 = f1.elements[j];
                         if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                            const float dx = e1.m[4] - e0.m[4];
-                            const float dy = e1.m[5] - e0.m[5];
+                            const float dx = HalfToFloat(e1.m[4]) - tx0;
+                            const float dy = HalfToFloat(e1.m[5]) - ty0;
                             const float d2 = dx * dx + dy * dy;
                             if (d2 <= kDupMaxDistSq) {
                                 const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);

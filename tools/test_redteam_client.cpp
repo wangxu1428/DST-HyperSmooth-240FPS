@@ -729,38 +729,85 @@ int main() {
                     fastIds.size(), bruteIds.size(), slices);
     }
 
-    // [9] v2.4.1 Firefly Swarm Duplicate-Key Nearest-Neighbor Anti-Streak Matcher
-    // Uses exact coordinates from data/anim/fireflies.zip swarm_loop Frame 0 -> Frame 1:
-    //   5 identical (layer=feather, symbol=firefly) dots -> 4 dots (dot #1 fades out, others advance fn 0->1 / 1->2).
-    //   Old index matcher created 140-263px cross-swarm laser streaks; new spatial matcher must match 4/4 within <=8.1px
-    //   and leave fading dot #1 cleanly unmatched (0 streaks)!
+    // [9] v2.4.1 Firefly Swarm + Evergreen Tree FP16 Zero-Crossing & Unique-(lh,sh,fn) Guard
+    // Verifies BOTH:
+    //   (a) Fireflies swarm_loop Frame 0 -> Frame 1 encoded as real uint16_t FP16 (including sign-flip
+    //       across tx=0 / ty=0!) matches 4/4 within <=8.1px and leaves dying dot unmatched (0 streaks);
+    //   (b) Evergreen tall tree pieces (fn=15/16/17/18 swaying across tx=0 from +0.5 -> -0.5) match
+    //       100% 1-to-1 by unique (lh,sh,fn) with ZERO tier vanishing/swapping!
     {
-        struct FDot { uint32_t lh, sh, fn; float tx, ty; };
+        auto h2f = [](uint16_t h) -> float {
+            uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+            uint32_t exp = (h >> 10) & 0x1Fu, mant = h & 0x03FFu, bits = 0;
+            if (exp == 0) {
+                if (mant) { exp = 127 - 14; while (!(mant & 0x0400u)) { mant <<= 1; --exp; } bits = sign | (exp << 23) | ((mant & 0x03FFu) << 13); }
+                else bits = sign;
+            } else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
+            else bits = sign | ((exp + 112) << 23) | (mant << 13);
+            float f; std::memcpy(&f, &bits, 4); return f;
+        };
+        auto f2h = [](float f) -> uint16_t {
+            uint32_t bits; std::memcpy(&bits, &f, 4);
+            uint32_t sign = (bits >> 16) & 0x8000u; int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFFu) - 112;
+            uint32_t mant = bits & 0x007FFFFFu;
+            if (exp <= 0) return static_cast<uint16_t>(sign);
+            if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu);
+            return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
+        };
+        struct FDot { uint32_t lh, sh, fn; uint16_t hx, hy; };
+        auto mk = [&](uint32_t lh, uint32_t sh, uint32_t fn, float x, float y) -> FDot {
+            return FDot{ lh, sh, fn, f2h(x), f2h(y) };
+        };
         const std::vector<FDot> f0 = {
-            { 0x19df60e3u, 0x3a67dc7du, 1,  128.1f,  -43.8f }, // A -> survives to f1[0]
-            { 0x19df60e3u, 0x3a67dc7du, 0,  -89.8f, -268.0f }, // B -> dies (must NOT streak!)
-            { 0x19df60e3u, 0x3a67dc7du, 0,   56.9f, -291.5f }, // C -> survives to f1[1]
-            { 0x19df60e3u, 0x3a67dc7du, 0,  -61.8f, -205.2f }, // D -> survives to f1[2]
-            { 0x19df60e3u, 0x3a67dc7du, 0,  -23.3f,   -0.5f }, // E -> survives to f1[3]
+            mk(0x19df60e3u, 0x3a67dc7du, 1,  128.1f,  -43.8f), // A -> survives to f1[0]
+            mk(0x19df60e3u, 0x3a67dc7du, 0,  -89.8f, -268.0f), // B -> dies (must NOT streak!)
+            mk(0x19df60e3u, 0x3a67dc7du, 0,   56.9f, -291.5f), // C -> survives to f1[1]
+            mk(0x19df60e3u, 0x3a67dc7du, 0,  -61.8f, -205.2f), // D -> survives to f1[2]
+            mk(0x19df60e3u, 0x3a67dc7du, 0,    0.5f,   -0.5f), // E -> crosses tx=0 -> -0.5! (FP16 sign flip!)
+            // Evergreen tall pine pieces (shared lh/sh, distinct fn=15..18, crossing tx=0!)
+            mk(0x55550001u, 0x55550001u, 15,   0.4f, -604.4f), // Top crown
+            mk(0x55550001u, 0x55550001u, 16,   0.4f, -585.6f), // 2nd crown (18.8px away!)
+            mk(0x55550001u, 0x55550001u, 17,  -7.8f, -485.5f),
+            mk(0x55550001u, 0x55550001u, 18,   3.0f, -324.4f),
         };
         const std::vector<FDot> f1 = {
-            { 0x19df60e3u, 0x3a67dc7du, 2,  129.8f,  -49.7f }, // A' (6.1px)
-            { 0x19df60e3u, 0x3a67dc7du, 1,   49.7f, -294.9f }, // C' (8.0px)
-            { 0x19df60e3u, 0x3a67dc7du, 1,  -55.9f, -207.9f }, // D' (6.5px)
-            { 0x19df60e3u, 0x3a67dc7du, 1,  -29.1f,   -3.4f }, // E' (6.5px)
+            mk(0x19df60e3u, 0x3a67dc7du, 2,  129.8f,  -49.7f), // A' (6.1px)
+            mk(0x19df60e3u, 0x3a67dc7du, 1,   49.7f, -294.9f), // C' (8.0px)
+            mk(0x19df60e3u, 0x3a67dc7du, 1,  -55.9f, -207.9f), // D' (6.5px)
+            mk(0x19df60e3u, 0x3a67dc7du, 1,   -0.5f,   -3.4f), // E' (3.1px across tx=0!)
+            mk(0x55550001u, 0x55550001u, 15,  -0.4f, -604.4f), // Top crown crosses tx=0!
+            mk(0x55550001u, 0x55550001u, 16,  -0.4f, -585.6f), // 2nd crown crosses tx=0!
+            mk(0x55550001u, 0x55550001u, 17,  -8.2f, -485.5f),
+            mk(0x55550001u, 0x55550001u, 18,   2.8f, -324.4f),
         };
         constexpr float kDupMaxDistSq = 48.0f * 48.0f;
         uint64_t usedF1 = 0;
-        int matchedIdx[5] = { -1, -1, -1, -1, -1 };
+        std::vector<int> matchedIdx(f0.size(), -1);
         float maxDist = 0.0f;
         for (size_t i = 0; i < f0.size(); ++i) {
+            uint32_t cnt0E = 0, cnt1E = 0;
+            int exactJ = -1;
+            for (size_t k = 0; k < f0.size(); ++k) {
+                if (f0[k].lh == f0[i].lh && f0[k].sh == f0[i].sh && f0[k].fn == f0[i].fn) ++cnt0E;
+            }
+            for (size_t j = 0; j < f1.size(); ++j) {
+                if (f1[j].lh == f0[i].lh && f1[j].sh == f0[i].sh && f1[j].fn == f0[i].fn) {
+                    if (exactJ < 0) exactJ = static_cast<int>(j);
+                    ++cnt1E;
+                }
+            }
+            if (cnt0E == 1 && cnt1E == 1 && !((usedF1 >> exactJ) & 1ULL)) {
+                usedF1 |= (1ULL << exactJ);
+                matchedIdx[i] = exactJ;
+                continue;
+            }
+            const float tx0 = h2f(f0[i].hx), ty0 = h2f(f0[i].hy);
             int bestJ = -1;
-            float bestScore = 1e30f;
-            float bestD2 = 0.0f;
+            float bestScore = 1e30f, bestD2 = 0.0f;
             for (size_t j = 0; j < f1.size(); ++j) {
                 if ((usedF1 >> j) & 1ULL) continue;
                 if (f1[j].lh == f0[i].lh && f1[j].sh == f0[i].sh) {
-                    float dx = f1[j].tx - f0[i].tx, dy = f1[j].ty - f0[i].ty;
+                    float dx = h2f(f1[j].hx) - tx0, dy = h2f(f1[j].hy) - ty0;
                     float d2 = dx * dx + dy * dy;
                     if (d2 <= kDupMaxDistSq) {
                         float score = d2 + ((f1[j].fn == f0[i].fn) ? 0.0f : 4.0f);
@@ -775,13 +822,14 @@ int main() {
                 if (d > maxDist) maxDist = d;
             }
         }
-        CHECK(matchedIdx[0] == 0);  // A -> A'
-        CHECK(matchedIdx[1] == -1); // B dies cleanly (ZERO streak!)
-        CHECK(matchedIdx[2] == 1);  // C -> C'
-        CHECK(matchedIdx[3] == 2);  // D -> D'
-        CHECK(matchedIdx[4] == 3);  // E -> E'
+        CHECK(matchedIdx[0] == 0);  // Firefly A -> A'
+        CHECK(matchedIdx[1] == -1); // Firefly B dies cleanly (ZERO streak!)
+        CHECK(matchedIdx[2] == 1);  // Firefly C -> C'
+        CHECK(matchedIdx[3] == 2);  // Firefly D -> D'
+        CHECK(matchedIdx[4] == 3);  // Firefly E -> E' across tx=0 FP16 sign-flip!
+        CHECK(matchedIdx[5] == 4 && matchedIdx[6] == 5 && matchedIdx[7] == 6 && matchedIdx[8] == 7); // Evergreen 4/4 exact!
         CHECK(maxDist < 9.0f);
-        std::printf("[PASS] 9. Firefly swarm duplicate-key spatial matcher verified (4/4 exact, dying dot unmatched, maxDist=%.2fpx, 0 streaks)\n", maxDist);
+        std::printf("[PASS] 9. Firefly FP16 zero-crossing & Evergreen tier matcher verified (4/4 fireflies + 4/4 tree tiers, maxDist=%.2fpx, 0 streaks/vanishes)\n", maxDist);
     }
 
     std::printf("ALL 9 CLIENT v2.4.1 RED-TEAM, RTSS PACER, ANTI-HITCH SWARM & FIREFLY TESTS PASSED!\n");
