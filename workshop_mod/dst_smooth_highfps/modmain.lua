@@ -11,6 +11,7 @@ local getmetatable = GLOBAL.getmetatable
 local type = GLOBAL.type
 local pairs = GLOBAL.pairs
 local ipairs = GLOBAL.ipairs
+local next = GLOBAL.next
 local math = GLOBAL.math
 local string = GLOBAL.string
 local table = GLOBAL.table
@@ -18,7 +19,7 @@ local tonumber = GLOBAL.tonumber
 local tostring = GLOBAL.tostring
 
 local TARGET_FPS = GetModConfigData("target_fps")
-if TARGET_FPS == nil then TARGET_FPS = 240 end
+if type(TARGET_FPS) ~= "number" then TARGET_FPS = 240 end
 local SKELETAL_TWEEN = GetModConfigData("skeletal_tween")
 if SKELETAL_TWEEN == nil then SKELETAL_TWEEN = true end
 local SMOOTH_CAMERA = GetModConfigData("smooth_camera")
@@ -41,12 +42,6 @@ local SHOW_1PCT_LOW = GetModConfigData("show_1pct_low")
 if SHOW_1PCT_LOW == nil then SHOW_1PCT_LOW = true end
 local AUTO_60HZ_SIM = GetModConfigData("auto_60hz_sim")
 if AUTO_60HZ_SIM == nil then AUTO_60HZ_SIM = true end
-local HOTKEY_MODIFIER = GetModConfigData("hotkey_modifier")
-if HOTKEY_MODIFIER == nil then HOTKEY_MODIFIER = "ALT" end
-local HOTKEY_NAME = GetModConfigData("hotkey_cycle")
-if HOTKEY_NAME == nil then HOTKEY_NAME = false end
-local HOTKEY_SKELETAL = GetModConfigData("hotkey_skeletal")
-if HOTKEY_SKELETAL == nil then HOTKEY_SKELETAL = false end
 
 local CFG_FILENAME = "dst_smooth_highfps_cfg"
 local FPS_PRESETS = { 60, 120, 144, 165, 240, 360, 0 }
@@ -169,9 +164,11 @@ if SKIP_TOP_MODS_QUERY and TheSim and getmetatable then
 end
 
 --------------------------------------------------------------------------------
--- 3. Pure-Client Zero-Unload Cave <-> Surface Switch (Multiplayer & Solo!)
---    Keeps vanilla "forest" and "cave" asset sets hot in client RAM during
---    BACKEND shard migrations; safely unloads everything on return to FRONTEND.
+-- 3. Pure-Client Zero-Reload Cave <-> Surface Acceleration (Cross-SimReset!)
+--    v2.4.1 FIX: Hook SimReset() to persist _hakimi_kept_worlds AND
+--    _hakimi_kept_chars inside instanceparameters across TheSim:Reset()!
+--    Keeps vanilla "forest"/"cave" AND active character prefabs hot in client
+--    RAM across BACKEND shard migrations; cleanly unloads ALL on FRONTEND.
 --------------------------------------------------------------------------------
 if KEEP_SHARD_ASSETS and TheSim and getmetatable then
     pcall(function()
@@ -183,8 +180,30 @@ if KEEP_SHARD_ASSETS and TheSim and getmetatable then
 
         local VANILLA_WORLDS = { forest = true, cave = true }
         local Settings = GLOBAL.Settings
-        if Settings and Settings._hakimi_kept_worlds == nil then
-            Settings._hakimi_kept_worlds = {}
+        if Settings then
+            if type(Settings._hakimi_kept_worlds) ~= "table" then Settings._hakimi_kept_worlds = {} end
+            if type(Settings._hakimi_kept_chars)  ~= "table" then Settings._hakimi_kept_chars  = {} end
+        end
+
+        -- CRITICAL: Forward kept asset maps through SimReset(instanceparameters) so
+        -- TheSim:Reset() VM rebuild NEVER wipes them!
+        local orig_SimReset = rawget(GLOBAL, "SimReset")
+        if type(orig_SimReset) == "function" then
+            rawset(GLOBAL, "SimReset", function(instanceparameters, ...)
+                if instanceparameters == nil then
+                    instanceparameters = {}
+                end
+                local s = GLOBAL.Settings
+                if s and s.current_asset_set ~= "FORCERESET" then
+                    if type(s._hakimi_kept_worlds) == "table" then
+                        instanceparameters._hakimi_kept_worlds = s._hakimi_kept_worlds
+                    end
+                    if type(s._hakimi_kept_chars) == "table" then
+                        instanceparameters._hakimi_kept_chars = s._hakimi_kept_chars
+                    end
+                end
+                return orig_SimReset(instanceparameters, ...)
+            end)
         end
 
         local old_LoadPrefabs = idx.LoadPrefabs
@@ -201,17 +220,97 @@ if KEEP_SHARD_ASSETS and TheSim and getmetatable then
             return true
         end
 
+        local function UnloadKeptChars(sim, s, exclude_list)
+            if type(s._hakimi_kept_chars) ~= "table" then return end
+            local seen = {}
+            if type(exclude_list) == "table" then
+                for i = 1, #exclude_list do seen[exclude_list[i]] = true end
+            end
+            local extras = {}
+            for kc in pairs(s._hakimi_kept_chars) do
+                if not seen[kc] then
+                    seen[kc] = true
+                    extras[#extras + 1] = kc
+                end
+            end
+            s._hakimi_kept_chars = {}
+            if #extras > 0 then
+                pcall(old_UnloadPrefabs, sim, extras)
+            end
+        end
+
+        local function UnloadAllKeptWorldsAndChars(sim, s, exclude_world)
+            local extras = {}
+            local seen = {}
+            if exclude_world then seen[exclude_world] = true end
+            if type(s._hakimi_kept_worlds) == "table" then
+                for kw in pairs(s._hakimi_kept_worlds) do
+                    if not seen[kw] then
+                        seen[kw] = true
+                        extras[#extras + 1] = kw
+                    end
+                end
+                s._hakimi_kept_worlds = {}
+            end
+            if type(s._hakimi_kept_chars) == "table" then
+                for kc in pairs(s._hakimi_kept_chars) do
+                    if not seen[kc] then
+                        seen[kc] = true
+                        extras[#extras + 1] = kc
+                    end
+                end
+                s._hakimi_kept_chars = {}
+            end
+            if #extras > 0 then
+                pcall(old_UnloadPrefabs, sim, extras)
+            end
+        end
+
         idx.LoadPrefabs = function(sim, prefabs, ...)
             local s = GLOBAL.Settings
-            if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and type(prefabs) == "table" and #prefabs == 1 then
-                local w = prefabs[1]
-                if VANILLA_WORLDS[w] then
-                    s._hakimi_kept_worlds = s._hakimi_kept_worlds or {}
+            if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and type(prefabs) == "table" then
+                -- 1) World layer (forest / cave): skip completely if already hot in RAM!
+                if #prefabs == 1 and VANILLA_WORLDS[prefabs[1]] then
+                    local w = prefabs[1]
+                    s._hakimi_kept_worlds = (type(s._hakimi_kept_worlds) == "table") and s._hakimi_kept_worlds or {}
                     if s._hakimi_kept_worlds[w] then
-                        -- Already hot in client RAM from earlier in this session!
                         return
                     end
                     s._hakimi_kept_worlds[w] = true
+                    return old_LoadPrefabs(sim, prefabs, ...)
+                end
+                -- 2) Active character prefabs (gamelogic.lua:L426): filter out already-kept chars!
+                if type(s._hakimi_kept_chars) == "table" and next(s._hakimi_kept_chars) ~= nil and #prefabs > 0 then
+                    local any_kept = false
+                    for i = 1, #prefabs do
+                        if s._hakimi_kept_chars[prefabs[i]] then
+                            any_kept = true
+                            break
+                        end
+                    end
+                    if any_kept then
+                        local remaining = {}
+                        for i = 1, #prefabs do
+                            local p = prefabs[i]
+                            if not s._hakimi_kept_chars[p] then
+                                remaining[#remaining + 1] = p
+                            end
+                        end
+                        if #remaining == 0 then
+                            return
+                        end
+                        local ret = old_LoadPrefabs(sim, remaining, ...)
+                        if type(s.loaded_characters) == "table" then
+                            local is_char = {}
+                            for i = 1, #s.loaded_characters do is_char[s.loaded_characters[i]] = true end
+                            for i = 1, #remaining do
+                                if is_char[remaining[i]] then
+                                    s._hakimi_kept_chars[remaining[i]] = true
+                                end
+                            end
+                        end
+                        return ret
+                    end
                 end
             end
             return old_LoadPrefabs(sim, prefabs, ...)
@@ -219,28 +318,31 @@ if KEEP_SHARD_ASSETS and TheSim and getmetatable then
 
         idx.UnloadPrefabs = function(sim, prefabs, ...)
             local s = GLOBAL.Settings
-            if s and type(prefabs) == "table" and #prefabs == 1 then
-                local w = prefabs[1]
-                if VANILLA_WORLDS[w] then
-                    if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and s.last_asset_set == "BACKEND" then
-                        -- Shard migration (Forest <-> Caves): keep previous layer hot in RAM!
-                        s._hakimi_kept_worlds = s._hakimi_kept_worlds or {}
-                        s._hakimi_kept_worlds[w] = true
+            if s and type(prefabs) == "table" then
+                -- A) Returning to FRONTEND / FORCERESET: cleanly unload all kept worlds & chars (zero double-unload!)
+                if s.current_asset_set == "FRONTEND" or s.current_asset_set == "FORCERESET" then
+                    local excl = (#prefabs == 1 and VANILLA_WORLDS[prefabs[1]]) and prefabs[1] or nil
+                    local ret = old_UnloadPrefabs(sim, prefabs, ...)
+                    if excl then
+                        UnloadAllKeptWorldsAndChars(sim, s, excl)
+                    elseif s.loaded_characters ~= nil and prefabs == s.loaded_characters then
+                        UnloadKeptChars(sim, s, prefabs)
+                    end
+                    return ret
+                end
+                -- B) BACKEND -> BACKEND shard migration (Forest <-> Caves):
+                if IsPureMultiplayerClient(s) and s.current_asset_set == "BACKEND" and s.last_asset_set == "BACKEND" then
+                    if #prefabs == 1 and VANILLA_WORLDS[prefabs[1]] then
+                        s._hakimi_kept_worlds = (type(s._hakimi_kept_worlds) == "table") and s._hakimi_kept_worlds or {}
+                        s._hakimi_kept_worlds[prefabs[1]] = true
                         return
-                    elseif s.current_asset_set == "FRONTEND" and s._hakimi_kept_worlds then
-                        -- Leaving world to main menu: cleanly release all kept layers
-                        local extras = {}
-                        for kw in pairs(s._hakimi_kept_worlds) do
-                            if kw ~= w then
-                                extras[#extras + 1] = kw
-                            end
+                    end
+                    if s.loaded_characters ~= nil and prefabs == s.loaded_characters then
+                        s._hakimi_kept_chars = (type(s._hakimi_kept_chars) == "table") and s._hakimi_kept_chars or {}
+                        for i = 1, #prefabs do
+                            s._hakimi_kept_chars[prefabs[i]] = true
                         end
-                        s._hakimi_kept_worlds = {}
-                        local ret = old_UnloadPrefabs(sim, prefabs, ...)
-                        if #extras > 0 then
-                            pcall(old_UnloadPrefabs, sim, extras)
-                        end
-                        return ret
+                        return
                     end
                 end
             end
@@ -1038,23 +1140,7 @@ local function FormatTargetLabel(fps)
     return tostring(fps) .. " FPS"
 end
 
-local function IsModifierPressed()
-    if HOTKEY_MODIFIER == "NONE" or not HOTKEY_MODIFIER then
-        return true
-    elseif HOTKEY_MODIFIER == "ALT" then
-        return TheInput:IsKeyDown(GLOBAL.KEY_ALT) or TheInput:IsKeyDown(GLOBAL.KEY_LALT) or TheInput:IsKeyDown(GLOBAL.KEY_RALT)
-    elseif HOTKEY_MODIFIER == "CTRL" then
-        return TheInput:IsKeyDown(GLOBAL.KEY_CTRL) or TheInput:IsKeyDown(GLOBAL.KEY_LCTRL) or TheInput:IsKeyDown(GLOBAL.KEY_RCTRL)
-    elseif HOTKEY_MODIFIER == "SHIFT" then
-        return TheInput:IsKeyDown(GLOBAL.KEY_SHIFT) or TheInput:IsKeyDown(GLOBAL.KEY_LSHIFT) or TheInput:IsKeyDown(GLOBAL.KEY_RSHIFT)
-    end
-    return true
-end
-
 local function CanTriggerInGameHotkey()
-    if not IsModifierPressed() then
-        return false
-    end
     local player = GLOBAL.ThePlayer
     local fe = GLOBAL.TheFrontEnd
     if not player or not fe then
@@ -1164,13 +1250,9 @@ AddClassPostConstruct("screens/playerhud", function(self)
     end
 end)
 
--- Optional Custom Hotkey 1: Cycle Target FPS (60 -> 120 -> 144 -> 165 -> 240 -> 360 -> UNLIMITED)
-if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
-    local key_code = GLOBAL[HOTKEY_NAME]
-    TheInput:AddKeyUpHandler(key_code, function()
-        if not CanTriggerInGameHotkey() then
-            return
-        end
+-- Live Any-Key & Mouse-Button Rebind Engine (wired by keybind.lua in Mod Config & ESC->Settings->Controls)
+local HOTKEY_ACTIONS = {
+    hotkey_cycle = function()
         local next_idx = 1
         for i, v in ipairs(FPS_PRESETS) do
             if v == current_target_fps then
@@ -1187,16 +1269,8 @@ if HOTKEY_NAME and GLOBAL[HOTKEY_NAME] then
         end
         toast_timer = 3.0
         hud_dirty_now = true
-    end)
-end
-
--- Optional Custom Hotkey 2: Live Toggle True 240fps 2D Skeletal Animation Tweening (A/B Comparison)
-if HOTKEY_SKELETAL and GLOBAL[HOTKEY_SKELETAL] then
-    local skel_key = GLOBAL[HOTKEY_SKELETAL]
-    TheInput:AddKeyUpHandler(skel_key, function()
-        if not CanTriggerInGameHotkey() then
-            return
-        end
+    end,
+    hotkey_skeletal = function()
         current_skeletal_tween = not current_skeletal_tween
         SyncToNativePlugin(true)
         if HasNativePlugin() then
@@ -1206,5 +1280,48 @@ if HOTKEY_SKELETAL and GLOBAL[HOTKEY_SKELETAL] then
         end
         toast_timer = 3.0
         hud_dirty_now = true
-    end)
+    end,
+    hotkey_hud = function()
+        current_show_fps_hud = not current_show_fps_hud
+        SyncToNativePlugin(true)
+        toast_msg = "FPS HUD -> " .. (current_show_fps_hud and "ON" or "OFF")
+        toast_timer = 2.0
+        hud_dirty_now = true
+    end,
+}
+
+local active_key_handlers = {}
+
+function HS_ApplyKeyBind(action_name, keycode)
+    local prev = active_key_handlers[action_name]
+    if prev and prev.Remove then
+        prev:Remove()
+    end
+    active_key_handlers[action_name] = nil
+
+    local action_fn = HOTKEY_ACTIONS[action_name]
+    if type(action_fn) ~= "function" or type(keycode) ~= "number" or not TheInput then
+        return
+    end
+    if keycode >= 1000 then
+        if TheInput.AddMouseButtonHandler then
+            active_key_handlers[action_name] = TheInput:AddMouseButtonHandler(function(btn, down)
+                if btn == keycode and down and CanTriggerInGameHotkey() then
+                    action_fn()
+                end
+            end)
+        end
+    else
+        if TheInput.AddKeyUpHandler then
+            active_key_handlers[action_name] = TheInput:AddKeyUpHandler(keycode, function()
+                if CanTriggerInGameHotkey() then
+                    action_fn()
+                end
+            end)
+        end
+    end
+end
+
+if type(modimport) == "function" then
+    pcall(modimport, "keybind")
 end

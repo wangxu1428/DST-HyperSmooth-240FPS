@@ -729,6 +729,61 @@ int main() {
                     fastIds.size(), bruteIds.size(), slices);
     }
 
-    std::printf("ALL 8 CLIENT v2.4.0 RED-TEAM, RTSS PACER, ANTI-HITCH SWARM & ZERO-COPY TESTS PASSED!\n");
+    // [9] v2.4.1 Firefly Swarm Duplicate-Key Nearest-Neighbor Anti-Streak Matcher
+    // Uses exact coordinates from data/anim/fireflies.zip swarm_loop Frame 0 -> Frame 1:
+    //   5 identical (layer=feather, symbol=firefly) dots -> 4 dots (dot #1 fades out, others advance fn 0->1 / 1->2).
+    //   Old index matcher created 140-263px cross-swarm laser streaks; new spatial matcher must match 4/4 within <=8.1px
+    //   and leave fading dot #1 cleanly unmatched (0 streaks)!
+    {
+        struct FDot { uint32_t lh, sh, fn; float tx, ty; };
+        const std::vector<FDot> f0 = {
+            { 0x19df60e3u, 0x3a67dc7du, 1,  128.1f,  -43.8f }, // A -> survives to f1[0]
+            { 0x19df60e3u, 0x3a67dc7du, 0,  -89.8f, -268.0f }, // B -> dies (must NOT streak!)
+            { 0x19df60e3u, 0x3a67dc7du, 0,   56.9f, -291.5f }, // C -> survives to f1[1]
+            { 0x19df60e3u, 0x3a67dc7du, 0,  -61.8f, -205.2f }, // D -> survives to f1[2]
+            { 0x19df60e3u, 0x3a67dc7du, 0,  -23.3f,   -0.5f }, // E -> survives to f1[3]
+        };
+        const std::vector<FDot> f1 = {
+            { 0x19df60e3u, 0x3a67dc7du, 2,  129.8f,  -49.7f }, // A' (6.1px)
+            { 0x19df60e3u, 0x3a67dc7du, 1,   49.7f, -294.9f }, // C' (8.0px)
+            { 0x19df60e3u, 0x3a67dc7du, 1,  -55.9f, -207.9f }, // D' (6.5px)
+            { 0x19df60e3u, 0x3a67dc7du, 1,  -29.1f,   -3.4f }, // E' (6.5px)
+        };
+        constexpr float kDupMaxDistSq = 48.0f * 48.0f;
+        uint64_t usedF1 = 0;
+        int matchedIdx[5] = { -1, -1, -1, -1, -1 };
+        float maxDist = 0.0f;
+        for (size_t i = 0; i < f0.size(); ++i) {
+            int bestJ = -1;
+            float bestScore = 1e30f;
+            float bestD2 = 0.0f;
+            for (size_t j = 0; j < f1.size(); ++j) {
+                if ((usedF1 >> j) & 1ULL) continue;
+                if (f1[j].lh == f0[i].lh && f1[j].sh == f0[i].sh) {
+                    float dx = f1[j].tx - f0[i].tx, dy = f1[j].ty - f0[i].ty;
+                    float d2 = dx * dx + dy * dy;
+                    if (d2 <= kDupMaxDistSq) {
+                        float score = d2 + ((f1[j].fn == f0[i].fn) ? 0.0f : 4.0f);
+                        if (score < bestScore) { bestScore = score; bestD2 = d2; bestJ = static_cast<int>(j); }
+                    }
+                }
+            }
+            if (bestJ >= 0) {
+                usedF1 |= (1ULL << bestJ);
+                matchedIdx[i] = bestJ;
+                float d = std::sqrt(bestD2);
+                if (d > maxDist) maxDist = d;
+            }
+        }
+        CHECK(matchedIdx[0] == 0);  // A -> A'
+        CHECK(matchedIdx[1] == -1); // B dies cleanly (ZERO streak!)
+        CHECK(matchedIdx[2] == 1);  // C -> C'
+        CHECK(matchedIdx[3] == 2);  // D -> D'
+        CHECK(matchedIdx[4] == 3);  // E -> E'
+        CHECK(maxDist < 9.0f);
+        std::printf("[PASS] 9. Firefly swarm duplicate-key spatial matcher verified (4/4 exact, dying dot unmatched, maxDist=%.2fpx, 0 streaks)\n", maxDist);
+    }
+
+    std::printf("ALL 9 CLIENT v2.4.1 RED-TEAM, RTSS PACER, ANTI-HITCH SWARM & FIREFLY TESTS PASSED!\n");
     return 0;
 }

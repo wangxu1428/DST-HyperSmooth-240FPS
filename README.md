@@ -1,7 +1,13 @@
-# DST HyperSmooth 240FPS & FastLoad (v2.4.0 · Zero-Contention RTSS Frame Pacer + mimalloc + Dual-Side 60Hz Ready)
+# DST HyperSmooth 240FPS & FastLoad (v2.4.1 · RTSS Frame Pacer + Boss Anti-Hitch + Any-Key Binding + Dual-Side 60Hz Ready)
 
-> **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼补帧、零争抢 RTSS 级 1% Low 稳帧引擎、反 GC 掉帧、mimalloc 无锁 Lua 堆与可选双端 60Hz 逻辑刻伴侣**  
-> **Client-Only 240FPS 2D Skeletal Tweening, Zero-Contention RTSS Frame Pacer (1% Low Opt), Anti-Stutter GC, mimalloc Lua Heap & Auto-Negotiated 60Hz SimTick for Don't Starve Together (64-bit)**
+> **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼与位移补帧、零争抢 RTSS 级 1% Low 稳帧引擎、Boss 并发防卡顿、真·全按键自由录制绑定与可选双端 60Hz 逻辑刻伴侣**  
+> **Client-Only 240FPS Skeletal & World-Pos Tweening, Zero-Contention RTSS Frame Pacer, Boss-Swarm Anti-Hitch, Interactive Any-Key Binding UI & Auto-Negotiated 60Hz SimTick for Don't Starve Together (64-bit)**
+
+### v2.4.1 社区反馈专项修复 & 真·全按键自由录制 / Community Hotfix & True Any-Key Binding
+- **彻底修复萤火虫光效连成直线（及全游戏多粒子同名骨骼动画防拉线）**：针对 `fireflies.zip`、`swarm_loop` 等同帧包含多个同名 `(layer, symbol)` 光点/火花/孢子的骨骼动画，升级为 **最近邻空间距离匹配 + `usedF1` 互斥占位 + `<=48px` 粒子防拉线熔断**（唯一键角色/Boss 骨骼仍保持 $O(1)$ 直连），彻底杜绝消失光点被跨群拉成直线！
+- **修复上下洞穴保活跨 `SimReset` 失效问题 + 角色资产同步保活**：Hook `GLOBAL.SimReset` 将保活列表随 `instanceparameters` 跨 Lua VM 重建持久化传递，并在 `BACKEND -> BACKEND` 联机切洞穴期间同时保活 `forest`/`cave` 与 `Settings.loaded_characters`（退回主菜单全部干净卸载释放，零双重卸载）。注：首次下洞仍需加载洞穴资源，且克雷切层必经 `TheSim:Reset()` 重建脚本与分片重连，复返耗时可显著缩短但非 0 秒瞬切。
+- **真·全按键自由录制绑定 UI（`keybind.lua` · 对标《热键：李皓奇》）**：启用模组并点击「应用」后，Mod 配置页与 **`ESC -> 设置 -> 控制` 页面最下方** 均升级为点击录制按钮，直接按下**键盘任意键**或点击**鼠标中键 / 侧键 4 / 侧键 5** 即刻绑定（点 `×` 一键解绑），支持绑定「循环切帧」「开关 240 帧骨骼补帧」「开关帧率 HUD」三项（默认全禁用零冲突）。
+- **双显卡笔记本排查提示**：若笔记本游戏内帧数停在 `150 FPS` 左右，请在显卡控制面板/电脑管家中切换为 **独显直连**（绕开核显 Optimus 帧拷贝瓶颈）即可跑满 `240+ FPS`。
 
 ### v2.4.0 1% Low 稳帧革命 · 关延迟补偿 240Hz 丝滑 · Boss 并发防卡顿 & 双端 60Hz / Zero-Contention Pacing, Lag-Comp-OFF 240Hz Interp, Boss-Swarm Anti-Hitch & Dual-Side 60Hz
 - **【A1】零争抢 RTSS 级帧时间控制器 (`FrameLimiter::Wait` 底层接管 · 1% Low 专项优化)**：
@@ -69,7 +75,7 @@
 - **240Hz 零冗余 CPU & GC 减负**：
   - `DistanceFade`：将树冠/洞穴柱体透明淡出改为零分配标量点积，消除 240Hz 下每秒数千次 `Vector3` 临时表分配。
   - `Input:OnUpdate`：静止帧无损缓存鼠标实体拾取结果（鼠标移动/镜头移动/界面切换 0ms 零延迟刷新；静止时跳过 ~75% 冗余 C++ 实体扫描与表分配；100% 兼容 ShowMe / Insight）。
-- **联机上下洞穴零卸载秒切**：纯客户端保留地面 (`forest`) 与洞穴 (`cave`) 原版资产常驻内存（自动旁路独行长路单人模式与本地主机），联机反复上下洞穴零重复解压；退回主界面自动安全释放（建议 >= 8GB 内存）。
+- **联机上下洞穴免重加载加速**：跨 `SimReset` 保活地面 (`forest`)、洞穴 (`cave`) 与角色资产常驻内存（自动旁路独行长路单人模式与本地主机），联机往返地面与洞穴跳过重复解压与重载；退回主界面自动安全释放（建议 >= 8GB 内存）。
 - **模组与网络等待全清空**：缓存未启用模组 `modinfo` 免重复读盘、跳过 Steam 热门模组榜请求 (`QueryTopMods`)、跳过主界面 MOTD 远程海报阻塞等待（不影响登录与联机）。
 - **轻量右上角 FPS / 1% Low / P99 HUD & 原生画面设置直控**：直接接入 `ESC -> 设置 -> 画面 -> 刷新率` 及同页骨骼补帧/HUD 开关，通过 `dinput8.dll` 原生 Lua VM 桥接 0ms 即时联动（并可选自定义热键与多路径文件桥接兜底）。
 
@@ -114,13 +120,13 @@
 - **推荐方式（零冲突 · 原生习惯）**：主界面或游戏局内直接按 **`ESC` -> 设置 -> 画面**：
   - 直接调整官方 **`刷新率`** 选项即可 0ms 实时切换 `60 / 120 / 144 / 165 / 240 / 360 / 无限制`（窗口化与全屏均已解锁可用！）。
   - 同页右列下方可直接开关 **`240帧骨骼补帧`** 与 **`帧率显示 HUD`**，点原生 **「应用」** 即持久生效。
-- **可选自定义热键**（默认全部「禁用」，绝不与数十个 Mod 抢键）：
+- **真·全按键自由录制热键**（默认全部禁用零冲突；启用并应用后可在 Mod 配置页或 **`ESC -> 设置 -> 控制` 页面底部** 直接点击并按下任意键盘按键或鼠标中键/侧键 4/侧键 5 实时改绑）：
 
-| 配置项 | 功能说明 | 可自定义选项 |
+| 配置项 | 功能说明 | 可自由绑定范围 |
 | :---: | :--- | :--- |
-| **组合键前缀** | 启用热键时要求按住的修饰键 | `Alt+ (默认防冲突) / Ctrl+ / Shift+ / 无` |
-| **切帧热键** | 局内循环切换 `60 -> 120 -> 144 -> 165 -> 240 -> 360 -> 无限制` | `禁用(默认) / F1~F12 / 小键盘 0~9 / 功能键 / A~Z` |
-| **骨骼补帧热键** | 局内实时开关 **真 240 帧骨骼动画补帧**（同屏 A/B 盲测） | `禁用(默认) / F1~F12 / 小键盘 0~9 / 功能键 / A~Z` |
+| **循环切换帧率热键** | 局内循环切换 `60 -> 120 -> 144 -> 165 -> 240 -> 360 -> 无限制` | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
+| **开关骨骼补帧热键** | 局内实时开关 **真 240 帧骨骼与位移补帧**（同屏 A/B 盲测） | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
+| **开关帧率 HUD 热键** | 局内一键显示/隐藏右上角实时 FPS / 1% Low HUD | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
 
 ---
 

@@ -54,7 +54,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.4.0", "Expected modinfo version 2.4.0, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.4.1", "Expected modinfo version 2.4.1, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do
@@ -63,13 +63,16 @@ AddSimPostInit(function()
     end
     assert(cfg_map.show_1pct_low ~= nil and cfg_map.show_1pct_low.default == true, "Missing show_1pct_low")
     assert(cfg_map.auto_60hz_sim ~= nil and cfg_map.auto_60hz_sim.default == true, "Missing auto_60hz_sim")
-    assert(#cfg_map.hotkey_cycle.options == 56, "Expected 56 hotkey choices, got " .. tostring(#cfg_map.hotkey_cycle.options))
-    -- Verify EVERY KEY_* data name exists in Klei GLOBAL constants!
-    for i = 2, #cfg_map.hotkey_cycle.options do
-        local kname = cfg_map.hotkey_cycle.options[i].data
-        assert(G[kname] ~= nil, "Invalid Klei KEY constant in modinfo.lua: " .. tostring(kname))
+    assert(cfg_map.hotkey_cycle ~= nil and cfg_map.hotkey_cycle.default == "KEY_DISABLED", "Missing hotkey_cycle")
+    assert(cfg_map.hotkey_skeletal ~= nil and cfg_map.hotkey_skeletal.default == "KEY_DISABLED", "Missing hotkey_skeletal")
+    assert(cfg_map.hotkey_hud ~= nil and cfg_map.hotkey_hud.default == "KEY_DISABLED", "Missing hotkey_hud")
+    assert(bare_env.keys ~= nil and #bare_env.keys >= 90, "Expected >=90 bindable keys, got " .. tostring(bare_env.keys and #bare_env.keys))
+    local extra_ok = { KEY_DISABLED = true, KEY_QUOTE = true, KEY_BACKQUOTE = true, ["\238\132\130"] = true, ["\238\132\131"] = true, ["\238\132\132"] = true }
+    for i = 1, #bare_env.keys do
+        local kname = bare_env.keys[i].data
+        assert(extra_ok[kname] or G[kname] ~= nil, "Invalid Klei KEY constant in modinfo.lua: " .. tostring(kname))
     end
-    print("[CLIENT_V24_TEST] 1. Bare-sandbox modinfo.lua PASS (v2.4.0, 15 opts, 56 valid Klei KEY_* constants)")
+    print("[CLIENT_V24_TEST] 1. Bare-sandbox modinfo.lua PASS (v2.4.1, " .. tostring(#bare_env.configuration_options) .. " opts, " .. tostring(#bare_env.keys) .. " valid Klei KEY/Mouse bindings)")
 
     -- =========================================================================
     -- TEST 2: modmain.lua Full Behavioral Suite (OptionsScreen + 1% Low HUD + Route B)
@@ -85,11 +88,11 @@ AddSimPostInit(function()
 
         local fakeG = {
             pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
-            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs,
+            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
             math = G.math, string = G.string, table = G.table,
             tonumber = G.tonumber, tostring = G.tostring, print = G.print,
             NUMBERFONT = "numberfont", ANCHOR_RIGHT = 2, ANCHOR_TOP = 1,
-            KEY_ALT = 308, KEY_LALT = 308, KEY_RALT = 307,
+            KEY_ALT = 308, KEY_LALT = 308, KEY_RALT = 307, KEY_F8 = 289, KEY_F9 = 290,
             CONTROL_MOVE_UP = 5, CONTROL_MOVE_DOWN = 6, CONTROL_MOVE_LEFT = 7, CONTROL_MOVE_RIGHT = 8,
             CONTROL_CONTROLLER_ATTACK = 39,
             TUNING = { CONTROLLER_DEADZONE_RADIUS = 0.3 },
@@ -391,6 +394,183 @@ AddSimPostInit(function()
     RunModMainScenario({ target_fps = 240, show_fps_hud = true, show_1pct_low = true, auto_60hz_sim = false }, false, "RPC")
     print("[CLIENT_V24_TEST] 5. User opt-out (auto_60hz_sim=false) PASS (ignores 60Hz handshake, stays 30Hz)")
 
+    -- =========================================================================
+    -- TEST 6: Cross-SimReset Cave <-> Surface Zero-Reload & Zero Double-Unload
+    -- =========================================================================
+    do
+        local load_log, unload_log = {}, {}
+        local sim_methods = {
+            GetTick = function() return 10 end,
+            GetStaticTick = function() return 10 end,
+            GetTickTime = function() return 1/30 end,
+            GetPersistentString = function(_, _, cb) cb(false, "") end,
+            SetPersistentString = function() end,
+            GetPosition = function() return 0, 0 end,
+            LoadPrefabs = function(_, list) load_log[#load_log + 1] = list end,
+            UnloadPrefabs = function(_, list) unload_log[#unload_log + 1] = list end,
+        }
+        local sim_obj = setmetatable({}, { __index = sim_methods })
+        local carried_params = nil
+        local function BootVmWithSettings(settings_tbl)
+            local fakeG2 = {
+                pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
+                getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+                math = G.math, string = G.string, table = G.table,
+                tonumber = G.tonumber, tostring = G.tostring, print = G.print,
+                Settings = settings_tbl,
+                TheNet = { GetIsServer = function() return false end },
+                TheSim = sim_obj,
+                TheInput = { OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end, AddMouseButtonHandler = function() end },
+                TheFrontEnd = { GetActiveScreen = function() return { name = "HUD" } end },
+                SimReset = function(ip) carried_params = ip end,
+                require = function() return {} end,
+            }
+            -- Restore fresh metatable __index before each simulated VM boot
+            local fresh_idx = {}
+            for k, v in pairs(sim_methods) do fresh_idx[k] = v end
+            setmetatable(sim_obj, { __index = fresh_idx })
+            local env2 = {
+                GLOBAL = fakeG2,
+                GetModConfigData = function(k)
+                    if k == "target_fps" then return 240 end
+                    return k == "keep_shard_assets" and true or false
+                end,
+                AddClassPostConstruct = function() end,
+                AddComponentPostInit = function() end,
+                AddPrefabPostInit = function() end,
+                AddSimPostInit = function() end,
+                AddClientModRPCHandler = function() end,
+            }
+            local fn_m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+            setfenv(fn_m, env2)
+            fn_m()
+            return fakeG2, env2
+        end
+
+        -- 1) Enter Forest from Main Menu
+        local s1 = { current_asset_set = "BACKEND", last_asset_set = "FRONTEND", loaded_characters = { "wilson", "wendy" } }
+        local g1 = BootVmWithSettings(s1)
+        sim_obj:LoadPrefabs({ "forest" })
+        assert(#load_log == 1 and load_log[1][1] == "forest", "1st forest load must execute")
+
+        -- 2) Migrate Forest -> Cave (SimReset must carry _hakimi_kept_worlds!)
+        g1.SimReset({})
+        assert(carried_params ~= nil and carried_params._hakimi_kept_worlds.forest == true, "SimReset failed to persist kept worlds!")
+        local s2 = {
+            current_asset_set = "BACKEND", last_asset_set = "BACKEND",
+            loaded_characters = { "wilson", "wendy" },
+            _hakimi_kept_worlds = carried_params._hakimi_kept_worlds,
+            _hakimi_kept_chars  = carried_params._hakimi_kept_chars,
+        }
+        local g2 = BootVmWithSettings(s2)
+        sim_obj:UnloadPrefabs(s2.loaded_characters) -- gamelogic L196: MUST skip!
+        sim_obj:LoadPrefabs({ "cave" })             -- gamelogic L281: 1st cave load executes
+        sim_obj:UnloadPrefabs({ "forest" })         -- gamelogic L284: MUST skip!
+        sim_obj:LoadPrefabs({ "wilson", "wendy" })  -- gamelogic L426: MUST skip!
+        assert(#load_log == 2 and load_log[2][1] == "cave", "Expected only 1st cave load, got " .. tostring(#load_log))
+        assert(#unload_log == 0, "Expected 0 unloads during BACKEND->BACKEND, got " .. tostring(#unload_log))
+
+        -- 3) Return Cave -> Forest (2nd+ trip: ZERO loads, ZERO unloads!)
+        g2.SimReset({})
+        local s3 = {
+            current_asset_set = "BACKEND", last_asset_set = "BACKEND",
+            loaded_characters = { "wilson", "wendy" },
+            _hakimi_kept_worlds = carried_params._hakimi_kept_worlds,
+            _hakimi_kept_chars  = carried_params._hakimi_kept_chars,
+        }
+        local g3 = BootVmWithSettings(s3)
+        sim_obj:UnloadPrefabs(s3.loaded_characters)
+        sim_obj:LoadPrefabs({ "forest" })           -- MUST SKIP (already hot!)
+        sim_obj:UnloadPrefabs({ "cave" })
+        sim_obj:LoadPrefabs({ "wilson", "wendy" })  -- MUST SKIP (already hot!)
+        assert(#load_log == 2, "2nd forest return should trigger ZERO LoadPrefabs, got " .. tostring(#load_log))
+        assert(#unload_log == 0, "2nd forest return should trigger ZERO UnloadPrefabs")
+
+        -- 4) Exit to Main Menu (FRONTEND): MUST unload forest, cave, and characters with ZERO double-unload!
+        g3.SimReset({})
+        local s4 = {
+            current_asset_set = "FRONTEND", last_asset_set = "BACKEND",
+            loaded_characters = { "wilson", "wendy" },
+            _hakimi_kept_worlds = carried_params._hakimi_kept_worlds,
+            _hakimi_kept_chars  = carried_params._hakimi_kept_chars,
+        }
+        BootVmWithSettings(s4)
+        sim_obj:UnloadPrefabs(s4.loaded_characters)
+        sim_obj:UnloadPrefabs({ "forest" })
+        local unloaded_counts = {}
+        for _, batch in ipairs(unload_log) do
+            for _, name in ipairs(batch) do
+                unloaded_counts[name] = (unloaded_counts[name] or 0) + 1
+            end
+        end
+        assert(unloaded_counts.forest == 1 and unloaded_counts.cave == 1, "Both worlds must unload exactly once!")
+        assert(unloaded_counts.wilson == 1 and unloaded_counts.wendy == 1, "Both chars must unload exactly once!")
+        print("[CLIENT_V24_TEST] 6. Cross-SimReset Cave<->Surface zero-reload & clean FRONTEND unload PASS")
+    end
+
+    -- =========================================================================
+    -- TEST 7: Live Any-Key & Mouse-Button Binding (keybind.lua + HS_ApplyKeyBind)
+    -- =========================================================================
+    do
+        local key_handlers, mouse_handlers = {}, {}
+        local native_fps = 240
+        local fakeG3 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
+            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            math = G.math, string = G.string, table = G.table,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print,
+            HyperSmooth_SetFps = function(v) native_fps = v; return true end,
+            HyperSmooth_SetSkeletal = function() return true end,
+            ThePlayer = { HUD = {} },
+            TheFrontEnd = { GetActiveScreen = function() return { name = "HUD" } end },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+            },
+            TheInput = {
+                OnUpdate = function() end,
+                IsKeyDown = function() return false end,
+                AddKeyUpHandler = function(_, k, fn)
+                    key_handlers[k] = fn
+                    return { Remove = function() key_handlers[k] = nil end }
+                end,
+                AddMouseButtonHandler = function(_, fn)
+                    mouse_handlers[#mouse_handlers + 1] = fn
+                    local idx = #mouse_handlers
+                    return { Remove = function() mouse_handlers[idx] = nil end }
+                end,
+            },
+            require = function() return {} end,
+        }
+        local env3 = {
+            GLOBAL = fakeG3,
+            GetModConfigData = function(k) return k == "target_fps" and 240 or false end,
+            AddClassPostConstruct = function() end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end,
+            AddSimPostInit = function() end,
+            AddClientModRPCHandler = function() end,
+        }
+        local fn_m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fn_m, env3)
+        fn_m()
+        assert(type(env3.HS_ApplyKeyBind) == "function", "HS_ApplyKeyBind missing!")
+        -- Bind cycle FPS to Keyboard KEY_F8 (289), fire -> 240 -> 360!
+        env3.HS_ApplyKeyBind("hotkey_cycle", 289)
+        assert(type(key_handlers[289]) == "function", "Keyboard key handler not registered!")
+        key_handlers[289]()
+        assert(native_fps == 360, "Expected cycle 240->360 on KEY_F8, got " .. tostring(native_fps))
+        -- Live rebind to Mouse Button 4 (1005): old KEY_F8 handler MUST be removed, mouse 1005 cycles 360->0!
+        env3.HS_ApplyKeyBind("hotkey_cycle", 1005)
+        assert(key_handlers[289] == nil, "Old KEY_F8 handler was not removed on rebind!")
+        mouse_handlers[1](1005, true)
+        assert(native_fps == 0, "Expected cycle 360->0 on Mouse Button 4 (1005), got " .. tostring(native_fps))
+        -- Verify keybind.lua compiles cleanly in Klei Lua 5.1 VM!
+        local fn_kb, err_kb = G.kleiloadlua("../mods/client_v24_lua_test/target_keybind.lua")
+        assert(fn_kb ~= nil, "keybind.lua syntax/load error: " .. tostring(err_kb))
+        print("[CLIENT_V24_TEST] 7. Live Any-Key & Mouse-Button rebinding + keybind.lua Lua 5.1 syntax PASS")
+    end
+
     print("[CLIENT_V24_TEST] ALL_PASS")
     G.c_shutdown(false)
 end)
@@ -404,6 +584,7 @@ def main():
         f.write(HARNESS_MODMAIN)
     shutil.copy2(os.path.join(CLIENT_MOD, "modinfo.lua"), os.path.join(HARNESS_DIR, "target_modinfo.lua"))
     shutil.copy2(os.path.join(CLIENT_MOD, "modmain.lua"), os.path.join(HARNESS_DIR, "target_modmain.lua"))
+    shutil.copy2(os.path.join(CLIENT_MOD, "keybind.lua"), os.path.join(HARNESS_DIR, "target_keybind.lua"))
 
     # Make sure iphlpapi.dll is absent so pure vanilla Klei Lua 5.1 runs cleanly
     dll_path = os.path.join(BIN64, "iphlpapi.dll")
@@ -420,9 +601,13 @@ def main():
         cwd=BIN64, capture_output=True, text=True, timeout=60
     )
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    for line in out.splitlines():
-        if "[CLIENT_V24_TEST]" in line or "LUA ERROR" in line or "MOD ERROR" in line:
+    out_lines = out.splitlines()
+    for idx, line in enumerate(out_lines):
+        if "[CLIENT_V24_TEST]" in line or "LUA ERROR" in line or "MOD ERROR" in line or "ERROR:" in line or "assertion failed" in line.lower():
             print(line)
+            if "LUA ERROR" in line:
+                for extra in out_lines[idx+1:idx+12]:
+                    print("  ", extra)
 
     shutil.rmtree(HARNESS_DIR, ignore_errors=True)
     assert proc.returncode == 0 and "[CLIENT_V24_TEST] ALL_PASS" in out, f"Lua test failed (rc={proc.returncode})"

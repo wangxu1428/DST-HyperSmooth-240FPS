@@ -1603,17 +1603,25 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const bool fastOnly = (tls.frameShedLevel >= 1 && channel != AnimChannel::UI);
     const bool useHash = (n0 > 4 && n1 <= kMaxAnimElements);
 
-    // L1-resident O(N) stack hash table for duplicate-safe exact Pass-1 & Pass-2 matching
+    // L1-resident O(N) stack hash table + duplicate-bucket spatial nearest-neighbor guard.
+    // Unique bones (99% of characters/Bosses) match in O(1); multi-instance duplicate-key
+    // elements (e.g. fireflies, spores, sparks, petals) match by nearest spatial distance
+    // (<=48px) with exclusive usedF1 bitset so dying/spawning particles NEVER streak in a line!
     constexpr uint32_t kHashSize = 128;
     constexpr uint32_t kHashMask = kHashSize - 1;
+    constexpr float kDupMaxDistSq = 48.0f * 48.0f;
     int16_t headLS[kHashSize];
     int16_t nextLS[kMaxAnimElements];
-    int16_t f0Prev[kHashSize];
-    int16_t f0Chain[kMaxAnimElements];
+    uint8_t f0BucketCnt[kHashSize];
+    uint64_t usedF1[4] = { 0, 0, 0, 0 };
 
     if (useHash) {
         memset(headLS, -1, sizeof(headLS));
-        memset(f0Prev, -1, sizeof(f0Prev));
+        memset(f0BucketCnt, 0, sizeof(f0BucketCnt));
+        for (uint32_t k = 0; k < n0; ++k) {
+            const uint32_t h = ((f0.elements[k].layer_hash * 2654435761u) ^ f0.elements[k].symbol_hash) & kHashMask;
+            if (f0BucketCnt[h] < 255) ++f0BucketCnt[h];
+        }
         // Reverse-insert f1 so bucket chains traverse in strict ascending index order (0, 1, 2, ...)
         for (int32_t j = static_cast<int32_t>(n1) - 1; j >= 0; --j) {
             const uint32_t h = ((f1.elements[j].layer_hash * 2654435761u) ^ f1.elements[j].symbol_hash) & kHashMask;
@@ -1621,6 +1629,13 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
             headLS[h] = static_cast<int16_t>(j);
         }
     }
+
+    auto isUsedF1 = [&](uint32_t j) -> bool {
+        return j < kMaxAnimElements && ((usedF1[j >> 6] >> (j & 63)) & 1ULL) != 0;
+    };
+    auto markUsedF1 = [&](uint32_t j) {
+        if (j < kMaxAnimElements) usedF1[j >> 6] |= (1ULL << (j & 63));
+    };
 
     uint32_t tweenedCount = 0;
     uint32_t pass2Count = 0;
@@ -1633,59 +1648,125 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
         if (useHash) {
             const uint32_t h = ((lhash * 2654435761u) ^ shash) & kHashMask;
-            uint32_t occExact = 0, occLS = 0;
-            for (int16_t k = f0Prev[h]; k >= 0; k = f0Chain[k]) {
-                const AnimElement& ek = f0.elements[k];
-                if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
-                    ++occLS;
-                    if (ek.frame_num == fnum) ++occExact;
+            bool dupKey = false;
+            if (f0BucketCnt[h] > 1) {
+                uint32_t exactF0 = 0;
+                for (uint32_t k = 0; k < n0; ++k) {
+                    if (f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) {
+                        if (++exactF0 > 1) { dupKey = true; break; }
+                    }
                 }
             }
-            f0Chain[i] = f0Prev[h];
-            f0Prev[h] = static_cast<int16_t>(i);
 
-            uint32_t seenExact = 0, seenLS = 0;
-            const AnimElement* pass2Cand = nullptr;
+            int32_t firstJ = -1;
+            uint32_t cnt1 = 0;
             for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
                 const AnimElement& e1 = f1.elements[j];
                 if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                    if (!fastOnly && seenLS == occLS) pass2Cand = &e1;
-                    ++seenLS;
+                    if (firstJ < 0) firstJ = j;
+                    if (++cnt1 > 1) { dupKey = true; break; }
+                }
+            }
+
+            if (firstJ >= 0) {
+                if (!dupKey) {
+                    // Fast O(1) unique 1-to-1 bone match (supports full 420px Boss sweeps)
+                    const AnimElement& e1 = f1.elements[firstJ];
                     if (e1.frame_num == fnum) {
-                        if (seenExact == occExact) { match = &e1; break; }
-                        ++seenExact;
+                        match = &e1;
+                    } else if (!fastOnly) {
+                        match = &e1;
+                        isPass2 = true;
+                    }
+                } else {
+                    // Multi-instance duplicate-key bucket (fireflies/sparks/spores/petals):
+                    // Nearest-neighbor spatial match with exclusive claim & <=48px anti-streak guard
+                    int32_t bestJ = -1;
+                    float bestScore = 1e30f;
+                    for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
+                        if (isUsedF1(static_cast<uint32_t>(j))) continue;
+                        const AnimElement& e1 = f1.elements[j];
+                        if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
+                            const float dx = e1.m[4] - e0.m[4];
+                            const float dy = e1.m[5] - e0.m[5];
+                            const float d2 = dx * dx + dy * dy;
+                            if (d2 <= kDupMaxDistSq) {
+                                const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);
+                                if (score < bestScore) {
+                                    bestScore = score;
+                                    bestJ = j;
+                                }
+                            }
+                        }
+                    }
+                    if (bestJ >= 0) {
+                        markUsedF1(static_cast<uint32_t>(bestJ));
+                        const AnimElement& e1 = f1.elements[bestJ];
+                        if (e1.frame_num == fnum) {
+                            match = &e1;
+                        } else if (!fastOnly) {
+                            match = &e1;
+                            isPass2 = true;
+                        }
                     }
                 }
             }
-            if (!match && pass2Cand) {
-                match = pass2Cand;
-                isPass2 = true;
-            }
         } else {
-            uint32_t occExact = 0, occLS = 0;
-            for (uint32_t k = 0; k < i; ++k) {
-                const AnimElement& ek = f0.elements[k];
-                if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
-                    ++occLS;
-                    if (ek.frame_num == fnum) ++occExact;
+            bool dupKey = false;
+            for (uint32_t k = 0; k < n0; ++k) {
+                if (k != i && f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) {
+                    dupKey = true;
+                    break;
                 }
             }
-            uint32_t seenExact = 0, seenLS = 0;
-            const AnimElement* pass2Cand = nullptr;
+            int32_t firstJ = -1;
+            uint32_t cnt1 = 0;
             for (uint32_t j = 0; j < n1; ++j) {
                 const AnimElement& e1 = f1.elements[j];
                 if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                    if (!fastOnly && seenLS == occLS) pass2Cand = &e1;
-                    ++seenLS;
-                    if (e1.frame_num == fnum) {
-                        if (seenExact == occExact) { match = &e1; break; }
-                        ++seenExact;
-                    }
+                    if (firstJ < 0) firstJ = static_cast<int32_t>(j);
+                    if (++cnt1 > 1) { dupKey = true; break; }
                 }
             }
-            if (!match && pass2Cand) {
-                match = pass2Cand;
-                isPass2 = true;
+            if (firstJ >= 0) {
+                if (!dupKey) {
+                    const AnimElement& e1 = f1.elements[firstJ];
+                    if (e1.frame_num == fnum) {
+                        match = &e1;
+                    } else if (!fastOnly) {
+                        match = &e1;
+                        isPass2 = true;
+                    }
+                } else {
+                    int32_t bestJ = -1;
+                    float bestScore = 1e30f;
+                    for (uint32_t j = 0; j < n1; ++j) {
+                        if (isUsedF1(j)) continue;
+                        const AnimElement& e1 = f1.elements[j];
+                        if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
+                            const float dx = e1.m[4] - e0.m[4];
+                            const float dy = e1.m[5] - e0.m[5];
+                            const float d2 = dx * dx + dy * dy;
+                            if (d2 <= kDupMaxDistSq) {
+                                const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);
+                                if (score < bestScore) {
+                                    bestScore = score;
+                                    bestJ = static_cast<int32_t>(j);
+                                }
+                            }
+                        }
+                    }
+                    if (bestJ >= 0) {
+                        markUsedF1(static_cast<uint32_t>(bestJ));
+                        const AnimElement& e1 = f1.elements[bestJ];
+                        if (e1.frame_num == fnum) {
+                            match = &e1;
+                        } else if (!fastOnly) {
+                            match = &e1;
+                            isPass2 = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -3118,7 +3199,7 @@ int LuaHyperSmoothGetSimTickRate(void* L) {
 
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.4.0");
+    g_luaPushString(L, "DST-HyperSmooth/2.4.1");
     return 1;
 }
 
@@ -3422,7 +3503,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) fclose(f);
     ReleaseSRWLockExclusive(&g_logLock);
 
-    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.4.0 (Zero-Contention RTSS Frame Pacer + mimalloc + 60Hz Ready) loaded.");
+    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.4.1 (RTSS Pacer + mimalloc + Boss Anti-Hitch + Firefly Spatial Matcher) loaded.");
 
     // Initialize QPC frequency scale BEFORE installing any timing/pacer/GC/anim hooks
     {
