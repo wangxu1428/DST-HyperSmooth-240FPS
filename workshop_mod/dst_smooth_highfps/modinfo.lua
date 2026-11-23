@@ -26,7 +26,7 @@ description = [[
 - 局内控制台命令：c_hsmenu() 开关实时微调面板、c_hslatency() 查看延迟/粒子/光源状态、c_hsvisual() 查看画质与显存、c_hsopt("mip", true) 单项开关。
 ]]
 author = "Hakimi Tech Lab"
-version = "2.6.0"
+version = "2.6.0.1"
 
 api_version = 10
 dst_compatible = true

@@ -56,7 +56,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.6.0", "Expected modinfo version 2.6.0, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.6.0.1", "Expected modinfo version 2.6.0.1, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do

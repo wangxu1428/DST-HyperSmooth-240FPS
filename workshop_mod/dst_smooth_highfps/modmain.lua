@@ -254,7 +254,8 @@ local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
-local EXPECTED_DLL_VERSION = (modinfo and modinfo.version) or "2.6.0"
+-- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.6.0.1)
+local EXPECTED_DLL_VERSION = "2.6.0"
 
 local function ParseSemVer(str)
     if type(str) ~= "string" then return nil, nil end
