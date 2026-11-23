@@ -17,10 +17,14 @@
 //     in conflicting orders.
 // =============================================================================
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #include <atomic>
 #include <cstddef>
@@ -32,12 +36,28 @@
 
 namespace fast_astar {
 
+struct RwLock {
+#ifdef _WIN32
+    SRWLOCK lk = SRWLOCK_INIT;
+    inline void LockExclusive() noexcept { AcquireSRWLockExclusive(&lk); }
+    inline void UnlockExclusive() noexcept { ReleaseSRWLockExclusive(&lk); }
+    inline void LockShared() noexcept { AcquireSRWLockShared(&lk); }
+    inline void UnlockShared() noexcept { ReleaseSRWLockShared(&lk); }
+#else
+    pthread_rwlock_t lk = PTHREAD_RWLOCK_INITIALIZER;
+    inline void LockExclusive() noexcept { pthread_rwlock_wrlock(&lk); }
+    inline void UnlockExclusive() noexcept { pthread_rwlock_unlock(&lk); }
+    inline void LockShared() noexcept { pthread_rwlock_rdlock(&lk); }
+    inline void UnlockShared() noexcept { pthread_rwlock_unlock(&lk); }
+#endif
+};
+
 template <size_t kMaxWarmPool = 64u>
 class StateManager {
 public:
     struct StateSlot {
         SearchState           state;
-        SRWLOCK               opLock = SRWLOCK_INIT;
+        RwLock                opLock;
         std::atomic<uint32_t> refs{1};
     };
 
@@ -47,7 +67,7 @@ public:
         StateHandle(StateManager* mgr, StateSlot* slot, uint64_t gen, bool lockOp) noexcept
             : mgr_(mgr), slot_(slot), gen_(gen), locked_(false) {
             if (slot_ && lockOp) {
-                AcquireSRWLockExclusive(&slot_->opLock);
+                slot_->opLock.LockExclusive();
                 locked_ = true;
             }
         }
@@ -79,7 +99,7 @@ public:
         void Release() noexcept {
             if (slot_) {
                 if (locked_) {
-                    ReleaseSRWLockExclusive(&slot_->opLock);
+                    slot_->opLock.UnlockExclusive();
                     locked_ = false;
                 }
                 if (mgr_) {
@@ -106,7 +126,7 @@ public:
 
     StateManager() = default;
     ~StateManager() {
-        AcquireSRWLockExclusive(&mapLock_);
+        mapLock_.LockExclusive();
         for (auto& e : map_) {
             if (e.key && reinterpret_cast<uintptr_t>(e.key) != kTombstoneVal && e.slot) {
                 delete e.slot;
@@ -117,14 +137,14 @@ public:
         map_.clear();
         count_ = 0;
         used_ = 0;
-        ReleaseSRWLockExclusive(&mapLock_);
+        mapLock_.UnlockExclusive();
 
-        AcquireSRWLockExclusive(&poolLock_);
+        poolLock_.LockExclusive();
         for (StateSlot* s : pool_) {
             delete s;
         }
         pool_.clear();
-        ReleaseSRWLockExclusive(&poolLock_);
+        poolLock_.UnlockExclusive();
     }
 
     StateHandle AcquireAndBind(void* key) {
@@ -134,7 +154,7 @@ public:
         StateSlot* chosen = nullptr;
         uint64_t chosenGen = 0;
 
-        AcquireSRWLockExclusive(&mapLock_);
+        mapLock_.LockExclusive();
         EnsureMapCapLocked();
         const size_t mask = map_.size() - 1;
         size_t idx = HashPtr(key) & mask;
@@ -171,7 +191,7 @@ public:
             }
             idx = (idx + 1) & mask;
         }
-        ReleaseSRWLockExclusive(&mapLock_);
+        mapLock_.UnlockExclusive();
 
         return StateHandle(this, chosen, chosenGen, true);
     }
@@ -181,7 +201,7 @@ public:
 
         StateSlot* chosen = nullptr;
         uint64_t chosenGen = 0;
-        AcquireSRWLockShared(&mapLock_);
+        mapLock_.LockShared();
         if (!map_.empty()) {
             const size_t mask = map_.size() - 1;
             size_t idx = HashPtr(key) & mask;
@@ -199,7 +219,7 @@ public:
                 idx = (idx + 1) & mask;
             }
         }
-        ReleaseSRWLockShared(&mapLock_);
+        mapLock_.UnlockShared();
 
         return StateHandle(this, chosen, chosenGen, true);
     }
@@ -217,16 +237,16 @@ public:
 
     // Diagnostic counters (useful for red-team stress tests)
     size_t ActiveCount() {
-        AcquireSRWLockShared(&mapLock_);
+        mapLock_.LockShared();
         size_t n = count_;
-        ReleaseSRWLockShared(&mapLock_);
+        mapLock_.UnlockShared();
         return n;
     }
 
     size_t WarmPoolSize() {
-        AcquireSRWLockShared(&poolLock_);
+        poolLock_.LockShared();
         size_t n = pool_.size();
-        ReleaseSRWLockShared(&poolLock_);
+        poolLock_.UnlockShared();
         return n;
     }
 
@@ -238,8 +258,8 @@ private:
     };
     static constexpr uintptr_t kTombstoneVal = 1u;
 
-    SRWLOCK                 mapLock_  = SRWLOCK_INIT;
-    SRWLOCK                 poolLock_ = SRWLOCK_INIT;
+    RwLock                  mapLock_;
+    RwLock                  poolLock_;
     std::vector<Entry>      map_;
     size_t                  count_   = 0;
     size_t                  used_    = 0;
@@ -280,12 +300,12 @@ private:
 
     StateSlot* PopFromPoolOrAlloc() {
         StateSlot* slot = nullptr;
-        AcquireSRWLockExclusive(&poolLock_);
+        poolLock_.LockExclusive();
         if (!pool_.empty()) {
             slot = pool_.back();
             pool_.pop_back();
         }
-        ReleaseSRWLockExclusive(&poolLock_);
+        poolLock_.UnlockExclusive();
         if (!slot) {
             slot = new (std::nothrow) StateSlot();
         }
@@ -295,7 +315,7 @@ private:
     void DetachInternal(void* key, StateSlot* expectedSlot, uint64_t expectedGen, bool checkMatch) {
         if (!key) return;
         StateSlot* detached = nullptr;
-        AcquireSRWLockExclusive(&mapLock_);
+        mapLock_.LockExclusive();
         if (!map_.empty()) {
             const size_t mask = map_.size() - 1;
             size_t idx = HashPtr(key) & mask;
@@ -315,7 +335,7 @@ private:
                 idx = (idx + 1) & mask;
             }
         }
-        ReleaseSRWLockExclusive(&mapLock_);
+        mapLock_.UnlockExclusive();
 
         if (detached) {
             ReleaseSlotRef(detached);
@@ -327,12 +347,12 @@ private:
         if (slot->refs.fetch_sub(1, std::memory_order_acq_rel) == 1u) {
             slot->state.ClearFast();
             bool recycled = false;
-            AcquireSRWLockExclusive(&poolLock_);
+            poolLock_.LockExclusive();
             if (pool_.size() < kMaxWarmPool) {
                 pool_.push_back(slot);
                 recycled = true;
             }
-            ReleaseSRWLockExclusive(&poolLock_);
+            poolLock_.UnlockExclusive();
             if (!recycled) {
                 delete slot;
             }

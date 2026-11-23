@@ -892,6 +892,18 @@ rawset(G, "c_hyperstats", function()
             s.fastdump_calls, s.fastdump_us_sum / 1000, s.fastdump_bytes_sum / (1024*1024), s.fastdump_fallbacks))
         print(string.format("  [Native] libdeflate: calls=%d total=%.2fms in=%.2fMB out=%.2fMB",
             s.deflate_calls, s.deflate_us_sum / 1000, s.deflate_in_bytes / (1024*1024), s.deflate_out_bytes / (1024*1024)))
+        local luaC = math.max(1, s.prof_lua_update_calls or 1)
+        local netC = math.max(1, s.prof_net_update_calls or 1)
+        local repC = math.max(1, s.prof_replica_update_calls or 1)
+        print(string.format("  [Native] SubPhase: luaUpd=%.0fus(max=%d) netUpd=%.0fus(max=%d) repUpd=%.0fus(max=%d)",
+            (s.prof_lua_update_us_sum or 0) / luaC, s.prof_lua_update_us_max or 0,
+            (s.prof_net_update_us_sum or 0) / netC, s.prof_net_update_us_max or 0,
+            (s.prof_replica_update_us_sum or 0) / repC, s.prof_replica_update_us_max or 0))
+        print(string.format("  [Native] FSNeg(%s): hits=%d misses=%d | AsyncSave(%s): enq=%d ok=%d MB=%.2f flush=%d fb=%d err=%d io=%.2fms",
+            tostring(s.opt_fs_neg_cache == true), s.fs_neg_hits or 0, s.fs_neg_misses or 0,
+            tostring(s.opt_async_save == true), s.async_save_enqueued or 0, s.async_save_committed or 0,
+            (s.async_save_bytes or 0) / (1024*1024), s.async_save_flushes or 0,
+            s.async_save_fallbacks or 0, s.async_save_errors or 0, (s.async_save_io_us_sum or 0) / 1000))
     else
         print("  [Native] iphlpapi.dll not installed (running pure-Lua Layer 2/3 mode)")
     end

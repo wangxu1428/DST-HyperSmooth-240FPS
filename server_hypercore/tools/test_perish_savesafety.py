@@ -250,7 +250,9 @@ def main():
 
         exe = os.path.join(BIN64, "dontstarve_dedicated_server_nullrenderer_x64.exe")
         proc = subprocess.run(
-            [exe, "-console", "-offline", "-port", "11017", "-persistent_storage_root", STORAGE,
+            [exe, "-console", "-offline", "-port", "11017",
+             "-steam_master_server_port", "27030", "-steam_authentication_port", "8780",
+             "-persistent_storage_root", STORAGE,
              "-cluster", CLUSTER_NAME, "-shard", "Master"],
             cwd=BIN64,
             capture_output=True,
@@ -263,8 +265,8 @@ def main():
         for line in out.splitlines():
             if "[PERISH_SAFETY_TEST]" in line or "LUA ERROR" in line or "HyperCore Server" in line:
                 print(line)
-        if "[PERISH_SAFETY_TEST] ALL_PASS" not in out:
-            print("=== FAILURE TAIL ===")
+        if proc.returncode != 0 or "[PERISH_SAFETY_TEST] ALL_PASS" not in out:
+            print(f"=== FAILURE TAIL (rc={proc.returncode}) ===")
             print("\n".join(out.splitlines()[-60:]))
             sys.exit(1)
     finally:

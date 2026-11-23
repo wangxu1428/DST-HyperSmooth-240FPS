@@ -12,6 +12,8 @@
 #include "../native_plugin/fast_astar.h"
 #include "../native_plugin/fast_astar_manager.h"
 #include "../native_plugin/anti_stw_gc.h"
+#include "../native_plugin/fs_neg_cache.h"
+#include "../native_plugin/async_save_commit.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -734,6 +736,133 @@ int main() {
         std::printf("[PASS] 13. Per-function Lua API dependency gating verified (missing pushnil/gettop/tonumber safely blocked)\n");
     }
 
-    std::printf("ALL 13 SERVER RED-TEAM REGRESSION TESTS PASSED!\n");
+    // [14] Read-Only Mod/Data Negative Stat Cache Allowlist, Invalidation & Multi-Thread Concurrency
+    {
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(nullptr));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L""));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"C:\\Users\\test\\Documents\\Klei\\DoNotStarveTogether\\save\\session\\0001.meta"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\Steam\\dst\\mods\\modoverrides.lua"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\Steam\\dst\\mods\\workshop-123\\modinfo.bin.tmp"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\Steam\\dst\\bin64\\iphlpapi.dll"));
+
+        uint64_t h1a = 0, h2a = 0, h1b = 0, h2b = 0;
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\DST\\mods\\workshop-999\\images\\missing_icon.tex", &h1a, &h2a));
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"d:/dst/mods/workshop-999/images/missing_icon.tex", &h1b, &h2b));
+        CHECK(h1a != 0 && h1a == h1b && h2a == h2b);
+
+        hs_fs_neg::NegativeStatCache cache;
+        cache.Insert(h1a, h2a, 1000, 5000);
+        CHECK(cache.Lookup(h1a, h2a, 3000));
+        CHECK(!cache.Lookup(h1a, h2a, 6000)); // TTL expired
+        cache.InvalidateAll();
+        CHECK(!cache.Lookup(h1a, h2a, 3000)); // Epoch invalidated
+
+        // 4-thread concurrency smoke
+        std::atomic<bool> go{false};
+        std::vector<std::thread> ths;
+        for (int t = 0; t < 4; ++t) {
+            ths.emplace_back([&, t]() {
+                while (!go.load(std::memory_order_acquire)) {}
+                for (int i = 0; i < 4000; ++i) {
+                    wchar_t path[128];
+                    std::swprintf(path, 128, L"mods\\workshop-%d\\anim\\item_%d.xml", t, i & 63);
+                    uint64_t a = 0, b = 0;
+                    CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(path, &a, &b));
+                    if ((i & 7) == 0) cache.Insert(a, b, 10000, 1000);
+                    else if ((i & 31) == 15) cache.InvalidateAll();
+                    else (void)cache.Lookup(a, b, 10100);
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        for (auto& w : ths) w.join();
+        std::printf("[PASS] 14. Read-only FS Negative Stat Cache allowlist, TTL/epoch invalidation & 4-thread concurrency verified\n");
+    }
+
+    // [15] Async Atomic Save-Commit Queue (FIFO ordering, read/delete/dir barriers, tiny-cap backpressure, clean shutdown)
+    {
+        wchar_t tempBase[MAX_PATH] = {};
+        DWORD tlen = GetTempPathW(MAX_PATH, tempBase);
+        CHECK(tlen > 0 && tlen < MAX_PATH);
+        std::wstring testDir = std::wstring(tempBase) + L"hc_async_save_rt_" + std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryW(testDir.c_str(), nullptr);
+
+        auto readAllBytes = [](const std::wstring& p, std::string& out) -> bool {
+            HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return false;
+            DWORD sz = GetFileSize(h, nullptr);
+            out.resize(sz);
+            DWORD rd = 0;
+            bool ok = (sz == 0) || (ReadFile(h, out.data(), sz, &rd, nullptr) && rd == sz);
+            CloseHandle(h);
+            return ok;
+        };
+
+        // 15a) Basic atomic commit + read-after-write barrier + zero .hc_tmp residue
+        {
+            hc_async_save::AsyncSaveQueue q;
+            std::wstring fSnap = testDir + L"\\0000000001";
+            std::wstring fMeta = testDir + L"\\0000000001.meta";
+            std::string snapPayload(64 * 1024, 'S');
+            std::string metaPayload = "return { day = 42 }";
+
+            CHECK(q.TryEnqueue(fSnap.c_str(), snapPayload.data(), snapPayload.size()));
+            CHECK(q.TryEnqueue(fMeta.c_str(), metaPayload.data(), metaPayload.size()));
+            // Read-after-write via dir pattern barrier (simulates FindFirstFileW + GetFileAttributesW)
+            q.FlushPendingForDirPattern((testDir + L"\\*").c_str());
+
+            std::string gotSnap, gotMeta;
+            CHECK(readAllBytes(fSnap, gotSnap) && gotSnap == snapPayload);
+            CHECK(readAllBytes(fMeta, gotMeta) && gotMeta == metaPayload);
+            CHECK(GetFileAttributesW((fSnap + L".hc_tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+            CHECK(GetFileAttributesW((fMeta + L".hc_tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+
+            // 15b) 20x rapid overwrite same path -> strict latest content on disk
+            std::wstring fOver = testDir + L"\\saveindex";
+            for (int i = 0; i < 20; ++i) {
+                std::string body = "IDX_GEN_" + std::to_string(i) + "_" + std::string(4096, static_cast<char>('A' + (i % 26)));
+                CHECK(q.TryEnqueue(fOver.c_str(), body.data(), body.size()));
+            }
+            q.FlushPendingForPath(fOver.c_str());
+            std::string gotOver;
+            CHECK(readAllBytes(fOver, gotOver));
+            CHECK(gotOver.rfind("IDX_GEN_19_", 0) == 0);
+
+            // 15c) Delete-after-write barrier -> async worker MUST NOT resurrect deleted file!
+            std::wstring fDel = testDir + L"\\shardindex";
+            std::string delPayload(16384, 'D');
+            CHECK(q.TryEnqueue(fDel.c_str(), delPayload.data(), delPayload.size()));
+            q.FlushPendingForPath(fDel.c_str());
+            CHECK(DeleteFileW(fDel.c_str()) != FALSE);
+            q.FlushAll();
+            CHECK(GetFileAttributesW(fDel.c_str()) == INVALID_FILE_ATTRIBUTES);
+
+            q.ShutdownAndFlush();
+            CHECK(q.CommittedCount() == 23 && q.ErrorCount() == 0);
+            CHECK(DeleteFileW(fSnap.c_str()) && DeleteFileW(fMeta.c_str()) && DeleteFileW(fOver.c_str()));
+        }
+
+        // 15d) Tiny-cap backpressure (256B queue + 15x 128B payloads + oversized 512B sync fallback)
+        {
+            hc_async_save::AsyncSaveQueue smallQ(256u);
+            std::wstring fBp = testDir + L"\\bp_test";
+            for (int i = 0; i < 15; ++i) {
+                std::string p(128, static_cast<char>('0' + (i % 10)));
+                CHECK(smallQ.TryEnqueue(fBp.c_str(), p.data(), p.size()));
+            }
+            // Oversized payload triggers FlushAll() then returns false for sync write
+            std::string big(512, 'Z');
+            CHECK(!smallQ.TryEnqueue(fBp.c_str(), big.data(), big.size()));
+            CHECK(!smallQ.HasPending()); // earlier queued jobs guaranteed flushed BEFORE returning false!
+            smallQ.ShutdownAndFlush();
+            CHECK(smallQ.CommittedCount() == 15 && smallQ.ErrorCount() == 0);
+            DeleteFileW(fBp.c_str());
+        }
+
+        RemoveDirectoryW(testDir.c_str());
+        std::printf("[PASS] 15. AsyncSaveQueue atomic commit, read/delete/dir barriers, 20x FIFO overwrite & backpressure verified\n");
+    }
+
+    std::printf("ALL 15 SERVER RED-TEAM REGRESSION TESTS PASSED!\n");
     return 0;
 }

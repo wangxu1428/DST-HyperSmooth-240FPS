@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,8 @@
 #include "fast_astar.h"
 #include "fast_astar_manager.h"
 #include "anti_stw_gc.h"
+#include "fs_neg_cache.h"
+#include "async_save_commit.h"
 #include "libdeflate.h"
 #include "mimalloc.h"
 
@@ -126,6 +129,8 @@ struct Config {
     bool   enable_fast_astar       = true; // O(N log N) flat-hash + binary-heap A* Pathfinder engine (v1.3.0)
     bool   enable_anti_stw_gc      = true; // Smooths startup/mod LUA_GCCOLLECT nukes into bounded incremental drain
     bool   enable_fast_load        = true; // SIMD libdeflate unzReadCurrentFile + 64-bit inflate_fast + rep stosb VecFill
+    bool   enable_fs_neg_cache     = true; // Read-only mod/data negative stat cache
+    bool   enable_async_save       = true; // Async atomic save-commit queue with strict FIFO & barriers
 };
 
 Config       g_cfg;
@@ -233,6 +238,8 @@ void LoadIniConfig() {
         else if (std::strcmp(k, "enable_fast_astar") == 0)       g_cfg.enable_fast_astar = std::atoi(v) != 0;
         else if (std::strcmp(k, "enable_anti_stw_gc") == 0)      g_cfg.enable_anti_stw_gc = std::atoi(v) != 0;
         else if (std::strcmp(k, "enable_fast_load") == 0)        g_cfg.enable_fast_load = std::atoi(v) != 0;
+        else if (std::strcmp(k, "enable_fs_neg_cache") == 0)     g_cfg.enable_fs_neg_cache = std::atoi(v) != 0;
+        else if (std::strcmp(k, "enable_async_save") == 0)       g_cfg.enable_async_save = std::atoi(v) != 0;
     }
     std::fclose(f);
 }
@@ -293,6 +300,21 @@ struct Telemetry {
     std::atomic<uint64_t> serialize_world_calls{0};
     std::atomic<uint64_t> serialize_world_us_sum{0};
 
+    std::atomic<uint64_t> prof_lua_update_calls{0};
+    std::atomic<uint64_t> prof_lua_update_us_sum{0};
+    std::atomic<uint64_t> prof_lua_update_us_max{0};
+    std::atomic<uint64_t> prof_net_update_calls{0};
+    std::atomic<uint64_t> prof_net_update_us_sum{0};
+    std::atomic<uint64_t> prof_net_update_us_max{0};
+    std::atomic<uint64_t> prof_replica_update_calls{0};
+    std::atomic<uint64_t> prof_replica_update_us_sum{0};
+    std::atomic<uint64_t> prof_replica_update_us_max{0};
+
+    std::atomic<uint64_t> fs_neg_hits{0};
+    std::atomic<uint64_t> fs_neg_misses{0};
+
+    std::atomic<uint64_t> async_save_fallbacks{0};
+
     // Ring buffer of recent tick durations (us) for P95/P99 calculation (SRWLOCK-protected)
     mutable SRWLOCK tick_ring_lock = SRWLOCK_INIT;
     uint32_t tick_ring[kTickRingSize] = {};
@@ -314,6 +336,11 @@ struct Telemetry {
         deflate_calls = 0; deflate_us_sum = 0; deflate_main_calls = 0; deflate_main_us_sum = 0; deflate_in_bytes = 0; deflate_out_bytes = 0;
         unz_hits = 0; unz_bytes = 0; unz_us_sum = 0;
         serialize_world_calls = 0; serialize_world_us_sum = 0;
+        prof_lua_update_calls = 0; prof_lua_update_us_sum = 0; prof_lua_update_us_max = 0;
+        prof_net_update_calls = 0; prof_net_update_us_sum = 0; prof_net_update_us_max = 0;
+        prof_replica_update_calls = 0; prof_replica_update_us_sum = 0; prof_replica_update_us_max = 0;
+        fs_neg_hits = 0; fs_neg_misses = 0;
+        async_save_fallbacks = 0;
         AcquireSRWLockExclusive(&tick_ring_lock);
         tick_ring_pos = 0; tick_ring_filled = 0;
         ReleaseSRWLockExclusive(&tick_ring_lock);
@@ -601,6 +628,118 @@ bool FinalizeTrampolineSlabWX() {
 // =============================================================================
 // Resolved Engine Pointers & Lua C API
 // =============================================================================
+// =============================================================================
+// Module 7 & 8: Read-Only FS Negative Stat Cache & Async Atomic Save-Commit
+// (Immortal placement singletons: ZERO destructors in DLL_PROCESS_DETACH!)
+// =============================================================================
+alignas(hs_fs_neg::NegativeStatCache) static uint8_t g_fsNegCacheStorage[sizeof(hs_fs_neg::NegativeStatCache)];
+alignas(hc_async_save::AsyncSaveQueue) static uint8_t g_asyncSaveStorage[sizeof(hc_async_save::AsyncSaveQueue)];
+static std::atomic<hs_fs_neg::NegativeStatCache*> g_fsNegCachePtr{nullptr};
+static std::atomic<hc_async_save::AsyncSaveQueue*> g_asyncSavePtr{nullptr};
+
+inline hs_fs_neg::NegativeStatCache& GetFsNegCache() noexcept {
+    auto* p = g_fsNegCachePtr.load(std::memory_order_acquire);
+    if (!p) [[unlikely]] {
+        static std::atomic<bool> init{false};
+        if (!init.exchange(true, std::memory_order_acq_rel)) {
+            p = new (g_fsNegCacheStorage) hs_fs_neg::NegativeStatCache();
+            g_fsNegCachePtr.store(p, std::memory_order_release);
+        } else {
+            while (!(p = g_fsNegCachePtr.load(std::memory_order_acquire))) {
+                _mm_pause();
+            }
+        }
+    }
+    return *p;
+}
+
+inline hc_async_save::AsyncSaveQueue& GetAsyncSave() noexcept {
+    auto* p = g_asyncSavePtr.load(std::memory_order_acquire);
+    if (!p) [[unlikely]] {
+        static std::atomic<bool> init{false};
+        if (!init.exchange(true, std::memory_order_acq_rel)) {
+            p = new (g_asyncSaveStorage) hc_async_save::AsyncSaveQueue();
+            g_asyncSavePtr.store(p, std::memory_order_release);
+        } else {
+            while (!(p = g_asyncSavePtr.load(std::memory_order_acquire))) {
+                _mm_pause();
+            }
+        }
+    }
+    return *p;
+}
+std::atomic<bool> g_fsNegCacheActive{false};
+std::atomic<bool> g_asyncSaveActive{false};
+
+using WritePersistentFile_t = uint8_t (*)(const char* utf8Path, const void* data, uint32_t size,
+                                          void* delegate, uint32_t arg5, void* arg6);
+using GetFileAttributesW_t  = DWORD (WINAPI*)(LPCWSTR);
+using CreateFileW_t         = HANDLE (WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using DeleteFileW_t         = BOOL (WINAPI*)(LPCWSTR);
+using MoveFileExW_t         = BOOL (WINAPI*)(LPCWSTR, LPCWSTR, DWORD);
+using CopyFileW_t           = BOOL (WINAPI*)(LPCWSTR, LPCWSTR, BOOL);
+using CreateDirectoryW_t    = BOOL (WINAPI*)(LPCWSTR, LPSECURITY_ATTRIBUTES);
+using RemoveDirectoryW_t    = BOOL (WINAPI*)(LPCWSTR);
+using FindFirstFileW_t      = HANDLE (WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+using SetCurrentDirectoryW_t = BOOL (WINAPI*)(LPCWSTR);
+using Wfopen_t              = FILE* (__cdecl*)(const wchar_t*, const wchar_t*);
+using WfopenS_t             = int (__cdecl*)(FILE**, const wchar_t*, const wchar_t*);
+using Fopen_t               = FILE* (__cdecl*)(const char*, const char*);
+using Fwrite_t              = size_t (__cdecl*)(const void*, size_t, size_t, FILE*);
+using Fclose_t              = int (__cdecl*)(FILE*);
+using Wstat_t               = int (__cdecl*)(const wchar_t*, void*);
+using StatA_t               = int (__cdecl*)(const char*, void*);
+using OpenA_t               = int (__cdecl*)(const char*, int, int);
+using ExeExit_t             = void (__cdecl*)(int);
+using ExeCexit_t            = void (__cdecl*)();
+
+WritePersistentFile_t  g_origWritePersistentFile = nullptr;
+GetFileAttributesW_t   g_origGetFileAttributesW  = nullptr;
+CreateFileW_t          g_origCreateFileW         = nullptr;
+DeleteFileW_t          g_origDeleteFileW         = nullptr;
+MoveFileExW_t          g_origMoveFileExW         = nullptr;
+CopyFileW_t            g_origCopyFileW           = nullptr;
+CreateDirectoryW_t     g_origCreateDirectoryW    = nullptr;
+RemoveDirectoryW_t     g_origRemoveDirectoryW    = nullptr;
+FindFirstFileW_t       g_origFindFirstFileW      = nullptr;
+SetCurrentDirectoryW_t g_origSetCurrentDirW      = nullptr;
+Wfopen_t               g_origWfopen              = nullptr;
+WfopenS_t              g_origWfopen_s            = nullptr;
+Fopen_t                g_origFopen               = nullptr;
+Fwrite_t               g_origFwrite              = nullptr;
+Fclose_t               g_origFclose              = nullptr;
+Wstat_t                g_origWstat64i32          = nullptr;
+StatA_t                g_origStat64              = nullptr;
+StatA_t                g_origStat64i32           = nullptr;
+OpenA_t                g_origOpenA               = nullptr;
+ExeExit_t              g_origExeExit             = nullptr;
+ExeExit_t              g_origExe_exit            = nullptr;
+ExeCexit_t             g_origExeCexit            = nullptr;
+
+// Unaligned low bit pointer impossible as a real CRT FILE* struct; intercepted before MSVCR90!
+FILE* const kAsyncSentinelFile = reinterpret_cast<FILE*>(static_cast<uintptr_t>(0x1ULL));
+
+struct AsyncCaptureState {
+    bool        active = false;
+    const void* data   = nullptr;
+    uint32_t    size   = 0;
+};
+thread_local AsyncCaptureState tl_asyncCapture;
+
+// Module 0B: Verified Sub-Phase Profiler Pointers
+using SimLuaUpdate_t      = uint8_t (*)(void* sim, float dt, uint8_t paused);
+using NetMgrUpdate_t      = void (*)(void* netMgr, float dt);
+using ReplicaMgr3Update_t = void (*)(void* rm3);
+
+SimLuaUpdate_t      g_origSimLuaUpdate      = nullptr;
+NetMgrUpdate_t      g_origNetMgrUpdate      = nullptr;
+ReplicaMgr3Update_t g_origReplicaMgr3Update = nullptr;
+
+inline void UpdateAtomicMax(std::atomic<uint64_t>& target, uint64_t val) noexcept {
+    uint64_t prev = target.load(std::memory_order_relaxed);
+    while (val > prev && !target.compare_exchange_weak(prev, val, std::memory_order_relaxed)) {}
+}
+
 LuaApiTable g_lua;
 
 using SimUpdate_t          = uint8_t (*)(void* sim, float dt, uint8_t flag);
@@ -1493,7 +1632,7 @@ int Lua_HyperCore_GetStats(void* L) {
     double avg = 0, p95 = 0, p99 = 0;
     g_stats.ComputePercentiles(avg, p95, p99);
 
-    g_lua.createtable(L, 0, 28);
+    g_lua.createtable(L, 0, 56);
     auto setNum = [&](const char* k, double v) {
         g_lua.pushnumber(L, v);
         g_lua.setfield(L, -2, k);
@@ -1543,6 +1682,25 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("deflate_out_bytes",     static_cast<double>(g_stats.deflate_out_bytes.load()));
     setNum("serialize_world_calls", static_cast<double>(g_stats.serialize_world_calls.load()));
     setNum("serialize_world_us_sum",static_cast<double>(g_stats.serialize_world_us_sum.load()));
+    setNum("prof_lua_update_calls", static_cast<double>(g_stats.prof_lua_update_calls.load()));
+    setNum("prof_lua_update_us_sum",static_cast<double>(g_stats.prof_lua_update_us_sum.load()));
+    setNum("prof_lua_update_us_max",static_cast<double>(g_stats.prof_lua_update_us_max.load()));
+    setNum("prof_net_update_calls", static_cast<double>(g_stats.prof_net_update_calls.load()));
+    setNum("prof_net_update_us_sum",static_cast<double>(g_stats.prof_net_update_us_sum.load()));
+    setNum("prof_net_update_us_max",static_cast<double>(g_stats.prof_net_update_us_max.load()));
+    setNum("prof_replica_update_calls",  static_cast<double>(g_stats.prof_replica_update_calls.load()));
+    setNum("prof_replica_update_us_sum", static_cast<double>(g_stats.prof_replica_update_us_sum.load()));
+    setNum("prof_replica_update_us_max", static_cast<double>(g_stats.prof_replica_update_us_max.load()));
+    setNum("fs_neg_hits",           static_cast<double>(g_stats.fs_neg_hits.load()));
+    setNum("fs_neg_misses",         static_cast<double>(g_stats.fs_neg_misses.load()));
+    setNum("async_save_enqueued",   static_cast<double>(GetAsyncSave().EnqueuedCount()));
+    setNum("async_save_committed",  static_cast<double>(GetAsyncSave().CommittedCount()));
+    setNum("async_save_bytes",      static_cast<double>(GetAsyncSave().CommittedBytes()));
+    setNum("async_save_flushes",    static_cast<double>(GetAsyncSave().FlushCount()));
+    setNum("async_save_fallbacks",  static_cast<double>(g_stats.async_save_fallbacks.load()));
+    setNum("async_save_errors",     static_cast<double>(GetAsyncSave().ErrorCount()));
+    setNum("async_save_enqueue_us_sum", static_cast<double>(GetAsyncSave().EnqueueUsSum()));
+    setNum("async_save_io_us_sum",  static_cast<double>(GetAsyncSave().IoUsSum()));
 
     setBool("opt_mimalloc",         g_cfg.enable_mimalloc);
     setBool("opt_spatial_zerocopy", g_cfg.enable_spatial_zerocopy);
@@ -1551,12 +1709,15 @@ int Lua_HyperCore_GetStats(void* L) {
     setBool("opt_libdeflate",       g_cfg.enable_libdeflate);
     setBool("opt_fast_dumper",      g_cfg.enable_fast_dumper);
     setBool("opt_fast_astar",       g_cfg.enable_fast_astar && g_astarReady);
+    setBool("opt_fs_neg_cache",     g_cfg.enable_fs_neg_cache && g_fsNegCacheActive.load(std::memory_order_relaxed));
+    setBool("opt_async_save",       g_cfg.enable_async_save && g_asyncSaveActive.load(std::memory_order_relaxed));
     setNum("sim_tick_rate",         static_cast<double>(g_activeSimTickRate.load(std::memory_order_relaxed)));
     return 1;
 }
 
 int Lua_HyperCore_ResetStats(void* /*L*/) {
     g_stats.Reset();
+    GetAsyncSave().ResetTelemetry();
     return 0;
 }
 
@@ -1901,6 +2062,33 @@ void LogTelemetrySummary(const char* tag) {
            static_cast<unsigned long long>(g_stats.unz_hits.load()),
            g_stats.unz_bytes.load() / (1024.0 * 1024.0),
            g_stats.unz_us_sum.load() / 1000.0);
+
+    const uint64_t luaC = g_stats.prof_lua_update_calls.load();
+    const uint64_t netC = g_stats.prof_net_update_calls.load();
+    const uint64_t repC = g_stats.prof_replica_update_calls.load();
+    LogMsg("[%s-SUB] luaUpdate(c=%llu avg=%.0fus max=%llu) | netUpdate(c=%llu avg=%.0fus max=%llu) | "
+           "repUpdate(c=%llu avg=%.0fus max=%llu) | FsNeg(hits=%llu misses=%llu) | "
+           "AsyncSave(enq=%llu ok=%llu bytes=%llu flush=%llu fb=%llu err=%llu enqUs=%llu ioMs=%.1f)",
+           tag,
+           static_cast<unsigned long long>(luaC),
+           luaC ? static_cast<double>(g_stats.prof_lua_update_us_sum.load()) / luaC : 0.0,
+           static_cast<unsigned long long>(g_stats.prof_lua_update_us_max.load()),
+           static_cast<unsigned long long>(netC),
+           netC ? static_cast<double>(g_stats.prof_net_update_us_sum.load()) / netC : 0.0,
+           static_cast<unsigned long long>(g_stats.prof_net_update_us_max.load()),
+           static_cast<unsigned long long>(repC),
+           repC ? static_cast<double>(g_stats.prof_replica_update_us_sum.load()) / repC : 0.0,
+           static_cast<unsigned long long>(g_stats.prof_replica_update_us_max.load()),
+           static_cast<unsigned long long>(g_stats.fs_neg_hits.load()),
+           static_cast<unsigned long long>(g_stats.fs_neg_misses.load()),
+           static_cast<unsigned long long>(GetAsyncSave().EnqueuedCount()),
+           static_cast<unsigned long long>(GetAsyncSave().CommittedCount()),
+           static_cast<unsigned long long>(GetAsyncSave().CommittedBytes()),
+           static_cast<unsigned long long>(GetAsyncSave().FlushCount()),
+           static_cast<unsigned long long>(g_stats.async_save_fallbacks.load()),
+           static_cast<unsigned long long>(GetAsyncSave().ErrorCount()),
+           static_cast<unsigned long long>(GetAsyncSave().EnqueueUsSum()),
+           GetAsyncSave().IoUsSum() / 1000.0);
 }
 
 DWORD WINAPI HttpMetricsThread(LPVOID);
@@ -1988,6 +2176,414 @@ int HookSerializeWorldSession(void* selfObj, void* L) {
     return rc;
 }
 
+uint8_t HookSimLuaUpdate(void* sim, float dt, uint8_t paused) {
+    const int64_t t0 = NowQpc();
+    const uint8_t ret = g_origSimLuaUpdate(sim, dt, paused);
+    const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
+    g_stats.prof_lua_update_calls.fetch_add(1, std::memory_order_relaxed);
+    g_stats.prof_lua_update_us_sum.fetch_add(us, std::memory_order_relaxed);
+    UpdateAtomicMax(g_stats.prof_lua_update_us_max, us);
+    return ret;
+}
+
+void HookNetMgrUpdate(void* netMgr, float dt) {
+    const int64_t t0 = NowQpc();
+    g_origNetMgrUpdate(netMgr, dt);
+    const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
+    g_stats.prof_net_update_calls.fetch_add(1, std::memory_order_relaxed);
+    g_stats.prof_net_update_us_sum.fetch_add(us, std::memory_order_relaxed);
+    UpdateAtomicMax(g_stats.prof_net_update_us_max, us);
+}
+
+void HookReplicaMgr3Update(void* rm3) {
+    const int64_t t0 = NowQpc();
+    g_origReplicaMgr3Update(rm3);
+    const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
+    g_stats.prof_replica_update_calls.fetch_add(1, std::memory_order_relaxed);
+    g_stats.prof_replica_update_us_sum.fetch_add(us, std::memory_order_relaxed);
+    UpdateAtomicMax(g_stats.prof_replica_update_us_max, us);
+}
+
+// =============================================================================
+// Unified Server EXE IAT Hook Layer (Modules 7 & 8 + Safe Exit Flush)
+// =============================================================================
+void** FindExeIatSlot(const char* dllName, uint16_t ordinal, const char* funcName) {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    if (!exe) return nullptr;
+    auto* base = reinterpret_cast<uint8_t*>(exe);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size) return nullptr;
+
+    auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+    for (; desc->Name != 0; ++desc) {
+        const char* curDll = reinterpret_cast<const char*>(base + desc->Name);
+        if (_stricmp(curDll, dllName) != 0) continue;
+        const DWORD origRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+        if (!origRva || !desc->FirstThunk) continue;
+        auto* origThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + origRva);
+        auto* iatThunk  = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
+        for (; origThunk->u1.AddressOfData != 0; ++origThunk, ++iatThunk) {
+            if (IMAGE_SNAP_BY_ORDINAL64(origThunk->u1.Ordinal)) {
+                if (ordinal != 0 && IMAGE_ORDINAL64(origThunk->u1.Ordinal) == ordinal) {
+                    return reinterpret_cast<void**>(&iatThunk->u1.Function);
+                }
+            } else if (funcName) {
+                auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + origThunk->u1.AddressOfData);
+                if (std::strcmp(reinterpret_cast<const char*>(ibn->Name), funcName) == 0) {
+                    return reinterpret_cast<void**>(&iatThunk->u1.Function);
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+template <typename FnPtr>
+bool PatchExeIatEntry(const char* dllName, const char* funcName, void* detour, FnPtr& outOrig) {
+    void** slot = FindExeIatSlot(dllName, 0, funcName);
+    if (!slot) return false;
+    void* orig = *slot;
+    DWORD oldProt = 0, dummy = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+        return false;
+    }
+    outOrig = reinterpret_cast<FnPtr>(orig);
+    std::atomic_thread_fence(std::memory_order_release);
+    *slot = detour;
+    VirtualProtect(slot, sizeof(void*), oldProt, &dummy);
+    return true;
+}
+
+static bool ModeHasWriteIntentW(const wchar_t* mode) noexcept {
+    if (!mode) return false;
+    return std::wcschr(mode, L'w') || std::wcschr(mode, L'a') || std::wcschr(mode, L'+');
+}
+
+static bool ModeHasWriteIntentA(const char* mode) noexcept {
+    if (!mode) return false;
+    return std::strchr(mode, 'w') || std::strchr(mode, 'a') || std::strchr(mode, '+');
+}
+
+static bool CanCaptureAsyncWfopen(const wchar_t* path) noexcept {
+    if (!path || path[0] == L'\0' || !g_origGetFileAttributesW) return false;
+    const size_t plen = std::wcslen(path);
+    if (plen >= 4 && _wcsicmp(path + plen - 4, L".zip") == 0) {
+        return false;
+    }
+    const wchar_t* lastFwd = std::wcsrchr(path, L'/');
+    const wchar_t* lastBck = std::wcsrchr(path, L'\\');
+    const wchar_t* lastSep = (lastFwd && (!lastBck || lastFwd > lastBck)) ? lastFwd : lastBck;
+    if (lastSep && lastSep > path) {
+        std::wstring parentDir(path, static_cast<size_t>(lastSep - path));
+        if (parentDir.size() == 2 && parentDir[1] == L':') {
+            parentDir.push_back(L'\\');
+        }
+        const DWORD pattrs = g_origGetFileAttributesW(parentDir.c_str());
+        if (pattrs == INVALID_FILE_ATTRIBUTES || (pattrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            return false;
+        }
+    }
+    const DWORD tattrs = g_origGetFileAttributesW(path);
+    if (tattrs != INVALID_FILE_ATTRIBUTES &&
+        (tattrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)) != 0) {
+        return false;
+    }
+    return true;
+}
+
+uint8_t HookWritePersistentFile(const char* utf8Path, const void* data, uint32_t size,
+                                void* delegate, uint32_t arg5, void* arg6) {
+    struct CaptureGuard {
+        AsyncCaptureState prev;
+        CaptureGuard(const void* d, uint32_t sz, bool enable) noexcept : prev(tl_asyncCapture) {
+            if (enable) {
+                tl_asyncCapture.active = true;
+                tl_asyncCapture.data   = d;
+                tl_asyncCapture.size   = sz;
+            }
+        }
+        ~CaptureGuard() noexcept { tl_asyncCapture = prev; }
+    };
+    const bool enable = g_cfg.enable_async_save &&
+                        g_asyncSaveActive.load(std::memory_order_acquire) &&
+                        data != nullptr && size > 0;
+    CaptureGuard guard(data, size, enable);
+    return g_origWritePersistentFile(utf8Path, data, size, delegate, arg5, arg6);
+}
+
+static DWORD WINAPI HookExeGetFileAttributesW(LPCWSTR lpFileName) {
+    if (!g_origGetFileAttributesW) return INVALID_FILE_ATTRIBUTES;
+    GetAsyncSave().FlushPendingForPath(lpFileName);
+
+    if (g_fsNegCacheActive.load(std::memory_order_acquire) && g_cfg.enable_fs_neg_cache) {
+        uint64_t h1 = 0, h2 = 0;
+        if (hs_fs_neg::IsCacheableReadOnlyAssetPath(lpFileName, &h1, &h2)) {
+            const uint64_t now = static_cast<uint64_t>(NowQpc());
+            if (GetFsNegCache().Lookup(h1, h2, now)) {
+                g_stats.fs_neg_hits.fetch_add(1, std::memory_order_relaxed);
+                SetLastError(ERROR_FILE_NOT_FOUND);
+                return INVALID_FILE_ATTRIBUTES;
+            }
+            const DWORD res = g_origGetFileAttributesW(lpFileName);
+            const DWORD err = GetLastError();
+            if (res == INVALID_FILE_ATTRIBUTES &&
+                (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)) {
+                g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
+                GetFsNegCache().Insert(h1, h2, now, static_cast<uint64_t>(g_qpcFreq) * 15ULL);
+            }
+            SetLastError(err);
+            return res;
+        }
+    }
+    return g_origGetFileAttributesW(lpFileName);
+}
+
+static HANDLE WINAPI HookExeCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+                                        LPSECURITY_ATTRIBUTES lpSec, DWORD dwCreationDisposition,
+                                        DWORD dwFlagsAndAttrs, HANDLE hTemplate) {
+    GetAsyncSave().FlushPendingForPath(lpFileName);
+    if ((dwDesiredAccess & GENERIC_WRITE) != 0 || dwCreationDisposition != OPEN_EXISTING) {
+        GetFsNegCache().InvalidateAll();
+    }
+    return g_origCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSec,
+                             dwCreationDisposition, dwFlagsAndAttrs, hTemplate);
+}
+
+static BOOL WINAPI HookExeDeleteFileW(LPCWSTR lpFileName) {
+    GetAsyncSave().FlushPendingForPath(lpFileName);
+    GetFsNegCache().InvalidateAll();
+    return g_origDeleteFileW(lpFileName);
+}
+
+static BOOL WINAPI HookExeMoveFileExW(LPCWSTR lpExisting, LPCWSTR lpNew, DWORD dwFlags) {
+    GetAsyncSave().FlushPendingForPath(lpExisting);
+    GetAsyncSave().FlushPendingForPath(lpNew);
+    GetFsNegCache().InvalidateAll();
+    return g_origMoveFileExW(lpExisting, lpNew, dwFlags);
+}
+
+static BOOL WINAPI HookExeCopyFileW(LPCWSTR lpExisting, LPCWSTR lpNew, BOOL bFailIfExists) {
+    GetAsyncSave().FlushPendingForPath(lpExisting);
+    GetAsyncSave().FlushPendingForPath(lpNew);
+    GetFsNegCache().InvalidateAll();
+    return g_origCopyFileW(lpExisting, lpNew, bFailIfExists);
+}
+
+static BOOL WINAPI HookExeCreateDirectoryW(LPCWSTR lpPath, LPSECURITY_ATTRIBUTES lpSec) {
+    GetAsyncSave().FlushPendingForPath(lpPath);
+    GetFsNegCache().InvalidateAll();
+    return g_origCreateDirectoryW(lpPath, lpSec);
+}
+
+static BOOL WINAPI HookExeRemoveDirectoryW(LPCWSTR lpPath) {
+    GetAsyncSave().FlushPendingForDirPattern(lpPath);
+    GetFsNegCache().InvalidateAll();
+    return g_origRemoveDirectoryW(lpPath);
+}
+
+static HANDLE WINAPI HookExeFindFirstFileW(LPCWSTR lpPattern, LPWIN32_FIND_DATAW lpData) {
+    GetAsyncSave().FlushPendingForDirPattern(lpPattern);
+    return g_origFindFirstFileW(lpPattern, lpData);
+}
+
+static BOOL WINAPI HookExeSetCurrentDirectoryW(LPCWSTR lpPath) {
+    GetAsyncSave().FlushAll();
+    return g_origSetCurrentDirW(lpPath);
+}
+
+static FILE* __cdecl HookExeWfopen(const wchar_t* path, const wchar_t* mode) {
+    if (tl_asyncCapture.active && path && mode && std::wcscmp(mode, L"wb") == 0) {
+        const void* capData = tl_asyncCapture.data;
+        const uint32_t capSize = tl_asyncCapture.size;
+        tl_asyncCapture.active = false;
+        if (CanCaptureAsyncWfopen(path) && GetAsyncSave().TryEnqueue(path, capData, capSize)) {
+            GetFsNegCache().InvalidateAll();
+            return kAsyncSentinelFile;
+        }
+        g_stats.async_save_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+    GetAsyncSave().FlushPendingForPath(path);
+    if (ModeHasWriteIntentW(mode)) {
+        GetFsNegCache().InvalidateAll();
+        return g_origWfopen(path, mode);
+    }
+    if (g_fsNegCacheActive.load(std::memory_order_acquire) && g_cfg.enable_fs_neg_cache &&
+        mode && (std::wcscmp(mode, L"rb") == 0 || std::wcscmp(mode, L"r") == 0)) {
+        uint64_t h1 = 0, h2 = 0;
+        if (hs_fs_neg::IsCacheableReadOnlyAssetPath(path, &h1, &h2)) {
+            const uint64_t now = static_cast<uint64_t>(NowQpc());
+            if (GetFsNegCache().Lookup(h1, h2, now)) {
+                g_stats.fs_neg_hits.fetch_add(1, std::memory_order_relaxed);
+                SetLastError(ERROR_FILE_NOT_FOUND);
+                return nullptr;
+            }
+            FILE* f = g_origWfopen(path, mode);
+            if (!f) {
+                g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
+                GetFsNegCache().Insert(h1, h2, now, static_cast<uint64_t>(g_qpcFreq) * 15ULL);
+            }
+            return f;
+        }
+    }
+    return g_origWfopen(path, mode);
+}
+
+static int __cdecl HookExeWfopenS(FILE** pFile, const wchar_t* path, const wchar_t* mode) {
+    GetAsyncSave().FlushPendingForPath(path);
+    if (ModeHasWriteIntentW(mode)) {
+        GetFsNegCache().InvalidateAll();
+    }
+    return g_origWfopen_s(pFile, path, mode);
+}
+
+static FILE* __cdecl HookExeFopen(const char* path, const char* mode) {
+    GetAsyncSave().FlushPendingForAnsiPath(path);
+    if (ModeHasWriteIntentA(mode)) {
+        GetFsNegCache().InvalidateAll();
+    }
+    return g_origFopen(path, mode);
+}
+
+static size_t __cdecl HookExeFwrite(const void* buf, size_t size, size_t count, FILE* stream) {
+    if (stream == kAsyncSentinelFile) {
+        return count;
+    }
+    return g_origFwrite(buf, size, count, stream);
+}
+
+static int __cdecl HookExeFclose(FILE* stream) {
+    if (stream == kAsyncSentinelFile) {
+        return 0;
+    }
+    return g_origFclose(stream);
+}
+
+static int __cdecl HookExeWstat64i32(const wchar_t* path, void* buf) {
+    GetAsyncSave().FlushPendingForPath(path);
+    if (g_fsNegCacheActive.load(std::memory_order_acquire) && g_cfg.enable_fs_neg_cache) {
+        uint64_t h1 = 0, h2 = 0;
+        if (hs_fs_neg::IsCacheableReadOnlyAssetPath(path, &h1, &h2)) {
+            const uint64_t now = static_cast<uint64_t>(NowQpc());
+            if (GetFsNegCache().Lookup(h1, h2, now)) {
+                g_stats.fs_neg_hits.fetch_add(1, std::memory_order_relaxed);
+                SetLastError(ERROR_FILE_NOT_FOUND);
+                return -1;
+            }
+            const int rc = g_origWstat64i32(path, buf);
+            if (rc == -1) {
+                g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
+                GetFsNegCache().Insert(h1, h2, now, static_cast<uint64_t>(g_qpcFreq) * 15ULL);
+            }
+            return rc;
+        }
+    }
+    return g_origWstat64i32(path, buf);
+}
+
+static int __cdecl HookExeStat64(const char* path, void* buf) {
+    GetAsyncSave().FlushPendingForAnsiPath(path);
+    return g_origStat64(path, buf);
+}
+
+static int __cdecl HookExeStat64i32(const char* path, void* buf) {
+    GetAsyncSave().FlushPendingForAnsiPath(path);
+    return g_origStat64i32(path, buf);
+}
+
+static int __cdecl HookExeOpenA(const char* path, int oflag, int pmode) {
+    GetAsyncSave().FlushPendingForAnsiPath(path);
+    if ((oflag & 0x0303) != 0) {
+        GetFsNegCache().InvalidateAll();
+    }
+    return g_origOpenA(path, oflag, pmode);
+}
+
+static void FlushSavesAndLogOnShutdown() {
+    if (auto* p = g_asyncSavePtr.load(std::memory_order_acquire)) {
+        p->ShutdownAndFlush();
+    }
+    g_stopHttp.store(true, std::memory_order_release);
+}
+
+static void __cdecl HookExeExit(int code) {
+    FlushSavesAndLogOnShutdown();
+    LogTelemetrySummary("EXIT");
+    g_origExeExit(code);
+}
+
+static void __cdecl HookExe_exit(int code) {
+    FlushSavesAndLogOnShutdown();
+    g_origExe_exit(code);
+}
+
+static void __cdecl HookExeCexit() {
+    FlushSavesAndLogOnShutdown();
+    g_origExeCexit();
+}
+
+static BOOL WINAPI HyperCoreConsoleCtrlHandler(DWORD) {
+    FlushSavesAndLogOnShutdown();
+    return FALSE; // chain to CRT / OS default handler cleanly
+}
+
+static bool InstallUnifiedFsAndAsyncSaveIatHooks() {
+    // Materialize immortal singletons on the single startup main thread before hooks go live
+    (void)GetFsNegCache();
+    (void)GetAsyncSave();
+
+    // Kernel32 path/dir IAT hooks (shared cleanly between Module 7 & Module 8 without double patching!)
+    bool okGa = PatchExeIatEntry("KERNEL32.dll", "GetFileAttributesW",  reinterpret_cast<void*>(&HookExeGetFileAttributesW), g_origGetFileAttributesW);
+    bool okMv = PatchExeIatEntry("KERNEL32.dll", "MoveFileExW",         reinterpret_cast<void*>(&HookExeMoveFileExW),        g_origMoveFileExW);
+    bool okCp = PatchExeIatEntry("KERNEL32.dll", "CopyFileW",           reinterpret_cast<void*>(&HookExeCopyFileW),          g_origCopyFileW);
+    bool okDl = PatchExeIatEntry("KERNEL32.dll", "DeleteFileW",         reinterpret_cast<void*>(&HookExeDeleteFileW),        g_origDeleteFileW);
+    bool okMd = PatchExeIatEntry("KERNEL32.dll", "CreateDirectoryW",    reinterpret_cast<void*>(&HookExeCreateDirectoryW),   g_origCreateDirectoryW);
+    bool okRd = PatchExeIatEntry("KERNEL32.dll", "RemoveDirectoryW",    reinterpret_cast<void*>(&HookExeRemoveDirectoryW),   g_origRemoveDirectoryW);
+    bool okCf = PatchExeIatEntry("KERNEL32.dll", "CreateFileW",         reinterpret_cast<void*>(&HookExeCreateFileW),        g_origCreateFileW);
+    bool okFf = PatchExeIatEntry("KERNEL32.dll", "FindFirstFileW",      reinterpret_cast<void*>(&HookExeFindFirstFileW),     g_origFindFirstFileW);
+    PatchExeIatEntry("KERNEL32.dll", "SetCurrentDirectoryW",            reinterpret_cast<void*>(&HookExeSetCurrentDirectoryW), g_origSetCurrentDirW);
+
+    // MSVCR90 CRT stream + stat + clean-exit hooks (required fail-closed for AsyncSave!)
+    bool okWf  = PatchExeIatEntry("MSVCR90.dll", "_wfopen",    reinterpret_cast<void*>(&HookExeWfopen),     g_origWfopen);
+    bool okFw  = PatchExeIatEntry("MSVCR90.dll", "fwrite",     reinterpret_cast<void*>(&HookExeFwrite),     g_origFwrite);
+    bool okFc  = PatchExeIatEntry("MSVCR90.dll", "fclose",     reinterpret_cast<void*>(&HookExeFclose),     g_origFclose);
+    bool okWfs = PatchExeIatEntry("MSVCR90.dll", "_wfopen_s",  reinterpret_cast<void*>(&HookExeWfopenS),    g_origWfopen_s);
+    bool okFo  = PatchExeIatEntry("MSVCR90.dll", "fopen",      reinterpret_cast<void*>(&HookExeFopen),      g_origFopen);
+    bool okWs  = PatchExeIatEntry("MSVCR90.dll", "_wstat64i32",reinterpret_cast<void*>(&HookExeWstat64i32),g_origWstat64i32);
+    bool okS64 = PatchExeIatEntry("MSVCR90.dll", "_stat64",    reinterpret_cast<void*>(&HookExeStat64),     g_origStat64);
+    bool okS32 = PatchExeIatEntry("MSVCR90.dll", "_stat64i32", reinterpret_cast<void*>(&HookExeStat64i32),  g_origStat64i32);
+    PatchExeIatEntry("MSVCR90.dll", "_open",                   reinterpret_cast<void*>(&HookExeOpenA),      g_origOpenA);
+    bool okEx  = PatchExeIatEntry("MSVCR90.dll", "exit",       reinterpret_cast<void*>(&HookExeExit),       g_origExeExit);
+    bool okEx2 = PatchExeIatEntry("MSVCR90.dll", "_exit",      reinterpret_cast<void*>(&HookExe_exit),      g_origExe_exit);
+    bool okCex = PatchExeIatEntry("MSVCR90.dll", "_cexit",     reinterpret_cast<void*>(&HookExeCexit),      g_origExeCexit);
+
+    SetConsoleCtrlHandler(&HyperCoreConsoleCtrlHandler, TRUE);
+
+    const bool fsNegReady = g_cfg.enable_fs_neg_cache && okGa && okMv && okCp && okDl && okMd && okWs && okWf && okWfs && okFo && okCf;
+    g_fsNegCacheActive.store(fsNegReady, std::memory_order_release);
+    if (g_cfg.enable_fs_neg_cache && !fsNegReady) {
+        g_cfg.enable_fs_neg_cache = false;
+    }
+    LogMsg("[PERF][FSNEG] KERNEL32/CRT Mod/Data Negative Stat Cache (ga=%d ws=%d wf=%d mv=%d cp=%d dl=%d md=%d) -> active=%d",
+           okGa?1:0, okWs?1:0, okWf?1:0, okMv?1:0, okCp?1:0, okDl?1:0, okMd?1:0, fsNegReady?1:0);
+
+    const bool asyncBarriersOk = okGa && okMv && okCp && okDl && okMd && okRd && okCf && okFf &&
+                                 okWf && okFw && okFc && okWfs && okFo && okWs && okS64 && okS32 && okEx && okCex;
+    if (!g_cfg.enable_async_save || !asyncBarriersOk) {
+        g_asyncSaveActive.store(false, std::memory_order_release);
+    }
+    LogMsg("[SAVE] Async Save Barriers (k32=%d%d%d%d crt=%d%d%d stat=%d%d%d exit=%d%d%d) -> barriersOk=%d",
+           okCf?1:0, okFf?1:0, okRd?1:0, okGa?1:0,
+           okWf?1:0, okFw?1:0, okFc?1:0,
+           okWs?1:0, okS64?1:0, okS32?1:0,
+           okEx?1:0, okEx2?1:0, okCex?1:0,
+           asyncBarriersOk ? 1 : 0);
+    return asyncBarriersOk;
+}
+
 // =============================================================================
 // Optional Zero-Dependency 127.0.0.1 Read-Only JSON Metrics Thread (Default OFF)
 // =============================================================================
@@ -2041,7 +2637,7 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
         double avg = 0, p95 = 0, p99 = 0;
         g_stats.ComputePercentiles(avg, p95, p99);
 
-        char body[1536];
+        char body[2048];
         int blen = std::snprintf(body, sizeof(body),
             "{\"version\":\"DST-HyperCore-Server/1.3.0\","
             "\"sim_tick_rate\":%d,"
@@ -2053,6 +2649,11 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
             "\"astar_inits\":%llu,\"astar_steps\":%llu,\"astar_us_sum\":%llu,\"astar_completed\":%llu,\"astar_failed\":%llu,"
             "\"fastdump_calls\":%llu,\"fastdump_us_sum\":%llu,\"fastdump_bytes\":%llu,"
             "\"serialize_calls\":%llu,\"serialize_us_sum\":%llu,"
+            "\"lua_update_calls\":%llu,\"lua_update_us_sum\":%llu,\"lua_update_max\":%llu,"
+            "\"net_update_calls\":%llu,\"net_update_us_sum\":%llu,\"net_update_max\":%llu,"
+            "\"replica_update_calls\":%llu,\"replica_update_us_sum\":%llu,\"replica_update_max\":%llu,"
+            "\"fs_neg_hits\":%llu,\"fs_neg_misses\":%llu,"
+            "\"async_save_enqueued\":%llu,\"async_save_committed\":%llu,\"async_save_bytes\":%llu,\"async_save_flushes\":%llu,\"async_save_errors\":%llu,"
             "\"deflate_calls\":%llu,\"deflate_main_calls\":%llu,\"deflate_us_sum\":%llu,\"deflate_in\":%llu,\"deflate_out\":%llu}",
             g_activeSimTickRate.load(std::memory_order_relaxed),
             static_cast<unsigned long long>(g_stats.ticks_total.load()), avg, p95, p99,
@@ -2080,6 +2681,22 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
             static_cast<unsigned long long>(g_stats.fastdump_bytes_sum.load()),
             static_cast<unsigned long long>(g_stats.serialize_world_calls.load()),
             static_cast<unsigned long long>(g_stats.serialize_world_us_sum.load()),
+            static_cast<unsigned long long>(g_stats.prof_lua_update_calls.load()),
+            static_cast<unsigned long long>(g_stats.prof_lua_update_us_sum.load()),
+            static_cast<unsigned long long>(g_stats.prof_lua_update_us_max.load()),
+            static_cast<unsigned long long>(g_stats.prof_net_update_calls.load()),
+            static_cast<unsigned long long>(g_stats.prof_net_update_us_sum.load()),
+            static_cast<unsigned long long>(g_stats.prof_net_update_us_max.load()),
+            static_cast<unsigned long long>(g_stats.prof_replica_update_calls.load()),
+            static_cast<unsigned long long>(g_stats.prof_replica_update_us_sum.load()),
+            static_cast<unsigned long long>(g_stats.prof_replica_update_us_max.load()),
+            static_cast<unsigned long long>(g_stats.fs_neg_hits.load()),
+            static_cast<unsigned long long>(g_stats.fs_neg_misses.load()),
+            static_cast<unsigned long long>(GetAsyncSave().EnqueuedCount()),
+            static_cast<unsigned long long>(GetAsyncSave().CommittedCount()),
+            static_cast<unsigned long long>(GetAsyncSave().CommittedBytes()),
+            static_cast<unsigned long long>(GetAsyncSave().FlushCount()),
+            static_cast<unsigned long long>(GetAsyncSave().ErrorCount()),
             static_cast<unsigned long long>(g_stats.deflate_calls.load()),
             static_cast<unsigned long long>(g_stats.deflate_main_calls.load()),
             static_cast<unsigned long long>(g_stats.deflate_us_sum.load()),
@@ -2359,6 +2976,23 @@ constexpr int16_t kAobVecFillB[] = {
     0xC0, 0x74, 0x15, 0x44, 0x88, 0x21, 0x48, 0xFF, 0xC8, 0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0xFF,
     0xC1, 0x48, 0x89, 0x4C, 0x24, 0x40, 0xEB, 0xE6
 };
+// Verified 1-of-1 AOBs for AsyncSaveCommit (WritePersistentFile) & Tick Sub-Phase Profiler
+constexpr int16_t kAobWritePersistentFile[] = {
+    0x40, 0x53, 0x55, 0x56, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0xD8, 0x00, 0x00,
+    0x00, 0x48, 0x8B, 0x05, -1, -1, -1, -1, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24, 0xB8
+};
+constexpr int16_t kAobSimLuaUpdate[] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x48, 0x89, 0x70, 0x20, 0xF3, 0x0F, 0x11, 0x48, 0x10,
+    0x57, 0x48, 0x81, 0xEC, 0x90, 0x00, 0x00, 0x00, 0x44, 0x0F, 0xB6, 0x49, 0x4A
+};
+constexpr int16_t kAobNetMgrUpdate[] = {
+    0x40, 0x55, 0x41, 0x55, 0x41, 0x56, 0x48, 0x81, 0xEC, 0x30, 0x0A, 0x00, 0x00, 0x0F, 0x29, 0xB4,
+    0x24, 0x00, 0x0A, 0x00, 0x00, 0x48, 0x8B, 0x05, -1, -1, -1, -1, 0x48, 0x33, 0xC4
+};
+constexpr int16_t kAobReplicaMgr3Update[] = {
+    0x40, 0x56, 0x48, 0x81, 0xEC, 0x00, 0x02, 0x00, 0x00, 0x48, 0x8B, 0x05, -1, -1, -1, -1,
+    0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24, 0xD0, 0x01, 0x00, 0x00, 0x48, 0x8B, 0xF1, 0x4C, 0x8D, 0x05
+};
 
 #define FIND_AOB(arr) FindUniqueAob(arr, sizeof(arr) / sizeof(arr[0]), #arr)
 
@@ -2410,10 +3044,11 @@ void InitServerHooks() {
     LoadIniConfig();
     LogMsg("=== DST HyperCore Server Native Engine v1.3.0 Boot (PID=%lu, outsideLoaderLock=%d) ===",
            static_cast<unsigned long>(GetCurrentProcessId()), g_initOutsideLoaderLock ? 1 : 0);
-    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_load=%d fast_dumper=%d fast_astar=%d sim_tick=%dHz http=%d",
+    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_load=%d fast_dumper=%d fast_astar=%d fs_neg=%d async_save=%d sim_tick=%dHz http=%d",
            g_cfg.enable_profiler, g_cfg.enable_mimalloc, g_cfg.enable_spatial_zerocopy,
            g_cfg.enable_adaptive_gc, g_cfg.enable_libdeflate, g_cfg.libdeflate_level,
            g_cfg.enable_fast_load, g_cfg.enable_fast_dumper, g_cfg.enable_fast_astar,
+           g_cfg.enable_fs_neg_cache, g_cfg.enable_async_save,
            g_cfg.sim_tick_rate, g_cfg.enable_http_metrics);
 
     if (!InitTextSection() || !InitTrampolineSlab()) {
@@ -2806,6 +3441,35 @@ void InitServerHooks() {
             bool ok = RestoreHookBytes(pB, patchB, kLenB);
             LogMsg("[FASTLOAD] std::vector::_Insert_n Loop B @ %p -> HW rep stosb (%zuB) -> %s", pB, kLenB, ok ? "OK" : "FAIL");
         }
+    }
+
+    // 12. Unified FS Negative Stat Cache & Async Atomic Save-Commit (fail-closed)
+    const bool asyncBarriersOk = InstallUnifiedFsAndAsyncSaveIatHooks();
+    if (g_cfg.enable_async_save && asyncBarriersOk) {
+        if (uint8_t* pWriteFile = FIND_AOB(kAobWritePersistentFile)) {
+            bool ok = InstallHookOrdered(pWriteFile, reinterpret_cast<void*>(&HookWritePersistentFile), 17,
+                                         reinterpret_cast<void**>(&g_origWritePersistentFile));
+            g_asyncSaveActive.store(ok, std::memory_order_release);
+            LogMsg("[HOOK] WritePersistentFile AsyncCommit @ %p -> %s", pWriteFile, ok ? "OK" : "FAIL");
+        }
+    }
+
+    // 13. Verified C++ Tick Sub-Phase Profiler Hooks
+    if (uint8_t* pLuaUpd = FIND_AOB(kAobSimLuaUpdate)) {
+        bool ok = InstallHookOrdered(pLuaUpd, reinterpret_cast<void*>(&HookSimLuaUpdate), 24,
+                                     reinterpret_cast<void**>(&g_origSimLuaUpdate));
+        LogMsg("[HOOK] Simulation::luaUpdate @ %p -> %s", pLuaUpd, ok ? "OK" : "FAIL");
+    }
+    if (uint8_t* pNetUpd = FIND_AOB(kAobNetMgrUpdate)) {
+        bool ok = InstallHookOrdered(pNetUpd, reinterpret_cast<void*>(&HookNetMgrUpdate), 21,
+                                     reinterpret_cast<void**>(&g_origNetMgrUpdate));
+        LogMsg("[HOOK] cNetworkManager::Update @ %p -> %s", pNetUpd, ok ? "OK" : "FAIL");
+    }
+    if (uint8_t* pRepUpd = FIND_AOB(kAobReplicaMgr3Update)) {
+        const RelocItem rel = {9, 7, 3}; // mov rax, [rip + disp32] (__security_cookie) at +9
+        bool ok = InstallHookOrdered(pRepUpd, reinterpret_cast<void*>(&HookReplicaMgr3Update), 16,
+                                     reinterpret_cast<void**>(&g_origReplicaMgr3Update), &rel, 1);
+        LogMsg("[HOOK] ReplicaManager3::Update @ %p -> %s", pRepUpd, ok ? "OK" : "FAIL");
     }
 
     // Lock trampoline slab to PAGE_EXECUTE_READ (100% W^X compliant, zero permanent RWX pages!)

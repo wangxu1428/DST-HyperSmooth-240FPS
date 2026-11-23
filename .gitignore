@@ -1,8 +1,11 @@
 # Build artifacts & release archives
 native_plugin/obj/
+native_plugin/linux/obj/
 native_plugin/*.dll
 native_plugin/*.lib
 native_plugin/*.log
+*.o
+*.so
 *.exe
 *.pdb
 release/

@@ -1,0 +1,24 @@
+{
+  global:
+    fopen;
+    fopen64;
+    fwrite;
+    fclose;
+    open;
+    open64;
+    __xstat;
+    __xstat64;
+    stat;
+    stat64;
+    access;
+    opendir;
+    mkdir;
+    rmdir;
+    unlink;
+    remove;
+    rename;
+    exit;
+    _exit;
+  local:
+    *;
+};

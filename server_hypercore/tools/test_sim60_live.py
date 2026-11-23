@@ -75,6 +75,13 @@ pcall(modimport, "phase.lua")
 
 local MARKER_TEXT = "R3_1_SIM60_TOKEN_20261123"
 
+local function WallNow()
+    local wt = rawget(G, "walltime")
+    if type(wt) == "function" then return wt() end
+    if G.os ~= nil and type(G.os.clock) == "function" then return G.os.clock() end
+    return G.GetTimeRealSeconds()
+end
+
 local function FindNearPrefab(prefab, tx, tz, max_r)
     local best, best_d2 = nil, max_r * max_r
     for _, ent in pairs(G.Ents) do
@@ -103,11 +110,11 @@ AddSimPostInit(function()
         assert(hz0 == 30 and math.abs(dt0 - (1.0 / 30.0)) < 1e-4, "Stage1A expected 30Hz boot!")
 
         w:DoTaskInTime(0.4, function()
-            local t30_wall0 = G.GetTimeRealSeconds()
+            local t30_wall0 = WallNow()
             local t30_tick0 = G.GetTick()
             w:DoTaskInTime(1.0, function()
                 local d30_ticks = G.GetTick() - t30_tick0
-                local d30_wall = G.GetTimeRealSeconds() - t30_wall0
+                local d30_wall = WallNow() - t30_wall0
                 print(string.format("[SIM60_VERIFY] Stage1A 30Hz 1s window: d_ticks=%d wall_dt=%.3fs real_hz=%.2f",
                     d30_ticks, d30_wall, d30_ticks / d30_wall))
                 assert(d30_ticks >= 27 and d30_ticks <= 34, "Stage1A 30Hz ticks out of range: " .. tostring(d30_ticks))
@@ -161,13 +168,13 @@ AddSimPostInit(function()
 
                 local p0 = carrot.components.perishable:GetPercent()
                 local t60_sim0 = G.GetTime()
-                local t60_wall0 = G.GetTimeRealSeconds()
+                local t60_wall0 = WallNow()
                 local t60_tick0 = G.GetTick()
 
                 w:DoTaskInTime(2.0, function()
                     local d60_ticks = G.GetTick() - t60_tick0
                     local d60_sim = G.GetTime() - t60_sim0
-                    local d60_wall = G.GetTimeRealSeconds() - t60_wall0
+                    local d60_wall = WallNow() - t60_wall0
                     local hz60_real = d60_ticks / d60_wall
                     local p1 = carrot.components.perishable:GetPercent()
                     print(string.format("[SIM60_VERIFY] Stage1B 60Hz 2s window: d_ticks=%d sim_dt=%.3fs wall_dt=%.3fs real_hz=%.2f perish_drop=%.6f",
@@ -185,11 +192,11 @@ AddSimPostInit(function()
                     assert(G.HyperCore_GetSimTickRate() == 30 and math.abs(dt30_back - (1.0 / 30.0)) < 1e-4,
                            "Stage1C GetTickTime not restored to 1/30: " .. tostring(dt30_back))
 
-                    local tb_wall0 = G.GetTimeRealSeconds()
+                    local tb_wall0 = WallNow()
                     local tb_tick0 = G.GetTick()
                     w:DoTaskInTime(1.0, function()
                         local db_ticks = G.GetTick() - tb_tick0
-                        local db_wall = G.GetTimeRealSeconds() - tb_wall0
+                        local db_wall = WallNow() - tb_wall0
                         print(string.format("[SIM60_VERIFY] Stage1C Restored 30Hz 1s window: d_ticks=%d wall_dt=%.3fs real_hz=%.2f",
                             db_ticks, db_wall, db_ticks / db_wall))
                         assert(db_ticks >= 27 and db_ticks <= 34, "Stage1C restored 30Hz ticks out of range: " .. tostring(db_ticks))
@@ -264,7 +271,7 @@ end)
 """
 
 
-def run_server(label: str, port: int) -> tuple[int, str]:
+def run_server(label: str, port: int, steam_master_port: int = 27026, steam_auth_port: int = 8776) -> tuple[int, str]:
     exe = os.path.join(BIN64, "dontstarve_dedicated_server_nullrenderer_x64.exe")
     cmd = [
         exe,
@@ -274,12 +281,18 @@ def run_server(label: str, port: int) -> tuple[int, str]:
         "-shard", "Master",
         "-offline",
         "-port", str(port),
+        "-steam_master_server_port", str(steam_master_port),
+        "-steam_authentication_port", str(steam_auth_port),
     ]
     proc = subprocess.run(cmd, cwd=BIN64, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    for line in out.splitlines():
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
         if "[SIM60_VERIFY]" in line or "[HyperCore Server]" in line or "LUA ERROR" in line or "ASSERT" in line:
             print(f"[{label}] {line}")
+            if "LUA ERROR" in line:
+                for extra in lines[i + 1:i + 7]:
+                    print(f"[{label}]   {extra}")
     return proc.returncode, out
 
 
@@ -319,7 +332,8 @@ def main():
             f.write(
                 "[HYPERCORE]\nenable_profiler=1\nenable_mimalloc=1\nenable_spatial_zerocopy=1\n"
                 "enable_adaptive_gc=1\nenable_anti_stw_gc=1\nenable_libdeflate=1\n"
-                "enable_fast_dumper=1\nenable_fast_astar=1\nenable_http_metrics=0\nsim_tick_rate=30\n"
+                "enable_fast_dumper=1\nenable_fast_astar=1\nenable_fs_neg_cache=1\n"
+                "enable_async_save=1\nenable_http_metrics=0\nsim_tick_rate=30\n"
             )
         with open(os.path.join(TEST_MOD_DIR, "phase.lua"), "w", encoding="utf-8") as f:
             f.write('PHASE = "SIM_CYCLE"\n')
@@ -335,13 +349,13 @@ def main():
         with open(os.path.join(MODS_DIR, "dedicated_server_mods_setup.lua"), "w", encoding="utf-8") as f:
             f.write("")
 
-        rc1, out1 = run_server("PHASE1_30_60_30", 11018)
+        rc1, out1 = run_server("PHASE1_30_60_30", 11014, 27026, 8776)
         log_path = os.path.join(BIN64, "dst_hypercore_Master.log")
         assert os.path.exists(log_path), "Missing dst_hypercore_Master.log!"
         dll_log1 = open(log_path, "r", encoding="utf-8", errors="replace").read()
         print("--- Phase 1 dst_hypercore_Master.log (key lines) ---")
         for ln in dll_log1.splitlines():
-            if any(k in ln for k in ("Boot", "lua_close", "Registered", "SIMTICK", "FASTLOAD", "W^X", "PROF", "ERROR", "CRITICAL")):
+            if any(k in ln for k in ("Boot", "lua_close", "Registered", "SIMTICK", "FASTLOAD", "W^X", "PROF", "PROF-SUB", "SAVE", "FSNEG", "ERROR", "CRITICAL")):
                 print("  " + ln)
 
         assert rc1 == 0 and "[SIM60_VERIFY] PHASE1_PASS" in out1, f"Phase 1 FAILED (rc={rc1})"
@@ -351,6 +365,14 @@ def main():
         assert "[FASTLOAD] zlib 1.2.3 inflate_fast" in dll_log1 and "-> OK" in dll_log1, "FAIL: FastLoad inflate_fast hook missing!"
         assert "[FASTLOAD] std::vector::_Insert_n Loop A" in dll_log1 and "-> OK" in dll_log1, "FAIL: FastLoad VecFillA missing!"
         assert "[FASTLOAD] std::vector::_Insert_n Loop B" in dll_log1 and "-> OK" in dll_log1, "FAIL: FastLoad VecFillB missing!"
+        assert "[PERF][FSNEG]" in dll_log1 and "active=1" in dll_log1, "FAIL: FSNEG negative cache not active!"
+        assert "[SAVE] Async Save Barriers" in dll_log1 and "barriersOk=1" in dll_log1, "FAIL: AsyncSave barriers not OK!"
+        assert "[HOOK] WritePersistentFile AsyncCommit" in dll_log1 and "-> OK" in dll_log1, "FAIL: WritePersistentFile hook missing!"
+        assert "[HOOK] Simulation::luaUpdate" in dll_log1 and "-> OK" in dll_log1, "FAIL: luaUpdate sub-phase hook missing!"
+        assert "[HOOK] cNetworkManager::Update" in dll_log1 and "-> OK" in dll_log1, "FAIL: cNetworkManager::Update sub-phase hook missing!"
+        assert "[HOOK] ReplicaManager3::Update" in dll_log1 and "-> OK" in dll_log1, "FAIL: ReplicaManager3::Update sub-phase hook missing!"
+        m_async = re.search(r"AsyncSave\(enq=(\d+) ok=(\d+) bytes=(\d+).*?err=(\d+)", dll_log1)
+        assert m_async and int(m_async.group(1)) > 0 and int(m_async.group(4)) == 0, f"FAIL: AsyncSave unexpected stats in {dll_log1}"
         m_unz = re.search(r"FastLoad\(unz=(\d+) MB=([0-9.]+) ms=([0-9.]+)\)", dll_log1)
         assert m_unz and int(m_unz.group(1)) > 0, "FAIL: Server FastLoad unzReadCurrentFile recorded 0 hits during boot!"
         assert "Synced Server NetworkTickRate -> U=60(1) for 60Hz SimTick" in dll_log1, "FAIL (#04): 60Hz U=60(1) sync missing!"
@@ -377,7 +399,7 @@ def main():
         with open(os.path.join(CLUSTER_DIR, "Master", "modoverrides.lua"), "w", encoding="utf-8") as f:
             f.write(f'return {{ ["{TEST_MOD_NAME}"] = {{ enabled = true, configuration_options = {{}} }} }}\n')
 
-        rc2, out2 = run_server("PHASE2_VANILLA30", 11019)
+        rc2, out2 = run_server("PHASE2_VANILLA30", 11015, 27027, 8777)
         assert rc2 == 0 and "[SIM60_VERIFY] PHASE2_PASS" in out2, f"Phase 2 FAILED (rc={rc2})"
         assert "LUA ERROR" not in out2, "Phase 2 vanilla reload had LUA ERROR!"
 
@@ -400,7 +422,7 @@ def main():
                 f'  ["{TEST_MOD_NAME}"] = {{ enabled = true, configuration_options = {{}} }},\n'
                 '}\n'
             )
-        rc3, out3 = run_server("PHASE3_CUSTOM_RATE30", 11020)
+        rc3, out3 = run_server("PHASE3_CUSTOM_RATE30", 11016, 27028, 8778)
         dll_log3 = open(log_path, "r", encoding="utf-8", errors="replace").read()
         print("--- Phase 3 dst_hypercore_Master.log (SIMTICK lines) ---")
         for ln in dll_log3.splitlines():

@@ -33,6 +33,7 @@ struct NeighborEntry {
 };
 static_assert(sizeof(NeighborEntry) == 16, "NeighborEntry must match Klei 16-byte layout");
 
+#ifdef _WIN32
 // Exact MSVC90 std::vector<NeighborEntry> layout (0x20 bytes)
 struct MsvcNeighborVec {
     void*          proxy;
@@ -41,11 +42,22 @@ struct MsvcNeighborVec {
     NeighborEntry* cap;
 };
 static_assert(sizeof(MsvcNeighborVec) == 32, "MsvcNeighborVec must be 32 bytes");
+using NeighborVec = MsvcNeighborVec;
+#else
+// Exact GCC/libstdc++ std::vector<NeighborEntry> layout (0x18 bytes)
+struct GccNeighborVec {
+    NeighborEntry* begin;
+    NeighborEntry* end;
+    NeighborEntry* cap;
+};
+static_assert(sizeof(GccNeighborVec) == 24, "GccNeighborVec must be 24 bytes");
+using NeighborVec = GccNeighborVec;
+#endif
 
 struct EngineCallbacks {
-    void  (*reserveNeighbors)(MsvcNeighborVec* vec, uint64_t count) = nullptr;
-    void  (*getNeighborsNormal)(void* ctx, const TileCoord* pos, MsvcNeighborVec* out) = nullptr;
-    void  (*getNeighborsType2)(void* ctx, const TileCoord* pos, MsvcNeighborVec* out) = nullptr;
+    void  (*reserveNeighbors)(NeighborVec* vec, uint64_t count) = nullptr;
+    void  (*getNeighborsNormal)(void* ctx, const TileCoord* pos, NeighborVec* out) = nullptr;
+    void  (*getNeighborsType2)(void* ctx, const TileCoord* pos, NeighborVec* out) = nullptr;
     float (*heuristic)(void* ctx, const TileCoord* pos) = nullptr;
     void  (*clearPath)(void* pathVec) = nullptr;
     void  (*pushPathNode)(void* pathVec, const TileCoord* pos) = nullptr;
@@ -131,7 +143,7 @@ public:
         outStatus = 0;
         if (maxSteps == 0u) return 0u;
 
-        MsvcNeighborVec nbVec = {nullptr, nullptr, nullptr, nullptr};
+        NeighborVec nbVec = {};
         if (cb.reserveNeighbors) {
             cb.reserveNeighbors(&nbVec, 8u);
         }
