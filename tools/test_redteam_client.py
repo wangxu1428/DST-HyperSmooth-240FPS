@@ -36,7 +36,7 @@ expected_exports = sorted([
 ])
 assert exports == expected_exports, f"Export mismatch: got {exports}, expected {expected_exports}"
 imports = [d.dll.decode().lower() for d in pe.DIRECTORY_ENTRY_IMPORT]
-forbidden = [d for d in imports if any(x in d for x in ("libstdc++", "libgcc", "winpthread", "vcruntime", "msvcp"))]
+forbidden = [d for d in imports if any(x in d for x in ("libstdc++", "libgcc", "winpthread", "vcruntime", "msvcp", "d3d9"))]
 assert not forbidden, f"Forbidden runtime DLL imports: {forbidden}"
 pe.close()
 print(f"[PASS] 1. PE check: exports=6/6 {exports}, pure UCRT imports={imports}")
@@ -53,9 +53,10 @@ assert not LOG_PATH.exists(), "FAIL: Non-DST process created dst_fps_plugin.log!
 assert not INI_PATH.exists(), "FAIL: Non-DST process created dst_fps.ini!"
 print(f"[PASS] 2. Lock-free System32 pass-through verified: GetdfDIJoystick={hex(df_ptr)}, DllCanUnloadNow={hr_unload}, 0 non-DST logs/INI")
 
-# 3. Verify ALL Client AOB Signatures uniquely match dontstarve_steam_x64.exe
+# 3. Verify ALL Client AOB Signatures uniquely match dontstarve_steam_x64.exe (FAIL-CLOSED: never silently skip!)
 dst_exe = Path(r"D:\steam\steamapps\common\Don't Starve Together\bin64\dontstarve_steam_x64.exe")
-if dst_exe.exists():
+assert dst_exe.exists(), f"FAIL: DST client exe not found at {dst_exe} (refusing silent skip)"
+if True:
     exe_pe = pefile.PE(str(dst_exe))
     text = [s for s in exe_pe.sections if s.Name.startswith(b".text")][0]
     data = text.get_data()
@@ -259,47 +260,153 @@ if dst_exe.exists():
             0x48, 0x83, 0xEC, 0x70, 0x80, 0x3A, 0x00, 0x41, 0x8B, 0xF0, 0x4C, 0x8B, 0xEA, 0x4C, 0x8B, 0xE1,
             0x0F, 0x84, 0, 0, 0, 0, 0x48, 0x8B, 0x42, 0x38, 0x48, 0x2B, 0x42, 0x30
         ]), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxx")),
+        ("VFX240: ParticleManager::Update Callsite", find_masked(bytes([
+            0x48, 0x8B, 0x8B, 0xB8, 0x00, 0x00, 0x00,
+            0xF3, 0x0F, 0x10, 0x0D, 0, 0, 0, 0,
+            0x48, 0x8B, 0x49, 0x50,
+            0xE8, 0, 0, 0, 0,
+            0xB2, 0x01, 0x48, 0x8B, 0xCB, 0xE8
+        ]), "xxxxxxxxxxx????xxxxx????xxxxxx")),
+        ("VFX240: VFXRenderCmd::VFXRenderCmd Callsite", find_masked(bytes([
+            0x48, 0x8B, 0x81, 0xD0, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF8, 0x48, 0x8B, 0xEA,
+            0x4C, 0x8B, 0x88, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF1,
+            0x66, 0x41, 0x83, 0x79, 0x0A, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+            0xB9, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x38, 0xE8, 0, 0, 0, 0,
+            0x33, 0xDB, 0x48, 0x85, 0xC0, 0x74, 0x13, 0x4C, 0x8B, 0xC5, 0x48, 0x8B, 0xD6, 0x48, 0x8B, 0xC8,
+            0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xD8
+        ]), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxx????xxxxxxxxxxxxxxxxx????xxx")),
+        ("VFX240: Legacy EmitterRenderCmd Callsite", find_masked(bytes([
+            0x48, 0x8B, 0x81, 0xD8, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF8, 0x48, 0x8B, 0xEA,
+            0x4C, 0x8B, 0x88, 0xA0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF1,
+            0x66, 0x41, 0x83, 0x79, 0x0A, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+            0xB9, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x38, 0xE8, 0, 0, 0, 0,
+            0x33, 0xDB, 0x48, 0x85, 0xC0, 0x74, 0x13, 0x4C, 0x8B, 0xC5, 0x48, 0x8B, 0xD6, 0x48, 0x8B, 0xC8,
+            0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xD8
+        ]), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxx????xxxxxxxxxxxxxxxxx????xxx")),
+        ("Visual Live: LightMap::Render (0ms Hot-Swap)", find_exact(bytes([
+            0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x80, 0x3A, 0x00,
+            0x48, 0x89, 0x5C, 0x24, 0x50, 0x48, 0x8B, 0xF2, 0x48, 0x8B, 0xF9,
+            0x0F, 0x84, 0x91, 0x00, 0x00, 0x00, 0x80, 0x79, 0x14, 0x00, 0x74, 0x40,
+            0x8B, 0x51, 0x10, 0x83, 0xFA, 0xFF, 0x74, 0x16
+        ]))),
+        ("Light240: LightMap Dynamic Light Transform", find_masked(bytes([
+            0x48, 0x8B, 0x2B, 0x80, 0x7D, 0x34, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+            0x48, 0x8B, 0x4D, 0x18, 0xE8, 0, 0, 0, 0,
+            0x48, 0x8D, 0x8C, 0x24, 0x88, 0x00, 0x00, 0x00,
+            0x48, 0x8D, 0x54, 0x24, 0x70,
+            0xF3, 0x0F, 0x10, 0x7D, 0x20,
+            0xF3, 0x44, 0x0F, 0x10, 0x40, 0x0C,
+            0xF3, 0x44, 0x0F, 0x10, 0x48, 0x1C,
+            0xF3, 0x44, 0x0F, 0x10, 0x50, 0x2C
+        ]), "xxxxxxxxx????xxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")),
+        ("Host: Client zlib::compress2 (libdeflate L6)", find_exact(bytes([
+            0x4C, 0x8B, 0xDC, 0x57, 0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x02, 0x4D, 0x89, 0x43,
+            0x98, 0x45, 0x89, 0x4B, 0xA0, 0x49, 0x89, 0x4B, 0xA8, 0x89, 0x44, 0x24, 0x38, 0x33, 0xC0, 0x48,
+            0x8B, 0xFA, 0x8B, 0x94, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05
+        ]))),
+        ("Host: Client AStar::Reset (FastAStar)", find_exact(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+            0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x79, 0x40, 0x48, 0x8B, 0x59, 0x38, 0x33, 0xED, 0x48, 0x8B
+        ]))),
+        ("Host: Client AStar::Init (FastAStar)", find_masked(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48,
+            0x8B, 0xDA, 0x48, 0x8B, 0xF1, 0xE8, 0, 0, 0, 0, 0x33, 0xFF, 0x48, 0x89, 0x5E, 0x50
+        ]), "xxxxxxxxxxxxxxxxxxxxxx????xxxxxx")),
+        ("Host: Client AStar::Step (FastAStar)", find_exact(bytes([
+            0x89, 0x54, 0x24, 0x10, 0x57, 0x41, 0x54, 0x48, 0x81, 0xEC, 0xB8, 0x00, 0x00, 0x00, 0x83, 0x79,
+            0x08, 0x00, 0x8B, 0xFA, 0x4C, 0x8B, 0xE1, 0x74, 0x0D, 0x33, 0xC0, 0x48, 0x81, 0xC4, 0xB8, 0x00
+        ]))),
+        ("Host: FastDataDumper lua_tolstring", find_masked(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x49,
+            0x8B, 0xD8, 0x8B, 0xF2, 0x48, 0x8B, 0xF9, 0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xD0, 0x83, 0x78, 0x08, 0x04, 0x74
+        ]), "xxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxx")),
+        ("Host: FastDataDumper lua_pushlstring", find_exact(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+            0x48, 0x83, 0xEC, 0x20, 0x80, 0xB9, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF0, 0x48, 0x8B, 0xEA, 0x48, 0x8B, 0xF9
+        ]))),
+        ("Host: FastDataDumper lua_next", find_masked(bytes([
+            0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, 0, 0, 0, 0, 0x4C, 0x8B,
+            0x43, 0x10, 0x48, 0x8B, 0x10, 0x49, 0x83, 0xE8, 0x10, 0x48, 0x8B, 0xCB, 0xE8, 0, 0, 0, 0, 0x85, 0xC0, 0x74
+        ]), "xxxxxxxxxx????xxxxxxxxxxxxxxx????xxx")),
     ]
     for name, hits in checks:
         assert len(hits) == 1, f"AOB {name} expected 1 unique match, got {len(hits)}: {[hex(h) for h in hits]}"
         print(f"  [AOB OK] {name:46s} -> {hex(hits[0])}")
-    # Verify libGLESv2.dll IAT ordinals for AF + HD-2D World Shaders (@109, @99, @90, @131, @32)
+    # Verify libGLESv2.dll + libEGL.dll IAT ordinals for AF, HD-2D Shaders, GL State-Cache & Present Telemetry
     exe_pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
     gles_ords = set()
+    egl_ords = set()
     for imp in exe_pe.DIRECTORY_ENTRY_IMPORT:
-        if imp.dll.decode().lower() == "libglesv2.dll":
+        dn = imp.dll.decode().lower()
+        if dn == "libglesv2.dll":
             for entry in imp.imports:
                 if entry.ordinal is not None:
                     gles_ords.add(entry.ordinal)
-    for req_ord, req_name in [(109, "glTexParameteri"), (99, "glShaderSource"), (90, "glLinkProgram"), (131, "glUseProgram"), (32, "glDeleteProgram")]:
+        elif dn == "libegl.dll":
+            for entry in imp.imports:
+                if entry.ordinal is not None:
+                    egl_ords.add(entry.ordinal)
+    for req_ord, req_name in [
+        (109, "glTexParameteri"), (99, "glShaderSource"), (90, "glLinkProgram"),
+        (131, "glUseProgram"), (32, "glDeleteProgram"),
+        (1, "glActiveTexture"), (7, "glBindTexture"), (31, "glDeleteTextures"),
+        (11, "glBlendFunc"), (37, "glDepthMask"), (43, "glEnable"), (39, "glDisable"),
+    ]:
         assert req_ord in gles_ords, f"Missing libGLESv2.dll IAT ordinal @{req_ord} ({req_name})!"
-    print("  [IAT OK] libGLESv2.dll ordinals @109/@99/@90/@131/@32 all verified in EXE IAT")
+    for req_ord, req_name in [(25, "eglMakeCurrent"), (32, "eglSwapBuffers")]:
+        assert req_ord in egl_ords, f"Missing libEGL.dll IAT ordinal @{req_ord} ({req_name})!"
+    print("  [IAT OK] libGLESv2.dll (12 ordinals) + libEGL.dll (@25/@32) all verified in EXE IAT")
     exe_pe.close()
     # Verify ANGLE 1.0 libGLESv2.dll AF cap unlock AOB uniqueness
     gles_path = dst_exe.parent / "libGLESv2.dll"
-    if gles_path.exists():
-        gl_pe = pefile.PE(str(gles_path), fast_load=True)
-        gl_sec = [s for s in gl_pe.sections if s.Name.rstrip(b"\x00") == b".text"][0]
-        gl_text = gl_sec.get_data()
-        gl_base = gl_pe.OPTIONAL_HEADER.ImageBase + gl_sec.VirtualAddress
-        sig_af = bytes([
-            0x88, 0x86, 0xE1, 0x08, 0x00, 0x00,
-            0x66, 0x44, 0x89, 0xA6, 0xE2, 0x08, 0x00, 0x00,
-            0x45, 0x33, 0xED, 0x41, 0x8B, 0xC5,
-            0x44, 0x38, 0xAE, 0xD6, 0x08, 0x00, 0x00,
-            0xB9, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x45, 0xC1,
-            0x89, 0x86, 0xE4, 0x08, 0x00, 0x00
-        ])
-        af_hits = []
-        p0 = 0
-        while True:
-            k = gl_text.find(sig_af, p0)
-            if k == -1: break
-            af_hits.append(gl_base + k)
-            p0 = k + 1
-        assert len(af_hits) == 1, f"ANGLE AF unlock AOB expected 1 match, got {len(af_hits)}"
-        print(f"  [AOB OK] {'Visual T1: ANGLE 1.0 AF Cap Unlock (0x8E3)':46s} -> {hex(af_hits[0])}")
-        gl_pe.close()
-    print(f"[PASS] 3. All {len(checks)+1}/{len(checks)+1} client + ANGLE AOB signatures uniquely verified!")
-else:
-    print("[SKIP] 3. DST client exe not found at default path")
+    egl_path  = dst_exe.parent / "libEGL.dll"
+    assert gles_path.exists(), f"FAIL: libGLESv2.dll missing at {gles_path} (refusing silent skip!)"
+    assert egl_path.exists(), f"FAIL: libEGL.dll missing at {egl_path} (refusing silent skip!)"
+    gl_pe = pefile.PE(str(gles_path), fast_load=True)
+    gl_pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+    gl_exports = {e.name.decode() for e in gl_pe.DIRECTORY_ENTRY_EXPORT.symbols if e.name}
+    for req_sym in ("glGetUniformLocation", "glGetProgramiv", "glUniform4fv"):
+        assert req_sym in gl_exports, f"FAIL: libGLESv2.dll missing required export {req_sym}"
+    gl_sec = [s for s in gl_pe.sections if s.Name.rstrip(b"\x00") == b".text"][0]
+    gl_text = gl_sec.get_data()
+    gl_base = gl_pe.OPTIONAL_HEADER.ImageBase + gl_sec.VirtualAddress
+    sig_af = bytes([
+        0x88, 0x86, 0xE1, 0x08, 0x00, 0x00,
+        0x66, 0x44, 0x89, 0xA6, 0xE2, 0x08, 0x00, 0x00,
+        0x45, 0x33, 0xED, 0x41, 0x8B, 0xC5,
+        0x44, 0x38, 0xAE, 0xD6, 0x08, 0x00, 0x00,
+        0xB9, 0x02, 0x00, 0x00, 0x00, 0x0F, 0x45, 0xC1,
+        0x89, 0x86, 0xE4, 0x08, 0x00, 0x00
+    ])
+    af_hits = []
+    p0 = 0
+    while True:
+        k = gl_text.find(sig_af, p0)
+        if k == -1: break
+        af_hits.append(gl_base + k)
+        p0 = k + 1
+    assert len(af_hits) == 1, f"ANGLE AF unlock AOB expected 1 match, got {len(af_hits)}"
+    print(f"  [AOB OK] {'Visual T1: ANGLE 1.0 AF Cap Unlock (0x8E3)':46s} -> {hex(af_hits[0])}")
+
+    sig_sampler = bytes([
+        0x41, 0x80, 0xBD, 0xE3, 0x08, 0x00, 0x00, 0x00,
+        0x74, 0x1A,
+        0x49, 0x8B, 0x4D, 0x18,
+        0x41, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+        0xF3, 0x4C, 0x0F, 0x2C, 0xCE,
+        0x8B, 0xD7,
+        0x48, 0x8B, 0x01,
+        0xFF, 0x90, 0x28, 0x02, 0x00, 0x00
+    ])
+    samp_hits = []
+    p0 = 0
+    while True:
+        k = gl_text.find(sig_sampler, p0)
+        if k == -1: break
+        samp_hits.append(gl_base + k)
+        p0 = k + 1
+    assert len(samp_hits) == 1, f"ANGLE applyTextures AOB expected 1 match, got {len(samp_hits)}"
+    print(f"  [AOB OK] {'Pillar2+3: ANGLE applyTextures (D3D9Ex+Mip)':46s} -> {hex(samp_hits[0])}")
+    gl_pe.close()
+    print(f"  [GL EXP] libGLESv2.dll required exports (glGetUniformLocation/glGetProgramiv/glUniform4fv) verified!")
+    print(f"[PASS] 3. All {len(checks)+2}/{len(checks)+2} client + ANGLE AOB signatures uniquely verified!")

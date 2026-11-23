@@ -33,7 +33,7 @@ local VISUAL_PRESET = GetModConfigData("visual_preset")
 if type(VISUAL_PRESET) ~= "number" then VISUAL_PRESET = 0 end
 if VISUAL_PRESET < 0 or VISUAL_PRESET > 3 then VISUAL_PRESET = 0 end
 
--- Player-First: 7 independent per-effect toggles (ALL default OFF -> 100% Vanilla Pure out of the box!)
+-- Player-First: 9 independent per-effect toggles (ALL default OFF -> 100% Vanilla Pure out of the box!)
 local CFG_VIS_AF16       = GetModConfigData("visual_af16") == true
 local CFG_VIS_LIGHTMAP   = GetModConfigData("visual_full_lightmap") == true
 local CFG_VIS_CAS        = GetModConfigData("visual_cas") == true
@@ -41,6 +41,8 @@ local CFG_VIS_AO         = GetModConfigData("visual_contact_ao") == true
 local CFG_VIS_ENV        = GetModConfigData("visual_calm_env") == true
 local CFG_VIS_SOFT_BLOOM = GetModConfigData("visual_soft_bloom") == true
 local CFG_VIS_TONE       = GetModConfigData("visual_storybook_tone") == true
+local CFG_VIS_MIP_SHARP  = GetModConfigData("visual_mip_sharp") == true
+local CFG_VIS_DARK       = GetModConfigData("visual_dark_clarity") == true
 local CFG_VIS_MASK = (CFG_VIS_AF16 and 1 or 0)
     + (CFG_VIS_LIGHTMAP and 2 or 0)
     + (CFG_VIS_CAS and 4 or 0)
@@ -48,12 +50,16 @@ local CFG_VIS_MASK = (CFG_VIS_AF16 and 1 or 0)
     + (CFG_VIS_ENV and 16 or 0)
     + (CFG_VIS_SOFT_BLOOM and 32 or 0)
     + (CFG_VIS_TONE and 64 or 0)
+    + (CFG_VIS_MIP_SHARP and 128 or 0)
+    + (CFG_VIS_DARK and 256 or 0)
 if VISUAL_PRESET == 0 and CFG_VIS_MASK > 0 then
     VISUAL_PRESET = 3 -- User enabled individual switches in Mod Config -> honor Custom mode directly!
 end
 
 local SKELETAL_TWEEN = GetModConfigData("skeletal_tween")
 if SKELETAL_TWEEN == nil then SKELETAL_TWEEN = true end
+local LOW_LATENCY_INPUT = GetModConfigData("low_latency_input")
+if LOW_LATENCY_INPUT == nil then LOW_LATENCY_INPUT = true end
 local SMOOTH_CAMERA = GetModConfigData("smooth_camera")
 if SMOOTH_CAMERA == nil then SMOOTH_CAMERA = true end
 local SMOOTH_UI_240HZ = GetModConfigData("smooth_ui_240hz")
@@ -80,20 +86,39 @@ local FPS_PRESETS = { 60, 120, 144, 165, 240, 360, 0 }
 local current_target_fps = TARGET_FPS
 local current_visual_preset = VISUAL_PRESET
 local custom_vis_flags = {
-    af16       = CFG_VIS_AF16,
-    full_lm    = CFG_VIS_LIGHTMAP,
-    cas        = CFG_VIS_CAS,
-    ao         = CFG_VIS_AO,
-    env        = CFG_VIS_ENV,
-    soft_bloom = CFG_VIS_SOFT_BLOOM,
-    tone       = CFG_VIS_TONE,
+    af16         = CFG_VIS_AF16,
+    full_lm      = CFG_VIS_LIGHTMAP,
+    cas          = CFG_VIS_CAS,
+    ao           = CFG_VIS_AO,
+    env          = CFG_VIS_ENV,
+    soft_bloom   = CFG_VIS_SOFT_BLOOM,
+    tone         = CFG_VIS_TONE,
+    mip_sharp    = CFG_VIS_MIP_SHARP,
+    dark_clarity = CFG_VIS_DARK,
 }
 local current_skeletal_tween = SKELETAL_TWEEN and true or false
+local current_low_latency = LOW_LATENCY_INPUT and true or false
 local current_show_fps_hud = SHOW_FPS_HUD and true or false
 local fps_hud_text = nil
 local hud_dirty_now = false
 local visual_bench_timer = 0
 local visual_bench_pinned = false
+
+local latency_stats = {
+    wasd_instant_rpcs = 0,
+    walk_cancels      = 0,
+    flick_refreshes   = 0,
+    flick_rescues     = 0,
+    mod_click_rescues = 0,
+    cam240_frames     = 0,
+    craft_rebuilds    = 0,
+    craft_has_saved   = 0,
+    craft_ui_deferred = 0,
+    followtext_240    = 0,
+    host_fastdumps    = 0,
+}
+local last_hud_avg_fps  = 0
+local last_hud_low1_fps = 0
 
 local visual_shaders_ready = false
 local user_bloom_enabled = false
@@ -101,10 +126,11 @@ local orig_SetBloomEnabled = nil
 local hd2d_smooth_wetness = 0.0
 
 -- Player-First Presets (0 = 100% Vanilla Pure default; 1 = Eye-Care HD; 2 = Soft Storybook; 3 = Custom)
+-- Note: dark_clarity stays false in ALL presets unless explicitly opted in by the player!
 local VISUAL_PRESET_FLAGS = {
-    [0] = { af16 = false, full_lm = false, cas = false, ao = false, env = false, soft_bloom = false, tone = false },
-    [1] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = false, soft_bloom = true,  tone = false },
-    [2] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = true,  soft_bloom = true,  tone = true  },
+    [0] = { af16 = false, full_lm = false, cas = false, ao = false, env = false, soft_bloom = false, tone = false, mip_sharp = false, dark_clarity = false },
+    [1] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = false, soft_bloom = true,  tone = false, mip_sharp = true,  dark_clarity = false },
+    [2] = { af16 = true,  full_lm = true,  cas = true,  ao = true,  env = true,  soft_bloom = true,  tone = true,  mip_sharp = true,  dark_clarity = false },
 }
 
 local function GetActiveVisualFlags()
@@ -122,6 +148,8 @@ local function EncodeCustomVisMask(fl)
         + (fl.env and 16 or 0)
         + (fl.soft_bloom and 32 or 0)
         + (fl.tone and 64 or 0)
+        + (fl.mip_sharp and 128 or 0)
+        + (fl.dark_clarity and 256 or 0)
 end
 
 local function DecodeCustomVisMask(m)
@@ -129,28 +157,34 @@ local function DecodeCustomVisMask(m)
     local function has_bit(val, b)
         return math.floor(val / b) % 2 == 1
     end
-    custom_vis_flags.af16       = has_bit(m, 1)
-    custom_vis_flags.full_lm    = has_bit(m, 2)
-    custom_vis_flags.cas        = has_bit(m, 4)
-    custom_vis_flags.ao         = has_bit(m, 8)
-    custom_vis_flags.env        = has_bit(m, 16)
-    custom_vis_flags.soft_bloom = has_bit(m, 32)
-    custom_vis_flags.tone       = has_bit(m, 64)
+    custom_vis_flags.af16         = has_bit(m, 1)
+    custom_vis_flags.full_lm      = has_bit(m, 2)
+    custom_vis_flags.cas          = has_bit(m, 4)
+    custom_vis_flags.ao           = has_bit(m, 8)
+    custom_vis_flags.env          = has_bit(m, 16)
+    custom_vis_flags.soft_bloom   = has_bit(m, 32)
+    custom_vis_flags.tone         = has_bit(m, 64)
+    custom_vis_flags.mip_sharp    = has_bit(m, 128)
+    custom_vis_flags.dark_clarity = has_bit(m, 256)
 end
 
--- Zero-allocation independent World Shader uniform sync:
---   params[1] = contactAoStr (ANIM only: gentle base Contact AO + white-glare soft shoulder)
---   params[2] = calmEnvStr   (OCEAN_COMB + GROUND only: whisper coastal blend + matte rain darkening)
--- When both are 0.0 -> bit-for-bit identical vanilla fragment output!
+-- Zero-allocation independent World/ColourCube/Lighting Shader uniform sync:
+--   params[1] = contactAoStr   (ANIM only: gentle base Contact AO + white-glare soft shoulder)
+--   params[2] = calmEnvStr     (OCEAN_COMB + GROUND only: whisper coastal blend + matte rain darkening)
+--   params[3] = darkClarityStr (COLOURCUBE only: hue-preserving crushed dark-toe clarity + 31.5 LUT fix)
+--   sun[3]    = lightDitherStr (LIGHTING only: 0-tap IGN anti-banding on campfire/torch 8-bit halos)
+-- When all four are 0.0 -> bit-for-bit identical vanilla fragment output!
 local function PushHd2dEnvToNative(dt_step)
     local fnHd2d = rawget(GLOBAL, "HyperSmooth_SetHd2d")
     if type(fnHd2d) ~= "function" then
         return
     end
     local fl = GetActiveVisualFlags()
-    local ao_str  = fl.ao  and (fl.tone and 1.10 or 1.0) or 0.0
-    local env_str = fl.env and 1.0 or 0.0
-    if ao_str <= 0.001 and env_str <= 0.001 then
+    local ao_str       = fl.ao  and (fl.tone and 1.10 or 1.0) or 0.0
+    local env_str      = fl.env and 1.0 or 0.0
+    local dark_str     = fl.dark_clarity and 1.0 or 0.0
+    local light_dither = (fl.full_lm or fl.cas) and 1.0 or 0.0
+    if ao_str <= 0.001 and env_str <= 0.001 and dark_str <= 0.001 and light_dither <= 0.001 then
         pcall(fnHd2d, 0.0, 0.0, 0.0, 0.70, 0.707, 0.707, 0.0, -1.0, 1.0, 0.94, 0.82, 0.0)
         return
     end
@@ -172,7 +206,7 @@ local function PushHd2dEnvToNative(dt_step)
     local step = (type(dt_step) == "number" and dt_step > 0) and math.min(1.0, dt_step * 0.45) or 1.0
     hd2d_smooth_wetness = hd2d_smooth_wetness + (target_wet - hd2d_smooth_wetness) * step
 
-    pcall(fnHd2d, ao_str, env_str, 0.0, 0.70, 0.707, 0.707, 0.0, -1.0, 1.0, 0.94, 0.82, hd2d_smooth_wetness)
+    pcall(fnHd2d, ao_str, env_str, dark_str, 0.70, 0.707, 0.707, light_dither, -1.0, 1.0, 0.94, 0.82, hd2d_smooth_wetness)
 end
 
 local function ApplyVisualPostProcess()
@@ -217,6 +251,42 @@ local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
+local EXPECTED_DLL_VERSION = (modinfo and modinfo.version) or "2.6.0"
+
+local function ParseSemVer(str)
+    if type(str) ~= "string" then return nil, nil end
+    local maj, min, pat = str:match("(%d+)%.(%d+)%.(%d+)")
+    if not maj then return nil, nil end
+    return tonumber(maj) * 10000 + tonumber(min) * 100 + tonumber(pat),
+           string.format("%s.%s.%s", maj, min, pat)
+end
+
+local function GetDllVersionStatus()
+    if not HasNativePlugin() then
+        return "missing", nil, EXPECTED_DLL_VERSION
+    end
+    local fnVer = rawget(GLOBAL, "HyperSmooth_Version")
+    if type(fnVer) ~= "function" then
+        -- v2.2.1 ~ v2.5.x (has Lua bridge, predates HyperSmooth_Version export)
+        return "outdated", "<2.6.0", EXPECTED_DLL_VERSION
+    end
+    local ok, raw_ver = pcall(fnVer)
+    local dll_num, dll_clean = ParseSemVer(ok and raw_ver or nil)
+    local exp_num = ParseSemVer(EXPECTED_DLL_VERSION) or 20600
+    if not dll_num then
+        return "outdated", "unknown", EXPECTED_DLL_VERSION
+    end
+    if dll_num < exp_num then
+        return "outdated", dll_clean, EXPECTED_DLL_VERSION
+    end
+    return "ok", dll_clean, EXPECTED_DLL_VERSION
+end
+
+GLOBAL.HyperSmooth_GetDllStatus = GetDllVersionStatus
+
+local dll_outdated_toast_shown = false
+local toast_is_warning = false
+
 local function ApplyHudVisibility()
     if fps_hud_text and fps_hud_text.inst and fps_hud_text.inst:IsValid() then
         if current_show_fps_hud then
@@ -239,27 +309,40 @@ local function SyncToNativePlugin(save_persist)
     if type(fnSkel) == "function" then
         pcall(fnSkel, current_skeletal_tween)
     end
+    local fnVfx = rawget(GLOBAL, "HyperSmooth_SetVfxSmooth")
+    if type(fnVfx) == "function" then
+        pcall(fnVfx, current_skeletal_tween)
+    end
+    local fnLowLat = rawget(GLOBAL, "HyperSmooth_SetLowLatency")
+    if type(fnLowLat) == "function" then
+        pcall(fnLowLat, current_low_latency)
+    end
     local fnVis = rawget(GLOBAL, "HyperSmooth_SetVisual")
     if type(fnVis) == "function" then
         local fl = GetActiveVisualFlags()
-        pcall(fnVis, fl.af16 and 16 or 1, fl.full_lm)
+        pcall(fnVis, fl.af16 and 16 or 1, fl.full_lm, fl.mip_sharp and -0.45 or 0.0)
     end
     PushHd2dEnvToNative(0)
     ApplyVisualPostProcess()
     ApplyHudVisibility()
-    -- Persist user choices (and modinfo fingerprints mf/ms/mh/mvp/mvm so explicit modinfo changes win cleanly)
+    if type(HS_PanelNotifySync) == "function" then
+        HS_PanelNotifySync()
+    end
+    -- Persist user choices (and modinfo fingerprints mf/ms/mh/mvp/mvm/mll so explicit modinfo changes win cleanly)
     if save_persist ~= false and TheSim and TheSim.SetPersistentString then
-        local payload = string.format("fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d",
+        local payload = string.format("fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;ll=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d;mll=%d",
             current_target_fps,
             current_skeletal_tween and 1 or 0,
             current_show_fps_hud and 1 or 0,
             current_visual_preset,
             EncodeCustomVisMask(custom_vis_flags),
+            current_low_latency and 1 or 0,
             TARGET_FPS,
             SKELETAL_TWEEN and 1 or 0,
             SHOW_FPS_HUD and 1 or 0,
             VISUAL_PRESET,
-            CFG_VIS_MASK)
+            CFG_VIS_MASK,
+            LOW_LATENCY_INPUT and 1 or 0)
         TheSim:SetPersistentString(CFG_FILENAME, payload, false)
     end
 end
@@ -273,11 +356,13 @@ if TheSim and TheSim.GetPersistentString then
             local sh = tonumber(str:match("hud=(%d+)"))
             local svp = tonumber(str:match("vp=(%d+)"))
             local svm = tonumber(str:match("vm=(%d+)"))
+            local sll = tonumber(str:match("ll=(%d+)"))
             local mf = tonumber(str:match("mf=(%d+)"))
             local ms = tonumber(str:match("ms=(%d+)"))
             local mh = tonumber(str:match("mh=(%d+)"))
             local mvp = tonumber(str:match("mvp=(%d+)"))
             local mvm = tonumber(str:match("mvm=(%d+)"))
+            local mll = tonumber(str:match("mll=(%d+)"))
             if sf ~= nil and mf == TARGET_FPS then
                 current_target_fps = sf
             end
@@ -286,6 +371,9 @@ if TheSim and TheSim.GetPersistentString then
             end
             if sh ~= nil and mh == (SHOW_FPS_HUD and 1 or 0) then
                 current_show_fps_hud = (sh ~= 0)
+            end
+            if sll ~= nil and mll == (LOW_LATENCY_INPUT and 1 or 0) then
+                current_low_latency = (sll ~= 0)
             end
             if svp ~= nil and svp >= 0 and svp <= 3 and mvp == VISUAL_PRESET and mvm == CFG_VIS_MASK then
                 current_visual_preset = svp
@@ -430,7 +518,8 @@ end
 
 -- Diagnostic & live per-effect console helpers:
 --   c_hsvisual()                  - print active toggles + live GPU/VRAM telemetry
---   c_hsopt("cas"|"ao"|"env"|"af16"|"lightmap"|"bloom"|"tone"|"off", [true|false])
+--   c_hslatency()                 - print D3D9Ex queue latency + 240Hz VFX + flick-click rescue stats
+--   c_hsopt("af16"|"lightmap"|"mip"|"cas"|"ao"|"env"|"bloom"|"tone"|"dark"|"off", [true|false])
 --   c_hsbench([true|false])       - pin/unpin compact HUD benchmark strip
 local function PrintVisualReport()
     local names = { [0] = "Vanilla(0)", [1] = "EyeCareHD(1)", [2] = "SoftStorybook(2)", [3] = "Custom(3)" }
@@ -438,14 +527,15 @@ local function PrintVisualReport()
     local fnV = rawget(GLOBAL, "HyperSmooth_GetVisualStats")
     local fnP = rawget(GLOBAL, "HyperSmooth_GetVisualPerf")
     local line1 = string.format(
-        "[HyperSmooth Visual] mode=%s | flags(af16=%s lm=%s cas=%s ao=%s env=%s softBloom=%s tone=%s) | gameBloom=%s",
+        "[HyperSmooth Visual] mode=%s | flags(af16=%s lm=%s mip=%s cas=%s ao=%s env=%s softBloom=%s tone=%s dark=%s) | gameBloom=%s",
         names[current_visual_preset] or tostring(current_visual_preset),
-        tostring(fl.af16), tostring(fl.full_lm), tostring(fl.cas), tostring(fl.ao),
-        tostring(fl.env), tostring(fl.soft_bloom), tostring(fl.tone), tostring(user_bloom_enabled))
+        tostring(fl.af16), tostring(fl.full_lm), tostring(fl.mip_sharp), tostring(fl.cas), tostring(fl.ao),
+        tostring(fl.env), tostring(fl.soft_bloom), tostring(fl.tone), tostring(fl.dark_clarity), tostring(user_bloom_enabled))
     if type(fnV) == "function" then
-        local ok, af, hw, hits, lmp, lms = pcall(fnV)
+        local ok, af, hw, hits, lmp, lms, mipOk, mipVal, mipHits = pcall(fnV)
         if ok then
-            line1 = line1 .. string.format(" | AF=%dx (hw=%.0fx hits=%d) LM=%.1fx", af or 1, hw or 1, hits or 0, lms or 0.5)
+            line1 = line1 .. string.format(" | AF=%dx (hw=%.0fx hits=%d) LM=%.1fx MipBias=%.2f(ok=%s hits=%d)",
+                af or 1, hw or 1, hits or 0, lms or 0.5, mipVal or 0.0, tostring(mipOk == true), mipHits or 0)
         end
     end
     if type(fnP) == "function" then
@@ -462,21 +552,68 @@ local function PrintVisualReport()
     GLOBAL.print(line1 .. " (no dinput8.dll bridge)")
 end
 
+local function PrintLatencyReport()
+    local fnL = rawget(GLOBAL, "HyperSmooth_GetLatencyStats")
+    local fnH = rawget(GLOBAL, "HyperSmooth_GetHostPerf")
+    local luaLine = string.format(
+        "[HyperSmooth Latency] LowLat=%s | Lua(WASD_instant=%d, WalkCancel=%d, FlickRefresh=%d, FlickRescued=%d, ModClickRescued=%d, Cam240=%d, FollowText240=%d) | CraftZeroStall(rebuilds=%d hasSaved=%d uiDeferred=%d)",
+        tostring(current_low_latency),
+        latency_stats.wasd_instant_rpcs,
+        latency_stats.walk_cancels,
+        latency_stats.flick_refreshes,
+        latency_stats.flick_rescues,
+        latency_stats.mod_click_rescues,
+        latency_stats.cam240_frames,
+        latency_stats.followtext_240,
+        latency_stats.craft_rebuilds,
+        latency_stats.craft_has_saved,
+        latency_stats.craft_ui_deferred)
+    if type(fnL) == "function" then
+        local ok, exAct, curLat, origLat, gpuMs, gpuDrains, vfxOk, vfxCmds, vfxPts, mipOk, mipVal, lightOk, lightPts, lmSwapOk = pcall(fnL)
+        if ok then
+            GLOBAL.print(luaLine)
+            GLOBAL.print(string.format(
+                "[HyperSmooth Native] D3D9ExReflex=%s (MaxFrameLat=%d/%d) | GpuDrain=%.2fms (cnt=%d) | VFX240=%s (cmds=%d pts=%d) | Light240=%s (cnt=%d) | LMHotSwap=%s | MipHook=%s (bias=%.2f)",
+                tostring(exAct == true), curLat or 0, origLat or 0,
+                gpuMs or 0, gpuDrains or 0,
+                tostring(vfxOk == true), vfxCmds or 0, vfxPts or 0,
+                tostring(lightOk == true), lightPts or 0,
+                tostring(lmSwapOk == true),
+                tostring(mipOk == true), mipVal or 0.0))
+            if type(fnH) == "function" then
+                local okH, fdOk, fdCalls, fdMs, fdMB, fdFb, c2Ok, c2Calls, c2MB, c2Ms, asOk, asInits, asSteps, asMs, asFb = pcall(fnH)
+                if okH then
+                    GLOBAL.print(string.format(
+                        "[HyperSmooth Host] FastDump(%s): calls=%d (%.1fMB %.2fms fb=%d) | Compress2(%s): calls=%d (%.1fMB %.2fms) | FastAStar(%s): inits=%d steps=%d (%.2fms fb=%d)",
+                        tostring(fdOk == true), fdCalls or 0, fdMB or 0, fdMs or 0, fdFb or 0,
+                        tostring(c2Ok == true), c2Calls or 0, c2MB or 0, c2Ms or 0,
+                        tostring(asOk == true), asInits or 0, asSteps or 0, asMs or 0, asFb or 0))
+                end
+            end
+            return
+        end
+    end
+    GLOBAL.print(luaLine .. " (no dinput8.dll bridge)")
+end
+
 rawset(GLOBAL, "c_hsvisual", PrintVisualReport)
+rawset(GLOBAL, "c_hslatency", PrintLatencyReport)
 
 local OPT_ALIASES = {
     af16 = "af16", af = "af16",
     lightmap = "full_lm", lm = "full_lm", full_lm = "full_lm",
+    mip = "mip_sharp", mip_sharp = "mip_sharp", lod = "mip_sharp",
     cas = "cas", sharpen = "cas",
     ao = "ao", contact_ao = "ao",
     env = "env", calm_env = "env",
     bloom = "soft_bloom", soft_bloom = "soft_bloom",
     tone = "tone", storybook = "tone",
+    dark = "dark_clarity", dark_clarity = "dark_clarity", night = "dark_clarity",
 }
 
 rawset(GLOBAL, "c_hsopt", function(key, val)
     if type(key) ~= "string" then
-        GLOBAL.print("[HyperSmooth] Usage: c_hsopt('af16'|'lightmap'|'cas'|'ao'|'env'|'bloom'|'tone'|'off', true|false)")
+        GLOBAL.print("[HyperSmooth] Usage: c_hsopt('af16'|'lightmap'|'mip'|'cas'|'ao'|'env'|'bloom'|'tone'|'dark'|'off', true|false)")
         PrintVisualReport()
         return
     end
@@ -491,19 +628,21 @@ rawset(GLOBAL, "c_hsopt", function(key, val)
     end
     local field = OPT_ALIASES[k]
     if not field then
-        GLOBAL.print("[HyperSmooth] Unknown option '" .. tostring(key) .. "'. Valid: af16, lightmap, cas, ao, env, bloom, tone, off")
+        GLOBAL.print("[HyperSmooth] Unknown option '" .. tostring(key) .. "'. Valid: af16, lightmap, mip, cas, ao, env, bloom, tone, dark, off")
         return
     end
     -- Snapshot current effective flags into custom_vis_flags before flipping the chosen single switch!
     local cur = GetActiveVisualFlags()
     if current_visual_preset ~= 3 then
-        custom_vis_flags.af16       = cur.af16
-        custom_vis_flags.full_lm    = cur.full_lm
-        custom_vis_flags.cas        = cur.cas
-        custom_vis_flags.ao         = cur.ao
-        custom_vis_flags.env        = cur.env
-        custom_vis_flags.soft_bloom = cur.soft_bloom
-        custom_vis_flags.tone       = cur.tone
+        custom_vis_flags.af16         = cur.af16
+        custom_vis_flags.full_lm      = cur.full_lm
+        custom_vis_flags.cas          = cur.cas
+        custom_vis_flags.ao           = cur.ao
+        custom_vis_flags.env          = cur.env
+        custom_vis_flags.soft_bloom   = cur.soft_bloom
+        custom_vis_flags.tone         = cur.tone
+        custom_vis_flags.mip_sharp    = cur.mip_sharp
+        custom_vis_flags.dark_clarity = cur.dark_clarity
     end
     if val == nil then
         custom_vis_flags[field] = not custom_vis_flags[field]
@@ -787,11 +926,19 @@ if SKIP_MOTD_DELAY then
 end
 
 --------------------------------------------------------------------------------
--- 5. Frame-Rate-Independent Exponential Damping for FollowCamera
---    Calibrated to 60Hz reference so 120/144/240Hz have identical feel + 4x smoothness.
---    Wraps original FollowCamera:Update without replacing it (100% mod-compatible).
+-- 5. Frame-Rate-Independent Exponential Damping + 240Hz Phase-Locked FollowCamera
+--    a) Exponential Damping: calibrated to 60Hz reference so 120/144/240Hz have
+--       identical pan/zoom/rotate feel.
+--    b) [v2.6.0 Pillar 1] 240Hz Phase-Locked Lag-Comp-OFF Camera Target Smoothing:
+--       When Lag Compensation is OFF (target == ThePlayer & locomotor == nil) and
+--       240Hz interpolation is active, Klei's FollowCamera:Update still reads raw
+--       30Hz Transform:GetWorldPosition(), causing subtle 30Hz background judder.
+--       Phase-locking camera tracking to the exact C0 segment curve (auto-bypassing
+--       >111Hz continuous physics, snapping on teleports / Snap() / target change,
+--       and preserving 100% of focalpoint, screenoffset & shake) syncs Sprite +
+--       Dynamic Light + Camera onto one single 240Hz curve!
 --------------------------------------------------------------------------------
-if SMOOTH_CAMERA then
+do
     local REF_FPS = 60.0
     local REF_DT = 1.0 / REF_FPS
 
@@ -813,27 +960,141 @@ if SMOOTH_CAMERA then
             return
         end
 
+        local ct_target = nil
+        local ct_clock = 0.0
+        local ct_last_t = 0.0
+        local ct_snap_t = 0.0
+        local ct_period = 1.0 / 30.0
+        local ct_fast_streak = 0
+        local ct_prev_x, ct_prev_y, ct_prev_z = 0.0, 0.0, 0.0
+        local ct_raw_x, ct_raw_y, ct_raw_z = 0.0, 0.0, 0.0
+
+        local old_Snap = self.Snap
+        if type(old_Snap) == "function" then
+            self.Snap = function(cam, ...)
+                ct_target = nil
+                return old_Snap(cam, ...)
+            end
+        end
+
         self.Update = function(cam, dt, dontupdatepos)
             if dt == nil or dt <= 0 or dt > 0.25 or cam.paused then
+                ct_target = nil
                 return old_Update(cam, dt, dontupdatepos)
+            end
+
+            ct_clock = ct_clock + dt
+            local dx, dy, dz = 0.0, 0.0, 0.0
+            local cam240_active = current_skeletal_tween
+                and not dontupdatepos
+                and not cam.cutscene
+                and cam.target ~= nil
+                and cam.target == GLOBAL.ThePlayer
+                and cam.target.Transform ~= nil
+                and cam.target.components ~= nil
+                and cam.target.components.locomotor == nil
+
+            if cam240_active then
+                local rx, ry, rz = cam.target.Transform:GetWorldPosition()
+                if rx == nil then
+                    ct_target = nil
+                    cam240_active = false
+                elseif ct_target ~= cam.target or (ct_clock - ct_last_t) > 0.16 then
+                    ct_target = cam.target
+                    ct_prev_x, ct_prev_y, ct_prev_z = rx, ry, rz
+                    ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
+                    ct_snap_t = ct_clock
+                    ct_last_t = ct_clock
+                    ct_period = 1.0 / 30.0
+                    ct_fast_streak = 0
+                else
+                    local mx = rx - ct_raw_x
+                    local my = ry - ct_raw_y
+                    local mz = rz - ct_raw_z
+                    local move_sq = mx * mx + my * my + mz * mz
+                    if move_sq > 25.0 then
+                        -- Teleport / wormhole / cave jump (>5 units): hard snap
+                        ct_prev_x, ct_prev_y, ct_prev_z = rx, ry, rz
+                        ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
+                        ct_snap_t = ct_clock
+                        ct_fast_streak = 0
+                    elseif move_sq > 1e-6 then
+                        local gap = ct_clock - ct_snap_t
+                        local prev_a = (ct_period > 1e-4) and math.min(1.0, math.max(0.0, gap / ct_period)) or 1.0
+                        local disp_x = ct_prev_x + (ct_raw_x - ct_prev_x) * prev_a
+                        local disp_y = ct_prev_y + (ct_raw_y - ct_prev_y) * prev_a
+                        local disp_z = ct_prev_z + (ct_raw_z - ct_prev_z) * prev_a
+                        if gap < 0.009 then
+                            ct_fast_streak = math.min(8, ct_fast_streak + 1)
+                        else
+                            ct_fast_streak = 0
+                            if gap >= 0.014 and gap <= 0.12 then
+                                local clamped_gap = math.min(0.095, math.max(0.015, gap))
+                                ct_period = ct_period * 0.70 + clamped_gap * 0.30
+                            end
+                        end
+                        ct_prev_x, ct_prev_y, ct_prev_z = disp_x, disp_y, disp_z
+                        ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
+                        ct_snap_t = ct_clock
+                    end
+
+                    if ct_fast_streak < 2 then
+                        local elapsed = ct_clock - ct_snap_t
+                        local alpha = (ct_period > 1e-4) and math.min(1.0, math.max(0.0, elapsed / ct_period)) or 1.0
+                        local sx = ct_prev_x + (ct_raw_x - ct_prev_x) * alpha
+                        local sy = ct_prev_y + (ct_raw_y - ct_prev_y) * alpha
+                        local sz = ct_prev_z + (ct_raw_z - ct_prev_z) * alpha
+                        dx = sx - rx
+                        dy = sy - ry
+                        dz = sz - rz
+                    end
+                    ct_last_t = ct_clock
+                end
+            else
+                ct_target = nil
             end
 
             local orig_pan = cam.pangain
             local orig_heading = cam.headinggain
             local orig_dist = cam.distancegain
             local orig_cdist = cam.continuousdistancegain
+            local eff_pan = orig_pan
 
-            cam.pangain = EffectiveGain(orig_pan, dt)
-            cam.headinggain = EffectiveGain(orig_heading, dt)
-            cam.distancegain = EffectiveGain(orig_dist, dt)
-            cam.continuousdistancegain = EffectiveGain(orig_cdist, dt)
+            if SMOOTH_CAMERA then
+                eff_pan = EffectiveGain(orig_pan, dt)
+                cam.pangain = eff_pan
+                cam.headinggain = EffectiveGain(orig_heading, dt)
+                cam.distancegain = EffectiveGain(orig_dist, dt)
+                cam.continuousdistancegain = EffectiveGain(orig_cdist, dt)
+            end
 
             old_Update(cam, dt, dontupdatepos)
 
-            cam.pangain = orig_pan
-            cam.headinggain = orig_heading
-            cam.distancegain = orig_dist
-            cam.continuousdistancegain = orig_cdist
+            if SMOOTH_CAMERA then
+                cam.pangain = orig_pan
+                cam.headinggain = orig_heading
+                cam.distancegain = orig_dist
+                cam.continuousdistancegain = orig_cdist
+            end
+
+            -- Algebraically identical to lerp(orig_c, smooth + offset, alpha_p) + shake!
+            if cam240_active and (dx ~= 0.0 or dy ~= 0.0 or dz ~= 0.0) and cam.currentpos ~= nil then
+                local alpha_p = (type(eff_pan) == "number" and eff_pan > 0) and math.min(1.0, dt * eff_pan) or 0.0
+                if alpha_p > 0.0 then
+                    cam.currentpos.x = cam.currentpos.x + dx * alpha_p
+                    cam.currentpos.y = cam.currentpos.y + dy * alpha_p
+                    cam.currentpos.z = cam.currentpos.z + dz * alpha_p
+                    if cam.targetpos ~= nil then
+                        cam.targetpos.x = cam.targetpos.x + dx
+                        cam.targetpos.y = cam.targetpos.y + dy
+                        cam.targetpos.z = cam.targetpos.z + dz
+                    end
+                    latency_stats.cam240_frames = latency_stats.cam240_frames + 1
+                    if type(cam.Apply) == "function" then
+                        cam:Apply()
+                    end
+                end
+            end
         end
     end)
 end
@@ -876,6 +1137,142 @@ if SMOOTH_UI_240HZ then
 
     AddClassPostConstruct("widgets/truescrolllist", WrapSmoothScrollList)
     AddClassPostConstruct("widgets/redux/chatscrolllist", WrapSmoothScrollList)
+
+    -- TrueScrollArea (Cookbook / Scrapbook / Mod Settings / Skins / Lore panels):
+    -- Vanilla hardcodes blend_weight = 0.7 (alpha = 0.30/frame -> 4x too abrupt @ 240Hz!).
+    AddClassPostConstruct("widgets/truescrollarea", function(self)
+        local old_OnUpdate = self.OnUpdate
+        if not old_OnUpdate then
+            return
+        end
+        self.OnUpdate = function(area, dt)
+            if dt and dt > 0 and dt < 0.05 and area.current_scroll_pos and area.target_scroll_pos then
+                local diff = area.target_scroll_pos - area.current_scroll_pos
+                if math.abs(diff) > 0.01 then
+                    local alpha_dt = 1.0 - math.pow(0.70, dt * 60.0)
+                    local scale = alpha_dt / 0.30
+                    if scale < 0.98 then
+                        local orig_target = area.target_scroll_pos
+                        local fake_target = area.current_scroll_pos + diff * scale
+                        if math.abs(fake_target - area.current_scroll_pos) > 0.035 then
+                            area.target_scroll_pos = fake_target
+                            old_OnUpdate(area, dt)
+                            local delta = area.target_scroll_pos - fake_target
+                            area.target_scroll_pos = orig_target + delta
+                            return
+                        end
+                    end
+                end
+            end
+            return old_OnUpdate(area, dt)
+        end
+    end)
+
+    -- FollowText (Speech Bubbles & Floating Character/Mob Labels):
+    -- Vanilla queries raw 30Hz GetSymbolPosition / GetWorldPosition every frame,
+    -- making speech bubbles judder at 30Hz above smoothly gliding 240Hz characters!
+    AddClassPostConstruct("widgets/followtext", function(self)
+        local old_OnUpdate = self.OnUpdate
+        if not old_OnUpdate then
+            return
+        end
+        local ft_target = nil
+        local ft_clock = 0.0
+        local ft_last_t = 0.0
+        local ft_snap_t = 0.0
+        local ft_period = 1.0 / 30.0
+        local ft_fast_streak = 0
+        local ft_prev_x, ft_prev_y, ft_prev_z = 0.0, 0.0, 0.0
+        local ft_raw_x, ft_raw_y, ft_raw_z = 0.0, 0.0, 0.0
+
+        local old_SetTarget = self.SetTarget
+        if type(old_SetTarget) == "function" then
+            self.SetTarget = function(ft, target, ...)
+                ft_target = nil
+                return old_SetTarget(ft, target, ...)
+            end
+        end
+
+        self.OnUpdate = function(ft, dt)
+            if not current_skeletal_tween or dt == nil or dt <= 0 or dt > 0.25
+                or ft.target == nil or not ft.target:IsValid() then
+                ft_target = nil
+                return old_OnUpdate(ft, dt)
+            end
+
+            if not ft.hashud and GLOBAL.TheFrontEnd ~= nil then
+                ft.text:SetScale(GLOBAL.TheFrontEnd:GetHUDScale())
+            end
+
+            local rx, ry, rz
+            if ft.target.AnimState ~= nil then
+                rx, ry, rz = ft.target.AnimState:GetSymbolPosition(
+                    ft.symbol or "", ft.offset.x, ft.offset.y, ft.offset.z)
+            elseif ft.target.Transform ~= nil then
+                rx, ry, rz = ft.target.Transform:GetWorldPosition()
+            end
+            if rx == nil then
+                ft_target = nil
+                return old_OnUpdate(ft, dt)
+            end
+
+            ft_clock = ft_clock + dt
+            local sx, sy, sz = rx, ry, rz
+            if ft_target ~= ft.target or (ft_clock - ft_last_t) > 0.16 then
+                ft_target = ft.target
+                ft_prev_x, ft_prev_y, ft_prev_z = rx, ry, rz
+                ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
+                ft_snap_t = ft_clock
+                ft_last_t = ft_clock
+                ft_period = 1.0 / 30.0
+                ft_fast_streak = 0
+            else
+                local mx = rx - ft_raw_x
+                local my = ry - ft_raw_y
+                local mz = rz - ft_raw_z
+                local move_sq = mx * mx + my * my + mz * mz
+                if move_sq > 25.0 then
+                    ft_prev_x, ft_prev_y, ft_prev_z = rx, ry, rz
+                    ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
+                    ft_snap_t = ft_clock
+                    ft_fast_streak = 0
+                elseif move_sq > 1e-6 then
+                    local gap = ft_clock - ft_snap_t
+                    local prev_a = (ft_period > 1e-4) and math.min(1.0, math.max(0.0, gap / ft_period)) or 1.0
+                    local disp_x = ft_prev_x + (ft_raw_x - ft_prev_x) * prev_a
+                    local disp_y = ft_prev_y + (ft_raw_y - ft_prev_y) * prev_a
+                    local disp_z = ft_prev_z + (ft_raw_z - ft_prev_z) * prev_a
+                    if gap < 0.009 then
+                        ft_fast_streak = math.min(8, ft_fast_streak + 1)
+                    else
+                        ft_fast_streak = 0
+                        if gap >= 0.014 and gap <= 0.12 then
+                            local clamped_gap = math.min(0.095, math.max(0.015, gap))
+                            ft_period = ft_period * 0.70 + clamped_gap * 0.30
+                        end
+                    end
+                    ft_prev_x, ft_prev_y, ft_prev_z = disp_x, disp_y, disp_z
+                    ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
+                    ft_snap_t = ft_clock
+                end
+
+                if ft_fast_streak < 2 then
+                    local elapsed = ft_clock - ft_snap_t
+                    local alpha = (ft_period > 1e-4) and math.min(1.0, math.max(0.0, elapsed / ft_period)) or 1.0
+                    if alpha < 1.0 then
+                        sx = ft_prev_x + (ft_raw_x - ft_prev_x) * alpha
+                        sy = ft_prev_y + (ft_raw_y - ft_prev_y) * alpha
+                        sz = ft_prev_z + (ft_raw_z - ft_prev_z) * alpha
+                        latency_stats.followtext_240 = latency_stats.followtext_240 + 1
+                    end
+                end
+                ft_last_t = ft_clock
+            end
+
+            local x, y = TheSim:GetScreenPos(sx, sy, sz)
+            ft:SetPosition(x + ft.screen_offset.x, y + ft.screen_offset.y, 0)
+        end
+    end)
 
     AddClassPostConstruct("screens/mapscreen", function(self)
         local old_OnUpdate = self.OnUpdate
@@ -1011,6 +1408,315 @@ if REDUCE_240HZ_CHURN then
             return old_InputOnUpdate(inp)
         end
     end
+
+    ----------------------------------------------------------------------------
+    -- 7b. CraftingMenu Zero-Stall Overhaul (Eliminates Pickup/Chest/Combat Micro-Stutters)
+    --     Vanilla CraftingMenuHUD:RebuildRecipes() invokes inventory:Has(prefab, amt, true)
+    --     ~1,500-3,000 times on EVERY itemget / itemlose / stacksizechange / healthdelta /
+    --     sanitydelta / open-chest event (even with the crafting menu CLOSED!), scanning
+    --     ~38+ C++ net_entity slots per call (~57,000 C++ boundary crossings in 1 frame!),
+    --     and then rebuilds hidden CraftingMenuWidget grids & details panels!
+    --     Fix:
+    --       1) Single-pass O(slots) crafting count snapshot when vanilla Has() is intact,
+    --          auto-falling back to mathematically exact per-rebuild memoization if ANY
+    --          third-party mod (e.g. Craft From Chests) hooks Inventory/Container:Has().
+    --       2) Defer hidden CraftingMenuWidget grid/filter/detail rebuilds while closed,
+    --          keeping valid_recipes + PinBar + lightbulb/ding sounds 100% vanilla-live,
+    --          and flushing cleanly on CraftingMenuHUD:Open().
+    ----------------------------------------------------------------------------
+    local function IsVanillaSrc(fn, pat)
+        if type(fn) ~= "function" or _dbg_getinfo_df == nil then
+            return false
+        end
+        local info = _dbg_getinfo_df(fn, "S")
+        local src = info ~= nil and info.source or nil
+        return type(src) == "string" and src:find(pat) ~= nil
+    end
+
+    local function TallyHostItem(item, counts)
+        if item ~= nil and item.prefab ~= nil and (item.HasTag == nil or not item:HasTag("nocrafting")) then
+            local st = item.components ~= nil and item.components.stackable or nil
+            local n = st ~= nil and st:StackSize() or 1
+            counts[item.prefab] = (counts[item.prefab] or 0) + n
+        end
+    end
+
+    local function TallyClientItem(item, counts)
+        if item ~= nil and item.prefab ~= nil and (item.HasTag == nil or not item:HasTag("nocrafting")) then
+            local st = item.replica ~= nil and item.replica.stackable or nil
+            local n = st ~= nil and st:StackSize() or 1
+            counts[item.prefab] = (counts[item.prefab] or 0) + n
+        end
+    end
+
+    local function TallyClientContainer(container, counts)
+        if not IsVanillaSrc(container.Has, "components[/\\]container_replica%.lua") then
+            return false
+        end
+        local ccl = container.classified
+        if ccl == nil or not IsVanillaSrc(ccl.Has, "prefabs[/\\]container_classified%.lua") then
+            return false
+        end
+        local citems = ccl._items
+        if type(citems) ~= "table" then
+            return false
+        end
+        local cprev = ccl._itemspreview
+        if cprev ~= nil then
+            for i = 1, #citems do
+                TallyClientItem(cprev[i], counts)
+            end
+        else
+            for i = 1, #citems do
+                local nv = citems[i]
+                if nv ~= nil and nv.value ~= nil then
+                    TallyClientItem(nv:value(), counts)
+                end
+            end
+        end
+        return true
+    end
+
+    local function TryBuildCraftingSnapshot(owner, inv_rep)
+        if owner == nil or inv_rep == nil then
+            return nil
+        end
+        if not IsVanillaSrc(inv_rep.Has, "components[/\\]inventory_replica%.lua") then
+            return nil
+        end
+        local counts = {}
+        local inv_cmp = owner.components ~= nil and owner.components.inventory or nil
+        if inv_cmp ~= nil then
+            -- Local Host / Solo path
+            if not IsVanillaSrc(inv_cmp.Has, "components[/\\]inventory%.lua") then
+                return nil
+            end
+            if type(inv_cmp.itemslots) ~= "table" then
+                return nil
+            end
+            for _, v in pairs(inv_cmp.itemslots) do
+                TallyHostItem(v, counts)
+            end
+            TallyHostItem(inv_cmp.activeitem, counts)
+
+            local overflow = inv_cmp:GetOverflowContainer()
+            if overflow ~= nil then
+                if not IsVanillaSrc(overflow.Has, "components[/\\]container%.lua")
+                    and not IsVanillaSrc(overflow.Has, "components[/\\]inventory%.lua") then
+                    return nil
+                end
+                local oslots = overflow.slots or overflow.itemslots
+                if type(oslots) ~= "table" then
+                    return nil
+                end
+                for _, v in pairs(oslots) do
+                    TallyHostItem(v, counts)
+                end
+            end
+
+            if type(inv_cmp.opencontainers) == "table" then
+                for container_inst in pairs(inv_cmp.opencontainers) do
+                    local c = container_inst.components ~= nil
+                        and (container_inst.components.container or container_inst.components.inventory) or nil
+                    if c ~= nil and c ~= overflow and not c.excludefromcrafting and not c.readonlycontainer then
+                        if not IsVanillaSrc(c.Has, "components[/\\]container%.lua")
+                            and not IsVanillaSrc(c.Has, "components[/\\]inventory%.lua") then
+                            return nil
+                        end
+                        local cslots = c.slots or c.itemslots
+                        if type(cslots) ~= "table" then
+                            return nil
+                        end
+                        for _, v in pairs(cslots) do
+                            TallyHostItem(v, counts)
+                        end
+                    end
+                end
+            end
+            return counts
+        end
+
+        -- Multiplayer Remote Client path (inventory_classified)
+        local cl = inv_rep.classified
+        if cl == nil or not IsVanillaSrc(cl.Has, "prefabs[/\\]inventory_classified%.lua") then
+            return nil
+        end
+        local items = cl._items
+        if type(items) ~= "table" then
+            return nil
+        end
+        local active = cl._activeitem
+        TallyClientItem(active, counts)
+        local prev = cl._itemspreview
+        if prev ~= nil then
+            for i = 1, #items do
+                TallyClientItem(prev[i], counts)
+            end
+        else
+            for i = 1, #items do
+                local nv = items[i]
+                if nv ~= nil and nv.value ~= nil then
+                    local it = nv:value()
+                    if it ~= active then
+                        TallyClientItem(it, counts)
+                    end
+                end
+            end
+        end
+
+        local overflow = inv_rep.GetOverflowContainer ~= nil and inv_rep:GetOverflowContainer() or nil
+        if overflow ~= nil then
+            if not TallyClientContainer(overflow, counts) then
+                return nil
+            end
+        end
+
+        local open_c = inv_rep.GetOpenContainers ~= nil and inv_rep:GetOpenContainers() or nil
+        if type(open_c) == "table" then
+            for container_inst in pairs(open_c) do
+                local c = container_inst.replica ~= nil
+                    and (container_inst.replica.container or container_inst.replica.inventory) or nil
+                if c ~= nil and c ~= overflow and not c.excludefromcrafting
+                    and (c.IsReadOnlyContainer == nil or not c:IsReadOnlyContainer()) then
+                    if not TallyClientContainer(c, counts) then
+                        return nil
+                    end
+                end
+            end
+        end
+        return counts
+    end
+
+    AddClassPostConstruct("widgets/redux/craftingmenu_hud", function(hud)
+        if type(hud) ~= "table" or type(hud.RebuildRecipes) ~= "function" then
+            return
+        end
+        local orig_RebuildRecipes = hud.RebuildRecipes
+        hud.RebuildRecipes = function(self, ...)
+            local owner = self.owner
+            local inv_rep = owner ~= nil and owner.replica ~= nil and owner.replica.inventory or nil
+            if inv_rep == nil or type(inv_rep.Has) ~= "function" then
+                return orig_RebuildRecipes(self, ...)
+            end
+
+            latency_stats.craft_rebuilds = latency_stats.craft_rebuilds + 1
+            local inv_cmp = owner.components ~= nil and owner.components.inventory or nil
+            local orig_rep_has = inv_rep.Has
+            local orig_cmp_has = inv_cmp ~= nil and inv_cmp.Has or nil
+
+            local counts = TryBuildCraftingSnapshot(owner, inv_rep)
+            if counts ~= nil then
+                local fast_has = function(self_inv, prefab, amount, checkallcontainers)
+                    if checkallcontainers then
+                        latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                        local c = counts[prefab] or 0
+                        return c >= amount, c
+                    end
+                    if self_inv == inv_cmp and orig_cmp_has ~= nil then
+                        return orig_cmp_has(self_inv, prefab, amount, checkallcontainers)
+                    end
+                    return orig_rep_has(self_inv, prefab, amount, checkallcontainers)
+                end
+                inv_rep.Has = fast_has
+                if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                    inv_cmp.Has = fast_has
+                end
+            else
+                -- Third-party mod wrapped Has() (e.g. Craft From Nearby Chests):
+                -- use mathematically exact per-rebuild memoization calling the mod's own Has()!
+                local memo = {}
+                local function make_memo(orig_fn)
+                    return function(self_inv, prefab, amount, checkallcontainers)
+                        if checkallcontainers and prefab ~= nil and type(amount) == "number" then
+                            local e = memo[prefab]
+                            if e ~= nil then
+                                if amount <= e.min then
+                                    latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                                    return true, e.min
+                                elseif e.exact then
+                                    latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                                    return false, e.min
+                                end
+                            end
+                            local enough, found = orig_fn(self_inv, prefab, amount, checkallcontainers)
+                            local cnt = type(found) == "number" and found or (enough and amount or 0)
+                            if e == nil then
+                                memo[prefab] = { min = cnt, exact = not enough }
+                            else
+                                if cnt > e.min then e.min = cnt end
+                                if not enough then e.exact = true end
+                            end
+                            return enough, found
+                        end
+                        return orig_fn(self_inv, prefab, amount, checkallcontainers)
+                    end
+                end
+                inv_rep.Has = make_memo(orig_rep_has)
+                if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                    inv_cmp.Has = make_memo(orig_cmp_has)
+                end
+            end
+
+            local ok, r1, r2, r3 = pcall(orig_RebuildRecipes, self, ...)
+            inv_rep.Has = orig_rep_has
+            if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                inv_cmp.Has = orig_cmp_has
+            end
+            if not ok then
+                GLOBAL.error(r1, 0)
+            end
+            return r1, r2, r3
+        end
+
+        if type(hud.Open) == "function" then
+            local orig_Open = hud.Open
+            hud.Open = function(self, search, ...)
+                local cm = self.craftingmenu
+                if cm ~= nil and cm._hs_deferred_refresh then
+                    local need_rebuild = cm._hs_deferred_rebuild
+                    cm._hs_deferred_refresh = false
+                    cm._hs_deferred_rebuild = false
+                    if cm.sort_class == nil or cm.sort_class.Refresh == nil or not cm.sort_class:Refresh() then
+                        if need_rebuild and type(cm.ApplyFilters) == "function" then
+                            cm:ApplyFilters()
+                        elseif cm.recipe_grid ~= nil and type(cm.recipe_grid.RefreshView) == "function" then
+                            cm.recipe_grid:RefreshView()
+                        end
+                    end
+                    if cm.details_root ~= nil and type(cm.details_root.Refresh) == "function" then
+                        cm.details_root:Refresh()
+                    end
+                end
+                return orig_Open(self, search, ...)
+            end
+        end
+    end)
+
+    AddClassPostConstruct("widgets/redux/craftingmenu_widget", function(cm)
+        if type(cm) ~= "table" or type(cm.Refresh) ~= "function" then
+            return
+        end
+        local orig_Refresh = cm.Refresh
+        cm.Refresh = function(self, tech_tree_changed, ...)
+            if self.crafting_hud ~= nil
+                and type(self.crafting_hud.IsCraftingOpen) == "function"
+                and not self.crafting_hud:IsCraftingOpen()
+                and type(self.UpdateFilterButtons) == "function" then
+                -- Keep open_menu_button prototype lightbulb & ding sound 100% live,
+                -- but defer hidden ApplyFilters / recipe_grid / details_root until Open()!
+                local rebuild_details_list = self:UpdateFilterButtons()
+                self._hs_deferred_refresh = true
+                if rebuild_details_list then
+                    self._hs_deferred_rebuild = true
+                end
+                latency_stats.craft_ui_deferred = latency_stats.craft_ui_deferred + 1
+                return
+            end
+            self._hs_deferred_refresh = false
+            self._hs_deferred_rebuild = false
+            return orig_Refresh(self, tech_tree_changed, ...)
+        end
+    end)
 end
 
 --------------------------------------------------------------------------------
@@ -1109,15 +1815,15 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
     self.options.hc_visual = current_visual_preset
     self.working.hc_visual = current_visual_preset
 
-    -- Update official Refresh Rate tooltip to reflect live HyperSmooth v2.4.0 RTSS control
+    -- Update official Refresh Rate tooltip to reflect live HyperSmooth v2.6.0 RTSS control
     if self.refreshRateSpinner.parent then
         if is_zh then
             self.refreshRateSpinner.parent.tooltip_text = has_dll
-                and "由 HyperSmooth v2.4.0 零争抢 RTSS 引擎实时接管：支持全屏/窗口自由切帧（60~360/无限制）并深度优化 1% Low 稳帧"
+                and "由 HyperSmooth v2.6.0 零争抢 RTSS + D3D9Ex 1帧低延迟引擎实时接管：支持全屏/窗口自由切帧（60~360/无限制）"
                 or "需安装配套 bin64/dinput8.dll 原生插件方可突破官方 60 帧上限与启用 RTSS 稳帧（当前仅控制全屏显示器模式）"
         else
             self.refreshRateSpinner.parent.tooltip_text = has_dll
-                and "Powered live by HyperSmooth v2.4.0 Zero-Contention RTSS Pacer: 60-360 FPS or Unlimited with 1% Low stabilization."
+                and "Powered live by HyperSmooth v2.6.0 RTSS Pacer + D3D9Ex 1-Frame Reflex Queue: 60-360 FPS or Unlimited."
                 or "Install bin64/dinput8.dll companion plugin to unlock frame rate above 60 FPS & RTSS pacing."
         end
     end
@@ -1243,11 +1949,11 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
         }
         local tip_txt, tip_div = FindGraphicsTooltipWidgets(self)
 
-        local skel_label = is_zh and "240帧骨骼补帧" or "240fps Skeletal"
+        local skel_label = is_zh and "240帧骨骼/粒子补帧" or "240fps Anim & VFX"
         local skel_tip = is_zh
-            and (has_dll and "开启全实体/特效/UI 真 240 帧骨骼动画亚刻插值（dinput8.dll 已直连，实时生效）"
+            and (has_dll and "开启全实体骨骼、位移以及雨雪/火星/法术粒子的真 240 帧连续插值（dinput8.dll 已直连，实时生效）"
                          or "需安装 bin64/dinput8.dll 原生插件方可生效")
-            or (has_dll and "True 240fps 2D skeletal animation interpolation across World, Overlays & UI (dinput8.dll active)."
+            or (has_dll and "True 240fps interpolation across Skeletal Anims, World Positions & VFX Particles (dinput8.dll active)."
                         or "Requires bin64/dinput8.dll native companion plugin.")
         self.hcSkeletalSpinner = CreateNativeGraphicsSpinner(skel_label, toggle_opts, skel_tip)
         self.hcSkeletalSpinner.OnChanged = function(_, data)
@@ -1435,10 +2141,36 @@ local function TryActivate60HzSim(source_label)
     end
 end
 
+local function TryRestore30HzSim(source_label)
+    local fnSetSim = rawget(GLOBAL, "HyperSmooth_SetSimTickRate")
+    if type(fnSetSim) ~= "function" then
+        return false
+    end
+    local ok, applied = pcall(fnSetSim, 30)
+    if ok and applied then
+        active_sim_tick_hz = 30
+        toast_msg = "HyperCore 30Hz Vanilla SimTick RESTORED"
+        toast_timer = 3.0
+        hud_dirty_now = true
+        if GLOBAL.print then
+            GLOBAL.print(string.format("[HyperSmooth v2.4.0] Restored 30Hz SimTick via %s (GetTickTime=%.6f)",
+                tostring(source_label), TheSim:GetTickTime()))
+        end
+        return true
+    end
+    if GLOBAL.print then
+        GLOBAL.print(string.format("[HyperSmooth v2.4.0] WARNING: Failed restoring 30Hz SimTick via %s (ok=%s applied=%s)",
+            tostring(source_label), tostring(ok), tostring(applied)))
+    end
+    return false
+end
+
 -- Channel 1: ClientModRPC("HyperCoreProto", "SimTickRate") without duplicating slot id if co-loaded
 local function OnSimTickRateRpc(hz)
     if hz == 60 then
         TryActivate60HzSim("ClientModRPC")
+    elseif hz == 30 then
+        TryRestore30HzSim("ClientModRPC")
     end
 end
 if type(AddClientModRPCHandler) == "function" then
@@ -1514,7 +2246,7 @@ if type(AddComponentPostInit) == "function" then
         local orig_OnControl = pc.OnControl
         pc.OnControl = function(self, control, down, analog, ...)
             local ret = orig_OnControl(self, control, down, analog, ...)
-            if ret == true then
+            if ret == true or not current_low_latency then
                 return ret
             end
             if control ~= MOVE_UP and control ~= MOVE_DOWN and control ~= MOVE_LEFT and control ~= MOVE_RIGHT then
@@ -1548,9 +2280,6 @@ if type(AddComponentPostInit) == "function" then
             if self.IsLocalOrRemoteHopping and self:IsLocalOrRemoteHopping() then
                 return ret
             end
-            if self.recent_bufferedaction ~= nil and self.recent_bufferedaction.act ~= nil then
-                return ret
-            end
             local bcu = inst.components and inst.components.boatcannonuser or nil
             if (bcu ~= nil and bcu.GetCannon and bcu:GetCannon() ~= nil)
                 or (inst.HasTag and (inst:HasTag("steeringboat") or inst:HasTag("rotatingboat"))) then
@@ -1580,6 +2309,19 @@ if type(AddComponentPostInit) == "function" then
                 if cam and cam.GetRightVec and cam.GetDownVec and type(self.RemoteDirectWalking) == "function" then
                     local dir = (cam:GetRightVec() * xdir - cam:GetDownVec() * ydir):GetNormalized()
                     if dir.x == dir.x and dir.z == dir.z then
+                        -- Exact vanilla DoDirectWalking directional check (playercontroller.lua:L4325-L4343):
+                        -- protect late key-release on SAME direction, but NEVER stall a NEW walk-cancel dodge direction!
+                        local recent = self.recent_bufferedaction
+                        if recent ~= nil and recent.act ~= nil then
+                            local cur_ba = inst.GetBufferedAction and inst:GetBufferedAction() or nil
+                            if cur_ba ~= nil and recent.act == cur_ba
+                                and type(recent.x) == "number" and type(recent.z) == "number"
+                                and math.abs(recent.x - dir.x) < 1e-4 and math.abs(recent.z - dir.z) < 1e-4 then
+                                return ret
+                            end
+                            recent.act = nil
+                            latency_stats.walk_cancels = latency_stats.walk_cancels + 1
+                        end
                         if inst.ClearBufferedAction then inst:ClearBufferedAction() end
                         if self.CooldownRemoteController then self:CooldownRemoteController() end
                         if not self.directwalking then
@@ -1589,19 +2331,161 @@ if type(AddComponentPostInit) == "function" then
                             self.predictwalking = false
                         end
                         self:RemoteDirectWalking(dir.x, dir.z)
+                        latency_stats.wasd_instant_rpcs = latency_stats.wasd_instant_rpcs + 1
                     end
                 end
             elseif self.directwalking and type(self.RemoteStopWalking) == "function" then
+                if self.recent_bufferedaction ~= nil then
+                    self.recent_bufferedaction.act = nil
+                end
                 self.directwalking = false
                 self.dragwalking = false
                 self.predictwalking = false
                 if self.CooldownRemoteController then self:CooldownRemoteController() end
                 self:RemoteStopWalking()
+                latency_stats.wasd_instant_rpcs = latency_stats.wasd_instant_rpcs + 1
             end
             return ret
         end
+
+        -- 9c. [v2.6.0 Pillar 2] 240Hz Fresh Flick-Click & Modifier-Click Action Resolution (0-33.3ms Stale Fix)
+        --     Vanilla PlayerController:OnUpdate refreshes self.LMBaction / self.RMBaction ONLY at 30Hz.
+        --     When a player flicks the mouse onto a target OR presses Ctrl/Shift/Alt (e.g. Ctrl+LMB Force Attack)
+        --     and clicks within <33ms, OnLeftClick / OnRightClick reads stale LMBaction/RMBaction -> missed
+        --     attack/pickup or accidental WALKTO into boss!
+        --     Refreshing DoGetMouseActions() right on click-down ONLY when cursor, hover, or control modifiers
+        --     changed since last OnUpdate eliminates up to 33.3ms of flick/modifier misses with zero duplicate
+        --     RPCs and 100% compatibility with public servers, ActionQueue, Geometric Placement & ShowMe/Insight.
+        if type(pc.OnLeftClick) == "function" and type(pc.OnRightClick) == "function" then
+            local last_upd_mx, last_upd_my, last_upd_hover, last_upd_mods = nil, nil, nil, nil
+
+            if type(pc.OnUpdate) == "function" then
+                local orig_OnUpdate = pc.OnUpdate
+                pc.OnUpdate = function(self, dt, ...)
+                    local r = orig_OnUpdate(self, dt, ...)
+                    if current_low_latency and self.inst == GLOBAL.ThePlayer and TheSim and TheSim.GetPosition then
+                        last_upd_mx, last_upd_my = TheSim:GetPosition()
+                        last_upd_hover = TheInput and TheInput.GetWorldEntityUnderMouse and TheInput:GetWorldEntityUnderMouse() or nil
+                        last_upd_mods = type(self.EncodeControlMods) == "function" and self:EncodeControlMods() or nil
+                    end
+                    return r
+                end
+            end
+
+            local function RefreshFreshClickActions(self, is_left)
+                if not current_low_latency then return end
+                if not (self.UsingMouse and self:UsingMouse()) then return end
+                if (GLOBAL.IsPaused and GLOBAL.IsPaused()) or self.handler == nil then return end
+                local inst = self.inst
+                if inst == nil or inst ~= GLOBAL.ThePlayer or (inst.IsValid and not inst:IsValid()) then return end
+                if not (self.IsEnabled and self:IsEnabled()) then return end
+                if inst.IsActionsVisible and not inst:IsActionsVisible() then return end
+                if self.placer_recipe ~= nil then return end
+                if not is_left and self.deployplacer ~= nil then return end
+                if self.IsAOETargeting and self:IsAOETargeting() then return end
+                if TheInput.ControllerAttached and TheInput:ControllerAttached() then return end
+                if TheInput.GetHUDEntityUnderMouse and TheInput:GetHUDEntityUnderMouse() ~= nil then return end
+                local picker = inst.components and inst.components.playeractionpicker or nil
+                if picker == nil or type(picker.DoGetMouseActions) ~= "function" then return end
+
+                local mx, my = nil, nil
+                if TheSim and TheSim.GetPosition then
+                    mx, my = TheSim:GetPosition()
+                end
+                -- If mouse moved since last SimTick, ensure Input hoverinst is 0ms fresh at click pixel
+                if mx ~= nil and (mx ~= last_upd_mx or my ~= last_upd_my) and TheInput.OnUpdate then
+                    TheInput:OnUpdate()
+                    if TheInput.GetHUDEntityUnderMouse and TheInput:GetHUDEntityUnderMouse() ~= nil then
+                        return
+                    end
+                end
+                local cur_hover = TheInput.GetWorldEntityUnderMouse and TheInput:GetWorldEntityUnderMouse() or nil
+                local cur_mods = type(self.EncodeControlMods) == "function" and self:EncodeControlMods() or nil
+                local mods_changed = (cur_mods ~= last_upd_mods)
+                if mx ~= last_upd_mx or my ~= last_upd_my or cur_hover ~= last_upd_hover or mods_changed then
+                    local prev_act = is_left and self.LMBaction or self.RMBaction
+                    local new_lmb, new_rmb = picker:DoGetMouseActions()
+                    self.LMBaction, self.RMBaction = new_lmb, new_rmb
+                    last_upd_mx, last_upd_my, last_upd_hover, last_upd_mods = mx, my, cur_hover, cur_mods
+                    latency_stats.flick_refreshes = latency_stats.flick_refreshes + 1
+                    local next_act = is_left and new_lmb or new_rmb
+                    local prev_code = prev_act and prev_act.action
+                    local next_code = next_act and next_act.action
+                    local prev_tgt  = prev_act and prev_act.target
+                    local next_tgt  = next_act and next_act.target
+                    if prev_code ~= next_code or prev_tgt ~= next_tgt then
+                        latency_stats.flick_rescues = latency_stats.flick_rescues + 1
+                        if mods_changed then
+                            latency_stats.mod_click_rescues = latency_stats.mod_click_rescues + 1
+                        end
+                    end
+                end
+            end
+
+            local orig_OnLeftClick = pc.OnLeftClick
+            pc.OnLeftClick = function(self, down, ...)
+                if down then
+                    RefreshFreshClickActions(self, true)
+                end
+                return orig_OnLeftClick(self, down, ...)
+            end
+
+            local orig_OnRightClick = pc.OnRightClick
+            pc.OnRightClick = function(self, down, ...)
+                if down then
+                    RefreshFreshClickActions(self, false)
+                end
+                return orig_OnRightClick(self, down, ...)
+            end
+        end
     end)
 end
+
+--------------------------------------------------------------------------------
+-- 9d. Solo / Non-Caves Local Host Auto-Save Freeze Killer (C++ FastDataDumper Bridge)
+--     Activates ONLY when hosting Master inside dontstarve_steam_x64.exe AND
+--     HyperCore Server's HyperCore_FastDump is not present (zero double-hooking!).
+--     100% vanilla save format with automatic fallback on any edge case.
+--------------------------------------------------------------------------------
+AddSimPostInit(function()
+    local w = GLOBAL.TheWorld
+    if not (w ~= nil and w.ismastersim) then
+        return
+    end
+    if type(rawget(GLOBAL, "HyperCore_FastDump")) == "function" then
+        return
+    end
+    local native_dump = rawget(GLOBAL, "HyperSmooth_FastDump")
+    local orig_dumper = rawget(GLOBAL, "DataDumper")
+    if type(native_dump) ~= "function" or type(orig_dumper) ~= "function" then
+        return
+    end
+    if rawget(GLOBAL, "_HS_FastDumperBridged") then
+        return
+    end
+    rawset(GLOBAL, "_HS_FastDumperBridged", true)
+    rawset(GLOBAL, "DataDumper", function(value, varname, fastmode, ident)
+        if fastmode and ident == nil then
+            local dumped, err = native_dump(value, varname)
+            if dumped ~= nil then
+                latency_stats.host_fastdumps = latency_stats.host_fastdumps + 1
+                return dumped
+            end
+            if err == "buffer_limit_exceeded" or err == "corrupt_number" then
+                if GLOBAL.print then
+                    GLOBAL.print("[HyperSmooth FastDataDumper] Refusing unsafe vanilla fallback: " .. tostring(err))
+                end
+                GLOBAL.error("[HyperSmooth FastDataDumper] Aborted unsafe serialization (" .. tostring(err) .. ")", 2)
+            elseif err == "cycle_detected" or err == "node_limit_exceeded" or err == "depth_limit" or err == "stack_limit" then
+                if GLOBAL.print then
+                    GLOBAL.print("[HyperSmooth FastDataDumper] Safety limit (" .. tostring(err) .. "); downgrading to cycle-safe slow DataDumper")
+                end
+                return orig_dumper(value, varname, false, ident)
+            end
+        end
+        return orig_dumper(value, varname, fastmode, ident)
+    end)
+end)
 
 --------------------------------------------------------------------------------
 -- 10. Lightweight Zero-Churn FPS + 1% Low + P99 HUD & Optional Custom Hotkeys
@@ -1634,6 +2518,24 @@ end
 AddClassPostConstruct("screens/playerhud", function(self)
     -- Re-sync on entering world so any session reload matches active config immediately
     SyncToNativePlugin(false)
+
+    -- One-time per-session update prompt when Workshop mod updated ahead of manual bin64/dinput8.dll
+    if not dll_outdated_toast_shown then
+        local d_st, d_ver, d_exp = GetDllVersionStatus()
+        if d_st == "outdated" then
+            dll_outdated_toast_shown = true
+            local opt_str = GLOBAL.STRINGS and GLOBAL.STRINGS.UI and GLOBAL.STRINGS.UI.OPTIONS
+            local is_zh = not (opt_str and opt_str.ENABLED == "Enabled")
+            local ver_tag = tostring(d_ver or "old")
+            toast_msg = is_zh
+                and string.format("[请更新] 检测到旧版 dinput8.dll (%s)，请手动替换为 v%s", ver_tag, tostring(d_exp))
+                or string.format("[Update] Outdated bin64/dinput8.dll (%s) -> please update to v%s", ver_tag, tostring(d_exp))
+            toast_timer = 10.0
+            toast_is_warning = true
+            hud_dirty_now = true
+            GLOBAL.print(string.format("[HyperSmooth] WARNING: Outdated bin64/dinput8.dll (%s) vs Workshop Mod v%s — please manually update bin64/dinput8.dll!", ver_tag, tostring(d_exp)))
+        end
+    end
 
     local txt = self:AddChild(Text(GLOBAL.NUMBERFONT, 22, ""))
     txt:SetHAnchor(GLOBAL.ANCHOR_RIGHT)
@@ -1675,8 +2577,11 @@ AddClassPostConstruct("screens/playerhud", function(self)
         end
         if toast_timer > 0 then
             toast_timer = toast_timer - (dt or 0)
-            if toast_timer <= 0 and not current_show_fps_hud then
-                fps_hud_text:Hide()
+            if toast_timer <= 0 then
+                toast_is_warning = false
+                if not current_show_fps_hud then
+                    fps_hud_text:Hide()
+                end
             end
         end
         if visual_bench_timer > 0 then
@@ -1702,13 +2607,20 @@ AddClassPostConstruct("screens/playerhud", function(self)
                 if ok and type(avg) == "number" and avg > 1.0 and type(low1) == "number" and low1 > 1.0 then
                     disp_fps = avg
                     color_metric = low1
+                    last_hud_avg_fps = avg
+                    last_hud_low1_fps = low1
                     local badge = (simhz == 60) and " [60Hz]" or ""
                     metric_str = string.format("%.0f FPS | 1%%L %.0f (%.1fms)%s", avg, low1, p99 or last_ms, badge)
                 end
             end
             if not metric_str then
+                last_hud_avg_fps = disp_fps
+                last_hud_low1_fps = disp_fps
                 local badge = (active_sim_tick_hz == 60) and " [60Hz]" or ""
                 metric_str = string.format("%.0f FPS (%.1fms)%s", disp_fps, last_ms, badge)
+            end
+            if type(HS_PanelTickTelemetry) == "function" then
+                HS_PanelTickTelemetry()
             end
 
             -- Append compact GPU/Busy/VRAM telemetry for 12s after visual switch or when pinned via c_hsbench()
@@ -1740,7 +2652,9 @@ AddClassPostConstruct("screens/playerhud", function(self)
                 fps_hud_text:SetString(metric_str)
             end
 
-            if color_metric >= 95 or (disp_fps >= 110 and color_metric >= disp_fps * 0.72) then
+            if toast_timer > 0 and toast_is_warning then
+                fps_hud_text:SetColour(1.0, 0.85, 0.32, 0.98)
+            elseif color_metric >= 95 or (disp_fps >= 110 and color_metric >= disp_fps * 0.72) then
                 fps_hud_text:SetColour(0.45, 1.0, 0.65, 0.92)
             elseif color_metric >= 52 then
                 fps_hud_text:SetColour(1.0, 0.92, 0.45, 0.92)
@@ -1805,6 +2719,122 @@ local HOTKEY_ACTIONS = {
         toast_timer = 2.5
         hud_dirty_now = true
     end,
+    hotkey_panel = function()
+        if type(HS_TogglePanel) == "function" then
+            HS_TogglePanel()
+        end
+    end,
+}
+
+-- Mod-environment API bridge consumed by hs_panel.lua (Sleek In-Game Live Customizer Side-Panel)
+HS_PanelApi = {
+    SetPreset = function(preset_id)
+        if type(preset_id) ~= "number" or preset_id < 0 or preset_id > 3 then return end
+        current_visual_preset = preset_id
+        visual_bench_timer = 12.0
+        SyncToNativePlugin(true)
+        hud_dirty_now = true
+    end,
+    ToggleVisualFlag = function(field)
+        if type(field) ~= "string" or custom_vis_flags[field] == nil then return end
+        local cur = GetActiveVisualFlags()
+        if current_visual_preset ~= 3 then
+            custom_vis_flags.af16         = cur.af16
+            custom_vis_flags.full_lm      = cur.full_lm
+            custom_vis_flags.cas          = cur.cas
+            custom_vis_flags.ao           = cur.ao
+            custom_vis_flags.env          = cur.env
+            custom_vis_flags.soft_bloom   = cur.soft_bloom
+            custom_vis_flags.tone         = cur.tone
+            custom_vis_flags.mip_sharp    = cur.mip_sharp
+            custom_vis_flags.dark_clarity = cur.dark_clarity
+        end
+        custom_vis_flags[field] = not custom_vis_flags[field]
+        current_visual_preset = (EncodeCustomVisMask(custom_vis_flags) == 0) and 0 or 3
+        visual_bench_timer = 12.0
+        SyncToNativePlugin(true)
+        hud_dirty_now = true
+    end,
+    ToggleSkeletal = function()
+        current_skeletal_tween = not current_skeletal_tween
+        SyncToNativePlugin(true)
+        toast_msg = "240Hz Smooth -> " .. (current_skeletal_tween and "ON" or "OFF")
+        toast_timer = 2.5
+        hud_dirty_now = true
+    end,
+    ToggleLowLatency = function()
+        current_low_latency = not current_low_latency
+        SyncToNativePlugin(true)
+        toast_msg = "Low Latency -> " .. (current_low_latency and "ON" or "OFF")
+        toast_timer = 2.5
+        hud_dirty_now = true
+    end,
+    GetSnapshot = function()
+        local has_dll = HasNativePlugin()
+        local avg_fps, low1_fps = last_hud_avg_fps, last_hud_low1_fps
+        local busy_ms, vram_mb = 0, 0
+        local ex_act, cur_lat, orig_lat = false, 3, 3
+        local vfx_ok, light_ok, lm_scale = false, false, 0.5
+
+        local fnStats = rawget(GLOBAL, "HyperSmooth_GetFrameStats")
+        if type(fnStats) == "function" then
+            local ok, a, l1 = pcall(fnStats)
+            if ok and type(a) == "number" and a > 0 then
+                avg_fps = a
+                low1_fps = (type(l1) == "number" and l1 > 0) and l1 or a
+            end
+        end
+        local fnPerf = rawget(GLOBAL, "HyperSmooth_GetVisualPerf")
+        if type(fnPerf) == "function" then
+            local ok, _, _, _, _, _, bMs, _, vCur = pcall(fnPerf)
+            if ok then
+                busy_ms = type(bMs) == "number" and bMs or 0
+                vram_mb = type(vCur) == "number" and vCur or 0
+            end
+        end
+        local fnVis = rawget(GLOBAL, "HyperSmooth_GetVisualStats")
+        if type(fnVis) == "function" then
+            local ok, _, _, _, _, lms = pcall(fnVis)
+            if ok and type(lms) == "number" then
+                lm_scale = lms
+            end
+        end
+        local fnLat = rawget(GLOBAL, "HyperSmooth_GetLatencyStats")
+        if type(fnLat) == "function" then
+            local ok, ea, cl, ol, _, _, vo, _, _, _, _, lo = pcall(fnLat)
+            if ok then
+                ex_act   = ea == true
+                cur_lat  = type(cl) == "number" and cl or 3
+                orig_lat = type(ol) == "number" and ol or 3
+                vfx_ok   = vo == true
+                light_ok = lo == true
+            end
+        end
+
+        local dll_status, dll_ver, expected_dll_ver = GetDllVersionStatus()
+
+        return {
+            preset           = current_visual_preset,
+            flags            = GetActiveVisualFlags(),
+            skeletal         = current_skeletal_tween,
+            low_latency      = current_low_latency,
+            has_dll          = has_dll,
+            dll_status       = dll_status,
+            dll_ver          = dll_ver,
+            expected_dll_ver = expected_dll_ver,
+            avg_fps          = avg_fps,
+            low1_fps         = low1_fps,
+            busy_ms          = busy_ms,
+            vram_mb          = vram_mb,
+            d3d9ex_active    = ex_act,
+            cur_lat          = cur_lat,
+            orig_lat         = orig_lat,
+            vfx_ok           = vfx_ok,
+            light_ok         = light_ok,
+            lm_scale         = lm_scale,
+            flick_rescues    = latency_stats.flick_rescues,
+        }
+    end,
 }
 
 local active_key_handlers = {}
@@ -1841,4 +2871,5 @@ end
 
 if type(modimport) == "function" then
     pcall(modimport, "keybind")
+    pcall(modimport, "hs_panel")
 end

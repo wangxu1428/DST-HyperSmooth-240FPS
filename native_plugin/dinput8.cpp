@@ -28,6 +28,7 @@
 #include <tlhelp32.h>
 #include <mmsystem.h>
 #include <dxgi1_4.h>
+#include <d3d9.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,10 @@
 
 #include "libdeflate.h"
 #include "mimalloc.h"
+#include "gl_state_cache.h"
+#include "fast_astar.h"
+#include "fast_astar_manager.h"
+#include "fast_dumper.h"
 
 namespace {
 
@@ -82,13 +87,27 @@ using GlLinkProgram_t = void (WINAPI*)(uint32_t program);
 using GlUseProgram_t = void (WINAPI*)(uint32_t program);
 using GlDeleteProgram_t = void (WINAPI*)(uint32_t program);
 using GlGetUniformLocation_t = int32_t (WINAPI*)(uint32_t program, const char* name);
+using GlGetProgramiv_t = void (WINAPI*)(uint32_t program, uint32_t pname, int32_t* params);
 using GlUniform4fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* value);
+using EglMakeCurrent_t = uint32_t (WINAPI*)(void* dpy, void* draw, void* read, void* ctx);
+using EglSwapBuffers_t = uint32_t (WINAPI*)(void* dpy, void* surface);
+using GlActiveTexture_t = void (WINAPI*)(uint32_t texture);
+using GlBindTexture_t = void (WINAPI*)(uint32_t target, uint32_t texture);
+using GlDeleteTextures_t = void (WINAPI*)(int32_t n, const uint32_t* textures);
+using GlBlendFunc_t = void (WINAPI*)(uint32_t sfactor, uint32_t dfactor);
+using GlDepthMask_t = void (WINAPI*)(uint8_t flag);
+using GlEnable_t = void (WINAPI*)(uint32_t cap);
+using GlDisable_t = void (WINAPI*)(uint32_t cap);
 using GameRender_t = void (*)(void* self, void* renderData);
 using PostProcessorRender_t = void (*)(void* pp, void* renderData, uint32_t primaryTexHandle);
 using CreateDXGIFactory1_t = HRESULT (WINAPI*)(REFIID riid, void** ppFactory);
 using ClientSpatialQuery_t = void (*)(void* grid, const float* posXZ, float radius, void* visitor);
 using ClientSpatialVisitor_t = uint8_t (*)(void* visitor, void* elem);
 using ProcessAsyncTexQueue_t = void (*)(void* loader);
+using ParticleMgrUpdate_t = void (*)(void* mgr, float dt);
+using ParticleRenderCmdCtor_t = void* (*)(void* cmd, void* renderNode, void* mtx);
+using TransformGetWorldMatrix_t = const float* (*)(void* transform);
+using LightMapRender_t = void (*)(void* lightMap, uint8_t* renderData);
 
 constexpr int kLuaGlobalsIndex = -10002;
 constexpr DWORD kCreateWaitableTimerHighRes = 0x00000002; // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
@@ -115,10 +134,41 @@ std::atomic<bool> g_optRtssPacer{true};
 std::atomic<bool> g_optMimallocLua{true};
 std::atomic<bool> g_optRakNetZeroStall{true};
 std::atomic<bool> g_optLowLatencyGpuSync{true};
+std::atomic<bool> g_optD3d9ExLowLatency{true};
 std::atomic<bool> g_optFastSpatialQuery{true};
 std::atomic<bool> g_optTexTimeSlice{true};
+std::atomic<bool> g_optGlStateCache{true};
+std::atomic<uint32_t> g_glCacheResetGen{1};
+std::atomic<uint32_t> g_displayRefreshHz{0};
 std::atomic<int>  g_visualAnisoLevel{1};
 std::atomic<bool> g_visualFullresLightmap{false};
+std::atomic<float> g_visualMipLodBias{0.0f}; // Player-First default: 0.0f (100% vanilla)
+std::atomic<uint32_t> g_d3d9ExLatGen{1};
+std::atomic<bool> g_angleSamplerHooked{false};
+std::atomic<bool> g_d3d9ExActive{false};
+std::atomic<uint32_t> g_d3d9ExOrigLatency{3};
+std::atomic<uint32_t> g_d3d9ExCurLatency{3};
+volatile LONG64   g_mipBiasAppliedHits = 0;
+
+// [v2.6.0] 240Hz Render-Only VFX & Particle Interpolation (VFXEffect + ParticleEmitter)
+std::atomic<LONG> g_vfxSmoothEnabled{1};
+std::atomic<bool> g_vfxSmoothHooked{false};
+std::atomic<int64_t> g_vfxLastTickQpc{0};
+std::atomic<float> g_vfxTickPeriodSec{1.0f / 30.0f};
+std::atomic<float> g_vfxLastSimDt{1.0f / 30.0f};
+ParticleMgrUpdate_t g_origParticleMgrUpdate = nullptr;
+ParticleRenderCmdCtor_t g_origVfxRenderCmdCtor = nullptr;
+ParticleRenderCmdCtor_t g_origEmitterRenderCmdCtor = nullptr;
+volatile LONG64   g_vfxCmdsSmoothed = 0;
+volatile LONG64   g_vfxParticlesSmoothed = 0;
+
+// [v2.6.0] 240Hz Moving Dynamic Light Interpolation + 0ms Live LightMap RT Hot-Swap
+TransformGetWorldMatrix_t g_origTransformGetWorldMatrix = nullptr;
+LightMapRender_t          g_origLightMapRender = nullptr;
+std::atomic<bool>         g_lightPos240Hooked{false};
+std::atomic<bool>         g_lightmapHotSwapHooked{false};
+std::atomic<uint32_t>     g_lightmapRebuildGen{0};
+volatile LONG64           g_lightPos240Count = 0;
 GlTexParameteri_t g_origGlTexParameteri = nullptr;
 GlTexParameterf_t g_fnGlTexParameterf   = nullptr;
 GlGetFloatv_t     g_fnGlGetFloatv       = nullptr;
@@ -139,7 +189,9 @@ struct Hd2dUniformState {
     float tint[4];   // (tintR, tintG, tintB, rainWetness)
 };
 struct Hd2dProgSlot {
+    void*    ctx;
     bool     checked;
+    bool     linkedOk;
     bool     hasAny;
     int32_t  locParams;
     int32_t  locSun;
@@ -148,6 +200,7 @@ struct Hd2dProgSlot {
 };
 constexpr uint32_t kMaxHd2dProgs = 4096u;
 SRWLOCK               g_hd2dStateLock = SRWLOCK_INIT;
+SRWLOCK               g_hd2dProgLock  = SRWLOCK_INIT;
 Hd2dUniformState      g_hd2dState = {
     { 0.0f, 0.0f, 0.0f, 0.70f },
     { 0.707f, 0.707f, 0.0f, -1.0f },
@@ -159,20 +212,55 @@ std::atomic<float>    g_hd2dMasterStr{0.0f};
 std::atomic<uint32_t> g_hd2dShadersInjected{0};
 std::atomic<uint32_t> g_hd2dProgsLinked{0};
 Hd2dProgSlot          g_hd2dProgs[kMaxHd2dProgs]{};
+// Multi-context overflow map when two distinct non-shared EGL contexts use the same program ID
+struct Hd2dCtxProgEntry {
+    void*        ctx;
+    uint32_t     program;
+    Hd2dProgSlot slot;
+};
+std::vector<Hd2dCtxProgEntry> g_hd2dOverflowProgs;
 GlShaderSource_t      g_origGlShaderSource = nullptr;
 GlLinkProgram_t       g_origGlLinkProgram = nullptr;
 GlUseProgram_t        g_origGlUseProgram = nullptr;
 GlDeleteProgram_t     g_origGlDeleteProgram = nullptr;
 GlGetUniformLocation_t g_fnGlGetUniformLocation = nullptr;
+GlGetProgramiv_t      g_fnGlGetProgramiv = nullptr;
 GlUniform4fv_t        g_fnGlUniform4fv = nullptr;
 bool                  g_hd2dIatHooked = false;
+bool                  g_glCacheIatHooked = false;
+std::atomic<bool>     g_glCacheActive{false};
+bool                  g_eglSwapIatHooked = false;
 bool                  g_renderPerfHooked = false;
+
+// Cold-start patch indices (status flags flip ONLY after ApplyPendingPatchesSafely confirms applied!)
+size_t g_vfxPmPatchIdx         = static_cast<size_t>(-1);
+size_t g_vfxCmdPatchIdx        = static_cast<size_t>(-1);
+size_t g_vfxEmitPatchIdx       = static_cast<size_t>(-1);
+size_t g_angleAfPatchIdx       = static_cast<size_t>(-1);
+size_t g_angleSamplerPatchIdx  = static_cast<size_t>(-1);
+size_t g_lightmapScalePatchIdx = static_cast<size_t>(-1);
+size_t g_lightmapHotSwapIdx    = static_cast<size_t>(-1);
+size_t g_light240PatchIdx      = static_cast<size_t>(-1);
+size_t g_gameRenderPatchIdx    = static_cast<size_t>(-1);
+size_t g_postProcPatchIdx      = static_cast<size_t>(-1);
+EglMakeCurrent_t      g_origEglMakeCurrent = nullptr;
+EglSwapBuffers_t      g_origEglSwapBuffers = nullptr;
+GlActiveTexture_t     g_origGlActiveTexture = nullptr;
+GlBindTexture_t       g_origGlBindTexture = nullptr;
+GlDeleteTextures_t    g_origGlDeleteTextures = nullptr;
+GlBlendFunc_t         g_origGlBlendFunc = nullptr;
+GlDepthMask_t         g_origGlDepthMask = nullptr;
+GlEnable_t            g_origGlEnable = nullptr;
+GlDisable_t           g_origGlDisable = nullptr;
+volatile LONG64       g_glCacheCalls = 0;
+volatile LONG64       g_glCacheHits = 0;
 GameRender_t          g_origGameRender = nullptr;
 PostProcessorRender_t g_origPostProcessorRender = nullptr;
 std::atomic<float>    g_emaWorldRenderUs{0.0f};
 std::atomic<float>    g_emaPostProcUs{0.0f};
 std::atomic<float>    g_emaFrameBusyUs{0.0f};
 std::atomic<float>    g_emaGpuDrainUs{0.0f};
+std::atomic<float>    g_emaSwapUs{0.0f};
 std::atomic<float>    g_processVramMb{0.0f};
 std::atomic<float>    g_processVramBudgetMb{0.0f};
 std::atomic<float>    g_peakVramMb{0.0f};
@@ -226,6 +314,9 @@ ClientSetNetworkTickRate_t g_fnClientSetNetTickRate = nullptr;
 ClientSetDownloadMs_t      g_fnClientSetDownloadMs  = nullptr;
 std::atomic<int> g_clientSimTickRate{30};
 std::atomic<uint32_t> g_clientSimTickGen{0};
+SRWLOCK g_clientSimTickLock = SRWLOCK_INIT;
+uint32_t g_clientSavedPre60NetRate = 0; // 0 = unset/default 15Hz; preserved across 30->60->30 transitions!
+bool g_clientHasSavedPre60NetRate = false;
 
 uint32_t g_cmdBuildOffset = 0xB8;
 uint32_t g_buildAltOffset = 0xB0;
@@ -277,15 +368,35 @@ std::atomic<uint32_t> g_lastAnimShed{0};
 std::atomic<uint32_t> g_lastGcUs{0};
 std::atomic<int32_t>  g_lastGcKb{0};
 std::atomic<uint32_t> g_lastTexUploadUs{0};
-std::atomic<uint32_t> g_hitchPendingCount{0};
-std::atomic<uint32_t> g_hitchPeakUs{0};
-std::atomic<uint32_t> g_hitchAnimUs{0};
-std::atomic<uint32_t> g_hitchAnimEnts{0};
-std::atomic<uint32_t> g_hitchAnimBones{0};
-std::atomic<uint32_t> g_hitchAnimShed{0};
-std::atomic<uint32_t> g_hitchGcUs{0};
-std::atomic<int32_t>  g_hitchGcKb{0};
-std::atomic<uint32_t> g_hitchTexUs{0};
+std::atomic<uint32_t> g_lastFrameBusyUs{0};
+std::atomic<uint32_t> g_lastSwapUs{0};
+std::atomic<uint32_t> g_lastWorldRenderUs{0};
+std::atomic<uint32_t> g_lastPostProcUs{0};
+std::atomic<uint32_t> g_frameUnzUs{0};
+std::atomic<uint32_t> g_frameShaderUs{0};
+
+// Tear-free Hitch & Severe-Stall telemetry snapshot (protected by lightweight SRWLOCK only on >25ms frames & 10s flush)
+struct HitchSnapshot {
+    uint32_t pendingCount = 0;
+    uint32_t severeCount  = 0; // frames >= 500ms (up to 60s)
+    uint32_t severeMaxUs  = 0;
+    uint32_t peakUs       = 0;
+    uint32_t busyUs       = 0;
+    uint32_t swapUs       = 0;
+    uint32_t worldUs      = 0;
+    uint32_t postUs       = 0;
+    uint32_t unzUs        = 0;
+    uint32_t shaderUs     = 0;
+    uint32_t animUs       = 0;
+    uint32_t animEnts     = 0;
+    uint32_t animBones    = 0;
+    uint32_t animShed     = 0;
+    uint32_t gcUs         = 0;
+    int32_t  gcKb         = 0;
+    uint32_t texUs        = 0;
+};
+SRWLOCK       g_hitchLock = SRWLOCK_INIT;
+HitchSnapshot g_hitchSnap{};
 
 // v2.4.0 512-Frame Ring Buffer for Lock-Free 1% Low / P99 / Jitter Telemetry
 struct FrameTimeRing {
@@ -593,27 +704,39 @@ bool GetTextSection(uint8_t*& outStart, size_t& outSize) {
     return false;
 }
 
+// Strict fail-closed unique AOB scanner: returns match ONLY if exactly 1 occurrence exists.
 uint8_t* FindPatternInText(uint8_t* start, size_t size, const uint8_t* sig, size_t sigLen) {
-    if (!start || size < sigLen) return nullptr;
+    if (!start || sigLen == 0 || size < sigLen) return nullptr;
+    uint8_t* hit = nullptr;
     for (size_t off = 0; off <= size - sigLen; ++off) {
         if (start[off] == sig[0] && memcmp(start + off, sig, sigLen) == 0) {
-            return start + off;
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = start + off;
         }
     }
-    return nullptr;
+    return hit;
 }
 
+// Strict fail-closed unique masked AOB scanner: returns match ONLY if exactly 1 occurrence exists.
 uint8_t* FindMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
-    if (!start || size < sigLen) return nullptr;
+    if (!start || sigLen == 0 || size < sigLen) return nullptr;
+    uint8_t* hit = nullptr;
     for (size_t off = 0; off <= size - sigLen; ++off) {
         if (mask[0] == 'x' && start[off] != sig[0]) continue;
         bool ok = true;
         for (size_t j = 1; j < sigLen; ++j) {
             if (mask[j] == 'x' && start[off + j] != sig[j]) { ok = false; break; }
         }
-        if (ok) return start + off;
+        if (ok) {
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = start + off;
+        }
     }
-    return nullptr;
+    return hit;
+}
+
+static uint8_t* FindUniqueMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
+    return FindMaskedPatternInText(start, size, sig, mask, sigLen);
 }
 
 uint8_t* ResolveRel32Call(uint8_t* callInstr) {
@@ -629,7 +752,11 @@ bool WriteCodeBytes(uint8_t* addr, const uint8_t* bytes, size_t len) {
     memcpy(addr, bytes, len);
     FlushInstructionCache(GetCurrentProcess(), addr, len);
     DWORD dummy = 0;
-    VirtualProtect(addr, len, oldProt, &dummy);
+    if (!VirtualProtect(addr, len, oldProt, &dummy)) {
+        LogMsg("[WARN] WriteCodeBytes @ %p failed restoring page protection 0x%lX (err=%lu)",
+               static_cast<void*>(addr), static_cast<unsigned long>(oldProt),
+               static_cast<unsigned long>(GetLastError()));
+    }
     return true;
 }
 
@@ -655,38 +782,61 @@ struct SuspendedThreadInfo {
     uintptr_t rip = 0;
 };
 
-// Cold-start RAII thread freezer: suspends sibling threads & captures RIP so .text patching
-// can NEVER tear an instruction currently being executed by the main game thread.
+// Cold-start Fail-Closed RAII thread freezer: suspends sibling threads & captures RIP so .text
+// patching can NEVER tear an executing instruction. If ANY sibling thread cannot be snapshotted,
+// opened (other than already-exited ERROR_INVALID_PARAMETER), suspended, or inspected for RIP,
+// complete_ becomes false and ApplyPendingPatchesSafely aborts patching for that pass!
 class ThreadFreezeGuard {
 public:
     ThreadFreezeGuard() {
         DWORD selfPid = GetCurrentProcessId();
         DWORD selfTid = GetCurrentThreadId();
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) return;
+        if (snap == INVALID_HANDLE_VALUE) {
+            complete_ = false;
+            return;
+        }
         THREADENTRY32 te{};
         te.dwSize = sizeof(te);
-        if (Thread32First(snap, &te)) {
-            do {
-                if (te.th32OwnerProcessID == selfPid && te.th32ThreadID != selfTid) {
-                    HANDLE ht = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                                           FALSE, te.th32ThreadID);
-                    if (ht) {
-                        if (SuspendThread(ht) != static_cast<DWORD>(-1)) {
-                            CONTEXT ctx{};
-                            ctx.ContextFlags = CONTEXT_CONTROL;
-                            uintptr_t rip = 0;
-                            if (GetThreadContext(ht, &ctx)) {
-                                rip = static_cast<uintptr_t>(ctx.Rip);
-                            }
-                            threads_.push_back({ht, rip});
-                        } else {
-                            CloseHandle(ht);
-                        }
-                    }
-                }
-            } while (Thread32Next(snap, &te));
+        if (!Thread32First(snap, &te)) {
+            complete_ = false;
+            CloseHandle(snap);
+            return;
         }
+        do {
+            if (te.th32OwnerProcessID == selfPid && te.th32ThreadID != selfTid) {
+                HANDLE ht = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                       FALSE, te.th32ThreadID);
+                if (!ht) {
+                    const DWORD err = GetLastError();
+                    // ERROR_INVALID_PARAMETER means the thread exited between snapshot and OpenThread.
+                    if (err != ERROR_INVALID_PARAMETER) {
+                        complete_ = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (SuspendThread(ht) == static_cast<DWORD>(-1)) {
+                    DWORD exitCode = 0;
+                    const bool confirmedExited = (GetExitCodeThread(ht, &exitCode) && exitCode != STILL_ACTIVE);
+                    CloseHandle(ht);
+                    if (!confirmedExited) {
+                        complete_ = false;
+                        break;
+                    }
+                    continue;
+                }
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (!GetThreadContext(ht, &ctx)) {
+                    // Thread was suspended; push so destructor resumes it, and mark freeze incomplete!
+                    threads_.push_back({ht, 0});
+                    complete_ = false;
+                    break;
+                }
+                threads_.push_back({ht, static_cast<uintptr_t>(ctx.Rip)});
+            }
+        } while (Thread32Next(snap, &te));
         CloseHandle(snap);
     }
 
@@ -697,16 +847,20 @@ public:
         }
     }
 
+    bool IsComplete() const noexcept { return complete_; }
+
     bool AnyRipNear(uint8_t* addr, size_t len) const {
+        if (!complete_) return true; // fail-closed!
         uintptr_t lo = reinterpret_cast<uintptr_t>(addr) - 16;
         uintptr_t hi = reinterpret_cast<uintptr_t>(addr) + len + 16;
         for (const auto& t : threads_) {
-            if (t.rip >= lo && t.rip <= hi) return true;
+            if (t.rip == 0 || (t.rip >= lo && t.rip <= hi)) return true;
         }
         return false;
     }
 
 private:
+    bool complete_ = true;
     std::vector<SuspendedThreadInfo> threads_;
 };
 
@@ -715,23 +869,33 @@ void ApplyPendingPatchesSafely(std::vector<PendingCodePatch>& patches) {
     // Publish all g_orig* function pointers & RX trampolines globally BEFORE patching any .text site
     std::atomic_thread_fence(std::memory_order_release);
 
+    int incompleteFreezes = 0;
     for (int attempt = 0; attempt < 5; ++attempt) {
         bool anyRemaining = false;
         {
             ThreadFreezeGuard freeze;
-            for (auto& p : patches) {
-                if (p.applied || !p.addr || p.len == 0) continue;
-                if (freeze.AnyRipNear(p.addr, p.len)) {
-                    anyRemaining = true;
-                    continue;
-                }
-                if (WriteCodeBytes(p.addr, p.bytes, p.len)) {
-                    p.applied = true;
+            if (!freeze.IsComplete()) {
+                ++incompleteFreezes;
+                anyRemaining = true;
+            } else {
+                for (auto& p : patches) {
+                    if (p.applied || !p.addr || p.len == 0) continue;
+                    if (freeze.AnyRipNear(p.addr, p.len)) {
+                        anyRemaining = true;
+                        continue;
+                    }
+                    if (WriteCodeBytes(p.addr, p.bytes, p.len)) {
+                        p.applied = true;
+                    }
                 }
             }
         }
         if (!anyRemaining) break;
         Sleep(1);
+    }
+    if (incompleteFreezes > 0) {
+        LogMsg("[SAFETY] ThreadFreezeGuard incomplete on %d/5 pass(es); unapplied patches skipped fail-closed",
+               incompleteFreezes);
     }
 
     for (auto& p : patches) {
@@ -784,6 +948,20 @@ struct ThreadLocalDecomp {
 };
 
 extern "C" int FastUnzReadCurrentFile(void* file, void* buf, uint32_t len) {
+    struct ScopedUnzTimer {
+        int64_t t0 = 0;
+        ScopedUnzTimer() {
+            if (g_inGameplay.load(std::memory_order_relaxed) != 0) t0 = NowQpc();
+        }
+        ~ScopedUnzTimer() {
+            if (t0 != 0) {
+                const double us = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
+                if (us > 0.0 && us < 1000000.0) {
+                    g_frameUnzUs.fetch_add(static_cast<uint32_t>(us), std::memory_order_relaxed);
+                }
+            }
+        }
+    } unzTimer;
     if (!file) return -102;
     auto* pinfo = *reinterpret_cast<UnzReadInfo**>(static_cast<uint8_t*>(file) + 0xC8);
     if (!pinfo || !pinfo->read_buffer || len == 0 || !buf) {
@@ -1310,28 +1488,21 @@ static inline ThreadLocalAnimState& GetTlsAnimState() {
     return *g_tlsAnimState;
 }
 
-// Render-only 240FPS world-position interpolator operating on freshly allocated per-frame
-// AnimRenderCmd (verified @ 0x1400FADE0) BEFORE AnimRenderer::Render reads matrix [cmd+0x18].
-// Zero gameplay/hitbox/physics mutation; 100% safe for Hats/FollowSymbol/Boats/Teleports.
-static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalAnimState& tls, int64_t nowQpc) {
-    if (!cmd || key == 0) return;
+// Shared 240FPS C0 world-position interpolator used by BOTH:
+//   1) AnimRenderCmd (entities, players, mobs, projectiles)
+//   2) LightMap::GenerateRenderData (moving torches, lanterns, miner hats, fireflies, spell lights)
+// Zero gameplay/hitbox/physics mutation; auto-bypasses continuous 240Hz Bullet physics (Lag Comp ON).
+static bool InterpolateWorldPosCore(float* pX, float* pY, float* pZ, uintptr_t key,
+                                    ThreadLocalAnimState& tls, int64_t nowQpc, bool countAsAnim) {
+    if (!pX || !pY || !pZ || key == 0) return false;
     if (g_worldPosInterpEnabled.load(std::memory_order_relaxed) == 0 ||
         g_skeletalTweenEnabled.load(std::memory_order_relaxed) == 0) {
-        return;
+        return false;
     }
-    // Skip screen-space / HUD / background layer commands ([cmd+0x60] == 8 @ 0x1400F49C9)
-    const uint32_t orientMode = *reinterpret_cast<const uint32_t*>(cmd + 0x60);
-    if (orientMode == 8u) return;
-
-    // 4x4 row-major World Transform Matrix at [cmd + 0x18]:
-    // Translation column: X = +0x24 (+0x0C), Y = +0x34 (+0x1C), Z = +0x44 (+0x2C)
-    float* pX = reinterpret_cast<float*>(cmd + 0x24);
-    float* pY = reinterpret_cast<float*>(cmd + 0x34);
-    float* pZ = reinterpret_cast<float*>(cmd + 0x44);
     const float rawX = *pX;
     const float rawY = *pY;
     const float rawZ = *pZ;
-    if (!std::isfinite(rawX) || !std::isfinite(rawY) || !std::isfinite(rawZ)) return;
+    if (!std::isfinite(rawX) || !std::isfinite(rawY) || !std::isfinite(rawZ)) return false;
 
     const uint32_t curSimGen = g_clientSimTickGen.load(std::memory_order_relaxed);
     const int curSimHz = g_clientSimTickRate.load(std::memory_order_relaxed);
@@ -1371,7 +1542,7 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalA
         tr.sim_gen = curSimGen;
         tr.fast_streak = 0;
         snapToRaw();
-        return;
+        return false;
     }
     if (tr.sim_gen != curSimGen) {
         tr.period = (curSimHz == 60) ? (1.0f / 60.0f) : (1.0f / 30.0f);
@@ -1381,7 +1552,7 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalA
 
     const bool rawChanged = (rawX != tr.last_raw_x || rawY != tr.last_raw_y || rawZ != tr.last_raw_z);
     if (!rawChanged && tr.settled) {
-        return; // Ultra-fast static entity path (trees, walls, chests, idle entities)
+        return false; // Ultra-fast static entity path (trees, walls, chests, idle entities)
     }
 
     if (rawChanged) {
@@ -1401,11 +1572,11 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalA
 
         // Teleport / wormhole / Lazy Explorer / respawn guard (> 5.0 tiles/step) or Lag-Comp-ON bypass
         if (!std::isfinite(distSq) || distSq > 25.0f || distSq < 1e-10f || tr.fast_streak >= 2) {
-            if (tr.fast_streak >= 2) {
+            if (countAsAnim && tr.fast_streak >= 2) {
                 ++tls.batchPosBypass;
             }
             snapToRaw();
-            return;
+            return false;
         }
 
         // Adaptive snapshot cadence EMA (auto-locks onto 16.7ms / 33.3ms / 66.7ms per entity!)
@@ -1457,7 +1628,7 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalA
         tr.rend_y = tr.curr_y;
         tr.rend_z = tr.curr_z;
         tr.settled = 1;
-        return; // Exact raw coordinate reached -> zero drift
+        return false; // Exact raw coordinate reached -> zero drift
     }
     if (alpha < 0.0f) alpha = 0.0f;
 
@@ -1467,7 +1638,47 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalA
     *pX = tr.rend_x;
     *pY = tr.rend_y;
     *pZ = tr.rend_z;
-    ++tls.batchPosInterp;
+    if (countAsAnim) {
+        ++tls.batchPosInterp;
+    }
+    return true;
+}
+
+static void InterpolateAnimCmdWorldPos(uint8_t* cmd, uintptr_t key, ThreadLocalAnimState& tls, int64_t nowQpc) {
+    if (!cmd || key == 0) return;
+    // Skip screen-space / HUD / background layer commands ([cmd+0x60] == 8 @ 0x1400F49C9)
+    const uint32_t orientMode = *reinterpret_cast<const uint32_t*>(cmd + 0x60);
+    if (orientMode == 8u) return;
+
+    // 4x4 row-major World Transform Matrix at [cmd + 0x18]:
+    // Translation column: X = +0x24 (+0x0C), Y = +0x34 (+0x1C), Z = +0x44 (+0x2C)
+    InterpolateWorldPosCore(
+        reinterpret_cast<float*>(cmd + 0x24),
+        reinterpret_cast<float*>(cmd + 0x34),
+        reinterpret_cast<float*>(cmd + 0x44),
+        key, tls, nowQpc, true);
+}
+
+static const float* HookLightGetWorldMatrix(void* transform) {
+    const float* orig = g_origTransformGetWorldMatrix ? g_origTransformGetWorldMatrix(transform) : nullptr;
+    if (!orig || !transform) return orig;
+    if (g_worldPosInterpEnabled.load(std::memory_order_relaxed) == 0 ||
+        g_skeletalTweenEnabled.load(std::memory_order_relaxed) == 0) {
+        return orig;
+    }
+    static thread_local float tl_lightMtx[16];
+    memcpy(tl_lightMtx, orig, sizeof(tl_lightMtx));
+    ThreadLocalAnimState& tls = GetTlsAnimState();
+    const int64_t nowQpc = tls.GetFrameQpc();
+    const uintptr_t lightKey = reinterpret_cast<uintptr_t>(transform) | 2ULL;
+    if (InterpolateWorldPosCore(&tl_lightMtx[3], &tl_lightMtx[7], &tl_lightMtx[11], lightKey, tls, nowQpc, false)) {
+        static thread_local uint32_t tl_lightHits = 0;
+        if (++tl_lightHits >= 64u) {
+            InterlockedAdd64(&g_lightPos240Count, static_cast<LONG64>(tl_lightHits));
+            tl_lightHits = 0;
+        }
+    }
+    return tl_lightMtx;
 }
 
 static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key,
@@ -1569,10 +1780,15 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     if (time != tr.last_time) {
         float oldF = tr.curr_f;
         float df = curF - oldF;
-        if (playMode == 1 && df < 0.0f) {
+        float elapsed = static_cast<float>(static_cast<double>(nowQpc - tr.tick_qpc) * g_qpcInvFreq);
+        // Seamless one-shot self-replay wrap (e.g. Wolfgang `use_dumbbell_loop`, `chop_loop`, `mine_loop`):
+        // Klei plays these looping actions with loop=false (playMode==0) and restarts on animover!
+        // Only wrap when the exact same anim immediately restarts right after finishing its final frame
+        // (elapsed <= 0.120s prevents idle rested one-shot anims from ever falsely wrapping).
+        const bool oneShotWrap = (playMode == 0 && oldF >= nf - 2.5f && curF <= 2.0f && elapsed > 0.0f && elapsed <= 0.120f);
+        if ((playMode == 1 || oneShotWrap) && df < 0.0f) {
             df += nf;
         }
-        float elapsed = static_cast<float>(static_cast<double>(nowQpc - tr.tick_qpc) * g_qpcInvFreq);
         bool smoothStep = (df > 0.01f && df <= 4.5f) ||
                           (playMode == 2 && fabsf(df) > 0.01f && fabsf(df) <= 4.5f);
         if (smoothStep) {
@@ -1582,7 +1798,8 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
             // C0-continuous skeletal handoff from last_rendered_f (prevents micro-pops on jitter)
             float handoffF = oldF;
             float dfRend = curF - tr.last_rendered_f;
-            if (playMode == 1 && dfRend < 0.0f) dfRend += nf;
+            const bool rendWrap = (playMode == 1) || (playMode == 0 && tr.last_rendered_f >= nf - 2.5f && curF <= 2.0f);
+            if (rendWrap && dfRend < 0.0f) dfRend += nf;
             if ((dfRend > 0.01f && dfRend <= 4.5f) ||
                 (playMode == 2 && fabsf(dfRend) > 0.01f && fabsf(dfRend) <= 4.5f)) {
                 handoffF = tr.last_rendered_f;
@@ -1607,8 +1824,9 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         tr.tick_qpc = nowQpc;
     }
 
+    const bool isWrappingSeg = (playMode == 1) || (playMode == 0 && tr.prev_f >= nf - 2.5f && tr.curr_f <= 2.0f);
     float stepF = tr.curr_f - tr.prev_f;
-    if (playMode == 1 && stepF < 0.0f) stepF += nf;
+    if (isWrappingSeg && stepF < 0.0f) stepF += nf;
     if (!std::isfinite(stepF) || fabsf(stepF) < 0.001f) {
         tr.last_rendered_f = curF;
         return discreteFrame();
@@ -1624,7 +1842,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         tr.last_rendered_f = curF;
         return discreteFrame();
     }
-    if (playMode == 1) {
+    if (isWrappingSeg) {
         fNow = fmodf(fNow, nf);
         if (fNow < 0.0f) fNow += nf;
     } else if (fNow < 0.0f) {
@@ -1645,7 +1863,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     uint32_t idx0 = 0, idx1 = 0;
     float frac = 0.0f;
 
-    if (playMode == 1) {
+    if (isWrappingSeg) {
         if (!std::isfinite(fNow) || fNow < 0.0f) fNow = 0.0f;
         float fl = floorf(fNow);
         idx0 = static_cast<uint32_t>(fl) % nframes;
@@ -1671,7 +1889,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     const AnimFrame& f0 = anim->frames[idx0];
     const AnimFrame& f1 = anim->frames[idx1];
     uint32_t n0 = f0.num_elements, n1 = f1.num_elements;
-    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > kMaxAnimElements) return &f0;
+    if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > kMaxAnimElements || n1 > kMaxAnimElements) return &f0;
 
     const int64_t workStartQpc = ((tls.frameTweenEnts & 15u) == 0) ? NowQpc() : 0;
 
@@ -1681,33 +1899,43 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     memcpy(bufSlot.elems, f0.elements, n0 * sizeof(AnimElement));
 
     const bool fastOnly = (tls.frameShedLevel >= 1 && channel != AnimChannel::UI);
-    const bool useHash = (n0 > 4 && n1 <= kMaxAnimElements);
 
-    // L1-resident O(N) stack hash table + duplicate-bucket spatial nearest-neighbor guard.
-    // Unique bones (99% of characters/Bosses) match in O(1); multi-instance duplicate-key
-    // elements (e.g. fireflies, spores, sparks, petals) match by nearest spatial distance
-    // (<=48px) with exclusive usedF1 bitset so dying/spawning particles NEVER streak in a line!
+    // L1-resident O(N) stack hash table + exact spatial/2-opt multi-instance particle matcher:
+    //   1) Unique (layer, symbol) bones: fast O(1) path; caps jump at 48px ONLY if the layer_hash
+    //      itself hosts multiple particles (fixes autumn tree_leaf_fx fade-out cross-tree streaks
+    //      while preserving full 420px Boss slams on unique limb layers).
+    //   2) Multi-instance duplicate (layer, symbol) buckets (fireflies, pond wave_still reflections,
+    //      oasis/lava pools, falling leaves, evergreen tiers):
+    //      - Safe exact-(layer,sym,fn) lock ONLY when <=48px, det-sign consistent, AND within
+    //        +16px^2 of the closest same-(layer,sym) candidate (fixes 689/2810 DST anim zips
+    //        including 48/48 pond reflection frames & firefly 153-234px streaks!).
+    //      - Global closest-pair matching (det-sign consistent, zero penalty for fn+1 flipbooks)
+    //        + 2-opt minimum-squared-distance uncrossing (eliminates crossing firefly swaps!).
     constexpr uint32_t kHashSize = 128;
     constexpr uint32_t kHashMask = kHashSize - 1;
     constexpr float kDupMaxDistSq = 48.0f * 48.0f;
+    constexpr uint32_t kMaxDupBucket = 64;
     int16_t headLS[kHashSize];
     int16_t nextLS[kMaxAnimElements];
     uint8_t f0BucketCnt[kHashSize];
-    uint64_t usedF1[4] = { 0, 0, 0, 0 };
+    int16_t matchedF1[kMaxAnimElements];
+    uint8_t f0Processed[kMaxAnimElements];
+    uint64_t usedF1[kMaxAnimElements / 64] = { 0 }; // 512 bits (matches kMaxAnimElements)
 
-    if (useHash) {
-        memset(headLS, -1, sizeof(headLS));
-        memset(f0BucketCnt, 0, sizeof(f0BucketCnt));
-        for (uint32_t k = 0; k < n0; ++k) {
-            const uint32_t h = ((f0.elements[k].layer_hash * 2654435761u) ^ f0.elements[k].symbol_hash) & kHashMask;
-            if (f0BucketCnt[h] < 255) ++f0BucketCnt[h];
-        }
-        // Reverse-insert f1 so bucket chains traverse in strict ascending index order (0, 1, 2, ...)
-        for (int32_t j = static_cast<int32_t>(n1) - 1; j >= 0; --j) {
-            const uint32_t h = ((f1.elements[j].layer_hash * 2654435761u) ^ f1.elements[j].symbol_hash) & kHashMask;
-            nextLS[j] = headLS[h];
-            headLS[h] = static_cast<int16_t>(j);
-        }
+    memset(headLS, -1, sizeof(headLS));
+    memset(f0BucketCnt, 0, sizeof(f0BucketCnt));
+    memset(matchedF1, -1, n0 * sizeof(int16_t));
+    memset(f0Processed, 0, n0 * sizeof(uint8_t));
+
+    for (uint32_t k = 0; k < n0; ++k) {
+        const uint32_t h = ((f0.elements[k].layer_hash * 2654435761u) ^ f0.elements[k].symbol_hash) & kHashMask;
+        if (f0BucketCnt[h] < 255) ++f0BucketCnt[h];
+    }
+    // Reverse-insert f1 so bucket chains traverse in strict ascending index order (0, 1, 2, ...)
+    for (int32_t j = static_cast<int32_t>(n1) - 1; j >= 0; --j) {
+        const uint32_t h = ((f1.elements[j].layer_hash * 2654435761u) ^ f1.elements[j].symbol_hash) & kHashMask;
+        nextLS[j] = headLS[h];
+        headLS[h] = static_cast<int16_t>(j);
     }
 
     auto isUsedF1 = [&](uint32_t j) -> bool {
@@ -1716,171 +1944,255 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     auto markUsedF1 = [&](uint32_t j) {
         if (j < kMaxAnimElements) usedF1[j >> 6] |= (1ULL << (j & 63));
     };
+    auto elemDet = [](const uint16_t m[6]) -> float {
+        return HalfToFloat(m[0]) * HalfToFloat(m[3]) - HalfToFloat(m[1]) * HalfToFloat(m[2]);
+    };
+    // Distinguishes dynamic particle layers (e.g. autumn `tree_leaf_fx` where leaves duplicate or
+    // spawn/despawn across frames) from rigid composite character rig layers (e.g. player `arm_carry`
+    // holding 6 distinct 1-to-1 limb/weapon symbols: arm_upper, arm_lower, hand, swap_object).
+    // Only dynamic particle layers receive the 48px jump cap; rigid character limbs retain full 420px!
+    auto isParticleLayer = [&](uint32_t lhash) -> bool {
+        uint32_t c0 = 0, c1 = 0;
+        for (uint32_t k = 0; k < n0; ++k) {
+            if (f0.elements[k].layer_hash == lhash) ++c0;
+        }
+        for (uint32_t j = 0; j < n1; ++j) {
+            if (f1.elements[j].layer_hash == lhash) ++c1;
+        }
+        if (c0 <= 1 && c1 <= 1) return false;
+        if (c0 != c1) return true; // particle spawn/despawn on this layer -> cap 48px
+        for (uint32_t k = 0; k < n0; ++k) {
+            if (f0.elements[k].layer_hash != lhash) continue;
+            const uint32_t sym = f0.elements[k].symbol_hash;
+            uint32_t m0 = 0, m1 = 0;
+            for (uint32_t a = 0; a < n0; ++a) {
+                if (f0.elements[a].layer_hash == lhash && f0.elements[a].symbol_hash == sym) ++m0;
+            }
+            if (m0 != 1) return true; // duplicate symbol on layer -> particle layer
+            for (uint32_t b = 0; b < n1; ++b) {
+                if (f1.elements[b].layer_hash == lhash && f1.elements[b].symbol_hash == sym) ++m1;
+            }
+            if (m1 != 1) return true; // symbol churn (vanished/replaced) -> particle layer
+        }
+        return false; // strict 1-to-1 symbol bijection -> rigid composite limb layer!
+    };
+
+    for (uint32_t i = 0; i < n0; ++i) {
+        if (f0Processed[i]) continue;
+        const AnimElement& e0 = f0.elements[i];
+        const uint32_t lhash = e0.layer_hash, shash = e0.symbol_hash;
+        const uint32_t h = ((lhash * 2654435761u) ^ shash) & kHashMask;
+
+        uint32_t cnt0LS = 1;
+        if (f0BucketCnt[h] > 1) {
+            cnt0LS = 0;
+            for (uint32_t k = i; k < n0; ++k) {
+                if (f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) ++cnt0LS;
+            }
+        }
+        int32_t firstJ = -1;
+        uint32_t cnt1LS = 0;
+        for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
+            const AnimElement& e1 = f1.elements[j];
+            if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
+                if (firstJ < 0) firstJ = j;
+                ++cnt1LS;
+            }
+        }
+        if (cnt1LS == 0) {
+            f0Processed[i] = 1;
+            continue;
+        }
+
+        if (cnt0LS == 1 && cnt1LS == 1) {
+            // Fast O(1) unique (layer, symbol) 1-to-1 bone match
+            const AnimElement& e1 = f1.elements[firstJ];
+            const float dx = HalfToFloat(e1.m[4]) - HalfToFloat(e0.m[4]);
+            const float dy = HalfToFloat(e1.m[5]) - HalfToFloat(e0.m[5]);
+            const float d2 = dx * dx + dy * dy;
+            if (d2 <= kDupMaxDistSq || !isParticleLayer(lhash)) {
+                matchedF1[i] = static_cast<int16_t>(firstJ);
+                markUsedF1(static_cast<uint32_t>(firstJ));
+            }
+            f0Processed[i] = 1;
+            continue;
+        }
+
+        // Multi-instance duplicate (layer, symbol) bucket: process the entire bucket together!
+        uint16_t b0[kMaxDupBucket], b1[kMaxDupBucket];
+        uint32_t m0 = 0, m1 = 0;
+        for (uint32_t k = i; k < n0; ++k) {
+            if (f0.elements[k].symbol_hash == shash && f0.elements[k].layer_hash == lhash) {
+                f0Processed[k] = 1;
+                if (m0 < kMaxDupBucket) b0[m0++] = static_cast<uint16_t>(k);
+            }
+        }
+        for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
+            if (isUsedF1(static_cast<uint32_t>(j))) continue;
+            const AnimElement& e1 = f1.elements[j];
+            if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
+                if (m1 < kMaxDupBucket) b1[m1++] = static_cast<uint16_t>(j);
+            }
+        }
+
+        if (cnt0LS <= kMaxDupBucket && cnt1LS <= kMaxDupBucket && m0 > 0 && m1 > 0) {
+            float x0[kMaxDupBucket], y0[kMaxDupBucket], d0[kMaxDupBucket];
+            float x1[kMaxDupBucket], y1[kMaxDupBucket], d1[kMaxDupBucket];
+            uint32_t fn0[kMaxDupBucket], fn1[kMaxDupBucket];
+            int16_t locMatch[kMaxDupBucket];
+            uint8_t locUsed1[kMaxDupBucket];
+
+            for (uint32_t a = 0; a < m0; ++a) {
+                const AnimElement& ea = f0.elements[b0[a]];
+                x0[a] = HalfToFloat(ea.m[4]); y0[a] = HalfToFloat(ea.m[5]);
+                d0[a] = elemDet(ea.m); fn0[a] = ea.frame_num;
+                locMatch[a] = -1;
+            }
+            for (uint32_t b = 0; b < m1; ++b) {
+                const AnimElement& eb = f1.elements[b1[b]];
+                x1[b] = HalfToFloat(eb.m[4]); y1[b] = HalfToFloat(eb.m[5]);
+                d1[b] = elemDet(eb.m); fn1[b] = eb.frame_num;
+                locUsed1[b] = 0;
+            }
+
+            // Step B1: Safe exact-(layer,sym,fn) lock (e.g. evergreen co-located tiers fn=15..18):
+            // ONLY allowed if <=48px, det-sign consistent, AND within +16px^2 of closest same-LS!
+            for (uint32_t a = 0; a < m0; ++a) {
+                uint32_t c0Ex = 0, c1Ex = 0;
+                int32_t exB = -1;
+                const uint32_t fa = fn0[a];
+                for (uint32_t k = 0; k < m0; ++k) {
+                    if (fn0[k] == fa) ++c0Ex;
+                }
+                if (c0Ex != 1) continue;
+                for (uint32_t b = 0; b < m1; ++b) {
+                    if (fn1[b] == fa) { exB = static_cast<int32_t>(b); ++c1Ex; }
+                }
+                if (c1Ex != 1 || locUsed1[exB] || d0[a] * d1[exB] < 0.0f) continue;
+                const float dxEx = x1[exB] - x0[a], dyEx = y1[exB] - y0[a];
+                const float d2Ex = dxEx * dxEx + dyEx * dyEx;
+                if (d2Ex > kDupMaxDistSq) continue;
+                float minD2 = 1e30f;
+                for (uint32_t b = 0; b < m1; ++b) {
+                    if (locUsed1[b] || d0[a] * d1[b] < 0.0f) continue;
+                    const float dx = x1[b] - x0[a], dy = y1[b] - y0[a];
+                    const float dd = dx * dx + dy * dy;
+                    if (dd < minD2) minD2 = dd;
+                }
+                if (d2Ex <= minD2 + 16.0f) {
+                    locMatch[a] = static_cast<int16_t>(exB);
+                    locUsed1[exB] = 1;
+                }
+            }
+
+            // Step B2: Global closest-pair greedy (det-consistent, 0 penalty for fn+1 flipbooks!)
+            uint8_t b2List[kMaxDupBucket];
+            uint32_t b2Cnt = 0;
+            for (;;) {
+                float bestSc = 1e30f;
+                int32_t bestA = -1, bestB = -1;
+                for (uint32_t a = 0; a < m0; ++a) {
+                    if (locMatch[a] >= 0) continue;
+                    for (uint32_t b = 0; b < m1; ++b) {
+                        if (locUsed1[b] || d0[a] * d1[b] < 0.0f) continue;
+                        const float dx = x1[b] - x0[a], dy = y1[b] - y0[a];
+                        const float dd = dx * dx + dy * dy;
+                        if (dd <= kDupMaxDistSq) {
+                            const float tie = (fn1[b] == fn0[a] || fn1[b] == fn0[a] + 1u) ? 0.0f : 0.25f;
+                            const float sc = dd + tie;
+                            if (sc < bestSc) {
+                                bestSc = sc;
+                                bestA = static_cast<int32_t>(a);
+                                bestB = static_cast<int32_t>(b);
+                            }
+                        }
+                    }
+                }
+                if (bestA < 0) break;
+                locMatch[bestA] = static_cast<int16_t>(bestB);
+                locUsed1[bestB] = 1;
+                b2List[b2Cnt++] = static_cast<uint8_t>(bestA);
+            }
+
+            // Step B3: 2-opt minimum-squared-distance uncrossing (fixes crossing firefly/leaf swaps!)
+            for (int sweep = 0; sweep < 2 && b2Cnt >= 2; ++sweep) {
+                bool improved = false;
+                for (uint32_t p = 0; p < b2Cnt; ++p) {
+                    const uint32_t a1 = b2List[p];
+                    int16_t b1i = locMatch[a1];
+                    for (uint32_t q = p + 1; q < b2Cnt; ++q) {
+                        const uint32_t a2 = b2List[q];
+                        const int16_t b2i = locMatch[a2];
+                        if (d0[a1] * d1[b2i] < 0.0f || d0[a2] * d1[b1i] < 0.0f) continue;
+                        const float dx11 = x1[b1i] - x0[a1], dy11 = y1[b1i] - y0[a1];
+                        const float dx22 = x1[b2i] - x0[a2], dy22 = y1[b2i] - y0[a2];
+                        const float dx12 = x1[b2i] - x0[a1], dy12 = y1[b2i] - y0[a1];
+                        const float dx21 = x1[b1i] - x0[a2], dy21 = y1[b1i] - y0[a2];
+                        const float d12 = dx12 * dx12 + dy12 * dy12;
+                        const float d21 = dx21 * dx21 + dy21 * dy21;
+                        if (d12 <= kDupMaxDistSq && d21 <= kDupMaxDistSq &&
+                            (d12 + d21 + 1e-3f) < (dx11 * dx11 + dy11 * dy11 + dx22 * dx22 + dy22 * dy22)) {
+                            locMatch[a1] = b2i;
+                            locMatch[a2] = b1i;
+                            b1i = b2i;
+                            improved = true;
+                        }
+                    }
+                }
+                if (!improved) break;
+            }
+
+            for (uint32_t a = 0; a < m0; ++a) {
+                if (locMatch[a] >= 0) {
+                    const uint16_t fj = b1[locMatch[a]];
+                    matchedF1[b0[a]] = static_cast<int16_t>(fj);
+                    markUsedF1(fj);
+                }
+            }
+        } else {
+            // Overflow fallback (>64 identical particles in one bucket): det-consistent bounded NN
+            for (uint32_t k = i; k < n0; ++k) {
+                const AnimElement& ek = f0.elements[k];
+                if (ek.symbol_hash != shash || ek.layer_hash != lhash) continue;
+                const float tx0 = HalfToFloat(ek.m[4]), ty0 = HalfToFloat(ek.m[5]);
+                const float det0k = elemDet(ek.m);
+                int32_t bestJ = -1;
+                float bestSc = 1e30f;
+                for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
+                    if (isUsedF1(static_cast<uint32_t>(j))) continue;
+                    const AnimElement& e1 = f1.elements[j];
+                    if (e1.symbol_hash != shash || e1.layer_hash != lhash) continue;
+                    if (det0k * elemDet(e1.m) < 0.0f) continue;
+                    const float dx = HalfToFloat(e1.m[4]) - tx0, dy = HalfToFloat(e1.m[5]) - ty0;
+                    const float dd = dx * dx + dy * dy;
+                    if (dd <= kDupMaxDistSq) {
+                        const float tie = (e1.frame_num == ek.frame_num || e1.frame_num == ek.frame_num + 1u) ? 0.0f : 0.25f;
+                        if (dd + tie < bestSc) { bestSc = dd + tie; bestJ = j; }
+                    }
+                }
+                if (bestJ >= 0) {
+                    matchedF1[k] = static_cast<int16_t>(bestJ);
+                    markUsedF1(static_cast<uint32_t>(bestJ));
+                }
+            }
+        }
+    }
 
     uint32_t tweenedCount = 0;
     uint32_t pass2Count = 0;
     for (uint32_t i = 0; i < n0; ++i) {
+        const int16_t mj = matchedF1[i];
+        if (mj < 0) continue;
         const AnimElement& e0 = f0.elements[i];
-        const uint32_t lhash = e0.layer_hash, shash = e0.symbol_hash, fnum = e0.frame_num;
-
-        const AnimElement* match = nullptr;
-        bool isPass2 = false;
-
-        if (useHash) {
-            const uint32_t h = ((lhash * 2654435761u) ^ shash) & kHashMask;
-            uint32_t cnt0LS = 0, cnt0Exact = 0;
-            if (f0BucketCnt[h] > 1) {
-                for (uint32_t k = 0; k < n0; ++k) {
-                    const AnimElement& ek = f0.elements[k];
-                    if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
-                        ++cnt0LS;
-                        if (ek.frame_num == fnum) ++cnt0Exact;
-                    }
-                }
-            } else {
-                cnt0LS = 1;
-                cnt0Exact = 1;
-            }
-
-            int32_t firstJ = -1, exactJ = -1;
-            uint32_t cnt1LS = 0, cnt1Exact = 0;
-            for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
-                const AnimElement& e1 = f1.elements[j];
-                if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                    if (firstJ < 0) firstJ = j;
-                    ++cnt1LS;
-                    if (e1.frame_num == fnum) {
-                        if (exactJ < 0) exactJ = j;
-                        ++cnt1Exact;
-                    }
-                }
-            }
-
-            if (firstJ >= 0) {
-                if (cnt0LS == 1 && cnt1LS == 1) {
-                    // Fast O(1) unique (layer, symbol) 1-to-1 bone match (full 420px Boss sweep range)
-                    const AnimElement& e1 = f1.elements[firstJ];
-                    if (e1.frame_num == fnum) {
-                        match = &e1;
-                    } else if (!fastOnly) {
-                        match = &e1;
-                        isPass2 = true;
-                    }
-                } else if (cnt0Exact == 1 && cnt1Exact == 1 && !isUsedF1(static_cast<uint32_t>(exactJ))) {
-                    // Unique (layer, symbol, frame_num) inside shared-symbol rig (e.g. evergreen tree
-                    // pieces fn=15/16/17/18 or co-located trunk fn=0/1): exact 1-to-1 match, never swap!
-                    markUsedF1(static_cast<uint32_t>(exactJ));
-                    match = &f1.elements[exactJ];
-                } else {
-                    // Multi-instance duplicate-key particle/rig bucket (fireflies/sparks/snow/spores):
-                    // Decode FP16 HalfToFloat(m[4..5]) for true Euclidean nearest-neighbor matching!
-                    const float tx0 = HalfToFloat(e0.m[4]);
-                    const float ty0 = HalfToFloat(e0.m[5]);
-                    int32_t bestJ = -1;
-                    float bestScore = 1e30f;
-                    for (int16_t j = headLS[h]; j >= 0; j = nextLS[j]) {
-                        if (isUsedF1(static_cast<uint32_t>(j))) continue;
-                        const AnimElement& e1 = f1.elements[j];
-                        if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                            const float dx = HalfToFloat(e1.m[4]) - tx0;
-                            const float dy = HalfToFloat(e1.m[5]) - ty0;
-                            const float d2 = dx * dx + dy * dy;
-                            if (d2 <= kDupMaxDistSq) {
-                                const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);
-                                if (score < bestScore) {
-                                    bestScore = score;
-                                    bestJ = j;
-                                }
-                            }
-                        }
-                    }
-                    if (bestJ >= 0) {
-                        markUsedF1(static_cast<uint32_t>(bestJ));
-                        const AnimElement& e1 = f1.elements[bestJ];
-                        if (e1.frame_num == fnum) {
-                            match = &e1;
-                        } else if (!fastOnly) {
-                            match = &e1;
-                            isPass2 = true;
-                        }
-                    }
-                }
-            }
-        } else {
-            uint32_t cnt0LS = 0, cnt0Exact = 0;
-            for (uint32_t k = 0; k < n0; ++k) {
-                const AnimElement& ek = f0.elements[k];
-                if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
-                    ++cnt0LS;
-                    if (ek.frame_num == fnum) ++cnt0Exact;
-                }
-            }
-            int32_t firstJ = -1, exactJ = -1;
-            uint32_t cnt1LS = 0, cnt1Exact = 0;
-            for (uint32_t j = 0; j < n1; ++j) {
-                const AnimElement& e1 = f1.elements[j];
-                if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                    if (firstJ < 0) firstJ = static_cast<int32_t>(j);
-                    ++cnt1LS;
-                    if (e1.frame_num == fnum) {
-                        if (exactJ < 0) exactJ = static_cast<int32_t>(j);
-                        ++cnt1Exact;
-                    }
-                }
-            }
-            if (firstJ >= 0) {
-                if (cnt0LS == 1 && cnt1LS == 1) {
-                    const AnimElement& e1 = f1.elements[firstJ];
-                    if (e1.frame_num == fnum) {
-                        match = &e1;
-                    } else if (!fastOnly) {
-                        match = &e1;
-                        isPass2 = true;
-                    }
-                } else if (cnt0Exact == 1 && cnt1Exact == 1 && !isUsedF1(static_cast<uint32_t>(exactJ))) {
-                    markUsedF1(static_cast<uint32_t>(exactJ));
-                    match = &f1.elements[exactJ];
-                } else {
-                    const float tx0 = HalfToFloat(e0.m[4]);
-                    const float ty0 = HalfToFloat(e0.m[5]);
-                    int32_t bestJ = -1;
-                    float bestScore = 1e30f;
-                    for (uint32_t j = 0; j < n1; ++j) {
-                        if (isUsedF1(j)) continue;
-                        const AnimElement& e1 = f1.elements[j];
-                        if (e1.symbol_hash == shash && e1.layer_hash == lhash) {
-                            const float dx = HalfToFloat(e1.m[4]) - tx0;
-                            const float dy = HalfToFloat(e1.m[5]) - ty0;
-                            const float d2 = dx * dx + dy * dy;
-                            if (d2 <= kDupMaxDistSq) {
-                                const float score = d2 + ((e1.frame_num == fnum) ? 0.0f : 4.0f);
-                                if (score < bestScore) {
-                                    bestScore = score;
-                                    bestJ = static_cast<int32_t>(j);
-                                }
-                            }
-                        }
-                    }
-                    if (bestJ >= 0) {
-                        markUsedF1(static_cast<uint32_t>(bestJ));
-                        const AnimElement& e1 = f1.elements[bestJ];
-                        if (e1.frame_num == fnum) {
-                            match = &e1;
-                        } else if (!fastOnly) {
-                            match = &e1;
-                            isPass2 = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (match && TweenElementMatrix(e0.m, match->m, frac, bufSlot.elems[i].m, fastOnly)) {
+        const AnimElement& e1 = f1.elements[mj];
+        const bool isPass2 = (e1.frame_num != e0.frame_num);
+        if (isPass2 && fastOnly) continue;
+        if (TweenElementMatrix(e0.m, e1.m, frac, bufSlot.elems[i].m, fastOnly)) {
             ++tweenedCount;
             if (isPass2) {
                 ++pass2Count;
                 if (frac >= 0.5f) {
-                    bufSlot.elems[i].frame_num = match->frame_num;
+                    bufSlot.elems[i].frame_num = e1.frame_num;
                 }
             }
         }
@@ -2005,15 +2317,17 @@ static bool QueueAnimCallsiteHook(std::vector<PendingCodePatch>& patches, uint8_
 
 static uint8_t* FindMaskedCallsite(uint8_t* textStart, size_t textSize, const uint8_t* pre, size_t preLen, const uint8_t* post, size_t postLen) {
     size_t total = preLen + 4 + postLen;
-    if (!textStart || textSize < total) return nullptr;
+    if (!textStart || preLen == 0 || textSize < total) return nullptr;
+    uint8_t* hit = nullptr;
     for (size_t off = 0; off <= textSize - total; ++off) {
         if (textStart[off] == pre[0] &&
             memcmp(textStart + off, pre, preLen) == 0 &&
             memcmp(textStart + off + preLen + 4, post, postLen) == 0) {
-            return textStart + off + preLen - 1; // points to 0xE8
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = textStart + off + preLen - 1; // points to 0xE8
         }
     }
-    return nullptr;
+    return hit;
 }
 
 void PrepareSkeletalAnimTweenHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
@@ -2339,8 +2653,37 @@ void* HyperClientWgLuaAlloc(void* /*ud*/, void* ptr, size_t /*osize*/, size_t ns
     return out;
 }
 
+static bool IsLuaJitEnvironmentPresent() {
+    if (GetModuleHandleW(L"lua51DS.dll") != nullptr ||
+        GetModuleHandleW(L"lua51.dll") != nullptr ||
+        GetModuleHandleW(L"Injector.dll") != nullptr ||
+        GetModuleHandleW(L"plugin_core_vm.dll") != nullptr ||
+        GetModuleHandleW(L"frida-gum.dll") != nullptr) {
+        return true;
+    }
+    // DontStarveLuaJIT2 (workshop-3444078585) injects via a local bin64\Winmm.dll proxy that loads
+    // before dinput8.dll (prior to Injector.dll / lua51DS.dll). Distinguish local proxy from System32!
+    wchar_t exePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+        if (wchar_t* slash = wcsrchr(exePath, L'\\')) {
+            *(slash + 1) = L'\0';
+            std::wstring winmmProxy = std::wstring(exePath) + L"Winmm.dll";
+            HMODULE hWinmm = GetModuleHandleW(L"Winmm.dll");
+            if (hWinmm) {
+                wchar_t modPath[MAX_PATH] = {};
+                if (GetModuleFileNameW(hWinmm, modPath, MAX_PATH) > 0 &&
+                    _wcsicmp(modPath, winmmProxy.c_str()) == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void* HookClientLuaNewState(LuaAlloc_t f, void* ud) {
-    if (g_optMimallocLua.load(std::memory_order_relaxed)) {
+    if (g_optMimallocLua.load(std::memory_order_relaxed) &&
+        GetModuleHandleW(L"lua51DS.dll") == nullptr) {
         if (reinterpret_cast<uint8_t*>(f) == g_clientSimLuaAllocAddr) {
             return g_origClientLuaNewState(&HyperClientSimLuaAlloc, ud);
         }
@@ -2352,6 +2695,11 @@ void* HookClientLuaNewState(LuaAlloc_t f, void* ud) {
 }
 
 void PrepareClientMimallocHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    if (IsLuaJitEnvironmentPresent()) {
+        g_optMimallocLua.store(false, std::memory_order_relaxed);
+        LogMsg("[COMPAT] Detected LuaJIT2 / local Winmm.dll proxy -> auto-skipped mimalloc lua_newstate hook for 100%% LuaJIT compatibility.");
+        return;
+    }
     uint8_t* pNewState = FindPatternInText(textStart, textSize, kSigLuaNewState, sizeof(kSigLuaNewState));
     uint8_t* pSimAlloc = FindMaskedPatternInText(textStart, textSize, kSigSimLuaAlloc, kMaskSimLuaAlloc, sizeof(kSigSimLuaAlloc));
     uint8_t* pWgAlloc  = FindPatternInText(textStart, textSize, kSigWgLuaAlloc, sizeof(kSigWgLuaAlloc));
@@ -2524,7 +2872,9 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                 }
             }
             if (baseStart > 0 && nowQpc >= baseStart) {
-                UpdateAtomicEma(g_emaFrameBusyUs, static_cast<float>((nowQpc - baseStart) * g_qpcToUs), 0.06f);
+                const float busyUs = static_cast<float>((nowQpc - baseStart) * g_qpcToUs);
+                UpdateAtomicEma(g_emaFrameBusyUs, busyUs, 0.06f);
+                g_lastFrameBusyUs.store(static_cast<uint32_t>(std::clamp(busyUs, 0.0f, 1000000.0f)), std::memory_order_relaxed);
             }
 
             if (remUs > tls.spinMarginUs + 450.0) {
@@ -2590,7 +2940,9 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
         }
     } else {
         if (fl && fl->startQpc > 0 && nowQpc >= fl->startQpc) {
-            UpdateAtomicEma(g_emaFrameBusyUs, static_cast<float>((nowQpc - fl->startQpc) * g_qpcToUs), 0.06f);
+            const float busyUs = static_cast<float>((nowQpc - fl->startQpc) * g_qpcToUs);
+            UpdateAtomicEma(g_emaFrameBusyUs, busyUs, 0.06f);
+            g_lastFrameBusyUs.store(static_cast<uint32_t>(std::clamp(busyUs, 0.0f, 1000000.0f)), std::memory_order_relaxed);
         }
         tls.nextDeadlineQpc = 0;
     }
@@ -2598,11 +2950,15 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
     // Publish exact frame start & sequence for RenderThread/GC/TexStream + 1% Low ring & Hitch breakdown
     g_frameStartQpc.store(nowQpc, std::memory_order_release);
     g_frameSeq.fetch_add(1, std::memory_order_release);
+    const uint32_t frameUnzUs    = g_frameUnzUs.exchange(0, std::memory_order_acq_rel);
+    const uint32_t frameShaderUs = g_frameShaderUs.exchange(0, std::memory_order_acq_rel);
     if (tls.lastEndQpc != 0) {
         double frameUs = static_cast<double>(nowQpc - tls.lastEndQpc) * g_qpcToUs;
-        if (frameUs >= 100.0 && frameUs <= 1000000.0) {
-            g_lastFrameUs.store(static_cast<int64_t>(frameUs), std::memory_order_relaxed);
-            g_frameRing.Push(static_cast<float>(frameUs));
+        if (frameUs >= 100.0 && frameUs <= 60000000.0) {
+            if (frameUs <= 1000000.0) {
+                g_lastFrameUs.store(static_cast<int64_t>(frameUs), std::memory_order_relaxed);
+                g_frameRing.Push(static_cast<float>(frameUs));
+            }
 
             // Promote to active gameplay ONLY on genuine 3D world activity (prevents Main Menu animated
             // puppet — orientMode=8, pos240=0, spatial=0 — from triggering gameplay throttling/hitch logs).
@@ -2620,21 +2976,34 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                 if (worldActive && frameUs < 25000.0) {
                     g_inGameplay.store(1, std::memory_order_release);
                 }
-            } else if (frameUs > 25000.0 && frameUs < 500000.0) {
-                // Lock-free Hitch breakdown capture (0 MainThread I/O; background WorkerProc logs max 1x/10s)
-                const uint32_t fUs = static_cast<uint32_t>(frameUs);
-                g_hitchPendingCount.fetch_add(1, std::memory_order_relaxed);
-                uint32_t prevPeak = g_hitchPeakUs.load(std::memory_order_relaxed);
-                if (fUs >= prevPeak) {
-                    g_hitchPeakUs.store(fUs, std::memory_order_relaxed);
-                    g_hitchAnimUs.store(g_lastAnimHookUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchAnimEnts.store(g_lastAnimEnts.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchAnimBones.store(g_lastAnimBones.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchAnimShed.store(g_lastAnimShed.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchGcUs.store(g_lastGcUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchGcKb.store(g_lastGcKb.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                    g_hitchTexUs.store(g_lastTexUploadUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            } else if (frameUs > 25000.0) {
+                // Tear-free Hitch & Severe-Stall (>=500ms) capture (0 MainThread I/O; WorkerProc logs max 1x/10s)
+                const uint32_t fUs = static_cast<uint32_t>(std::min(frameUs, 60000000.0));
+                const bool isSevere = (frameUs >= 500000.0);
+                AcquireSRWLockExclusive(&g_hitchLock);
+                if (isSevere) {
+                    ++g_hitchSnap.severeCount;
+                    if (fUs > g_hitchSnap.severeMaxUs) g_hitchSnap.severeMaxUs = fUs;
+                } else {
+                    ++g_hitchSnap.pendingCount;
                 }
+                if (fUs >= g_hitchSnap.peakUs) {
+                    g_hitchSnap.peakUs    = fUs;
+                    g_hitchSnap.busyUs    = g_lastFrameBusyUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.swapUs    = g_lastSwapUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.worldUs   = g_lastWorldRenderUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.postUs    = g_lastPostProcUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.unzUs     = frameUnzUs;
+                    g_hitchSnap.shaderUs  = frameShaderUs;
+                    g_hitchSnap.animUs    = g_lastAnimHookUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.animEnts  = g_lastAnimEnts.load(std::memory_order_relaxed);
+                    g_hitchSnap.animBones = g_lastAnimBones.load(std::memory_order_relaxed);
+                    g_hitchSnap.animShed  = g_lastAnimShed.load(std::memory_order_relaxed);
+                    g_hitchSnap.gcUs      = g_lastGcUs.load(std::memory_order_relaxed);
+                    g_hitchSnap.gcKb      = g_lastGcKb.load(std::memory_order_relaxed);
+                    g_hitchSnap.texUs     = g_lastTexUploadUs.load(std::memory_order_relaxed);
+                }
+                ReleaseSRWLockExclusive(&g_hitchLock);
             }
         }
     }
@@ -2663,53 +3032,123 @@ static bool PatchClientFloatProtected(float* ptr, float val) {
     DWORD oldProt = 0, dummy = 0;
     if (!VirtualProtect(ptr, sizeof(float), PAGE_READWRITE, &oldProt)) return false;
     *ptr = val;
-    VirtualProtect(ptr, sizeof(float), oldProt, &dummy);
+    if (!VirtualProtect(ptr, sizeof(float), oldProt, &dummy)) {
+        LogMsg("[WARN] PatchClientFloatProtected @ %p failed restoring prot 0x%lX",
+               static_cast<void*>(ptr), static_cast<unsigned long>(oldProt));
+    }
+    return true;
+}
+
+static bool PatchClientDoubleProtected(double* ptr, double val) {
+    if (!ptr) return false;
+    DWORD oldProt = 0, dummy = 0;
+    if (!VirtualProtect(ptr, sizeof(double), PAGE_READWRITE, &oldProt)) return false;
+    *ptr = val;
+    if (!VirtualProtect(ptr, sizeof(double), oldProt, &dummy)) {
+        LogMsg("[WARN] PatchClientDoubleProtected @ %p failed restoring prot 0x%lX",
+               static_cast<void*>(ptr), static_cast<unsigned long>(oldProt));
+    }
     return true;
 }
 
 bool SetClientSimTickRate(int hz) {
     if (hz != 30 && hz != 60) return false;
+
+    AcquireSRWLockExclusive(&g_clientSimTickLock);
+    struct UnlockGuard {
+        SRWLOCK* lk;
+        ~UnlockGuard() { ReleaseSRWLockExclusive(lk); }
+    } guard{&g_clientSimTickLock};
+
     if (!g_clientSimTickFloatPtr || !g_clientSimTickDoublePtr) return false;
-    if (g_clientSimTickRate.load(std::memory_order_acquire) == hz) return true;
+    // Fail-closed: activating 60Hz requires ALL 4 subsystem constants + netTickScale verified!
+    if (hz == 60 &&
+        (!g_clientAnimShaderTickPtr || !g_clientPathfinderTickPtr ||
+         !g_clientSpatialTickPtr || !g_clientSimTimeDiffPtr || !g_clientNetTickScalePtr)) {
+        LogMsg("[SIMTICK] Refused Client 60Hz (incomplete subsystem pointers: anim=%d path=%d spat=%d diff=%d netScale=%d)",
+               g_clientAnimShaderTickPtr != nullptr, g_clientPathfinderTickPtr != nullptr,
+               g_clientSpatialTickPtr != nullptr, g_clientSimTimeDiffPtr != nullptr,
+               g_clientNetTickScalePtr != nullptr);
+        return false;
+    }
+
+    const int prevHz = g_clientSimTickRate.load(std::memory_order_acquire);
+    if (prevHz == hz) return true;
 
     const float newF = 1.0f / static_cast<float>(hz);
     const double newD = 1.0 / static_cast<double>(hz);
+    const float newNetScale = (hz == 60) ? 60.499998f : 30.499998f;
 
-    if (!PatchClientFloatProtected(g_clientSimTickFloatPtr, newF)) return false;
+    // Transactional snapshot of every mutable constant before any write
+    struct FloatPatchEntry {
+        float* ptr;
+        float  prevVal;
+        float  newVal;
+        bool   written;
+    };
+    FloatPatchEntry fEntries[6] = {
+        { g_clientSimTickFloatPtr,   g_clientSimTickFloatPtr   ? *g_clientSimTickFloatPtr   : 0.0f, newF,        false },
+        { g_clientAnimShaderTickPtr, g_clientAnimShaderTickPtr ? *g_clientAnimShaderTickPtr : 0.0f, newF,        false },
+        { g_clientPathfinderTickPtr, g_clientPathfinderTickPtr ? *g_clientPathfinderTickPtr : 0.0f, newF,        false },
+        { g_clientSpatialTickPtr,    g_clientSpatialTickPtr    ? *g_clientSpatialTickPtr    : 0.0f, newF,        false },
+        { g_clientSimTimeDiffPtr,    g_clientSimTimeDiffPtr    ? *g_clientSimTimeDiffPtr    : 0.0f, newF,        false },
+        { g_clientNetTickScalePtr,   g_clientNetTickScalePtr   ? *g_clientNetTickScalePtr   : 0.0f, newNetScale, false },
+    };
+    const double savedD = *g_clientSimTickDoublePtr;
+    bool dWritten = false;
 
-    DWORD oldD = 0, dummy = 0;
-    if (!VirtualProtect(g_clientSimTickDoublePtr, sizeof(double), PAGE_READWRITE, &oldD)) return false;
-    *g_clientSimTickDoublePtr = newD;
-    VirtualProtect(g_clientSimTickDoublePtr, sizeof(double), oldD, &dummy);
+    auto rollbackAll = [&]() {
+        if (dWritten) {
+            PatchClientDoubleProtected(g_clientSimTickDoublePtr, savedD);
+        }
+        for (int i = 5; i >= 0; --i) {
+            if (fEntries[i].written && fEntries[i].ptr) {
+                PatchClientFloatProtected(fEntries[i].ptr, fEntries[i].prevVal);
+            }
+        }
+    };
 
-    // Patch ALL secondary exclusive mTick*(1/30) subsystems (AnimRenderer shader time, PathFinder, EntityMgr, LightWatcher)
+    // 1. Primary double + float
+    if (!PatchClientDoubleProtected(g_clientSimTickDoublePtr, newD)) {
+        rollbackAll();
+        return false;
+    }
+    dWritten = true;
+
     int extras = 0;
-    if (PatchClientFloatProtected(g_clientAnimShaderTickPtr, newF)) ++extras;
-    if (PatchClientFloatProtected(g_clientPathfinderTickPtr, newF)) ++extras;
-    if (PatchClientFloatProtected(g_clientSpatialTickPtr, newF))    ++extras;
-    if (PatchClientFloatProtected(g_clientSimTimeDiffPtr, newF))    ++extras;
-
-    // Patch SetNetworkTickRate 30.5f -> 60.5f so upload ticksPerSnapshot stays exact (U=10(6) on Client, U=60(1) on Local Host)
-    bool netScaleOk = PatchClientFloatProtected(g_clientNetTickScalePtr, (hz == 60) ? 60.499998f : 30.499998f);
+    for (int i = 0; i < 6; ++i) {
+        if (!fEntries[i].ptr) continue;
+        if (!PatchClientFloatProtected(fEntries[i].ptr, fEntries[i].newVal)) {
+            rollbackAll();
+            LogMsg("[SIMTICK] Client %dHz patch failed at slot %d -> rolled back atomically to %dHz", hz, i, prevHz);
+            return false;
+        }
+        fEntries[i].written = true;
+        if (i >= 1 && i <= 4) ++extras;
+    }
+    const bool netScaleOk = fEntries[5].written;
 
     g_clientSimTickRate.store(hz, std::memory_order_release);
     g_clientSimTickGen.fetch_add(1, std::memory_order_release);
 
-    // Re-sync NetworkManager & disable RakNet ReplicaManager3 download throttle (D=0) in 60Hz mode!
-    // Prevents RakPeer::PushBackPacket sawtooth when Server sends >15Hz snapshots to a D=15 client!
-    const char* netSyncDesc = "none";
+    // Re-sync NetworkManager (and restore pre-60Hz rate + vanilla download throttle on 60->30!)
+    char netSyncBuf[96] = "none";
     if (g_clientNetMgrGlobalPtr && *g_clientNetMgrGlobalPtr) {
         auto* netMgr = static_cast<uint8_t*>(*g_clientNetMgrGlobalPtr);
         void* replicaMgr = *reinterpret_cast<void**>(netMgr + 0x288);
-        uint8_t isClient = netMgr[0x308];
-        uint32_t curRate = *reinterpret_cast<uint32_t*>(netMgr + 0xD8);
+        const uint8_t isClient = netMgr[0x308];
+        const uint32_t curRate = *reinterpret_cast<uint32_t*>(netMgr + 0xD8);
         if (hz == 60 && replicaMgr) {
+            if (!g_clientHasSavedPre60NetRate) {
+                g_clientSavedPre60NetRate = (curRate != 0) ? curRate : 15u;
+                g_clientHasSavedPre60NetRate = true;
+            }
             if (isClient == 0) {
                 // No-Caves Local Host running inside Client binary: upgrade default 15Hz -> 60Hz (U=60(1))
-                uint32_t hostRate = (curRate == 0 || curRate == 15) ? 60u : curRate;
+                const uint32_t hostRate = (curRate == 0 || curRate == 15) ? 60u : curRate;
                 if (g_fnClientSetNetTickRate) {
                     g_fnClientSetNetTickRate(netMgr, hostRate);
-                    netSyncDesc = "local-host U=60(1)";
+                    snprintf(netSyncBuf, sizeof(netSyncBuf), "local-host U=%u (saved=%u)", hostRate, g_clientSavedPre60NetRate);
                 }
             } else {
                 // Dedicated-Server Client: recalc upload ticksPerSnapshot=6 (10Hz) AND set D=0 (unthrottled receive!)
@@ -2718,18 +3157,28 @@ bool SetClientSimTickRate(int hz) {
                 }
                 if (g_fnClientSetDownloadMs) {
                     g_fnClientSetDownloadMs(replicaMgr, 0);
-                    netSyncDesc = "client U=10(6) D=0(unthrottled)";
+                    snprintf(netSyncBuf, sizeof(netSyncBuf), "client U=10(6) D=0 (saved=%u)", g_clientSavedPre60NetRate);
                 } else {
-                    netSyncDesc = "client U=10(6)";
+                    snprintf(netSyncBuf, sizeof(netSyncBuf), "client U=10(6) (saved=%u)", g_clientSavedPre60NetRate);
                 }
             }
         } else if (hz == 30) {
-            netSyncDesc = "restored 30Hz vanilla";
+            const uint32_t restoreRate = g_clientHasSavedPre60NetRate ? g_clientSavedPre60NetRate : (curRate ? curRate : 15u);
+            g_clientHasSavedPre60NetRate = false;
+            g_clientSavedPre60NetRate = 0;
+            if (replicaMgr && g_fnClientSetNetTickRate) {
+                // SetNetworkTickRate with restored 30.5f recalculates ALL 4 fields:
+                // m_netTickRate, uploadMs, ticksPerSnapshot, AND downloadMs (100% vanilla)!
+                g_fnClientSetNetTickRate(netMgr, restoreRate);
+                snprintf(netSyncBuf, sizeof(netSyncBuf), "restored 30Hz vanilla (rate=%u)", restoreRate);
+            } else {
+                snprintf(netSyncBuf, sizeof(netSyncBuf), "restored 30Hz vanilla (no replicaMgr)");
+            }
         }
     }
 
     LogMsg("[SIMTICK] Client Simulation tick rate -> %d Hz (dt=%.6fs, subsys=%d/4, netScale=%s, net=%s)",
-           hz, newD, extras, netScaleOk ? "OK" : "SKIP", netSyncDesc);
+           hz, newD, extras, netScaleOk ? "OK" : "SKIP", netSyncBuf);
     return true;
 }
 
@@ -3277,6 +3726,273 @@ void PrepareTexStreamTimeSliceHook(std::vector<PendingCodePatch>& patches, uint8
 }
 
 //------------------------------------------------------------------------------
+// [v2.6.0] Pillar 1: True 240Hz Render-Only VFX & Particle Interpolation
+//   - Vanilla DST steps BOTH modern VFXEffect (rain/snow/pollen/fire/sparks/boss
+//     magic) and legacy ParticleEmitter strictly inside 30Hz Simulation::Update.
+//   - Intercepts ParticleManager::Update to measure exact simulation tick phase
+//     (auto-adapts to 30Hz vanilla AND 60Hz HyperCore), then smoothly interpolates
+//     positions, rotation angles, and envelope ages IN-PLACE inside Klei's fresh
+//     per-frame ParticleRenderCmd / EmitterRenderCmd snapshots:
+//       pos(alpha) = pos_curr - (1 - alpha) * vel_curr == lerp(pos_prev, pos_curr, alpha)
+//   - Zero mutation of simulation ParticleBuffer, zero allocation, zero overshoot,
+//     fresh-spawn & ground-collision guarded, auto-freezes cleanly on pause!
+//------------------------------------------------------------------------------
+static void HookParticleMgrUpdate(void* mgr, float dt) {
+    const int64_t nowQpc = NowQpc();
+    const int64_t prevQpc = g_vfxLastTickQpc.exchange(nowQpc, std::memory_order_acq_rel);
+    if (dt > 0.004f && dt < 0.10f) {
+        g_vfxLastSimDt.store(dt, std::memory_order_relaxed);
+    }
+    if (prevQpc > 0 && nowQpc > prevQpc && g_qpcInvFreq > 0.0) {
+        const double elapsed = static_cast<double>(nowQpc - prevQpc) * g_qpcInvFreq;
+        if (elapsed >= 0.010 && elapsed <= 0.080) {
+            const float prevPer = g_vfxTickPeriodSec.load(std::memory_order_relaxed);
+            const float nextPer = (prevPer > 0.008f && prevPer < 0.080f)
+                ? (prevPer * 0.85f + static_cast<float>(elapsed) * 0.15f)
+                : static_cast<float>(elapsed);
+            g_vfxTickPeriodSec.store(std::clamp(nextPer, 0.012f, 0.060f), std::memory_order_relaxed);
+        } else if (dt > 0.010f && dt < 0.060f) {
+            g_vfxTickPeriodSec.store(dt, std::memory_order_relaxed);
+        }
+    }
+    if (g_origParticleMgrUpdate) {
+        g_origParticleMgrUpdate(mgr, dt);
+    }
+}
+
+static inline void SmoothParticleCmdInPlace(
+    uint32_t count, const uint8_t* pool,
+    float* cmdPos, float* cmdAges, float* cmdAngles,
+    bool hasGroundCollision) {
+    if (!pool || !cmdPos || count == 0 || count > 65535u) return;
+    if (g_vfxSmoothEnabled.load(std::memory_order_relaxed) == 0) return;
+
+    const uint16_t poolCount = *reinterpret_cast<const uint16_t*>(pool + 0x0A);
+    if (poolCount != count) return;
+    const float* poolVel = *reinterpret_cast<const float* const*>(pool + 0x18);
+    if (!poolVel) return;
+
+    const int64_t lastTickQpc = g_vfxLastTickQpc.load(std::memory_order_acquire);
+    if (lastTickQpc <= 0 || g_qpcInvFreq <= 0.0) return;
+
+    const int64_t nowQpc = NowQpc();
+    if (nowQpc < lastTickQpc) return;
+    const float period = g_vfxTickPeriodSec.load(std::memory_order_relaxed);
+    if (!(period > 0.008f)) return;
+
+    const float elapsed = static_cast<float>(static_cast<double>(nowQpc - lastTickQpc) * g_qpcInvFreq);
+    if (elapsed >= period) return; // alpha >= 1.0 (or paused) -> back == 0, exact current pose
+    const float alpha = std::clamp(elapsed / period, 0.0f, 1.0f);
+    const float back = 1.0f - alpha;
+    if (back <= 0.002f) return;
+
+    const float* poolAngVel = cmdAngles ? *reinterpret_cast<const float* const*>(pool + 0x30) : nullptr;
+    const float simDtBack = back * g_vfxLastSimDt.load(std::memory_order_relaxed);
+
+    uint32_t smoothed = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        // Freshly spawned particles (age == 0 before first ParticleBuffer::Update) must NOT step backward
+        if (cmdAges) {
+            const float age = cmdAges[i];
+            if (!(age > 0.0005f)) continue;
+            const float interpAge = age - simDtBack;
+            cmdAges[i] = (interpAge > 0.0f) ? interpAge : 0.0f;
+        }
+        const size_t base = static_cast<size_t>(i) * 3u;
+        const float vx = poolVel[base + 0];
+        const float vy = poolVel[base + 1];
+        const float vz = poolVel[base + 2];
+        if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) continue;
+        if (fabsf(vx) > 20.0f || fabsf(vy) > 20.0f || fabsf(vz) > 20.0f) continue;
+
+        // Match Klei ParticleBuffer::Update ground-collision halt (pos.y <= 0 skips pos += vel)
+        const float py = cmdPos[base + 1];
+        if (hasGroundCollision && py <= 0.0001f) continue;
+
+        cmdPos[base + 0] -= back * vx;
+        float ny = py - back * vy;
+        if (hasGroundCollision && ny < 0.0f) ny = 0.0f;
+        cmdPos[base + 1] = ny;
+        cmdPos[base + 2] -= back * vz;
+
+        if (cmdAngles && poolAngVel) {
+            const float av = poolAngVel[i];
+            if (std::isfinite(av) && fabsf(av) <= 6.283185f) {
+                cmdAngles[i] -= back * av;
+            }
+        }
+        ++smoothed;
+    }
+
+    if (smoothed > 0) {
+        static thread_local uint32_t tl_cmds = 0;
+        static thread_local uint64_t tl_parts = 0;
+        ++tl_cmds;
+        tl_parts += smoothed;
+        if (tl_cmds >= 64u) {
+            InterlockedAdd64(&g_vfxCmdsSmoothed, static_cast<LONG64>(tl_cmds));
+            InterlockedAdd64(&g_vfxParticlesSmoothed, static_cast<LONG64>(tl_parts));
+            tl_cmds = 0;
+            tl_parts = 0;
+        }
+    }
+}
+
+static void* HookVfxRenderCmdCtor(void* cmd, void* renderNode, void* mtx) {
+    void* ret = g_origVfxRenderCmdCtor ? g_origVfxRenderCmdCtor(cmd, renderNode, mtx) : cmd;
+    if (ret && g_vfxSmoothHooked.load(std::memory_order_acquire)) {
+        auto* c = static_cast<uint8_t*>(ret);
+        const auto* vfx = *reinterpret_cast<const uint8_t* const*>(c + 0x18);
+        if (vfx) {
+            const auto* pool = *reinterpret_cast<const uint8_t* const*>(vfx + 0x98);
+            const bool groundCol = (vfx[0x3B] != 0);
+            const uint32_t count = *reinterpret_cast<const uint32_t*>(c + 0x60);
+            float* ages   = *reinterpret_cast<float**>(c + 0x70);
+            float* pos    = *reinterpret_cast<float**>(c + 0x78);
+            float* angles = *reinterpret_cast<float**>(c + 0x88);
+            SmoothParticleCmdInPlace(count, pool, pos, ages, angles, groundCol);
+        }
+    }
+    return ret;
+}
+
+static void* HookEmitterRenderCmdCtor(void* cmd, void* renderNode, void* mtx) {
+    void* ret = g_origEmitterRenderCmdCtor ? g_origEmitterRenderCmdCtor(cmd, renderNode, mtx) : cmd;
+    if (ret && g_vfxSmoothHooked.load(std::memory_order_acquire)) {
+        auto* c = static_cast<uint8_t*>(ret);
+        const auto* emitter = *reinterpret_cast<const uint8_t* const*>(c + 0x60);
+        if (emitter) {
+            const auto* pool = *reinterpret_cast<const uint8_t* const*>(emitter + 0xA0);
+            const uint32_t count = *reinterpret_cast<const uint32_t*>(c + 0x6C);
+            float* ages   = *reinterpret_cast<float**>(c + 0x78);
+            float* pos    = *reinterpret_cast<float**>(c + 0x80);
+            float* angles = *reinterpret_cast<float**>(c + 0x90);
+            SmoothParticleCmdInPlace(count, pool, pos, ages, angles, false);
+        }
+    }
+    return ret;
+}
+
+static void PrepareVfxParticleSmoothHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    // 1. Unique callsite of ParticleManager::Update(dt) inside Simulation::Update (0x140108ede)
+    constexpr uint8_t kSigPmCall[] = {
+        0x48, 0x8B, 0x8B, 0xB8, 0x00, 0x00, 0x00,
+        0xF3, 0x0F, 0x10, 0x0D, 0, 0, 0, 0,
+        0x48, 0x8B, 0x49, 0x50,
+        0xE8, 0, 0, 0, 0,
+        0xB2, 0x01, 0x48, 0x8B, 0xCB, 0xE8
+    };
+    constexpr char kMaskPmCall[] = "xxxxxxxxxxx????xxxxx????xxxxxx";
+
+    // 2. Unique callsite of VFXRenderCmd::VFXRenderCmd inside ParticleRenderNode::GenerateRenderCommand (0x1400e4fbf)
+    constexpr uint8_t kSigVfxCmdCall[] = {
+        0x48, 0x8B, 0x81, 0xD0, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF8, 0x48, 0x8B, 0xEA,
+        0x4C, 0x8B, 0x88, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF1,
+        0x66, 0x41, 0x83, 0x79, 0x0A, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+        0xB9, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x38, 0xE8, 0, 0, 0, 0,
+        0x33, 0xDB, 0x48, 0x85, 0xC0, 0x74, 0x13, 0x4C, 0x8B, 0xC5, 0x48, 0x8B, 0xD6, 0x48, 0x8B, 0xC8,
+        0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xD8
+    };
+    constexpr char kMaskVfxCmdCall[] =
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxx????xxxxxxxxxxxxxxxxx????xxx";
+
+    // 3. Unique callsite of EmitterRenderCmd::EmitterRenderCmd (0x1400b465f)
+    constexpr uint8_t kSigEmitCmdCall[] = {
+        0x48, 0x8B, 0x81, 0xD8, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF8, 0x48, 0x8B, 0xEA,
+        0x4C, 0x8B, 0x88, 0xA0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF1,
+        0x66, 0x41, 0x83, 0x79, 0x0A, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+        0xB9, 0x98, 0x00, 0x00, 0x00, 0x48, 0x89, 0x5C, 0x24, 0x38, 0xE8, 0, 0, 0, 0,
+        0x33, 0xDB, 0x48, 0x85, 0xC0, 0x74, 0x13, 0x4C, 0x8B, 0xC5, 0x48, 0x8B, 0xD6, 0x48, 0x8B, 0xC8,
+        0xE8, 0, 0, 0, 0, 0x4C, 0x8B, 0xD8
+    };
+
+    const uintptr_t textLo = reinterpret_cast<uintptr_t>(textStart);
+    const uintptr_t textHi = textLo + textSize;
+
+    uint8_t* pPmSite = FindUniqueMaskedPatternInText(textStart, textSize, kSigPmCall, kMaskPmCall, sizeof(kSigPmCall));
+    uint8_t* pVfxSite = FindUniqueMaskedPatternInText(textStart, textSize, kSigVfxCmdCall, kMaskVfxCmdCall, sizeof(kSigVfxCmdCall));
+    uint8_t* pEmitSite = FindUniqueMaskedPatternInText(textStart, textSize, kSigEmitCmdCall, kMaskVfxCmdCall, sizeof(kSigEmitCmdCall));
+    if (!pPmSite || !pVfxSite) {
+        LogMsg("[VFX240] Skipped 240Hz Particle Smoothing (Fail-Closed AOB miss: pm=%p vfx=%p emit=%p)",
+               static_cast<void*>(pPmSite), static_cast<void*>(pVfxSite), static_cast<void*>(pEmitSite));
+        return;
+    }
+
+    uint8_t* pmCs = pPmSite + 19;
+    uint8_t* pmFn = ResolveRel32Call(pmCs);
+    uint8_t* vfxCs = pVfxSite + 66;
+    uint8_t* vfxFn = ResolveRel32Call(vfxCs);
+    if (!pmFn || !vfxFn ||
+        reinterpret_cast<uintptr_t>(pmFn) < textLo || reinterpret_cast<uintptr_t>(pmFn) >= textHi ||
+        reinterpret_cast<uintptr_t>(vfxFn) < textLo || reinterpret_cast<uintptr_t>(vfxFn) + 0x180 > textHi) {
+        LogMsg("[VFX240] Skipped 240Hz Particle Smoothing (target bounds check failed)");
+        return;
+    }
+
+    // Strict fail-closed struct layout check inside VFXRenderCmd ctor (+0x153: pool +0x98, count +0x0A->+0x60, +0x38/+0x40/+0x10/+0x20/+0x28)
+    constexpr uint8_t kExpectedVfxBody[] = {
+        0x48, 0x8B, 0xB8, 0x98, 0x00, 0x00, 0x00, 0x0F, 0xB7, 0x4F, 0x0A, 0x89, 0x4B, 0x60,
+        0x48, 0x8B, 0x82, 0xD0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x77, 0x38, 0x48, 0x8B, 0x6F, 0x40,
+        0x4C, 0x8B, 0x6F, 0x10, 0x4C, 0x8B, 0x67, 0x20, 0x4C, 0x8B, 0x77, 0x28
+    };
+    if (memcmp(vfxFn + 0x153, kExpectedVfxBody, sizeof(kExpectedVfxBody)) != 0) {
+        LogMsg("[VFX240] Skipped 240Hz Particle Smoothing (VFXRenderCmd layout mismatch @ %p)", static_cast<void*>(vfxFn));
+        return;
+    }
+
+    g_origParticleMgrUpdate = reinterpret_cast<ParticleMgrUpdate_t>(pmFn);
+    g_origVfxRenderCmdCtor  = reinterpret_cast<ParticleRenderCmdCtor_t>(vfxFn);
+
+    char msgPm[224], msgVfx[224];
+    snprintf(msgPm, sizeof(msgPm), "[VFX240] Hooked ParticleManager::Update @ %p (fn=%p) -> exact SimTick phase clock",
+             static_cast<void*>(pmCs), static_cast<void*>(pmFn));
+    snprintf(msgVfx, sizeof(msgVfx), "[VFX240] Hooked VFXRenderCmd @ %p (fn=%p) -> True 240Hz Render-Only Particle Interp",
+             static_cast<void*>(vfxCs), static_cast<void*>(vfxFn));
+    const size_t pmIdx = patches.size();
+    const bool okPm  = QueueRel32NearRelayHook(patches, pmCs, reinterpret_cast<const void*>(&HookParticleMgrUpdate), msgPm);
+    const size_t vfxIdx = patches.size();
+    const bool okVfx = okPm && QueueRel32NearRelayHook(patches, vfxCs, reinterpret_cast<const void*>(&HookVfxRenderCmdCtor), msgVfx);
+
+    if (okPm && okVfx) {
+        g_vfxPmPatchIdx  = pmIdx;
+        g_vfxCmdPatchIdx = vfxIdx;
+    } else {
+        // Never leave orphaned clock patch if VFX render hook failed to queue
+        while (patches.size() > pmIdx) {
+            if (patches.back().ownedExecPage) VirtualFree(patches.back().ownedExecPage, 0, MEM_RELEASE);
+            patches.pop_back();
+        }
+        return;
+    }
+
+    bool okEmit = false;
+    if (pEmitSite) {
+        uint8_t* emitCs = pEmitSite + 66;
+        uint8_t* emitFn = ResolveRel32Call(emitCs);
+        constexpr uint8_t kExpectedEmitBody[] = {
+            0x48, 0x8B, 0x88, 0xA0, 0x00, 0x00, 0x00, 0x0F, 0xB7, 0x41, 0x0A, 0x89, 0x43, 0x6C,
+            0x4C, 0x8B, 0x69, 0x38, 0x48, 0x8B, 0x79, 0x40, 0x4C, 0x8B, 0x61, 0x10, 0x48, 0x8B, 0x69, 0x20,
+            0x48, 0x8B, 0x71, 0x28
+        };
+        if (emitFn &&
+            reinterpret_cast<uintptr_t>(emitFn) >= textLo &&
+            reinterpret_cast<uintptr_t>(emitFn) + 0x120 <= textHi &&
+            memcmp(emitFn + 0xEB, kExpectedEmitBody, sizeof(kExpectedEmitBody)) == 0) {
+            g_origEmitterRenderCmdCtor = reinterpret_cast<ParticleRenderCmdCtor_t>(emitFn);
+            char msgEm[224];
+            snprintf(msgEm, sizeof(msgEm), "[VFX240] Hooked Legacy EmitterRenderCmd @ %p (fn=%p) -> True 240Hz Particle Interp",
+                     static_cast<void*>(emitCs), static_cast<void*>(emitFn));
+            const size_t emIdx = patches.size();
+            okEmit = QueueRel32NearRelayHook(patches, emitCs, reinterpret_cast<const void*>(&HookEmitterRenderCmdCtor), msgEm);
+            if (okEmit) g_vfxEmitPatchIdx = emIdx;
+        }
+    }
+    if (!okEmit) {
+        LogMsg("[VFX240] Modern VFXEffect 240Hz queued (legacy ParticleEmitter skipped)");
+    }
+}
+
+//------------------------------------------------------------------------------
 // Visual Fidelity Tier-1 Native Engine (v2.5.0-alpha):
 //   V1. Unlock ANGLE 1.0.0.2249 hardware Anisotropic Filtering (0x8E3 cap bit)
 //       + PE IAT hook on libGLESv2!glTexParameteri -> true 16x AF + trilinear
@@ -3412,6 +4128,87 @@ void WINAPI HookGlTexParameteri(uint32_t target, uint32_t pname, int32_t param) 
     }
 }
 
+//------------------------------------------------------------------------------
+// [v2.6.0] Pillar 2 + Pillar 3 Unified ANGLE D3D9Ex Hook (libGLESv2!applyTextures):
+//   1. Hardware Reflex: IDirect3DDevice9Ex::SetMaximumFrameLatency(1) (cuts up to
+//      2 queued GPU frames without stalling CPU/GPU parallelism; restores original
+//      latency cleanly when disabled). Zero D3D9 vtable hooks!
+//   2. Native Mipmap LOD Bias (D3DSAMP_MIPMAPLODBIAS): strictly applied ONLY to
+//      mipmapped world textures (mipFilter != 0), 0.0f on UI/LUTs/FBOs, 0 extra
+//      D3D9 API calls in Vanilla Pure default, 0ms instant restore to 0.0f!
+//------------------------------------------------------------------------------
+extern "C" void OnAngleApplySampler(void* d3d9DevRaw, uint32_t sampler, uint32_t mipAndAfPacked, float maxAniso) {
+    if (!d3d9DevRaw) return;
+    auto* dev = static_cast<IDirect3DDevice9*>(d3d9DevRaw);
+    const uint32_t mipFilter = mipAndAfPacked & 0xFFFFu;
+    const bool afSupported = ((mipAndAfPacked >> 16) != 0);
+
+    // 1. Hardware D3D9Ex SetMaximumFrameLatency(1) — runs ONLY on device init or mode toggle (~1ns fast path)
+    static void* s_lastDev = nullptr;
+    static uint32_t s_lastLatGen = 0;
+    static uint32_t s_lastBiasBits[16] = {};
+    const uint32_t curLatGen = g_d3d9ExLatGen.load(std::memory_order_acquire);
+    if (d3d9DevRaw != s_lastDev || curLatGen != s_lastLatGen) {
+        if (d3d9DevRaw != s_lastDev) {
+            for (int i = 0; i < 16; ++i) s_lastBiasBits[i] = 0xFFFFFFFFu;
+        }
+        s_lastDev = d3d9DevRaw;
+        s_lastLatGen = curLatGen;
+
+        static constexpr GUID kIidD3d9DevEx = {
+            0xb18b10ce, 0x2649, 0x405a, { 0x87, 0x0f, 0x95, 0xf7, 0x77, 0xd4, 0x31, 0x3a }
+        };
+        void* pExRaw = nullptr;
+        if (SUCCEEDED(dev->QueryInterface(kIidD3d9DevEx, &pExRaw)) && pExRaw) {
+            auto* devEx = static_cast<IDirect3DDevice9Ex*>(pExRaw);
+            static bool s_capturedOrig = false;
+            if (!s_capturedOrig) {
+                UINT origLat = 3;
+                if (SUCCEEDED(devEx->GetMaximumFrameLatency(&origLat)) && origLat >= 1 && origLat <= 16) {
+                    g_d3d9ExOrigLatency.store(origLat, std::memory_order_relaxed);
+                }
+                s_capturedOrig = true;
+            }
+            const UINT origLat = g_d3d9ExOrigLatency.load(std::memory_order_relaxed);
+            const bool wantLow = g_optD3d9ExLowLatency.load(std::memory_order_relaxed);
+            const UINT targetLat = wantLow ? 1u : origLat;
+            HRESULT hr = devEx->SetMaximumFrameLatency(targetLat);
+            UINT readback = targetLat;
+            devEx->GetMaximumFrameLatency(&readback);
+            devEx->Release();
+            if (SUCCEEDED(hr)) {
+                g_d3d9ExCurLatency.store(readback, std::memory_order_relaxed);
+                g_d3d9ExActive.store(wantLow && readback == 1u, std::memory_order_release);
+                LogMsg("[LATENCY] D3D9Ex SetMaximumFrameLatency: orig=%u -> target=%u (readback=%u, ReflexQueue=%s)",
+                       origLat, targetLat, readback, (wantLow && readback == 1u) ? "ON" : "OFF");
+            }
+        }
+    }
+
+    // 2. Native Hardware Mipmap LOD Bias (D3DSAMP_MIPMAPLODBIAS = 8)
+    //    Strictly mipmapped world textures (mipFilter != 0); UI/LUT/FBO stay 0.0f!
+    //    Zero extra D3D9 calls when Vanilla Pure (0.0f) and already clean.
+    if (sampler < 16u) {
+        const float rawBias = g_visualMipLodBias.load(std::memory_order_relaxed);
+        const float desiredBias = (mipFilter != 0) ? rawBias : 0.0f;
+        uint32_t biasBits = 0;
+        memcpy(&biasBits, &desiredBias, sizeof(biasBits));
+        if (biasBits != 0u || s_lastBiasBits[sampler] != 0u) {
+            dev->SetSamplerState(sampler, D3DSAMP_MIPMAPLODBIAS, static_cast<DWORD>(biasBits));
+            s_lastBiasBits[sampler] = biasBits;
+            if (biasBits != 0u) {
+                InterlockedIncrement64(&g_mipBiasAppliedHits);
+            }
+        }
+    }
+
+    // 3. Original ANGLE D3DSAMP_MAXANISOTROPY (10) behavior
+    if (afSupported) {
+        const DWORD aniso = static_cast<DWORD>(static_cast<int64_t>(maxAniso));
+        dev->SetSamplerState(sampler, D3DSAMP_MAXANISOTROPY, aniso);
+    }
+}
+
 static void PrepareVisualFidelityHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
     // V1a: Unlock ANGLE 1.0.0.2249 hardcoded mSupportsTextureFilterAnisotropy = false (+0x8E3)
     //      inside libGLESv2.dll Context::initCaps so D3D9 SetSamplerState(D3DSAMP_MAXANISOTROPY) activates!
@@ -3471,11 +4268,70 @@ static void PrepareVisualFidelityHooks(std::vector<PendingCodePatch>& patches, u
                     char msg[192];
                     snprintf(msg, sizeof(msg), "[VISUAL] Unlocked ANGLE 1.0 hardware AF cap @ %p (W^X RX stub)", static_cast<void*>(patchSite));
                     p.logMsg = msg;
+                    g_angleAfPatchIdx = patches.size();
                     patches.push_back(std::move(p));
-                    g_angleAfUnlocked = true;
                 }
             } else {
                 LogMsg("[VISUAL] ANGLE AF cap unlock skipped (libGLESv2 AOB miss; fail-closed)");
+            }
+
+            // V1b + Pillar 2: Unified ANGLE gl::Context::applyTextures hook (0x18000fdf3..0x18000fe17, 36B, 0 RIP-rel)
+            //   Enables BOTH hardware D3D9Ex SetMaximumFrameLatency(1) AND native D3DSAMP_MIPMAPLODBIAS!
+            constexpr uint8_t kSigAngleApplySampler[36] = {
+                0x41, 0x80, 0xBD, 0xE3, 0x08, 0x00, 0x00, 0x00,
+                0x74, 0x1A,
+                0x49, 0x8B, 0x4D, 0x18,
+                0x41, 0xB8, 0x0A, 0x00, 0x00, 0x00,
+                0xF3, 0x4C, 0x0F, 0x2C, 0xCE,
+                0x8B, 0xD7,
+                0x48, 0x8B, 0x01,
+                0xFF, 0x90, 0x28, 0x02, 0x00, 0x00
+            };
+            uint8_t* pSamp = FindUniquePatternInText(glText, glTextSz, kSigAngleApplySampler, sizeof(kSigAngleApplySampler));
+            if (pSamp) {
+                uint8_t* stub = AllocNearExecutable(pSamp, 64);
+                if (stub) {
+                    const uint64_t fnVa  = reinterpret_cast<uint64_t>(&OnAngleApplySampler);
+                    const uint64_t retVa = reinterpret_cast<uint64_t>(pSamp + sizeof(kSigAngleApplySampler));
+                    uint8_t code[62] = {
+                        0x49, 0x8B, 0x4D, 0x18,                         // mov rcx, [r13 + 0x18]
+                        0x8B, 0xD7,                                     // mov edx, edi
+                        0x44, 0x8B, 0x44, 0x24, 0x24,                   // mov r8d, [rsp + 0x24]
+                        0x41, 0x0F, 0xB6, 0x85, 0xE3, 0x08, 0x00, 0x00, // movzx eax, byte ptr [r13 + 0x8e3]
+                        0xC1, 0xE0, 0x10,                               // shl eax, 16
+                        0x41, 0x09, 0xC0,                               // or r8d, eax
+                        0x0F, 0x28, 0xDE,                               // movaps xmm3, xmm6
+                        0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 0x20
+                        0x48, 0xB8, 0,0,0,0,0,0,0,0,                    // movabs rax, &OnAngleApplySampler
+                        0xFF, 0xD0,                                     // call rax
+                        0x48, 0x83, 0xC4, 0x20,                         // add rsp, 0x20
+                        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,             // jmp [rip + 0] -> retVa
+                        0,0,0,0,0,0,0,0
+                    };
+                    memcpy(code + 34, &fnVa, 8);
+                    memcpy(code + 54, &retVa, 8);
+                    memcpy(stub, code, sizeof(code));
+                    FinalizeExecPageWX(stub, sizeof(code));
+
+                    PendingCodePatch p{};
+                    p.addr = pSamp;
+                    p.len = sizeof(kSigAngleApplySampler);
+                    p.ownedExecPage = stub;
+                    memset(p.bytes, 0x90, p.len);
+                    uint8_t jmp[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+                    const uint64_t dst = reinterpret_cast<uint64_t>(stub);
+                    memcpy(jmp + 6, &dst, 8);
+                    memcpy(p.bytes, jmp, 14);
+                    char msg[224];
+                    snprintf(msg, sizeof(msg),
+                             "[LATENCY+VISUAL] Hooked ANGLE applyTextures @ %p -> D3D9Ex MaxLatency=1 + Native MipLodBias (W^X RX stub)",
+                             static_cast<void*>(pSamp));
+                    p.logMsg = msg;
+                    g_angleSamplerPatchIdx = patches.size();
+                    patches.push_back(std::move(p));
+                }
+            } else {
+                LogMsg("[LATENCY+VISUAL] ANGLE applyTextures hook skipped (libGLESv2 AOB miss; fail-closed)");
             }
         }
     }
@@ -3514,8 +4370,8 @@ static void PrepareVisualFidelityHooks(std::vector<PendingCodePatch>& patches, u
                              "[VISUAL] Patched LightMap::InitRenderTarget @ %p -> Full-Res %.1fx (private RW slot %p)",
                              static_cast<void*>(lmFn), static_cast<double>(*slot), static_cast<void*>(rwPage));
                     p.logMsg = msg;
+                    g_lightmapScalePatchIdx = patches.size();
                     patches.push_back(std::move(p));
-                    g_lightmapPatched = true;
                 } else {
                     VirtualFree(rwPage, 0, MEM_RELEASE);
                 }
@@ -3543,25 +4399,11 @@ static void PrepareVisualFidelityHooks(std::vector<PendingCodePatch>& patches, u
 //   - Strictly NO fake Z-buffer DoF (PrimaryRT uses unsampleable Depth Renderbuffer).
 //   - Live World Render / PostProcess / Busy / GPU Drain ms + DXGI VRAM telemetry.
 //------------------------------------------------------------------------------
-static uint8_t* FindUniqueMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
-    if (!start || size < sigLen) return nullptr;
-    uint8_t* hit = nullptr;
-    for (size_t off = 0; off <= size - sigLen; ++off) {
-        if (mask[0] == 'x' && start[off] != sig[0]) continue;
-        bool ok = true;
-        for (size_t j = 1; j < sigLen; ++j) {
-            if (mask[j] == 'x' && start[off + j] != sig[j]) { ok = false; break; }
-        }
-        if (ok) {
-            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
-            hit = start + off;
-        }
-    }
-    return hit;
-}
-
 static size_t FindPrecisionEndOffset(const std::string& src) {
     size_t p = src.find("precision mediump float;");
+    if (p == std::string::npos) {
+        p = src.find("precision highp float;");
+    }
     if (p == std::string::npos) return 0;
     size_t e = src.find("#endif", p);
     if (e == std::string::npos) return 0;
@@ -3676,6 +4518,81 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
         }
     }
 
+    // 4. COLOURCUBE (postprocess_colourcube.ksh & postprocess_colourcube_linedistort.ksh):
+    //    Runs on EVERY frame even with Game Bloom OFF!
+    //    When HS_HD2D_PARAMS.z == 0.0 (Player-First default): 100% bit-for-bit identical vanilla.
+    //    When HS_HD2D_PARAMS.z > 0.001 (opt-in Dark-Scene Eye-Comfort Clarity):
+    //      a) Hue-preserving crushed dark-toe lift strictly in dim visible shadows (0.006..0.24),
+    //         keeping pitch-black fog-of-war (<0.006) pure black and daylight (>0.24) 100% untouched!
+    //      b) Fixes Klei's 31.0 -> 31.5 LUT texel-center clamp on R/G channels (0 extra taps!).
+    static constexpr const char* kCcAnchor =
+        "vec3 intermediate = colour.rgb * vec3( CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0 );";
+    if (src.find("#define SRC_IMAGE SAMPLER[0]") != std::string::npos &&
+        src.find("#define COLOUR_CUBE SAMPLER[1]") != std::string::npos &&
+        src.find("UI_CC") == std::string::npos &&
+        src.find(kCcAnchor) != std::string::npos &&
+        src.find("min( intermediate.r + 0.5, 31.0 )") != std::string::npos) {
+        std::string s = src;
+        size_t uOff = FindPrecisionEndOffset(s);
+        s.insert(uOff, kUniformDecls);
+        size_t posCc = s.find(kCcAnchor);
+        if (posCc != std::string::npos) {
+            static constexpr const char* kCcBody =
+                "vec3 hs_cc_in = colour.rgb;\n"
+                "\tfloat hs_cc_max = 31.0;\n"
+                "\tif (HS_HD2D_PARAMS.z > 0.001) {\n"
+                "\t\tfloat hs_dc = min(HS_HD2D_PARAMS.z, 1.0);\n"
+                "\t\tfloat hs_l = dot(hs_cc_in, vec3(0.299, 0.587, 0.114));\n"
+                "\t\tfloat hs_toe = smoothstep(0.006, 0.032, hs_l) * (1.0 - smoothstep(0.09, 0.24, hs_l));\n"
+                "\t\ths_cc_in = min(hs_cc_in * (1.0 + 0.26 * hs_dc * hs_toe), vec3(1.0));\n"
+                "\t\ths_cc_max = 31.5;\n"
+                "\t}\n"
+                "\tvec3 intermediate = hs_cc_in * vec3( CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0 );";
+            s.replace(posCc, strlen(kCcAnchor), kCcBody);
+            // Replace all 4 occurrences of `, 31.0 )` inside ApplyColourCube with `, hs_cc_max )`
+            size_t endCc = s.find("return mix(floor_col", posCc);
+            if (endCc != std::string::npos) {
+                size_t scan = posCc;
+                while ((scan = s.find(", 31.0 )", scan)) != std::string::npos && scan < endCc) {
+                    s.replace(scan, 8, ", hs_cc_max )");
+                    endCc += 5;
+                    scan += 13;
+                }
+            }
+            outSrc = std::move(s);
+            outTag = "COLOURCUBE";
+            return true;
+        }
+    }
+
+    // 5. LIGHTING (shaders/lighting.ksh): Zero-tap screen-space IGN triangular dithering on
+    //    campfire / torch / lantern / firefly 8-bit LightMap falloff gradients (gated by HS_HD2D_SUN.z).
+    //    Eliminates concentric night ring banding without lifting pitch-black darkness (t <= 0.002 untouched).
+    //    When HS_HD2D_SUN.z == 0.0 (Vanilla Pure default): 100% bit-for-bit identical vanilla!
+    static constexpr const char* kLightAnchor = "gl_FragColor = vec4( colour, 1 );";
+    if (src.find("LIGHT_POS") != std::string::npos &&
+        src.find("LIGHT_PARAMETERS") != std::string::npos &&
+        src.find("LIGHT_CONSTANTS") != std::string::npos &&
+        src.find("exp(K0* pow((dist/RC), -K1))") != std::string::npos &&
+        src.find(kLightAnchor) != std::string::npos) {
+        std::string s = src;
+        size_t uOff = FindPrecisionEndOffset(s);
+        s.insert(uOff, kUniformDecls);
+        size_t posL = s.find(kLightAnchor);
+        if (posL != std::string::npos) {
+            static constexpr const char* kLightBody =
+                "if (HS_HD2D_SUN.z > 0.001 && t > 0.002) {\n"
+                "\t\tfloat hs_ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\n"
+                "\t\tcolour = clamp(colour + vec3((hs_ign - 0.5) * (1.35 / 255.0)), vec3(0.0), vec3(1.0));\n"
+                "\t}\n"
+                "\tgl_FragColor = vec4( colour, 1 );";
+            s.replace(posL, strlen(kLightAnchor), kLightBody);
+            outSrc = std::move(s);
+            outTag = "LIGHTING";
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -3706,58 +4623,294 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
     g_origGlShaderSource(shader, count, string, length);
 }
 
-static void WINAPI HookGlLinkProgram(uint32_t program) {
-    if (g_origGlLinkProgram) {
-        g_origGlLinkProgram(program);
+// =============================================================================
+// Per-Thread GLES2 State-Mirror Cache (cuts redundant 2015 ANGLE D3D9 calls)
+// + eglSwapBuffers Present-Latency Telemetry & Context-Switch Invalidation
+// =============================================================================
+static thread_local hs_gl_cache::ThreadState tl_glCache;
+static thread_local uint32_t                 tl_glCacheGen = 0;
+
+static inline hs_gl_cache::ThreadState& GetSyncedGlCache() {
+    const uint32_t curGen = g_glCacheResetGen.load(std::memory_order_acquire);
+    if (tl_glCacheGen != curGen) {
+        tl_glCache.Reset();
+        tl_glCacheGen = curGen;
     }
-    if (program < kMaxHd2dProgs && g_fnGlGetUniformLocation) {
-        Hd2dProgSlot& slot = g_hd2dProgs[program];
-        const bool wasLinked = slot.hasAny;
-        slot.checked   = true;
-        slot.locParams = g_fnGlGetUniformLocation(program, "HS_HD2D_PARAMS");
-        slot.locSun    = g_fnGlGetUniformLocation(program, "HS_HD2D_SUN");
-        slot.locTint   = g_fnGlGetUniformLocation(program, "HS_HD2D_TINT");
-        slot.hasAny    = (slot.locParams >= 0 || slot.locSun >= 0 || slot.locTint >= 0);
-        slot.lastGen   = 0;
-        if (slot.hasAny && !wasLinked) {
-            const uint32_t total = g_hd2dProgsLinked.fetch_add(1, std::memory_order_relaxed) + 1;
-            LogMsg("[VISUAL][HD2D] Linked HD-2D program #%u (prog=%u, locs=%d/%d/%d)",
-                   total, program, slot.locParams, slot.locSun, slot.locTint);
+    return tl_glCache;
+}
+
+static inline void FlushGlCacheStatsIfReady(hs_gl_cache::ThreadState& st) {
+    if (st.batchCalls >= 256u) {
+        InterlockedAdd64(&g_glCacheCalls, static_cast<LONG64>(st.batchCalls));
+        InterlockedAdd64(&g_glCacheHits,  static_cast<LONG64>(st.batchHits));
+        st.batchCalls = 0;
+        st.batchHits  = 0;
+    }
+}
+
+static inline bool IsGlCacheOperational() {
+    return g_glCacheActive.load(std::memory_order_acquire) &&
+           g_optGlStateCache.load(std::memory_order_relaxed);
+}
+
+static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, void* ctx) {
+    const uint32_t ok = g_origEglMakeCurrent ? g_origEglMakeCurrent(dpy, draw, read, ctx) : 0u;
+    if (ok) {
+        tl_glCache.OnMakeCurrent(ctx);
+    } else {
+        tl_glCache.Reset();
+    }
+    return ok;
+}
+
+static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
+    if (!g_origEglSwapBuffers) return 0u;
+    const int64_t t0 = NowQpc();
+    const uint32_t rc = g_origEglSwapBuffers(dpy, surface);
+    const double swapUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
+    if (swapUs >= 0.0 && swapUs < 1000000.0) {
+        g_lastSwapUs.store(static_cast<uint32_t>(swapUs), std::memory_order_relaxed);
+        UpdateAtomicEma(g_emaSwapUs, static_cast<float>(swapUs), 0.06f);
+    }
+    return rc;
+}
+
+static void WINAPI HookGlActiveTexture(uint32_t texture) {
+    if (!g_origGlActiveTexture) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallActiveTexture(texture);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlActiveTexture(texture);
+}
+
+static void WINAPI HookGlBindTexture(uint32_t target, uint32_t texture) {
+    if (!g_origGlBindTexture) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallBindTexture(target, texture);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlBindTexture(target, texture);
+}
+
+static void WINAPI HookGlDeleteTextures(int32_t n, const uint32_t* textures) {
+    tl_glCache.OnDeleteTextures(n, textures);
+    if (g_origGlDeleteTextures) {
+        g_origGlDeleteTextures(n, textures);
+    }
+}
+
+static void WINAPI HookGlBlendFunc(uint32_t sfactor, uint32_t dfactor) {
+    if (!g_origGlBlendFunc) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallBlendFunc(sfactor, dfactor);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlBlendFunc(sfactor, dfactor);
+}
+
+static void WINAPI HookGlDepthMask(uint8_t flag) {
+    if (!g_origGlDepthMask) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallDepthMask(flag);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlDepthMask(flag);
+}
+
+static void WINAPI HookGlEnable(uint32_t cap) {
+    if (!g_origGlEnable) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallEnableDisable(cap, true);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlEnable(cap);
+}
+
+static void WINAPI HookGlDisable(uint32_t cap) {
+    if (!g_origGlDisable) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallEnableDisable(cap, false);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlDisable(cap);
+}
+
+// Context-scoped program slot helpers (fast O(1) array for primary context + overflow vector for multi-context)
+static Hd2dProgSlot* FindProgSlotLocked(void* ctx, uint32_t program) {
+    if (program < kMaxHd2dProgs && g_hd2dProgs[program].checked && g_hd2dProgs[program].ctx == ctx) {
+        return &g_hd2dProgs[program];
+    }
+    for (auto& e : g_hd2dOverflowProgs) {
+        if (e.ctx == ctx && e.program == program) {
+            return &e.slot;
+        }
+    }
+    return nullptr;
+}
+
+static Hd2dProgSlot& UpsertProgSlotLocked(void* ctx, uint32_t program) {
+    // 1. Exact match in primary array first
+    if (program < kMaxHd2dProgs && g_hd2dProgs[program].checked && g_hd2dProgs[program].ctx == ctx) {
+        return g_hd2dProgs[program];
+    }
+    // 2. Exact match in multi-context overflow vector (prevents duplicate slots when primary was erased!)
+    for (auto& e : g_hd2dOverflowProgs) {
+        if (e.ctx == ctx && e.program == program) {
+            return e.slot;
+        }
+    }
+    // 3. Occupy empty primary array slot only if not already present in overflow
+    if (program < kMaxHd2dProgs && !g_hd2dProgs[program].checked) {
+        return g_hd2dProgs[program];
+    }
+    // 4. Allocate new overflow entry
+    g_hd2dOverflowProgs.push_back(Hd2dCtxProgEntry{ctx, program, Hd2dProgSlot{}});
+    return g_hd2dOverflowProgs.back().slot;
+}
+
+static void EraseProgSlotLocked(void* ctx, uint32_t program) {
+    auto decLinked = []() {
+        uint32_t cur = g_hd2dProgsLinked.load(std::memory_order_relaxed);
+        while (cur > 0 && !g_hd2dProgsLinked.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) {}
+    };
+    if (program < kMaxHd2dProgs && g_hd2dProgs[program].checked && g_hd2dProgs[program].ctx == ctx) {
+        if (g_hd2dProgs[program].hasAny) decLinked();
+        g_hd2dProgs[program] = {};
+        return;
+    }
+    for (size_t i = 0; i < g_hd2dOverflowProgs.size(); ++i) {
+        if (g_hd2dOverflowProgs[i].ctx == ctx && g_hd2dOverflowProgs[i].program == program) {
+            if (g_hd2dOverflowProgs[i].slot.hasAny) decLinked();
+            g_hd2dOverflowProgs[i] = g_hd2dOverflowProgs.back();
+            g_hd2dOverflowProgs.pop_back();
+            return;
         }
     }
 }
 
+static void WINAPI HookGlLinkProgram(uint32_t program) {
+    tl_glCache.OnDeleteOrLinkProgram(program);
+    const int64_t t0 = (g_inGameplay.load(std::memory_order_relaxed) != 0) ? NowQpc() : 0;
+    if (g_origGlLinkProgram) {
+        g_origGlLinkProgram(program);
+    }
+    if (t0 != 0) {
+        const double us = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
+        if (us > 0.0 && us < 1000000.0) {
+            g_frameShaderUs.fetch_add(static_cast<uint32_t>(us), std::memory_order_relaxed);
+        }
+    }
+
+    constexpr uint32_t kGlLinkStatus = 0x8B82u;
+    int32_t linkStatus = 0;
+    bool linkedOk = false;
+    if (program != 0 && g_fnGlGetProgramiv) {
+        g_fnGlGetProgramiv(program, kGlLinkStatus, &linkStatus);
+        linkedOk = (linkStatus != 0);
+    }
+
+    int32_t locP = -1, locS = -1, locT = -1;
+    if (linkedOk && g_fnGlGetUniformLocation) {
+        locP = g_fnGlGetUniformLocation(program, "HS_HD2D_PARAMS");
+        locS = g_fnGlGetUniformLocation(program, "HS_HD2D_SUN");
+        locT = g_fnGlGetUniformLocation(program, "HS_HD2D_TINT");
+    }
+
+    void* const curCtx = tl_glCache.curContext;
+    bool newlyLinkedHd2d = false;
+    AcquireSRWLockExclusive(&g_hd2dProgLock);
+    Hd2dProgSlot& slot = UpsertProgSlotLocked(curCtx, program);
+    const bool hadAny = slot.hasAny;
+    slot.ctx       = curCtx;
+    slot.checked   = true;
+    slot.linkedOk  = linkedOk;
+    slot.locParams = locP;
+    slot.locSun    = locS;
+    slot.locTint   = locT;
+    slot.hasAny    = linkedOk && (locP >= 0 || locS >= 0 || locT >= 0);
+    slot.lastGen   = 0;
+    if (slot.hasAny && !hadAny) {
+        newlyLinkedHd2d = true;
+    } else if (!slot.hasAny && hadAny) {
+        uint32_t cur = g_hd2dProgsLinked.load(std::memory_order_relaxed);
+        while (cur > 0 && !g_hd2dProgsLinked.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) {}
+    }
+    ReleaseSRWLockExclusive(&g_hd2dProgLock);
+
+    if (newlyLinkedHd2d) {
+        const uint32_t total = g_hd2dProgsLinked.fetch_add(1, std::memory_order_relaxed) + 1;
+        LogMsg("[VISUAL][HD2D] Linked HD-2D program #%u (ctx=%p prog=%u, locs=%d/%d/%d)",
+               total, curCtx, program, locP, locS, locT);
+    }
+}
+
 static void WINAPI HookGlUseProgram(uint32_t program) {
-    if (g_origGlUseProgram) {
+    void* const curCtx = tl_glCache.curContext;
+    bool progLinkedOk = false;
+    bool hasHd2d = false;
+    int32_t locP = -1, locS = -1, locT = -1;
+    uint32_t slotLastGen = 0;
+
+    if (program > 0) {
+        AcquireSRWLockShared(&g_hd2dProgLock);
+        if (Hd2dProgSlot* slot = FindProgSlotLocked(curCtx, program)) {
+            progLinkedOk = slot->linkedOk;
+            hasHd2d      = slot->hasAny && slot->linkedOk;
+            locP         = slot->locParams;
+            locS         = slot->locSun;
+            locT         = slot->locTint;
+            slotLastGen  = slot->lastGen;
+        }
+        ReleaseSRWLockShared(&g_hd2dProgLock);
+    }
+
+    bool shouldCall = true;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        shouldCall = st.ShouldCallUseProgramChecked(program, progLinkedOk);
+        FlushGlCacheStatsIfReady(st);
+    }
+    if (shouldCall && g_origGlUseProgram) {
         g_origGlUseProgram(program);
     }
-    if (program > 0 && program < kMaxHd2dProgs && g_fnGlUniform4fv) {
-        Hd2dProgSlot& slot = g_hd2dProgs[program];
-        if (slot.hasAny) {
-            const uint32_t curGen = g_hd2dStateGen.load(std::memory_order_acquire);
-            if (slot.lastGen != curGen) {
-                Hd2dUniformState st{};
-                AcquireSRWLockShared(&g_hd2dStateLock);
-                st = g_hd2dState;
-                ReleaseSRWLockShared(&g_hd2dStateLock);
-                if (slot.locParams >= 0) g_fnGlUniform4fv(slot.locParams, 1, st.params);
-                if (slot.locSun >= 0)    g_fnGlUniform4fv(slot.locSun,    1, st.sun);
-                if (slot.locTint >= 0)   g_fnGlUniform4fv(slot.locTint,   1, st.tint);
-                slot.lastGen = curGen;
+
+    if (hasHd2d && g_fnGlUniform4fv) {
+        const uint32_t curGen = g_hd2dStateGen.load(std::memory_order_acquire);
+        if (slotLastGen != curGen) {
+            Hd2dUniformState st{};
+            AcquireSRWLockShared(&g_hd2dStateLock);
+            st = g_hd2dState;
+            ReleaseSRWLockShared(&g_hd2dStateLock);
+            if (locP >= 0) g_fnGlUniform4fv(locP, 1, st.params);
+            if (locS >= 0) g_fnGlUniform4fv(locS, 1, st.sun);
+            if (locT >= 0) g_fnGlUniform4fv(locT, 1, st.tint);
+            AcquireSRWLockExclusive(&g_hd2dProgLock);
+            if (Hd2dProgSlot* slot = FindProgSlotLocked(curCtx, program)) {
+                slot->lastGen = curGen;
             }
+            ReleaseSRWLockExclusive(&g_hd2dProgLock);
         }
     }
 }
 
 static void WINAPI HookGlDeleteProgram(uint32_t program) {
-    if (program < kMaxHd2dProgs) {
-        Hd2dProgSlot& slot = g_hd2dProgs[program];
-        if (slot.hasAny) {
-            uint32_t cur = g_hd2dProgsLinked.load(std::memory_order_relaxed);
-            while (cur > 0 && !g_hd2dProgsLinked.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) {}
-        }
-        slot = {};
-    }
+    tl_glCache.OnDeleteOrLinkProgram(program);
+    AcquireSRWLockExclusive(&g_hd2dProgLock);
+    EraseProgSlotLocked(tl_glCache.curContext, program);
+    ReleaseSRWLockExclusive(&g_hd2dProgLock);
     if (g_origGlDeleteProgram) {
         g_origGlDeleteProgram(program);
     }
@@ -3773,6 +4926,7 @@ static void HookGameRender(void* self, void* renderData) {
     }
     const double totalGameUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
     const double worldUs = std::max(0.0, totalGameUs - g_tlsLastPostProcUs);
+    g_lastWorldRenderUs.store(static_cast<uint32_t>(std::clamp(worldUs, 0.0, 1000000.0)), std::memory_order_relaxed);
     UpdateAtomicEma(g_emaWorldRenderUs, static_cast<float>(worldUs), 0.06f);
 }
 
@@ -3783,6 +4937,7 @@ static void HookPostProcessorRender(void* pp, void* renderData, uint32_t primary
     }
     const double postUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
     g_tlsLastPostProcUs = postUs;
+    g_lastPostProcUs.store(static_cast<uint32_t>(std::clamp(postUs, 0.0, 1000000.0)), std::memory_order_relaxed);
     UpdateAtomicEma(g_emaPostProcUs, static_cast<float>(postUs), 0.06f);
 }
 
@@ -3845,15 +5000,94 @@ static void PrepareRenderPerfHooks(std::vector<PendingCodePatch>& patches, uint8
     snprintf(msgGR, sizeof(msgGR), "[VISUAL][PERF] Hooked GameRender @ %p -> Live WorldRender ms telemetry", static_cast<void*>(fnGR));
     snprintf(msgPP, sizeof(msgPP), "[VISUAL][PERF] Hooked PostProcessor::Render @ %p -> Live PostProcess ms telemetry", static_cast<void*>(fnPP));
 
+    const size_t grIdx = patches.size();
     const bool okGR = QueuePrologueTrampolineHook(patches, fnGR, 15, reinterpret_cast<const void*>(&HookGameRender), origGR, msgGR);
-    const bool okPP = QueuePrologueTrampolineHook(patches, fnPP, 16, reinterpret_cast<const void*>(&HookPostProcessorRender), origPP, msgPP);
+    const size_t ppIdx = patches.size();
+    const bool okPP = okGR && QueuePrologueTrampolineHook(patches, fnPP, 16, reinterpret_cast<const void*>(&HookPostProcessorRender), origPP, msgPP);
     if (!okGR || !okPP) {
+        while (patches.size() > grIdx) {
+            if (patches.back().ownedExecPage) VirtualFree(patches.back().ownedExecPage, 0, MEM_RELEASE);
+            patches.pop_back();
+        }
         LogMsg("[VISUAL][PERF] Render telemetry hooks skipped (trampoline alloc failed)");
         return;
     }
     g_origGameRender          = reinterpret_cast<GameRender_t>(origGR);
     g_origPostProcessorRender = reinterpret_cast<PostProcessorRender_t>(origPP);
-    g_renderPerfHooked = true;
+    g_gameRenderPatchIdx      = grIdx;
+    g_postProcPatchIdx        = ppIdx;
+}
+
+static void HookLightMapRender(void* lightMap, uint8_t* renderData) {
+    if (!g_origLightMapRender) return;
+    static uint32_t s_appliedRebuildGen = 0;
+    const uint32_t wantGen = g_lightmapRebuildGen.load(std::memory_order_acquire);
+    if (renderData && wantGen != s_appliedRebuildGen) {
+        s_appliedRebuildGen = wantGen;
+        const uint8_t savedFlag = renderData[0];
+        renderData[0] = 1; // Triggers Klei's native LightMap RT destroy + InitRenderTarget() rebuild!
+        g_origLightMapRender(lightMap, renderData);
+        renderData[0] = savedFlag;
+        LogMsg("[VISUAL] Live 0ms LightMap RT hot-swapped -> %.1fx (no reload needed!)",
+               g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5);
+        return;
+    }
+    g_origLightMapRender(lightMap, renderData);
+}
+
+static void PrepareLightMap240AndHotSwapHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    const uintptr_t textLo = reinterpret_cast<uintptr_t>(textStart);
+    const uintptr_t textHi = textLo + textSize;
+
+    // 1. Live 0ms 0.5x <-> 1.0x LightMap RT Hot-Swap (LightMap::Render @ 0x140026ca0, 18B RIP-free prologue)
+    constexpr uint8_t kSigLightMapRender[44] = {
+        0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x80, 0x3A, 0x00,
+        0x48, 0x89, 0x5C, 0x24, 0x50, 0x48, 0x8B, 0xF2, 0x48, 0x8B, 0xF9,
+        0x0F, 0x84, 0x91, 0x00, 0x00, 0x00, 0x80, 0x79, 0x14, 0x00, 0x74, 0x40,
+        0x8B, 0x51, 0x10, 0x83, 0xFA, 0xFF, 0x74, 0x16
+    };
+    if (uint8_t* fnLmR = FindUniquePatternInText(textStart, textSize, kSigLightMapRender, sizeof(kSigLightMapRender))) {
+        void* origLmR = nullptr;
+        char msg[224];
+        snprintf(msg, sizeof(msg), "[VISUAL] Hooked LightMap::Render @ %p -> 0ms Live 0.5x<->1.0x LightMap RT Hot-Swap",
+                 static_cast<void*>(fnLmR));
+        const size_t hsIdx = patches.size();
+        if (QueuePrologueTrampolineHook(patches, fnLmR, 18, reinterpret_cast<const void*>(&HookLightMapRender), origLmR, msg)) {
+            g_origLightMapRender = reinterpret_cast<LightMapRender_t>(origLmR);
+            g_lightmapHotSwapIdx = hsIdx;
+        }
+    } else {
+        LogMsg("[VISUAL] Live LightMap Hot-Swap skipped (AOB miss; fail-closed)");
+    }
+
+    // 2. Pillar 1: 240Hz Dynamic Light Interpolation (LightMap::GenerateRenderData @ 0x140026640 -> call +17)
+    constexpr uint8_t kSigLightWorldMtx[58] = {
+        0x48, 0x8B, 0x2B, 0x80, 0x7D, 0x34, 0x00, 0x0F, 0x84, 0, 0, 0, 0,
+        0x48, 0x8B, 0x4D, 0x18, 0xE8, 0, 0, 0, 0,
+        0x48, 0x8D, 0x8C, 0x24, 0x88, 0x00, 0x00, 0x00,
+        0x48, 0x8D, 0x54, 0x24, 0x70,
+        0xF3, 0x0F, 0x10, 0x7D, 0x20,
+        0xF3, 0x44, 0x0F, 0x10, 0x40, 0x0C,
+        0xF3, 0x44, 0x0F, 0x10, 0x48, 0x1C,
+        0xF3, 0x44, 0x0F, 0x10, 0x50, 0x2C
+    };
+    constexpr char kMaskLightWorldMtx[] = "xxxxxxxxx????xxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    if (uint8_t* pLight = FindUniqueMaskedPatternInText(textStart, textSize, kSigLightWorldMtx, kMaskLightWorldMtx, sizeof(kSigLightWorldMtx))) {
+        uint8_t* cs = pLight + 17;
+        uint8_t* fn = ResolveRel32Call(cs);
+        if (fn && reinterpret_cast<uintptr_t>(fn) >= textLo && reinterpret_cast<uintptr_t>(fn) < textHi) {
+            g_origTransformGetWorldMatrix = reinterpret_cast<TransformGetWorldMatrix_t>(fn);
+            char msg[224];
+            snprintf(msg, sizeof(msg), "[LIGHT240] Hooked LightMap Dynamic Light Transform @ %p (fn=%p) -> True 240Hz Moving Light Halos",
+                     static_cast<void*>(cs), static_cast<void*>(fn));
+            const size_t lIdx = patches.size();
+            if (QueueRel32NearRelayHook(patches, cs, reinterpret_cast<const void*>(&HookLightGetWorldMatrix), msg)) {
+                g_light240PatchIdx = lIdx;
+            }
+        }
+    } else {
+        LogMsg("[LIGHT240] 240Hz Dynamic Light Interp skipped (AOB miss; fail-closed)");
+    }
 }
 
 // Background-only DXGI Local VRAM Telemetry (runs 1x/sec on WorkerProc; 0 GameThread/RenderThread overhead)
@@ -3906,16 +5140,27 @@ static void SampleProcessVramDXGI() {
     }
 }
 
-static bool PatchExeIatEntry(const char* dllName, uint16_t ordinal, const char* funcName, void* hookFn, void*& outOrig) {
+// Race-free IAT hook helper: publishes the original function pointer directly into the
+// caller's global g_orig* variable with a release fence BEFORE atomically swapping the IAT slot!
+template <typename FnT>
+static bool PatchExeIatEntry(const char* dllName, uint16_t ordinal, const char* funcName, void* hookFn, FnT& outOrigGlobal) {
     void** iatSlot = FindExeIatSlot(dllName, ordinal, funcName);
     if (!iatSlot || !*iatSlot) return false;
-    outOrig = *iatSlot;
+    void* origVal = *iatSlot;
+    if (origVal == hookFn) return true; // already hooked
+    outOrigGlobal = reinterpret_cast<FnT>(origVal);
     std::atomic_thread_fence(std::memory_order_release);
     DWORD oldProt = 0;
-    if (!VirtualProtect(iatSlot, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
-    *iatSlot = hookFn;
+    if (!VirtualProtect(iatSlot, sizeof(void*), PAGE_READWRITE, &oldProt)) {
+        outOrigGlobal = nullptr;
+        return false;
+    }
+    InterlockedExchangePointer(iatSlot, hookFn);
     DWORD dummy = 0;
-    VirtualProtect(iatSlot, sizeof(void*), oldProt, &dummy);
+    if (!VirtualProtect(iatSlot, sizeof(void*), oldProt, &dummy)) {
+        LogMsg("[WARN] PatchExeIatEntry(%s!%s) failed restoring IAT protection 0x%lX",
+               dllName, funcName ? funcName : "?", static_cast<unsigned long>(oldProt));
+    }
     return true;
 }
 
@@ -3923,12 +5168,11 @@ static void InstallGlIatHooks() {
     HMODULE hGles = GetModuleHandleW(L"libGLESv2.dll");
     if (hGles) {
         g_fnGlGetUniformLocation = reinterpret_cast<GlGetUniformLocation_t>(GetProcAddress(hGles, "glGetUniformLocation"));
+        g_fnGlGetProgramiv       = reinterpret_cast<GlGetProgramiv_t>(GetProcAddress(hGles, "glGetProgramiv"));
         g_fnGlUniform4fv         = reinterpret_cast<GlUniform4fv_t>(GetProcAddress(hGles, "glUniform4fv"));
     }
 
-    void* origTex = nullptr;
-    if (PatchExeIatEntry("libGLESv2.dll", 109, "glTexParameteri", reinterpret_cast<void*>(&HookGlTexParameteri), origTex)) {
-        g_origGlTexParameteri = reinterpret_cast<GlTexParameteri_t>(origTex);
+    if (PatchExeIatEntry("libGLESv2.dll", 109, "glTexParameteri", reinterpret_cast<void*>(&HookGlTexParameteri), g_origGlTexParameteri)) {
         g_afIatHooked = true;
         LogMsg("[VISUAL] Hooked libGLESv2!glTexParameteri (@109) IAT -> 16x AF + Trilinear (target=%dx)",
                g_visualAnisoLevel.load(std::memory_order_relaxed));
@@ -3936,23 +5180,55 @@ static void InstallGlIatHooks() {
         LogMsg("[VISUAL] glTexParameteri (@109) IAT hook skipped (slot not found)");
     }
 
-    if (g_optHd2dWorldShaders.load(std::memory_order_relaxed)) {
-        void* origSrc = nullptr;
-        void* origLnk = nullptr;
-        void* origUse = nullptr;
-        void* origDel = nullptr;
-        bool okSrc = PatchExeIatEntry("libGLESv2.dll", 99,  "glShaderSource",  reinterpret_cast<void*>(&HookGlShaderSource),  origSrc);
-        bool okLnk = PatchExeIatEntry("libGLESv2.dll", 90,  "glLinkProgram",   reinterpret_cast<void*>(&HookGlLinkProgram),   origLnk);
-        bool okUse = PatchExeIatEntry("libGLESv2.dll", 131, "glUseProgram",    reinterpret_cast<void*>(&HookGlUseProgram),    origUse);
-        bool okDel = PatchExeIatEntry("libGLESv2.dll", 32,  "glDeleteProgram", reinterpret_cast<void*>(&HookGlDeleteProgram), origDel);
-        if (okSrc) g_origGlShaderSource  = reinterpret_cast<GlShaderSource_t>(origSrc);
-        if (okLnk) g_origGlLinkProgram   = reinterpret_cast<GlLinkProgram_t>(origLnk);
-        if (okUse) g_origGlUseProgram    = reinterpret_cast<GlUseProgram_t>(origUse);
-        if (okDel) g_origGlDeleteProgram = reinterpret_cast<GlDeleteProgram_t>(origDel);
-        g_hd2dIatHooked = (okSrc && okLnk && okUse && okDel && g_fnGlGetUniformLocation && g_fnGlUniform4fv);
-        LogMsg("[VISUAL][HD2D] libGLESv2 IAT hooks (src=%d lnk=%d use=%d del=%d loc=%d uni=%d) -> active=%d",
+    bool okLnk = false, okUse = false, okDel = false;
+    if (g_optHd2dWorldShaders.load(std::memory_order_relaxed) || g_optGlStateCache.load(std::memory_order_relaxed)) {
+        bool okSrc = g_optHd2dWorldShaders.load(std::memory_order_relaxed)
+            ? PatchExeIatEntry("libGLESv2.dll", 99,  "glShaderSource",  reinterpret_cast<void*>(&HookGlShaderSource),  g_origGlShaderSource)
+            : false;
+        okLnk = PatchExeIatEntry("libGLESv2.dll", 90,  "glLinkProgram",   reinterpret_cast<void*>(&HookGlLinkProgram),   g_origGlLinkProgram);
+        okUse = PatchExeIatEntry("libGLESv2.dll", 131, "glUseProgram",    reinterpret_cast<void*>(&HookGlUseProgram),    g_origGlUseProgram);
+        okDel = PatchExeIatEntry("libGLESv2.dll", 32,  "glDeleteProgram", reinterpret_cast<void*>(&HookGlDeleteProgram), g_origGlDeleteProgram);
+        g_hd2dIatHooked = (okSrc && okLnk && okUse && okDel && g_fnGlGetUniformLocation && g_fnGlGetProgramiv && g_fnGlUniform4fv);
+        LogMsg("[VISUAL][HD2D] libGLESv2 IAT hooks (src=%d lnk=%d use=%d del=%d loc=%d piv=%d uni=%d) -> active=%d",
                okSrc ? 1 : 0, okLnk ? 1 : 0, okUse ? 1 : 0, okDel ? 1 : 0,
-               g_fnGlGetUniformLocation ? 1 : 0, g_fnGlUniform4fv ? 1 : 0, g_hd2dIatHooked ? 1 : 0);
+               g_fnGlGetUniformLocation ? 1 : 0, g_fnGlGetProgramiv ? 1 : 0, g_fnGlUniform4fv ? 1 : 0,
+               g_hd2dIatHooked ? 1 : 0);
+    }
+
+    // EGL Present Telemetry (eglSwapBuffers @32) + Context Reset Invalidation (eglMakeCurrent @25)
+    {
+        bool okMc = PatchExeIatEntry("libEGL.dll", 25, "eglMakeCurrent", reinterpret_cast<void*>(&HookEglMakeCurrent), g_origEglMakeCurrent);
+        bool okSw = PatchExeIatEntry("libEGL.dll", 32, "eglSwapBuffers", reinterpret_cast<void*>(&HookEglSwapBuffers), g_origEglSwapBuffers);
+        g_eglSwapIatHooked = okSw;
+        LogMsg("[PERF][EGL] libEGL IAT hooks (makeCurrent=%d swapBuffers=%d)", okMc ? 1 : 0, okSw ? 1 : 0);
+
+        // ANGLE 1.0 (D3D9) Redundant GL State-Mirror Cache Deduplication
+        // Fail-closed: ALL 11 required hooks (eglMakeCurrent + link/use/deleteProgram + 7 state hooks) MUST succeed!
+        if (g_optGlStateCache.load(std::memory_order_relaxed) && okMc && okLnk && okUse && okDel) {
+            bool okAt = PatchExeIatEntry("libGLESv2.dll",  1, "glActiveTexture",  reinterpret_cast<void*>(&HookGlActiveTexture),  g_origGlActiveTexture);
+            bool okBt = PatchExeIatEntry("libGLESv2.dll",  7, "glBindTexture",    reinterpret_cast<void*>(&HookGlBindTexture),    g_origGlBindTexture);
+            bool okDt = PatchExeIatEntry("libGLESv2.dll", 31, "glDeleteTextures", reinterpret_cast<void*>(&HookGlDeleteTextures), g_origGlDeleteTextures);
+            bool okBf = PatchExeIatEntry("libGLESv2.dll", 11, "glBlendFunc",      reinterpret_cast<void*>(&HookGlBlendFunc),      g_origGlBlendFunc);
+            bool okDm = PatchExeIatEntry("libGLESv2.dll", 37, "glDepthMask",      reinterpret_cast<void*>(&HookGlDepthMask),      g_origGlDepthMask);
+            bool okEn = PatchExeIatEntry("libGLESv2.dll", 43, "glEnable",         reinterpret_cast<void*>(&HookGlEnable),         g_origGlEnable);
+            bool okDi = PatchExeIatEntry("libGLESv2.dll", 39, "glDisable",        reinterpret_cast<void*>(&HookGlDisable),        g_origGlDisable);
+            g_glCacheIatHooked = (okMc && okLnk && okUse && okDel &&
+                                  okAt && okBt && okDt && okBf && okDm && okEn && okDi);
+            g_glCacheActive.store(g_glCacheIatHooked, std::memory_order_release);
+            if (!g_glCacheIatHooked) {
+                g_optGlStateCache.store(false, std::memory_order_release);
+            }
+            LogMsg("[PERF][GLCACHE] ANGLE State-Mirror IAT hooks (mc=%d lnk=%d use=%d del=%d at=%d bt=%d dt=%d bf=%d dm=%d en=%d di=%d) -> active=%d",
+                   okMc?1:0, okLnk?1:0, okUse?1:0, okDel?1:0,
+                   okAt?1:0, okBt?1:0, okDt?1:0, okBf?1:0, okDm?1:0, okEn?1:0, okDi?1:0,
+                   g_glCacheIatHooked?1:0);
+        } else if (g_optGlStateCache.load(std::memory_order_relaxed)) {
+            g_glCacheIatHooked = false;
+            g_glCacheActive.store(false, std::memory_order_release);
+            g_optGlStateCache.store(false, std::memory_order_release);
+            LogMsg("[PERF][GLCACHE] Disabled fail-closed (missing prerequisite hooks: mc=%d lnk=%d use=%d del=%d)",
+                   okMc?1:0, okLnk?1:0, okUse?1:0, okDel?1:0);
+        }
     }
 }
 
@@ -3963,13 +5239,21 @@ int LuaHyperSmoothSetVisual(void* L) {
     if (aniso < 1) aniso = 1;
     if (aniso > 16) aniso = 16;
     bool fullLm = g_luaToBoolean ? (g_luaToBoolean(L, 2) != 0) : (aniso > 1);
+    float mipBias = static_cast<float>(g_luaToNumber(L, 3)); // optional 3rd arg; nil/omitted -> 0.0f
+    if (!(mipBias >= -0.75f) || mipBias > 0.0f) mipBias = 0.0f;
     int prevAf = g_visualAnisoLevel.exchange(aniso, std::memory_order_relaxed);
     bool prevLm = g_visualFullresLightmap.exchange(fullLm, std::memory_order_relaxed);
+    float prevMip = g_visualMipLodBias.exchange(mipBias, std::memory_order_relaxed);
     if (g_lightmapScaleSlot) {
         *g_lightmapScaleSlot = fullLm ? 1.0f : 0.5f;
     }
-    if (prevAf != aniso || prevLm != fullLm) {
-        LogMsg("[VISUAL] Lua Bridge -> AF=%dx, FullResLightmap=%d", aniso, fullLm ? 1 : 0);
+    if (prevLm != fullLm) {
+        g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
+    }
+    if (prevAf != aniso || prevLm != fullLm || fabsf(prevMip - mipBias) > 1e-4f) {
+        LogMsg("[VISUAL] Lua Bridge -> AF=%dx, FullResLightmap=%d (liveSwap=%d), MipLodBias=%.2f",
+               aniso, fullLm ? 1 : 0, g_lightmapHotSwapHooked.load(std::memory_order_relaxed) ? 1 : 0,
+               static_cast<double>(mipBias));
     }
     g_luaPushBoolean(L, 1);
     return 1;
@@ -3982,7 +5266,55 @@ int LuaHyperSmoothGetVisualStats(void* L) {
     g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_afAppliedHits, 0, 0)));
     g_luaPushBoolean(L, g_lightmapPatched ? 1 : 0);
     g_luaPushNumber(L, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5);
-    return 5;
+    g_luaPushBoolean(L, g_angleSamplerHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_visualMipLodBias.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_mipBiasAppliedHits, 0, 0)));
+    return 8;
+}
+
+int LuaHyperSmoothSetLowLatency(void* L) {
+    if (!g_luaToBoolean || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    const bool on = (g_luaToBoolean(L, 1) != 0);
+    const bool prevEx = g_optD3d9ExLowLatency.exchange(on, std::memory_order_relaxed);
+    g_optLowLatencyGpuSync.store(on, std::memory_order_relaxed);
+    if (prevEx != on) {
+        g_d3d9ExLatGen.fetch_add(1, std::memory_order_release);
+        LogMsg("[LATENCY] Lua Bridge -> LowLatency=%d (D3D9Ex MaxLatency=%s + GpuDrain=%d)",
+               on ? 1 : 0, on ? "1" : "orig", on ? 1 : 0);
+    }
+    g_luaPushBoolean(L, g_angleSamplerHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    return 1;
+}
+
+int LuaHyperSmoothSetVfxSmooth(void* L) {
+    if (!g_luaToBoolean || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    const LONG newVal = g_luaToBoolean(L, 1) ? 1 : 0;
+    const LONG prev = g_vfxSmoothEnabled.exchange(newVal, std::memory_order_relaxed);
+    if (prev != newVal) {
+        LogMsg("[VFX240] Lua Bridge -> SmoothVfxParticles=%ld", newVal);
+    }
+    g_luaPushBoolean(L, g_vfxSmoothHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    return 1;
+}
+
+int LuaHyperSmoothGetLatencyStats(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    g_luaPushBoolean(L, g_d3d9ExActive.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_d3d9ExCurLatency.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_d3d9ExOrigLatency.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_emaGpuDrainUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_gpuSyncDrains, 0, 0)));
+    g_luaPushBoolean(L, g_vfxSmoothHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_vfxCmdsSmoothed, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_vfxParticlesSmoothed, 0, 0)));
+    g_luaPushBoolean(L, g_angleSamplerHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_visualMipLodBias.load(std::memory_order_relaxed)));
+    g_luaPushBoolean(L, g_lightPos240Hooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_lightPos240Count, 0, 0)));
+    g_luaPushBoolean(L, g_lightmapHotSwapHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    return 13;
 }
 
 int LuaHyperSmoothSetHd2d(void* L) {
@@ -3996,7 +5328,7 @@ int LuaHyperSmoothSetHd2d(void* L) {
     Hd2dUniformState next{};
     next.params[0] = clampF(static_cast<float>(g_luaToNumber(L, 1)), 0.0f, 1.5f);  // contactAoStr (ANIM)
     next.params[1] = clampF(static_cast<float>(g_luaToNumber(L, 2)), 0.0f, 1.5f);  // calmEnvStr (OCEAN/GROUND)
-    next.params[2] = clampF(static_cast<float>(g_luaToNumber(L, 3)), -1.0f, 1.0f); // reserved
+    next.params[2] = clampF(static_cast<float>(g_luaToNumber(L, 3)), 0.0f, 1.5f);  // darkClarityStr (COLOURCUBE)
     next.params[3] = clampF(static_cast<float>(g_luaToNumber(L, 4)), 0.05f, 1.0f); // sunElev
     next.sun[0]    = clampF(static_cast<float>(g_luaToNumber(L, 5)), -1.0f, 1.0f); // sunWorldX
     next.sun[1]    = clampF(static_cast<float>(g_luaToNumber(L, 6)), -1.0f, 1.0f); // sunWorldZ
@@ -4023,7 +5355,7 @@ int LuaHyperSmoothSetHd2d(void* L) {
     ReleaseSRWLockExclusive(&g_hd2dStateLock);
 
     if (changed) {
-        g_hd2dMasterStr.store(std::max(next.params[0], next.params[1]), std::memory_order_relaxed);
+        g_hd2dMasterStr.store(std::max({ next.params[0], next.params[1], next.params[2], next.sun[2] }), std::memory_order_relaxed);
         g_hd2dStateGen.fetch_add(1, std::memory_order_release);
     }
     g_luaPushBoolean(L, g_hd2dIatHooked ? 1 : 0);
@@ -4080,9 +5412,430 @@ int LuaHyperSmoothGetSimTickRate(void* L) {
     return 1;
 }
 
+// =============================================================================
+// [v2.6.0] Solo / Non-Caves Local Host Smoothness Engine:
+//   1. SIMD libdeflate v1.23 zlib::compress2 (morning auto-save / minimap)
+//   2. C++ Native FastDataDumper (155 MB/s cycle-safe save serializer)
+//   3. O(N log N) Flat-Hash + Binary-Heap FastAStar PathFinder (25x faster walled bases)
+// Zero overhead on multiplayer clients (only fires when client hosts Master locally!)
+// =============================================================================
+static uint8_t* FindUniqueAobInt16(uint8_t* textStart, size_t textSize, const int16_t* pat, size_t len) {
+    if (!textStart || textSize < len) return nullptr;
+    size_t firstFixed = 0;
+    while (firstFixed < len && pat[firstFixed] < 0) ++firstFixed;
+    if (firstFixed >= len) return nullptr;
+    const uint8_t fb = static_cast<uint8_t>(pat[firstFixed]);
+    uint8_t* hit = nullptr;
+    const size_t limit = textSize - len;
+    for (size_t i = 0; i <= limit; ++i) {
+        if (textStart[i + firstFixed] != fb) continue;
+        bool ok = true;
+        for (size_t k = 0; k < len; ++k) {
+            if (pat[k] >= 0 && textStart[i + k] != static_cast<uint8_t>(pat[k])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = textStart + i;
+        }
+    }
+    return hit;
+}
+
+static uint8_t* BuildPlainRelocTrampoline(uint8_t* target, size_t stolenLen) {
+    if (!target || stolenLen < 14) return nullptr;
+    uint8_t* tramp = AllocNearExecutable(target, 64);
+    if (!tramp) return nullptr;
+    memcpy(tramp, target, stolenLen);
+    uint8_t jmpBack[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    uint64_t resumeAddr = reinterpret_cast<uint64_t>(target + stolenLen);
+    memcpy(jmpBack + 6, &resumeAddr, sizeof(resumeAddr));
+    memcpy(tramp + stolenLen, jmpBack, 14);
+    if (!FinalizeExecPageWX(tramp, stolenLen + 14)) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return tramp;
+}
+
+// --- 1. Client libdeflate zlib::compress2 Hook ---
+using ClientCompress2_t = int (*)(uint8_t* dest, uint32_t* destLen,
+                                  const uint8_t* source, uint32_t sourceLen, int level);
+ClientCompress2_t g_origClientCompress2 = nullptr;
+std::atomic<bool> g_clientCompress2Hooked{false};
+size_t g_clientComp2PatchIdx = static_cast<size_t>(-1);
+volatile LONG64 g_clientDeflateCompCalls = 0;
+volatile LONG64 g_clientDeflateCompInBytes = 0;
+volatile LONG64 g_clientDeflateCompOutBytes = 0;
+volatile LONG64 g_clientDeflateCompUs = 0;
+
+struct ClientTlsDeflateComp {
+    libdeflate_compressor* comp = nullptr;
+    ~ClientTlsDeflateComp() {
+        if (comp) libdeflate_free_compressor(comp);
+    }
+};
+thread_local ClientTlsDeflateComp tl_clientDeflateComp;
+
+static int HookClientCompress2(uint8_t* dest, uint32_t* destLen,
+                               const uint8_t* source, uint32_t sourceLen, int level) {
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    InterlockedIncrement64(&g_clientDeflateCompCalls);
+    InterlockedAdd64(&g_clientDeflateCompInBytes, static_cast<LONG64>(sourceLen));
+
+    if (dest && destLen && source && *destLen > 0) {
+        if (!tl_clientDeflateComp.comp) {
+            tl_clientDeflateComp.comp = libdeflate_alloc_compressor(6);
+        }
+        if (tl_clientDeflateComp.comp) {
+            const size_t outSz = libdeflate_zlib_compress(
+                tl_clientDeflateComp.comp, source, sourceLen, dest, *destLen);
+            if (outSz > 0 && outSz <= *destLen) {
+                *destLen = static_cast<uint32_t>(outSz);
+                InterlockedAdd64(&g_clientDeflateCompOutBytes, static_cast<LONG64>(outSz));
+                QueryPerformanceCounter(&t1);
+                const LONG64 us = static_cast<LONG64>(
+                    static_cast<double>(t1.QuadPart - t0.QuadPart) * g_qpcInvFreq * 1000000.0);
+                InterlockedAdd64(&g_clientDeflateCompUs, us);
+                return 0; // Z_OK
+            }
+        }
+    }
+
+    int rc = g_origClientCompress2 ? g_origClientCompress2(dest, destLen, source, sourceLen, level) : -1;
+    if (rc == 0 && destLen) {
+        InterlockedAdd64(&g_clientDeflateCompOutBytes, static_cast<LONG64>(*destLen));
+    }
+    QueryPerformanceCounter(&t1);
+    const LONG64 us = static_cast<LONG64>(
+        static_cast<double>(t1.QuadPart - t0.QuadPart) * g_qpcInvFreq * 1000000.0);
+    InterlockedAdd64(&g_clientDeflateCompUs, us);
+    return rc;
+}
+
+static void PrepareClientCompress2Hook(std::vector<PendingCodePatch>& patches,
+                                       uint8_t* textStart, size_t textSize) {
+    static constexpr int16_t kAobClientCompress2[] = {
+        0x4C, 0x8B, 0xDC, 0x57, 0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x02, 0x4D, 0x89, 0x43,
+        0x98, 0x45, 0x89, 0x4B, 0xA0, 0x49, 0x89, 0x4B, 0xA8, 0x89, 0x44, 0x24, 0x38, 0x33, 0xC0, 0x48,
+        0x8B, 0xFA, 0x8B, 0x94, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x05
+    };
+    uint8_t* pComp2 = FindUniqueAobInt16(textStart, textSize, kAobClientCompress2,
+                                         sizeof(kAobClientCompress2) / sizeof(kAobClientCompress2[0]));
+    if (!pComp2) {
+        LogMsg("[HOST] Client zlib::compress2 skipped (AOB miss; fail-closed)");
+        return;
+    }
+    uint8_t* tramp = BuildPlainRelocTrampoline(pComp2, 17);
+    if (!tramp) return;
+    g_origClientCompress2 = reinterpret_cast<ClientCompress2_t>(tramp);
+
+    PendingCodePatch p{};
+    p.addr = pComp2;
+    p.len = 17;
+    p.ownedExecPage = tramp;
+    uint8_t jmpHook[17] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0,0,0,0,0,0,0,0, 0x90, 0x90, 0x90 };
+    uint64_t dst = reinterpret_cast<uint64_t>(&HookClientCompress2);
+    memcpy(jmpHook + 6, &dst, sizeof(dst));
+    memcpy(p.bytes, jmpHook, 17);
+    char msg[200];
+    snprintf(msg, sizeof(msg), "[HOST] Hooked Client zlib::compress2 @ %p -> SIMD libdeflate v1.23 (L6)",
+             static_cast<void*>(pComp2));
+    p.logMsg = msg;
+    g_clientComp2PatchIdx = patches.size();
+    patches.push_back(std::move(p));
+}
+
+// --- 2. Client O(N log N) FastAStar PathFinder Hook (Solo / Local Host) ---
+using ClientAStarReset_t = void (*)(void* astar);
+using ClientAStarInit_t  = void (*)(void* astar, void* ctx);
+using ClientAStarStep_t  = uint32_t (*)(void* astar, uint32_t maxSteps);
+
+ClientAStarReset_t g_origClientAStarReset = nullptr;
+ClientAStarInit_t  g_origClientAStarInit  = nullptr;
+ClientAStarStep_t  g_origClientAStarStep  = nullptr;
+fast_astar::EngineCallbacks g_clientAStarCb{};
+std::atomic<bool> g_clientAStarReady{false};
+size_t g_clientAStarPatchIdx[3] = {
+    static_cast<size_t>(-1), static_cast<size_t>(-1), static_cast<size_t>(-1)
+};
+
+volatile LONG64 g_clientAStarInits = 0;
+volatile LONG64 g_clientAStarSteps = 0;
+volatile LONG64 g_clientAStarCompleted = 0;
+volatile LONG64 g_clientAStarFailed = 0;
+volatile LONG64 g_clientAStarFallbacks = 0;
+volatile LONG64 g_clientAStarUs = 0;
+
+static void ClearClientKleiPathVec(void* pathVec) {
+    if (!pathVec) return;
+    auto* pv = reinterpret_cast<uint8_t*>(pathVec);
+    *reinterpret_cast<void**>(pv + 0x10) = *reinterpret_cast<void**>(pv + 0x08);
+}
+
+fast_astar::StateManager<48u> g_clientAStarMgr;
+
+static void HookClientAStarReset(void* astar) {
+    if (astar) {
+        g_clientAStarMgr.DetachAndRecycle(astar);
+    }
+    if (g_origClientAStarReset) {
+        g_origClientAStarReset(astar);
+    }
+}
+
+static void HookClientAStarInit(void* astar, void* ctx) {
+    if (!g_clientAStarReady.load(std::memory_order_acquire) || !astar || !ctx) {
+        if (astar) g_clientAStarMgr.DetachAndRecycle(astar);
+        if (g_origClientAStarInit) g_origClientAStarInit(astar, ctx);
+        return;
+    }
+
+    if (g_origClientAStarReset) g_origClientAStarReset(astar);
+    auto* ab = reinterpret_cast<uint8_t*>(astar);
+    *reinterpret_cast<void**>(ab + 0x50)   = ctx;
+    *reinterpret_cast<float*>(ab + 0x78)   = 0.0f;
+    *reinterpret_cast<int32_t*>(ab + 0x08) = 0;
+
+    auto handle = g_clientAStarMgr.AcquireAndBind(astar);
+    if (!handle) {
+        InterlockedIncrement64(&g_clientAStarFallbacks);
+        if (g_origClientAStarInit) g_origClientAStarInit(astar, ctx);
+        return;
+    }
+
+    const auto* cb = reinterpret_cast<const uint8_t*>(ctx);
+    fast_astar::TileCoord start{};
+    memcpy(&start, cb + 0x30, sizeof(fast_astar::TileCoord));
+    const float h = g_clientAStarCb.heuristic(ctx, &start);
+    handle->Init(start, h);
+    InterlockedIncrement64(&g_clientAStarInits);
+}
+
+static uint32_t HookClientAStarStep(void* astar, uint32_t maxSteps) {
+    if (!astar) return 0u;
+    auto* ab = reinterpret_cast<uint8_t*>(astar);
+    if (*reinterpret_cast<int32_t*>(ab + 0x08) != 0) {
+        return 0u;
+    }
+
+    auto handle = g_clientAStarMgr.AcquireRef(astar);
+    if (!handle || !g_clientAStarReady.load(std::memory_order_acquire)) {
+        handle.Release();
+        InterlockedIncrement64(&g_clientAStarFallbacks);
+        return g_origClientAStarStep ? g_origClientAStarStep(astar, maxSteps) : 0u;
+    }
+
+    auto* slotPtr = handle.Slot();
+    const uint64_t slotGen = handle.Gen();
+    void* ctx = *reinterpret_cast<void**>(ab + 0x50);
+    if (!ctx) {
+        handle.Release();
+        g_clientAStarMgr.DetachIfMatch(astar, slotPtr, slotGen);
+        *reinterpret_cast<int32_t*>(ab + 0x08) = 2;
+        return 0u;
+    }
+
+    fast_astar::TileCoord goal{};
+    memcpy(&goal, reinterpret_cast<const uint8_t*>(ctx) + 0x3C, sizeof(fast_astar::TileCoord));
+
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    int32_t outStatus = 0;
+    const uint32_t steps = handle->Step(ctx, goal, maxSteps, g_clientAStarCb, ab + 0x58, outStatus);
+    QueryPerformanceCounter(&t1);
+    const double us = static_cast<double>(t1.QuadPart - t0.QuadPart) * g_qpcInvFreq * 1000000.0;
+
+    *reinterpret_cast<float*>(ab + 0x78) += static_cast<float>(us * 1e-6);
+    InterlockedAdd64(&g_clientAStarSteps, static_cast<LONG64>(steps));
+    InterlockedAdd64(&g_clientAStarUs, static_cast<LONG64>(us));
+
+    if (outStatus != 0) {
+        *reinterpret_cast<int32_t*>(ab + 0x08) = outStatus;
+        handle.Release();
+        g_clientAStarMgr.DetachIfMatch(astar, slotPtr, slotGen);
+        if (outStatus == 1) {
+            InterlockedIncrement64(&g_clientAStarCompleted);
+        } else {
+            InterlockedIncrement64(&g_clientAStarFailed);
+        }
+    }
+    return steps;
+}
+
+static void PrepareClientFastAStarHooks(std::vector<PendingCodePatch>& patches,
+                                        uint8_t* textStart, size_t textSize) {
+    static constexpr int16_t kAobClientAStarReset[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+        0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x79, 0x40, 0x48, 0x8B, 0x59, 0x38, 0x33, 0xED, 0x48, 0x8B
+    };
+    static constexpr int16_t kAobClientAStarInit[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48,
+        0x8B, 0xDA, 0x48, 0x8B, 0xF1, 0xE8, -1, -1, -1, -1, 0x33, 0xFF, 0x48, 0x89, 0x5E, 0x50
+    };
+    static constexpr int16_t kAobClientAStarStep[] = {
+        0x89, 0x54, 0x24, 0x10, 0x57, 0x41, 0x54, 0x48, 0x81, 0xEC, 0xB8, 0x00, 0x00, 0x00, 0x83, 0x79,
+        0x08, 0x00, 0x8B, 0xFA, 0x4C, 0x8B, 0xE1, 0x74, 0x0D, 0x33, 0xC0, 0x48, 0x81, 0xC4, 0xB8, 0x00
+    };
+
+    uint8_t* pReset = FindUniqueAobInt16(textStart, textSize, kAobClientAStarReset,
+                                         sizeof(kAobClientAStarReset) / sizeof(kAobClientAStarReset[0]));
+    uint8_t* pInit  = FindUniqueAobInt16(textStart, textSize, kAobClientAStarInit,
+                                         sizeof(kAobClientAStarInit) / sizeof(kAobClientAStarInit[0]));
+    uint8_t* pStep  = FindUniqueAobInt16(textStart, textSize, kAobClientAStarStep,
+                                         sizeof(kAobClientAStarStep) / sizeof(kAobClientAStarStep[0]));
+    if (!pReset || !pInit || !pStep) {
+        LogMsg("[HOST] Client FastAStar skipped (AOB miss: r=%p i=%p s=%p)", pReset, pInit, pStep);
+        return;
+    }
+
+    auto inText = [&](uint8_t* ptr) -> bool {
+        return ptr && ptr >= textStart && ptr < (textStart + textSize);
+    };
+    uint8_t* initReset = ResolveRel32Call(pInit + 21);
+    uint8_t* stepReset = ResolveRel32Call(pStep + 0x479);
+    uint8_t* pReserve  = ResolveRel32Call(pStep + 0x068);
+    uint8_t* pNbType2  = ResolveRel32Call(pStep + 0x1C9);
+    uint8_t* pNbNorm   = ResolveRel32Call(pStep + 0x1D9);
+    uint8_t* pHeur1    = ResolveRel32Call(pStep + 0x32F);
+    uint8_t* pHeur2    = ResolveRel32Call(pStep + 0x3B6);
+    uint8_t* pPushPath = ResolveRel32Call(pStep + 0x469);
+    uint8_t* pFreeMem  = ResolveRel32Call(pStep + 0x4E5);
+
+    const bool xcheck = (initReset == pReset) && (stepReset == pReset) &&
+                        (pHeur1 != nullptr && pHeur1 == pHeur2) &&
+                        inText(pReserve) && inText(pNbType2) && inText(pNbNorm) &&
+                        inText(pHeur1) && inText(pPushPath) && inText(pFreeMem);
+    if (!xcheck) {
+        LogMsg("[HOST] Client FastAStar skipped (Fail-Closed cross-check failed: ir=%p sr=%p h1=%p h2=%p)",
+               initReset, stepReset, pHeur1, pHeur2);
+        return;
+    }
+
+    uint8_t* trReset = BuildPlainRelocTrampoline(pReset, 15);
+    uint8_t* trInit  = trReset ? BuildPlainRelocTrampoline(pInit, 15) : nullptr;
+    uint8_t* trStep  = trInit  ? BuildPlainRelocTrampoline(pStep, 14) : nullptr;
+    if (!trReset || !trInit || !trStep) {
+        if (trReset) VirtualFree(trReset, 0, MEM_RELEASE);
+        if (trInit)  VirtualFree(trInit, 0, MEM_RELEASE);
+        if (trStep)  VirtualFree(trStep, 0, MEM_RELEASE);
+        return;
+    }
+
+    g_clientAStarCb.reserveNeighbors   = reinterpret_cast<decltype(g_clientAStarCb.reserveNeighbors)>(pReserve);
+    g_clientAStarCb.getNeighborsNormal = reinterpret_cast<decltype(g_clientAStarCb.getNeighborsNormal)>(pNbNorm);
+    g_clientAStarCb.getNeighborsType2  = reinterpret_cast<decltype(g_clientAStarCb.getNeighborsType2)>(pNbType2);
+    g_clientAStarCb.heuristic          = reinterpret_cast<decltype(g_clientAStarCb.heuristic)>(pHeur1);
+    g_clientAStarCb.clearPath          = &ClearClientKleiPathVec;
+    g_clientAStarCb.pushPathNode       = reinterpret_cast<decltype(g_clientAStarCb.pushPathNode)>(pPushPath);
+    g_clientAStarCb.freeMem            = reinterpret_cast<decltype(g_clientAStarCb.freeMem)>(pFreeMem);
+
+    g_origClientAStarReset = reinterpret_cast<ClientAStarReset_t>(trReset);
+    g_origClientAStarInit  = reinterpret_cast<ClientAStarInit_t>(trInit);
+    g_origClientAStarStep  = reinterpret_cast<ClientAStarStep_t>(trStep);
+
+    auto pushHook = [&](int slot, uint8_t* addr, size_t len, void* detour, uint8_t* tramp, const char* msg) {
+        PendingCodePatch p{};
+        p.addr = addr;
+        p.len = len;
+        p.ownedExecPage = tramp;
+        memset(p.bytes, 0x90, len);
+        p.bytes[0] = 0xFF; p.bytes[1] = 0x25;
+        uint32_t zero = 0; memcpy(p.bytes + 2, &zero, 4);
+        uint64_t dst = reinterpret_cast<uint64_t>(detour);
+        memcpy(p.bytes + 6, &dst, sizeof(dst));
+        p.logMsg = msg;
+        g_clientAStarPatchIdx[slot] = patches.size();
+        patches.push_back(std::move(p));
+    };
+
+    char msg[240];
+    snprintf(msg, sizeof(msg), "[HOST] Hooked Client FastAStar O(N log N) @ (Reset=%p Init=%p Step=%p)",
+             static_cast<void*>(pReset), static_cast<void*>(pInit), static_cast<void*>(pStep));
+    pushHook(0, pReset, 15, reinterpret_cast<void*>(&HookClientAStarReset), trReset, "");
+    pushHook(1, pInit,  15, reinterpret_cast<void*>(&HookClientAStarInit),  trInit,  "");
+    pushHook(2, pStep,  14, reinterpret_cast<void*>(&HookClientAStarStep),  trStep,  msg);
+}
+
+// --- 3. Client C++ Native FastDataDumper (Solo / Non-Caves Morning Auto-Save) ---
+LuaApiTable g_clientLuaApi{};
+thread_local fast_dumper::GrowBuf tl_clientDumpBuf;
+volatile LONG64 g_clientFastDumpCalls = 0;
+volatile LONG64 g_clientFastDumpFallbacks = 0;
+volatile LONG64 g_clientFastDumpBytes = 0;
+volatile LONG64 g_clientFastDumpUs = 0;
+
+static int LuaHyperSmoothFastDump(void* L) {
+    if (!g_clientLuaApi.ReadyForFastDump()) {
+        if (g_clientLuaApi.pushnil && g_clientLuaApi.pushstring) {
+            g_clientLuaApi.pushnil(L);
+            g_clientLuaApi.pushstring(L, "unavailable");
+            return 2;
+        }
+        return 0;
+    }
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    const int nargs = g_clientLuaApi.gettop(L);
+    if (nargs < 1) {
+        g_clientLuaApi.pushnil(L);
+        g_clientLuaApi.pushstring(L, "no_arg");
+        return 2;
+    }
+
+    const char* varname = nullptr;
+    size_t varlen = 0;
+    if (nargs >= 2 && g_clientLuaApi.type(L, 2) == HC_LUA_TSTRING) {
+        varname = g_clientLuaApi.tolstring(L, 2, &varlen);
+    }
+
+    const char* failReason = nullptr;
+    const auto st = fast_dumper::DumpRoot(L, g_clientLuaApi, 1, varname, varlen, tl_clientDumpBuf, &failReason);
+    QueryPerformanceCounter(&t1);
+    const LONG64 us = static_cast<LONG64>(
+        static_cast<double>(t1.QuadPart - t0.QuadPart) * g_qpcInvFreq * 1000000.0);
+
+    if (st == fast_dumper::Status::Ok && !tl_clientDumpBuf.oom && tl_clientDumpBuf.data) {
+        InterlockedIncrement64(&g_clientFastDumpCalls);
+        InterlockedAdd64(&g_clientFastDumpUs, us);
+        InterlockedAdd64(&g_clientFastDumpBytes, static_cast<LONG64>(tl_clientDumpBuf.len));
+        g_clientLuaApi.pushlstring(L, tl_clientDumpBuf.data, tl_clientDumpBuf.len);
+        tl_clientDumpBuf.ShrinkIfLarge();
+        return 1;
+    }
+
+    tl_clientDumpBuf.ShrinkIfLarge();
+    InterlockedIncrement64(&g_clientFastDumpFallbacks);
+    g_clientLuaApi.pushnil(L);
+    g_clientLuaApi.pushstring(L, failReason ? failReason : "fallback");
+    return 2;
+}
+
+static int LuaHyperSmoothGetHostPerf(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    g_luaPushBoolean(L, g_clientLuaApi.ReadyForFastDump() ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientFastDumpCalls, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientFastDumpUs, 0, 0)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientFastDumpBytes, 0, 0)) / (1024.0 * 1024.0));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientFastDumpFallbacks, 0, 0)));
+    g_luaPushBoolean(L, g_clientCompress2Hooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientDeflateCompCalls, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientDeflateCompInBytes, 0, 0)) / (1024.0 * 1024.0));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientDeflateCompUs, 0, 0)) * 0.001);
+    g_luaPushBoolean(L, g_clientAStarReady.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientAStarInits, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientAStarSteps, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientAStarUs, 0, 0)) * 0.001);
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_clientAStarFallbacks, 0, 0)));
+    return 14;
+}
+
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.5.0");
+    g_luaPushString(L, "DST-HyperSmooth/2.6.0");
     return 1;
 }
 
@@ -4095,14 +5848,21 @@ void RegisterHyperSmoothLuaApi(void* L) {
     reg("HyperSmooth_SetFps", &LuaHyperSmoothSetFps);
     reg("HyperSmooth_SetSkeletal", &LuaHyperSmoothSetSkeletal);
     reg("HyperSmooth_SetWorldInterp", &LuaHyperSmoothSetWorldInterp);
+    reg("HyperSmooth_SetVfxSmooth", &LuaHyperSmoothSetVfxSmooth);
+    reg("HyperSmooth_SetLowLatency", &LuaHyperSmoothSetLowLatency);
     reg("HyperSmooth_GetStatus", &LuaHyperSmoothGetStatus);
     reg("HyperSmooth_GetFrameStats", &LuaHyperSmoothGetFrameStats);
+    reg("HyperSmooth_GetLatencyStats", &LuaHyperSmoothGetLatencyStats);
     reg("HyperSmooth_SetSimTickRate", &LuaHyperSmoothSetSimTickRate);
     reg("HyperSmooth_GetSimTickRate", &LuaHyperSmoothGetSimTickRate);
     reg("HyperSmooth_SetVisual", &LuaHyperSmoothSetVisual);
     reg("HyperSmooth_GetVisualStats", &LuaHyperSmoothGetVisualStats);
     reg("HyperSmooth_SetHd2d", &LuaHyperSmoothSetHd2d);
     reg("HyperSmooth_GetVisualPerf", &LuaHyperSmoothGetVisualPerf);
+    reg("HyperSmooth_GetHostPerf", &LuaHyperSmoothGetHostPerf);
+    if (g_clientLuaApi.ReadyForFastDump()) {
+        reg("HyperSmooth_FastDump", &LuaHyperSmoothFastDump);
+    }
     if (g_luaPushString) {
         reg("HyperSmooth_Version", &LuaHyperSmoothVersion);
     }
@@ -4116,16 +5876,24 @@ void HookLuaOpenLibs(void* L) {
     g_vmBaseInterpFrames.store(InterlockedCompareExchange64(&g_animInterpFrames, 0, 0), std::memory_order_relaxed);
     g_vmBaseWorldPos.store(InterlockedCompareExchange64(&g_worldPosInterpCount, 0, 0), std::memory_order_relaxed);
     g_vmBaseSpatialQueries.store(InterlockedCompareExchange64(&g_clientSpatialQueries, 0, 0), std::memory_order_relaxed);
-    SetClientSimTickRate(30);
-    // Player-First safety: reset world-shader strengths to 0.0 (Vanilla Pure) on fresh Lua VM
-    // so disabling the Workshop Mod never leaks world-shader state!
+    if (g_clientSimTickRate.load(std::memory_order_acquire) != 30) {
+        if (!SetClientSimTickRate(30)) {
+            LogMsg("[ERROR][SIMTICK] Failed restoring Client SimTick to 30Hz on new Lua VM init (cur=%dHz)!",
+                   g_clientSimTickRate.load(std::memory_order_acquire));
+        }
+    }
+    // Player-First safety: reset world-shader strengths & Mip LOD Bias to 0.0 (Vanilla Pure) on fresh Lua VM
+    // so disabling the Workshop Mod never leaks visual state!
     {
         AcquireSRWLockExclusive(&g_hd2dStateLock);
         g_hd2dState.params[0] = 0.0f;
         g_hd2dState.params[1] = 0.0f;
+        g_hd2dState.params[2] = 0.0f;
+        g_hd2dState.sun[2]    = 0.0f;
         ReleaseSRWLockExclusive(&g_hd2dStateLock);
         g_hd2dMasterStr.store(0.0f, std::memory_order_relaxed);
         g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+        g_visualMipLodBias.store(0.0f, std::memory_order_relaxed);
     }
     if (g_origLuaOpenLibs) {
         g_origLuaOpenLibs(L);
@@ -4203,6 +5971,68 @@ void PrepareLuaBridgeHook(std::vector<PendingCodePatch>& patches, uint8_t* textS
     g_luaToNumber     = reinterpret_cast<LuaToNumber_t>(pToNum);
     g_luaToBoolean    = reinterpret_cast<LuaToBoolean_t>(pToBool);
 
+    // Populate LuaApiTable for C++ Native FastDataDumper (all verified unique 1-match AOBs on Client EXE!)
+    static constexpr int16_t kAobCLuaCheckStack[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x81, 0xFA, 0x40, 0x1F, 0x00, 0x00,
+        0x48, 0x8B, 0xD9, 0x7F, 0x75, 0x4C, 0x8B, 0x41, 0x10, 0x48, 0x63, 0xFA, 0x49, 0x8B, 0xC0, 0x48
+    };
+    static constexpr int16_t kAobCLuaGetTop[] = {
+        0x48, 0x8B, 0x41, 0x10, 0x48, 0x2B, 0x41, 0x18, 0x48, 0xC1, 0xF8, 0x04, 0xC3
+    };
+    static constexpr int16_t kAobCLuaSetTop[] = {
+        0x4C, 0x8B, 0xC1, 0x85, 0xD2, 0x78, 0x40, 0x48, 0x8B, 0x41, 0x18, 0x4C, 0x63, 0xCA, 0x4D, 0x03,
+        0xC9, 0x4A, 0x8D, 0x14, 0xC8, 0x48, 0x39, 0x51, 0x10, 0x73, 0x1F, 0x33, 0xD2, 0x0F, 0x1F, 0x00
+    };
+    static constexpr int16_t kAobCLuaPushValue[] = {
+        0x48, 0x83, 0xEC, 0x28, 0x4C, 0x8B, 0xD1, 0xE8, -1, -1, -1, -1, 0x4D, 0x8B, 0x42, 0x10,
+        0x48, 0x8B, 0x10, 0x49, 0x89, 0x10, 0x8B, 0x40, 0x08, 0x41, 0x89, 0x40, 0x08, 0x49, 0x83, 0x42
+    };
+    static constexpr int16_t kAobCLuaType[] = {
+        0x48, 0x83, 0xEC, 0x28, 0xE8, -1, -1, -1, -1, 0x48, 0x8D, 0x0D, -1, -1, -1, -1,
+        0x48, 0x3B, 0xC1, 0x75, 0x08, 0x83, 0xC8, 0xFF, 0x48, 0x83, 0xC4, 0x28, 0xC3, 0x8B, 0x40, 0x08
+    };
+    static constexpr int16_t kAobCLuaToLString[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x49,
+        0x8B, 0xD8, 0x8B, 0xF2, 0x48, 0x8B, 0xF9, 0xE8, -1, -1, -1, -1, 0x4C, 0x8B, 0xD0, 0x83, 0x78, 0x08, 0x04, 0x74
+    };
+    static constexpr int16_t kAobCLuaToPointer[] = {
+        0x48, 0x83, 0xEC, 0x28, 0x44, 0x8B, 0xD2, 0x4C, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1, 0x44,
+        0x8B, 0x48, 0x08, 0x41, 0x83, 0xE9, 0x02, 0x74, 0x1F, 0x41, 0x83, 0xE9, 0x03, 0x74, 0x3D,
+        0x41, 0x83, 0xE9, 0x01, 0x74, 0x37, 0x41, 0x83, 0xE9, 0x01, 0x74, 0x0D
+    };
+    static constexpr int16_t kAobCLuaPushNil[] = {
+        0x48, 0x8B, 0x41, 0x10, 0xC7, 0x40, 0x08, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83, 0x41, 0x10, 0x10, 0xC3
+    };
+    static constexpr int16_t kAobCLuaPushLString[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+        0x48, 0x83, 0xEC, 0x20, 0x80, 0xB9, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xF0, 0x48, 0x8B, 0xEA, 0x48, 0x8B, 0xF9
+    };
+    static constexpr int16_t kAobCLuaNext[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1, 0x4C, 0x8B,
+        0x43, 0x10, 0x48, 0x8B, 0x10, 0x49, 0x83, 0xE8, 0x10, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1, 0x85, 0xC0, 0x74
+    };
+    auto findU16 = [&](const auto& arr) -> uint8_t* {
+        return FindUniqueAobInt16(textStart, textSize, arr, sizeof(arr) / sizeof(arr[0]));
+    };
+    g_clientLuaApi.checkstack   = reinterpret_cast<decltype(g_clientLuaApi.checkstack)>(findU16(kAobCLuaCheckStack));
+    g_clientLuaApi.gettop       = reinterpret_cast<decltype(g_clientLuaApi.gettop)>(findU16(kAobCLuaGetTop));
+    g_clientLuaApi.settop       = reinterpret_cast<decltype(g_clientLuaApi.settop)>(findU16(kAobCLuaSetTop));
+    g_clientLuaApi.pushvalue    = reinterpret_cast<decltype(g_clientLuaApi.pushvalue)>(findU16(kAobCLuaPushValue));
+    g_clientLuaApi.type         = reinterpret_cast<decltype(g_clientLuaApi.type)>(findU16(kAobCLuaType));
+    g_clientLuaApi.tonumber     = g_luaToNumber;
+    g_clientLuaApi.toboolean    = g_luaToBoolean;
+    g_clientLuaApi.tolstring    = reinterpret_cast<decltype(g_clientLuaApi.tolstring)>(findU16(kAobCLuaToLString));
+    g_clientLuaApi.topointer    = reinterpret_cast<decltype(g_clientLuaApi.topointer)>(findU16(kAobCLuaToPointer));
+    g_clientLuaApi.pushnil      = reinterpret_cast<decltype(g_clientLuaApi.pushnil)>(findU16(kAobCLuaPushNil));
+    g_clientLuaApi.pushnumber   = g_luaPushNumber;
+    g_clientLuaApi.pushlstring  = reinterpret_cast<decltype(g_clientLuaApi.pushlstring)>(findU16(kAobCLuaPushLString));
+    g_clientLuaApi.pushstring   = g_luaPushString;
+    g_clientLuaApi.pushcclosure = g_luaPushCClosure;
+    g_clientLuaApi.pushboolean  = g_luaPushBoolean;
+    g_clientLuaApi.setfield     = g_luaSetField;
+    g_clientLuaApi.next         = reinterpret_cast<decltype(g_clientLuaApi.next)>(findU16(kAobCLuaNext));
+    LogMsg("[HOST] Client FastDataDumper C++ Lua API ready=%d", g_clientLuaApi.ReadyForFastDump() ? 1 : 0);
+
     // 17-byte trampoline for luaL_openlibs (relocates mov rax, [rip+disp32] at +10/+13)
     uint8_t* tramp = AllocNearExecutable(pOpenLibs, 64);
     if (!tramp) return;
@@ -4245,7 +6075,7 @@ void EnsureDefaultIni() {
     FILE* f = _wfopen(g_iniPath.c_str(), L"w");
     if (!f) return;
     fprintf(f,
-        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.5.0)\n"
+        "; DST HyperSmooth & FastLoad Native Companion Plugin Configuration (v2.6.0)\n"
         "; Note: If you also use the Steam Workshop Companion Mod, in-game ESC->Settings->Graphics overrides these live.\n"
         "[FPS]\n"
         "target_fps=240\n"
@@ -4261,17 +6091,21 @@ void EnsureDefaultIni() {
         "fast_libdeflate_zip=1\n"
         "fast_zlib_inflate=1\n"
         "smooth_skeletal_anim=1\n"
+        "smooth_vfx_particles=1\n"
         "world_pos_interp=1\n"
         "raknet_zero_stall=1\n"
+        "d3d9ex_low_latency=1\n"
         "low_latency_gpu_sync=1\n"
         "smooth_lua_gc=1\n"
         "fast_spatial_query=1\n"
         "timeslice_tex_upload=1\n"
+        "gl_state_cache=1\n"
         "\n"
         "[VISUAL]\n"
         "; Player-First Default: 100%% Vanilla Pure (all visual enhancements strictly opt-in)\n"
         "anisotropic_filter=1\n"
         "fullres_lightmap=0\n"
+        "mip_lod_sharp=0\n"
         "hd2d_world_shaders=1\n");
     fclose(f);
 }
@@ -4406,7 +6240,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) fclose(f);
     ReleaseSRWLockExclusive(&g_logLock);
 
-    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.5.0 (RTSS Pacer + mimalloc + Boss Anti-Hitch + Player-First Eye-Care Visual Fidelity) loaded.");
+    LogMsg("DST HyperSmooth & FastLoad Native Companion Plugin v2.6.0 (240Hz Skeletal+VFX + D3D9Ex Reflex Queue + RTSS Pacer + mimalloc + Player-First Visual Fidelity) loaded.");
 
     // Initialize QPC frequency scale BEFORE installing any timing/pacer/GC/anim hooks
     {
@@ -4429,31 +6263,47 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optLibdeflate = ReadIniInt(L"OPTIMIZE", L"fast_libdeflate_zip", 1) != 0;
     bool optFastZlib = ReadIniInt(L"OPTIMIZE", L"fast_zlib_inflate", 1) != 0;
     bool optSkeletal = ReadIniInt(L"OPTIMIZE", L"smooth_skeletal_anim", 1) != 0;
+    bool optVfxSmooth = ReadIniInt(L"OPTIMIZE", L"smooth_vfx_particles", 1) != 0;
     bool optWorldPos = ReadIniInt(L"OPTIMIZE", L"world_pos_interp", 1) != 0;
     bool optRakZeroStall = ReadIniInt(L"OPTIMIZE", L"raknet_zero_stall", 1) != 0;
+    bool optD3d9ExLowLat = ReadIniInt(L"OPTIMIZE", L"d3d9ex_low_latency", 1) != 0;
     bool optLowLatGpu = ReadIniInt(L"OPTIMIZE", L"low_latency_gpu_sync", 1) != 0;
     bool optSmoothGc = ReadIniInt(L"OPTIMIZE", L"smooth_lua_gc", 1) != 0;
     bool optFastSpatial = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1) != 0;
     bool optTexTimeSlice = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1) != 0;
+    bool optGlStateCache = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1) != 0;
+    {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 0) {
+            g_displayRefreshHz.store(dm.dmDisplayFrequency, std::memory_order_relaxed);
+            LogMsg("[DISPLAY] Primary monitor refresh rate detected: %lu Hz", static_cast<unsigned long>(dm.dmDisplayFrequency));
+        }
+    }
     int  optAniso = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
     if (optAniso < 1) optAniso = 1;
     if (optAniso > 16) optAniso = 16;
     bool optFullresLm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0) != 0;
+    bool optMipSharp = ReadIniInt(L"VISUAL", L"mip_lod_sharp", 0) != 0;
     bool optHd2dWorld = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1) != 0;
     int initFps = ReadIniInt(L"FPS", L"target_fps", 240);
     if (initFps < 0) initFps = 0;
     if (initFps > 1000) initFps = 1000;
     g_currentFps.store(initFps, std::memory_order_relaxed);
     g_skeletalTweenEnabled.store(optSkeletal ? 1 : 0, std::memory_order_relaxed);
+    g_vfxSmoothEnabled.store(optVfxSmooth ? 1 : 0, std::memory_order_relaxed);
     g_worldPosInterpEnabled.store(optWorldPos ? 1 : 0, std::memory_order_relaxed);
     g_optRtssPacer.store(optRtssPacer, std::memory_order_relaxed);
     g_optMimallocLua.store(optMimallocLua, std::memory_order_relaxed);
     g_optRakNetZeroStall.store(optRakZeroStall, std::memory_order_relaxed);
+    g_optD3d9ExLowLatency.store(optD3d9ExLowLat, std::memory_order_relaxed);
     g_optLowLatencyGpuSync.store(optLowLatGpu, std::memory_order_relaxed);
     g_optFastSpatialQuery.store(optFastSpatial, std::memory_order_relaxed);
     g_optTexTimeSlice.store(optTexTimeSlice, std::memory_order_relaxed);
+    g_optGlStateCache.store(optGlStateCache, std::memory_order_relaxed);
     g_visualAnisoLevel.store(optAniso, std::memory_order_relaxed);
     g_visualFullresLightmap.store(optFullresLm, std::memory_order_relaxed);
+    g_visualMipLodBias.store(optMipSharp ? -0.45f : 0.0f, std::memory_order_relaxed);
     g_optHd2dWorldShaders.store(optHd2dWorld, std::memory_order_release);
 
     // Install libGLESv2 PE IAT hooks FIRST (at ~t=+1ms, BEFORE AOB scan) so glShaderSource
@@ -4479,14 +6329,20 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
         PrepareVisualFidelityHooks(patches, textStart, textSize);
         PrepareRenderPerfHooks(patches, textStart, textSize);
+        PrepareLightMap240AndHotSwapHooks(patches, textStart, textSize);
         if (optMimallocLua) PrepareClientMimallocHook(patches, textStart, textSize);
         if (optFastVec) PrepareVectorMemsetPatch(patches, textStart, textSize);
-        if (optLibdeflate) PrepareLibdeflateUnzHook(patches, textStart, textSize);
+        if (optLibdeflate) {
+            PrepareLibdeflateUnzHook(patches, textStart, textSize);
+            PrepareClientCompress2Hook(patches, textStart, textSize);
+        }
         if (optFastZlib) PrepareFastInflatePatch(patches, textStart, textSize);
         if (optSmoothGc) PrepareSmoothLuaGcHook(patches, textStart, textSize);
         if (optRakZeroStall) PrepareRakNetZeroStallPatch(patches, textStart, textSize);
         if (optFastSpatial) PrepareClientSpatialZeroCopyHooks(patches, textStart, textSize);
         if (optTexTimeSlice) PrepareTexStreamTimeSliceHook(patches, textStart, textSize);
+        PrepareClientFastAStarHooks(patches, textStart, textSize);
+        PrepareVfxParticleSmoothHooks(patches, textStart, textSize);
         PrepareSkeletalAnimTweenHooks(patches, textStart, textSize);
         InitClientSimTickPointers(textStart, textSize);
 
@@ -4532,10 +6388,42 @@ DWORD WINAPI WorkerProc(LPVOID) {
 
         PrepareLuaBridgeHook(patches, textStart, textSize);
 
-        // Phase 2: Atomic cold-start patch application under ThreadFreezeGuard (RIP-safe!)
+        // Phase 2: Atomic cold-start patch application under ThreadFreezeGuard (RIP-safe, fail-closed!)
         ApplyPendingPatchesSafely(patches);
-        if (flPatchIdx != static_cast<size_t>(-1) && patches[flPatchIdx].applied) {
+        auto isApplied = [&](size_t idx) -> bool {
+            return idx != static_cast<size_t>(-1) && idx < patches.size() && patches[idx].applied;
+        };
+        if (isApplied(flPatchIdx)) {
             g_frameLimiterHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_clientComp2PatchIdx)) {
+            g_clientCompress2Hooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_clientAStarPatchIdx[0]) &&
+            isApplied(g_clientAStarPatchIdx[1]) &&
+            isApplied(g_clientAStarPatchIdx[2])) {
+            g_clientAStarReady.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_vfxPmPatchIdx) && isApplied(g_vfxCmdPatchIdx)) {
+            g_vfxSmoothHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_angleAfPatchIdx)) {
+            g_angleAfUnlocked = true;
+        }
+        if (isApplied(g_angleSamplerPatchIdx)) {
+            g_angleSamplerHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_lightmapScalePatchIdx)) {
+            g_lightmapPatched = true;
+        }
+        if (isApplied(g_lightmapHotSwapIdx)) {
+            g_lightmapHotSwapHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_light240PatchIdx)) {
+            g_lightPos240Hooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_gameRenderPatchIdx) && isApplied(g_postProcPatchIdx)) {
+            g_renderPerfHooked = true;
         }
     }
 
@@ -4592,15 +6480,29 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 LONG64 texSl = InterlockedCompareExchange64(&g_texUploadSlices, 0, 0);
                 LONG64 afHits = InterlockedCompareExchange64(&g_afAppliedHits, 0, 0);
                 LONG64 afTri  = InterlockedCompareExchange64(&g_afTrilinearUpgrades, 0, 0);
+                LONG64 vfxCmds = InterlockedCompareExchange64(&g_vfxCmdsSmoothed, 0, 0);
+                LONG64 vfxPts  = InterlockedCompareExchange64(&g_vfxParticlesSmoothed, 0, 0);
+                LONG64 light240 = InterlockedCompareExchange64(&g_lightPos240Count, 0, 0);
+                LONG64 glCalls = InterlockedCompareExchange64(&g_glCacheCalls, 0, 0);
+                LONG64 glHits  = InterlockedCompareExchange64(&g_glCacheHits, 0, 0);
+                double glHitPct = (glCalls > 0) ? (100.0 * static_cast<double>(glHits) / static_cast<double>(glCalls)) : 0.0;
                 double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
                 g_frameRing.ComputeStats(avgFps, low1Fps, p99Ms, jitterMs);
-                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | pos240=%lld (byp=%lld) | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
+                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz disp=%uHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | vfx240=%lld (%lld pts) | light240=%lld | pos240=%lld (byp=%lld) | d3d9ex_lat=%u/%u | glCache=%.1f%% (%lld/%lld) swap=%.2fms | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx mip=%.2f hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
                        avgFps, low1Fps, p99Ms, jitterMs, g_clientSimTickRate.load(std::memory_order_relaxed),
+                       g_displayRefreshHz.load(std::memory_order_relaxed),
                        hits, static_cast<double>(bytes) / (1024.0 * 1024.0), interp, bones, p2, shed,
-                       posInterp, posBypass, spQ, spC, texUp, texSl,
+                       vfxCmds, vfxPts, light240,
+                       posInterp, posBypass,
+                       g_d3d9ExCurLatency.load(std::memory_order_relaxed),
+                       g_d3d9ExOrigLatency.load(std::memory_order_relaxed),
+                       glHitPct, glHits, glCalls,
+                       static_cast<double>(g_emaSwapUs.load(std::memory_order_relaxed)) * 0.001,
+                       spQ, spC, texUp, texSl,
                        g_visualAnisoLevel.load(std::memory_order_relaxed),
                        static_cast<double>(g_hwMaxAniso.load(std::memory_order_relaxed)),
                        afHits, afTri, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5,
+                       static_cast<double>(g_visualMipLodBias.load(std::memory_order_relaxed)),
                        g_hd2dShadersInjected.load(std::memory_order_relaxed),
                        g_hd2dProgsLinked.load(std::memory_order_relaxed),
                        static_cast<double>(g_hd2dMasterStr.load(std::memory_order_relaxed)),
@@ -4614,31 +6516,32 @@ DWORD WINAPI WorkerProc(LPVOID) {
             }
         }
 
-        // Zero-spam Hitch breakdown telemetry: logs ONLY when >=1 frame >25ms occurs in active gameplay
-        // (rate-limited to at most 1 line every 10 seconds, 0 MainThread/RenderThread disk I/O!)
+        // Zero-spam Hitch & Severe-Stall breakdown telemetry: logs ONLY when >=1 frame >25ms occurs in gameplay
+        // (rate-limited to at most 1 line every 10 seconds, tear-free snapshot, 0 MainThread/RenderThread disk I/O!)
         if (tickCounter - lastHitchLogTick >= 20) {
-            const uint32_t hCnt = g_hitchPendingCount.exchange(0, std::memory_order_acq_rel);
-            if (hCnt > 0) {
+            HitchSnapshot snap{};
+            AcquireSRWLockExclusive(&g_hitchLock);
+            snap = g_hitchSnap;
+            g_hitchSnap = {};
+            ReleaseSRWLockExclusive(&g_hitchLock);
+            if (snap.pendingCount > 0 || snap.severeCount > 0) {
                 lastHitchLogTick = tickCounter;
-                const uint32_t peakUs = g_hitchPeakUs.exchange(0, std::memory_order_relaxed);
-                const uint32_t aUs = g_hitchAnimUs.load(std::memory_order_relaxed);
-                const uint32_t aEnts = g_hitchAnimEnts.load(std::memory_order_relaxed);
-                const uint32_t aBones = g_hitchAnimBones.load(std::memory_order_relaxed);
-                const uint32_t aShed = g_hitchAnimShed.load(std::memory_order_relaxed);
-                const uint32_t gcUs = g_hitchGcUs.load(std::memory_order_relaxed);
-                const int32_t  gcKb = g_hitchGcKb.load(std::memory_order_relaxed);
-                const uint32_t texUs = g_hitchTexUs.load(std::memory_order_relaxed);
                 const LONG64 gcFull = InterlockedCompareExchange64(&g_gcEmergencyFulls, 0, 0);
                 const LONG64 spQ = InterlockedCompareExchange64(&g_clientSpatialQueries, 0, 0);
                 const LONG64 texUp = InterlockedCompareExchange64(&g_texUploadsTotal, 0, 0);
                 const LONG64 texSl = InterlockedCompareExchange64(&g_texUploadSlices, 0, 0);
                 double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
                 g_frameRing.ComputeStats(avgFps, low1Fps, p99Ms, jitterMs);
-                LogMsg("[Hitch] peak=%.1fms (cnt=%u | avg=%.0f 1%%L=%.0f p99=%.1fms) | anim=%.2fms (ents=%u bones=%u shed=%u) | gc=%.2fms (kb=%d full=%lld) | tex=%.2fms (up=%lld slice=%lld) | spatial=%lld",
-                       static_cast<double>(peakUs) * 0.001, hCnt, avgFps, low1Fps, p99Ms,
-                       static_cast<double>(aUs) * 0.001, aEnts, aBones, aShed,
-                       static_cast<double>(gcUs) * 0.001, gcKb, gcFull,
-                       static_cast<double>(texUs) * 0.001, texUp, texSl, spQ);
+                LogMsg("[Hitch] peak=%.1fms (cnt=%u severe=%u[max=%.1fms] | avg=%.0f 1%%L=%.0f p99=%.1fms) | busy=%.1fms swap=%.1fms world=%.1fms post=%.1fms | anim=%.2fms (ents=%u bones=%u shed=%u) | gc=%.2fms (kb=%d full=%lld) | tex=%.2fms (up=%lld slice=%lld) | zip=%.2fms shdr=%.2fms | spatial=%lld",
+                       static_cast<double>(snap.peakUs) * 0.001, snap.pendingCount,
+                       snap.severeCount, static_cast<double>(snap.severeMaxUs) * 0.001,
+                       avgFps, low1Fps, p99Ms,
+                       static_cast<double>(snap.busyUs) * 0.001, static_cast<double>(snap.swapUs) * 0.001,
+                       static_cast<double>(snap.worldUs) * 0.001, static_cast<double>(snap.postUs) * 0.001,
+                       static_cast<double>(snap.animUs) * 0.001, snap.animEnts, snap.animBones, snap.animShed,
+                       static_cast<double>(snap.gcUs) * 0.001, snap.gcKb, gcFull,
+                       static_cast<double>(snap.texUs) * 0.001, texUp, texSl,
+                       static_cast<double>(snap.unzUs) * 0.001, static_cast<double>(snap.shaderUs) * 0.001, spQ);
             }
         }
 
@@ -4649,26 +6552,42 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 lastIniTime = curIniTime;
                 int fps = ReadIniInt(L"FPS", L"target_fps", 240);
                 int skel = ReadIniInt(L"OPTIMIZE", L"smooth_skeletal_anim", 1);
+                int vfx = ReadIniInt(L"OPTIMIZE", L"smooth_vfx_particles", 1);
                 int wpos = ReadIniInt(L"OPTIMIZE", L"world_pos_interp", 1);
+                int d3d9lat = ReadIniInt(L"OPTIMIZE", L"d3d9ex_low_latency", 1);
                 int gsync = ReadIniInt(L"OPTIMIZE", L"low_latency_gpu_sync", 1);
                 int spq = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1);
                 int texs = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1);
+                int glsc = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1);
                 int af = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
                 if (af < 1) af = 1;
                 if (af > 16) af = 16;
                 int flm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0);
+                int mips = ReadIniInt(L"VISUAL", L"mip_lod_sharp", 0);
                 int hd2d = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1);
                 g_skeletalTweenEnabled.store(skel ? 1 : 0, std::memory_order_relaxed);
+                g_vfxSmoothEnabled.store(vfx ? 1 : 0, std::memory_order_relaxed);
                 g_worldPosInterpEnabled.store(wpos ? 1 : 0, std::memory_order_relaxed);
+                if (g_optD3d9ExLowLatency.exchange(d3d9lat != 0, std::memory_order_relaxed) != (d3d9lat != 0)) {
+                    g_d3d9ExLatGen.fetch_add(1, std::memory_order_release);
+                }
                 g_optLowLatencyGpuSync.store(gsync != 0, std::memory_order_relaxed);
                 g_optFastSpatialQuery.store(spq != 0, std::memory_order_relaxed);
                 g_optTexTimeSlice.store(texs != 0, std::memory_order_relaxed);
+                const bool wantGlsc = (glsc != 0) && g_glCacheActive.load(std::memory_order_acquire);
+                if (g_optGlStateCache.exchange(wantGlsc, std::memory_order_relaxed) != wantGlsc) {
+                    g_glCacheResetGen.fetch_add(1, std::memory_order_release);
+                }
                 g_visualAnisoLevel.store(af, std::memory_order_relaxed);
-                g_visualFullresLightmap.store(flm != 0, std::memory_order_relaxed);
+                const bool prevIniLm = g_visualFullresLightmap.exchange(flm != 0, std::memory_order_relaxed);
+                g_visualMipLodBias.store(mips ? -0.45f : 0.0f, std::memory_order_relaxed);
                 g_optHd2dWorldShaders.store(hd2d != 0, std::memory_order_relaxed);
                 if (g_lightmapScaleSlot) *g_lightmapScaleSlot = (flm != 0) ? 1.0f : 0.5f;
-                LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, WorldPos240=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d, AF=%dx, FullLM=%d, HD2D=%d",
-                       fps, skel ? 1 : 0, wpos ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0, af, flm ? 1 : 0, hd2d ? 1 : 0);
+                if (prevIniLm != (flm != 0)) {
+                    g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
+                }
+                LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, Vfx240=%d, WorldPos240=%d, D3D9ExLat=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d, AF=%dx, FullLM=%d, MipSharp=%d, HD2D=%d",
+                       fps, skel ? 1 : 0, vfx ? 1 : 0, wpos ? 1 : 0, d3d9lat ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0, af, flm ? 1 : 0, mips ? 1 : 0, hd2d ? 1 : 0);
                 ApplyFpsPatch(fps);
             }
         }

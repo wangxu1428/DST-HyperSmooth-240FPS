@@ -1,195 +1,101 @@
-# DST HyperSmooth 240FPS & FastLoad (v2.5.0 · RTSS Frame Pacer + Boss Anti-Hitch + Player-First Eye-Care Visual Fidelity + Dual-Side 60Hz Ready)
+# DST HyperSmooth 240FPS & FastLoad (v2.6.0)
 
-> **饥荒联机版（Don't Starve Together）纯客户端 240 帧骨骼与位移补帧、零争抢 RTSS 级 1% Low 稳帧引擎、Boss 并发防卡顿、全按键自由录制绑定、玩家优先护眼画质精修与可选双端 60Hz 逻辑刻伴侣**  
-> **Client-Only 240FPS Skeletal & World-Pos Tweening, Zero-Contention RTSS Frame Pacer, Boss-Swarm Anti-Hitch, Player-First Eye-Care Visual Fidelity, Interactive Any-Key Binding UI & Auto-Negotiated 60Hz SimTick for Don't Starve Together (64-bit)**
-
-### v2.5.0 玩家优先护眼画质精修（默认原版纯净 · 7 项独立开关） / Player-First Eye-Care Visual Fidelity
-- **严格遵守「玩家优先五铁律」**：
-  - **默认 100% 原版纯净**（所有画质增强均默认关闭，零额外视觉负担、绝不强迫开启任何后处理、连 `BloomSampler` 都不提前改写）。
-  - **7 项效果全部独立开关**：在 Mod 配置页与局内控制台 `c_hsopt("af16"|"lightmap"|"cas"|"ao"|"env"|"bloom"|"tone"|"off", true/false)` 均可逐项独立启停，亦可在 **`ESC -> 设置 -> 画面 -> 画质增强`** 一键在「原版纯净 / 护眼高清 / 柔和绘本 / 自定义」间 0ms 同屏对比；**关闭后 100% 完整恢复原版表现**。
-- **尊重 99% 饥荒玩家关闭「泛光 / 失真 / 摇晃 / 闪烁」的真实护眼习惯（关泛光同样全效）**：
-  - **`16× 硬件各向异性过滤 + 三线性`**：解除 ANGLE 1.0 硬编码 AF 上限（`libGLESv2.dll` + `@109 glTexParameteri`），斜视角地皮与建筑贴图干爽锐利、零偏色零闪烁。
-  - **`全分辨率 1.0× 光照图`**：将 `LightMap::InitRenderTarget` 局部重定位至私有只读数据槽（不污染其余 170 处 `0.5f`），消除篝火与黄昏光圈方块锯齿。
-  - **`极轻度保真微锐化（CAS 0.24，邻域防白边）+ 暗夜 IGN 8-bit 防色带`**：去 2K 轻微双线性发虚，保留手绘黑描边干净利落，暗夜渐变更顺滑护眼。
-  - **`温和实体接地阴影 + 高亮柔肩防爆白`**：零额外纹理采样（`@99/@90/@131/@32` 精准注入 9 个世界着色器，严禁触碰 UI/字体/小地图），类似原版「树荫」哲学，仅在树干与双脚贴地处添加柔和落地阴影并压制白脸/大理石刺眼过曝。
-  - **`护眼防过曝柔光 Bloom`**：仅在玩家主动开启游戏「泛光」时替代原版 0.25× 刺眼泛光（`screen_protect=0.85` 防白脸糊五官）；游戏泛光关闭时零开销。
-  - **零额外显存 & 实测 240FPS 几乎零损耗**：内置 `GameRender / PostProcessor::Render` 毫秒与后台 DXGI VRAM 遥测（`c_hsvisual()` / `c_hsbench()`），RTX 4060 2K 240Hz 实测 `Busy 2.5ms`、`1%L 231+`、`VRAM 零增长`；并修复右上角 HUD 文字左移避让时钟表盘。
-
-### v2.4.1 社区反馈专项修复 & 真·全按键自由录制 / Community Hotfix & True Any-Key Binding
-- **彻底修复萤火虫光效连成直线（及全游戏多粒子同名骨骼动画防拉线）**：针对 `fireflies.zip`、`swarm_loop` 等同帧包含多个同名 `(layer, symbol)` 光点/火花/孢子的骨骼动画，升级为 **最近邻空间距离匹配 + `usedF1` 互斥占位 + `<=48px` 粒子防拉线熔断**（唯一键角色/Boss 骨骼仍保持 $O(1)$ 直连），彻底杜绝消失光点被跨群拉成直线！
-- **修复上下洞穴保活跨 `SimReset` 失效问题 + 角色资产同步保活**：Hook `GLOBAL.SimReset` 将保活列表随 `instanceparameters` 跨 Lua VM 重建持久化传递，并在 `BACKEND -> BACKEND` 联机切洞穴期间同时保活 `forest`/`cave` 与 `Settings.loaded_characters`（退回主菜单全部干净卸载释放，零双重卸载）。注：首次下洞仍需加载洞穴资源，且克雷切层必经 `TheSim:Reset()` 重建脚本与分片重连，复返耗时可显著缩短但非 0 秒瞬切。
-- **真·全按键自由录制绑定 UI（`keybind.lua` · 对标《热键：李皓奇》）**：启用模组并点击「应用」后，Mod 配置页与 **`ESC -> 设置 -> 控制` 页面最下方** 均升级为点击录制按钮，直接按下**键盘任意键**或点击**鼠标中键 / 侧键 4 / 侧键 5** 即刻绑定（点 `×` 一键解绑），支持绑定「循环切帧」「开关 240 帧骨骼补帧」「开关帧率 HUD」三项（默认全禁用零冲突）。
-- **双显卡笔记本排查提示**：若笔记本游戏内帧数停在 `150 FPS` 左右，请在显卡控制面板/电脑管家中切换为 **独显直连**（绕开核显 Optimus 帧拷贝瓶颈）即可跑满 `240+ FPS`。
-
-### v2.4.0 1% Low 稳帧革命 · 关延迟补偿 240Hz 丝滑 · Boss 并发防卡顿 & 双端 60Hz / Zero-Contention Pacing, Lag-Comp-OFF 240Hz Interp, Boss-Swarm Anti-Hitch & Dual-Side 60Hz
-- **【A1】零争抢 RTSS 级帧时间控制器 (`FrameLimiter::Wait` 底层接管 · 1% Low 专项优化)**：
-  - 彻底取代克雷原版粗糙的 `Sleep(1)` + 满核自旋死循环：改用 Win10/11 高精度内核等待计时器（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`）+ 自适应唤醒过冲 EMA（`[500, 1950] µs` 针对 Win10 过冲专项防抖 + 屏蔽 `<450 µs` 微睡眠）+ 绝对截止期调度（卡顿后立即对齐不追帧连爆）+ `_mm_pause()` 退让收尾。
-  - **约 85%~90% 等待时间保持 0% CPU 占用**，将 CPU 核与内存带宽完整让给 GPU 驱动（ANGLE `libglesv2.dll`）、音频与网络线程；实测 240Hz 稳帧器 **`Avg = 240.0 FPS`、`1% Low = 221.6~239.1 FPS`、`P99 = 4.27ms`、帧间抖动 `0.023ms`**（较旧版过冲抖动压低 **6.8×**）。
-- **【A2】关延迟补偿 240Hz 丝滑位移 (`WorldPos240`) + 零等待网络操控 (`RakNet Zero-Stall` + `240Hz WASD RPC`)**：
-  - 针对关闭延迟补偿（`Lag Compensation = OFF`）时远程客户端缺少本地 `locomotor` 插值、实体位置按 30Hz/60Hz 阶梯跳动锯齿的问题，新增底层 **240Hz 世界坐标连续插值**（精准追踪 `AnimNode` 变换与瞬移/传送/上船熔断保护），在保留 100% 精确服务器判定的同时画面丝滑无锯齿。
-  - **RakNet 事件驱动零停顿唤醒**：移除客户端 `SendBuffered` / `SendBufferedList` 的优先级拦截，消除非 `IMMEDIATE` 级游戏操作 RPC 在 `WaitOnEvent(10)` 中白等的 `0~10ms` 延迟（零轮询、0% 空闲 CPU）。
-  - **240Hz 即时 WASD 发包（仅关延迟补偿远程客户端生效）**：在 `PlayerController:OnControl` 键盘按下/抬起边沿即时触发 `RemoteDirectWalking` / `RemoteStopWalking`（由 `self.remote_vector` 天然去重、零重复 RPC、自动旁路手柄摇杆与所有原版保护状态），削减 `8~33ms` 按键起停等待，100% 兼容纯原版公共服。
-- **【A3】Boss 并发防卡顿五件套（天体 3 阶段陨石 / 龙蝇岩浆虫 / 蜂后蜜蜂群 / 织影者小虫全覆盖）**：
-  - **5× 提速零卡顿骨骼管线**：3 级矩阵插值快路径（静止 / 纯平移 / `<3.5°` 小角近似 / 极分解）+ 栈上 $O(N)$ L1 哈希骨骼配对（`i7-12700KF` 300 实体 × 18 骨骼实测 `292 µs -> 67 µs`，**提速 4.3×~5.1×**）+ L1 热槽位缓存 + 2 级极端并发降级护栏（极端同屏优先减负远景旋转矩阵，**永不关闭 240Hz 世界坐标插值**）。
-  - **5 条客户端 `SpatialGrid::Query` 全路径零拷贝**：将服务端验证过的零拷贝只读空间查询完整移植至客户端全部 5 条只读入口（`FindEntities` 缓存/直查/注册 3 条 + `LightWatcher` 亮度/RGB 2 条），全部独立 AOB Fail-Closed 校验，彻底消除每帧海量的单元格 `std::vector` 堆分配风暴。
-  - **`RenderThread` 异步纹理上传时间片限流 (`ProcessAsyncQueueResults`)**：局内激战遇到 Boss 召唤物按需上传 DXT5 纹理爆发时，自动按 **`1.2ms`/帧**（每帧至少完成 1 个任务）分帧消化，彻底消除 `20~60ms` 渲染线程单帧冻屏；切图/读图加载期间自动全速无限制。
-  - **并发平滑避让 GC (`FastSmoothCollectGarbage`) + 独立无锁 `mimalloc v2.1.7` Lua 堆**：在 `240 -> 150 FPS` 并发掉帧区间以连续平滑 `0.30~1.60ms` 预算消除旧版延后爆发锯齿，并搭配 `thread_local` 批量计账的静态 `mimalloc v2.1.7` 堆，彻底消灭全局锁争抢与 Full-GC 冻屏。
-  - **无锁后台 `[Hitch]` 归因遥测**：仅在真实局内发生 `>25ms` 异常帧时由后台线程每 10 秒最多落盘 1 条各子系统耗时明细（`anim / gc / tex / spatial`），主线程与渲染线程零磁盘 I/O。
-- **【A4】零分配 C++ 512 帧环形 `1% Low / P99` 实时 HUD & 纯被动双端 60Hz 自动协商**：
-  - 右上角 HUD 直接读取 C++ 底层 `HyperSmooth_GetFrameStats()`，零 Lua 表分配实时展示 **`240 FPS | 1%L 232 (4.2ms)`**（接入双端 60Hz 服务端时自动显示 **`[60Hz]`** 徽标）。
-  - 默认严格保持原版 **30Hz**，且 `dinput8.dll` 在每次重建 Lua VM（返回主菜单 / 切换服务器 / 上下洞穴）时 **无条件重置为 30Hz**；仅在连接开启 `opt_sim_60hz` 的 **[DST HyperCore Server v1.2.0](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/tree/server-hypercore)** 时通过 `hypercore_sim60` 标签与 `HyperCoreProto` RPC 自动握手切至双端 60Hz（同步解锁 4/4 子系统时钟与客户端 `D=0` 无节流收包）。
-
-### v2.3.0 红队安全加固 & 原生画面设置直控 / Security Hardening & Native Graphics UI
-- **原生接管 `ESC -> 设置 -> 画面 -> 刷新率`（零多余控件、零键位冲突）**：
-  - 直接复活克雷原版 `画面 -> 刷新率` 下拉项，**全屏 / 窗口 / 无边框全部解除置灰可用**，原生支持 `60 / 120 / 144 / 165 / 240 / 360 / 无限制`；顺手修复克雷原版 `IsGraphicsDirty()` 漏判刷新率 Bug，全屏切换高帧/无限制时自动映射安全显示器硬件刷新率（杜绝误回退 640×480）。
-  - 在 `画面` 页右列 `动态树影` 下方同风格原位补齐仅有的 2 个新增画面项（`240帧骨骼补帧` + `帧率显示 HUD`），100% 接入克雷原生「修改黄底 -> 应用 / 撤销 -> 持久保存」闭环。
-  - **重度模组零冲突热键**：为兼容数十个 Mod 的玩家，局内热键默认改为 **「禁用」**，同时在 Mod 配置开放 **全键盘自由选键**（`F1~F12` / 小键盘 `0~9` / 功能键 / `A~Z`）+ **`Alt / Ctrl / Shift` 组合修饰键**。
-- **零运行时 `.text` 改写（彻底消除并发指令撕裂）**：将 `FrameLimiter::SetTargetFrameTime`（16B 对齐槽）升级为启动期一次性 14B 永久跳转，运行时切帧改为 **100% 纯原子变量写入**（`0` 运行时 `VirtualProtect`、`0` 指令边界撕裂风险），4 线程 400 万次并发实测 `PAGE_EXECUTE_READ` 恒稳通过。
-- **冷启动线程冻结与 W^X 内存防线**：新增 `ThreadFreezeGuard`（挂起同进程其他线程并逐一核查 `RIP` 寄存器避让碰撞后再写补丁），且全部动态跳板/中继桩安装后立即锁定为 **`PAGE_EXECUTE_READ`**（零常驻 `RWX` 页）。
-- **无锁完整 6/6 `dinput8.dll` 代理 + 模块钉扎**：完整导出并无锁透传 `System32\dinput8.dll` 全部 6 个函数（消除 `InitOnceExecuteOnce` 死锁风险）；接入 `GET_MODULE_HANDLE_EX_FLAG_PIN` 防止卸载悬空，清理 `DllMain` 退出的阻塞/卸载调用，采用严格文件名隔离并移除跨进程扫描。
-- **`ALT_RENDERPATH` 三通配符动态解析 + Fail-Closed 安全熔断**：采用 3 通配符掩码签名动态提取结构偏移，若未来游戏更新导致未匹配则自动禁用主世界骨骼插值（绝不冒险崩溃）；同时在所有早退分支前刷新 `g_tlsLastParentKey`，消除 1 帧/特殊实体对后续特效层的键污染。
-- **实测帧间隔（Real-`dt`）自适应 GC + 周期完成阈值回落**：改用实测 QPC 帧间隔连续缩放增量预算（`0.35ms~1.80ms`），彻底消灭高目标帧率在低帧大基地场景下的 GC 饥饿死区，并在增量周期完成时自动回落紧急阈值；第三方 Mod 的 `deployhelper` / `distancefade` 钩子自动识别保留；直连 Lua VM 桥接激活后自动停止 `Documents\Klei` 磁盘轮询。
-
-### v2.2.1 历史兼容修复 / Previous Hotfix Notes
-- **修复局内热键 F9 / F10 全员失效**：修复 `modmain.lua` 加载期捕获 `TheFrontEnd == nil` 导致的拦截 Bug，并在 `dinput8.dll` 新增 `luaL_openlibs` **0ms 直通 Lua VM 原生桥接**。
-- **彻底修复老麦暗影陷阱/暗影囚笼闪退**（及植物人藤蔓陷阱、月雹、裂隙等 `ALT_RENDERPATH` 资产闪退）与三通道独立定长数组池隔离。
-- **彻底修复 ShowMe（中文 / 原版）默认不显示详情冲突**与 **独行长路 (Don't Starve Alone)** 多模组世界生成兼容问题。
+> **《饥荒联机版》（Don't Starve Together 64-bit）纯客户端旗舰级体验增强套件**  
+> **Client-Only Performance, Ultra-Low-Latency Input & Player-First Eye-Care Visual Suite for DST 64-bit**
 
 ---
 
-## 核心特性 / Key Features
+## 核心定位：DST 三大体验支柱 × 玩家优先五铁律
 
-本套件采用**「Steam 创意工坊纯客户端 Mod + 开源原生引擎伴侣插件 (`dinput8.dll`)」**双轨架构，**100% 纯客户端生效**，不改动任何服务端逻辑、不修改游戏硬盘原始可执行文件 (`dontstarve_steam_x64.exe`)，支持所有官方/公共联机服务器与单人档。
+我们把数十项 C++ 底层逆向与 Lua 引擎优化，收束为玩家打开游戏就能直观感受到的 **三大体验支柱**：
 
-### 1. 原生引擎级优化 (`bin64/dinput8.dll` · Universal x86-64)
-- **突破 60 帧锁定 + 混合精准限帧器 (Hybrid Frame Pacer)**  
-  通过跨版本特征码 (AOB) 动态解除官方 60 FPS 硬编码上限（支持 `60 / 120 / 144 / 165 / 240 / 360 / 无限制`），并开启 2 字节混合限帧补丁（`Sleep(1) + 2ms` 精准自旋等待），兼顾极致帧时间平滑与低 CPU 功耗。
-- **全实体真 240 帧三通道 2D 骨骼动画补帧 (True 240fps Full-World Skeletal Tweening)**  
-  Hook 引擎底层 `Animation::GetFrame` 全部 3 条渲染管线（**主世界实体 + FollowSymbol 特效层 + UI/AnimNode**），直接锁定底层持久化 `AnimNode*`（解决每帧临时渲染指令地址漂移问题），采用 **8,192 槽位 4 路 LRU 追踪器 + 连续浮点 QPC 亚刻插值**，覆盖全屏所有玩家、怪物、Boss（梦魇疯猪/巨鹿/龙蝇等）、制作/跳跃/攻击及加速动画：
-  - 使用 **2D 列向量极分解 (Polar Decomposition)** 对齐旋转角与缩放因子，消除线性混合导致的骨骼萎缩与剪切畸变。
-  - 采用**两段式骨骼配对**（先精确配对 `(layer_hash, symbol_hash, frame_num)`，再对换图挥砍/手部/Boss 爪部执行 `(layer_hash, symbol_hash)` 矩阵平滑并在中点换图），搭配 **Boss 级 `420px / 135°` 位移旋转保护**与镜像翻转保护。
-  - 局内可直接通过 **`ESC -> 设置 -> 画面`** 随时一键开关（或配置自定义热键），支持同屏 A/B 盲测对比！
-- **平滑 240Hz Lua GC 调度器 & 反卡顿冻屏保护 (`Simulation::CollectGarbage` Hook)**  
-  - 针对官方每帧固定 `1.0ms` GC 预算在 240Hz 下侵占 24% 帧时间的问题，结合心跳帧避让与并发平滑策略将单帧增量预算收束至 **`0.30~1.60ms`**（总回收吞吐优于原版，而单帧最大 GC 尖峰压低 **3×**，显著拉高 1% Low 帧率！）。
-  - 将官方激进的 `1.5×` Stop-The-World 全量 GC 触发线升级为紧急安全兜底（`max(2.5×, +256MB)`），彻底消除打 Boss / 大型基地时的 `60~200ms` 主线程瞬冻，同时保留防第三方漏内存 Mod 的 OOM 保护。
-- **2.5 倍极速加载：`libdeflate v1.23` + 硬件 `rep stosb` 修复**  
-  - 接管游戏陈旧的 2005 版 `zlib 1.2.3` + `minizip` 16KB 分片解压循环，替换为现代 **`libdeflate v1.23`** 整块极速解压（运行时按 CPUID 自动调度 AVX-512 / AVX2 / BMI2 / SSE2，兼容所有 64 位 x86-64 CPU）。
-  - 修复 MSVC 2008 编译遗留的 `std::vector<uint8_t>::_Insert_n` 逐字节清零热点循环，原地替换为 CPU 硬件 `rep stosb` 指令。
-- **系统级调度与磁盘预热**  
-  开启 1ms Windows 高精度系统定时器 (`timeBeginPeriod(1)`)、将客户端进程平滑提升至 `ABOVE_NORMAL_PRIORITY_CLASS`（绝不抢占本地子专服建图 CPU，亦绝不扫描或干涉其他进程），并异步将 `data/databundles/*.zip` 预热进系统文件缓存。
+1. **画面流畅（Visual Smoothness）—— 让整个世界以 240Hz 连续呼吸**
+   - 全场景 **240Hz 同相补帧闭环**：主世界/特效/UI 三通道 2D 骨骼、关延迟补偿世界坐标 (`WorldPos240`)、全引擎 VFX 与旧版粒子（雨雪/火星/法术）、移动火把/萤火虫动态光源、跟拍镜头与头顶对话气泡 (`FollowText`)、以及 `TrueScrollArea` / 聊天窗 / 小地图缩放。
+   - **零争抢 RTSS 级内核稳帧 (`FrameLimiter::Wait`)** + **GLES2 状态镜像缓存** + **合成栏零卡顿 (`CraftingMenu Zero-Stall`)** + **单人/本地建房引擎级三件套（`FastAStar` 25× 寻路 + `FastDataDumper` 155MB/s 存档 + `libdeflate` 2.5× 极速加载）**。
+2. **操作低延迟（Ultra-Low Latency）—— 走 A、切装、闪避零粘滞**
+   - **D3D9Ex 硬件 1 帧渲染队列（DST 版 Reflex）**：将 ANGLE 后台帧队列从默认 `3` 帧压至 `1` 帧，砍掉 `8~33ms` 显示管线积压延迟。
+   - **240Hz 边沿直发操控**：键盘 WASD 走位、`F` 攻走 A / `Ctrl+LMB` 强制攻击防漏、空格交互、急甩鼠标左右键即时解析，配合 **RakNet 零停顿事件唤醒**，彻底消除 `0~33.3ms` 逻辑刻等待与 `0~10ms` 发包滞留。
+3. **画质提升（Player-First Eye-Care Visuals）—— 服务于眼睛，拒绝算法炸弹**
+   - 严格遵守 **玩家优先五铁律**：
+     1. **默认 100% 原版纯净**（安装即零额外视觉负担）；
+     2. **绝不强迫开启任何后处理**（连 `BloomSampler` 都原封不动）；
+     3. **全部 9 项精修独立开关**，支持局内侧边面板 (`c_hsmenu()`) 0ms 实时微调对比；
+     4. **关闭后 100% 完整恢复原版表现**；
+     5. **尊重 99% 饥荒玩家关闭「泛光/摇晃/失真/闪烁」的护眼习惯**（关泛光同样全效，绝不做刺眼爆白特效）。
 
-### 2. 纯客户端 Lua Mod (`mods/dst_smooth_highfps/`)
-- **全套原版高刷新率 Bug 修复**：
-  - `FollowCamera`：60Hz 等效精确指数阻尼，消除高刷镜头手感偏移。
-  - `TrueScrollList` & `ChatScrollList`：修复制作栏、模组列表、服务器列表、皮肤、图鉴、聊天窗硬编码 `Lerp(..., 0.25)` 在 240Hz 下滚轮 **4 倍过快** 的问题。
-  - `MapScreen`：修复小地图按键缩放硬编码 `1/60` 在 240Hz 下 **4 倍过快** 的问题。
-  - `DeployHelper`：修复灭火器/避雷针/发电机等建筑放置辅助圈按帧递减导致 240Hz 闪烁的问题。
-- **240Hz 零冗余 CPU & GC 减负**：
-  - `DistanceFade`：将树冠/洞穴柱体透明淡出改为零分配标量点积，消除 240Hz 下每秒数千次 `Vector3` 临时表分配。
-  - `Input:OnUpdate`：静止帧无损缓存鼠标实体拾取结果（鼠标移动/镜头移动/界面切换 0ms 零延迟刷新；静止时跳过 ~75% 冗余 C++ 实体扫描与表分配；100% 兼容 ShowMe / Insight）。
-- **联机上下洞穴免重加载加速**：跨 `SimReset` 保活地面 (`forest`)、洞穴 (`cave`) 与角色资产常驻内存（自动旁路独行长路单人模式与本地主机），联机往返地面与洞穴跳过重复解压与重载；退回主界面自动安全释放（建议 >= 8GB 内存）。
-- **模组与网络等待全清空**：缓存未启用模组 `modinfo` 免重复读盘、跳过 Steam 热门模组榜请求 (`QueryTopMods`)、跳过主界面 MOTD 远程海报阻塞等待（不影响登录与联机）。
-- **轻量右上角 FPS / 1% Low / P99 HUD & 原生画面设置直控**：直接接入 `ESC -> 设置 -> 画面 -> 刷新率` 及同页骨骼补帧/HUD 开关，通过 `dinput8.dll` 原生 Lua VM 桥接 0ms 即时联动（并可选自定义热键与多路径文件桥接兜底）。
+---
+
+## v2.6.0 超级大版本核心更新 / What's New in v2.6.0
+
+### 1. 画面流畅全面闭环
+- **全引擎 240Hz 粒子与动态光源补帧**：新增 `ParticleManager::Update` + `VFXRenderCmd` + `EmitterRenderCmd` 与 `LightMap::GenerateRenderData` 底层 240Hz 连续插值，雨滴、雪花、火星、法术粒子与提灯/火把光圈彻底告别 30Hz 抽帧。
+- **社区反馈多粒子骨骼专项修复 + 沃尔夫冈举哑铃丝滑修复**：
+  - 针对**萤火虫、秋天飘落树叶、池塘波纹反光**升级为全局最近邻 + `2-opt` 反交叉匹配器，彻底消除萤火虫分裂成 5 个静止光点与落叶跨树拉丝。
+  - 将共享层判定升级为严格 **「刚体骨骼层 vs 动态粒子层」双射分流**（`isParticleLayer`），全面解救角色 `arm_carry` 等 6 部件复合骨骼层在高速运动时的 48px 误杀（沃尔夫冈大力士举哑铃拒补 `22→0`、变身 `89→0`、全角色挥刀攻击 `59→3`，同时 `tree_leaf_fx` 防拉丝 100% 保留）。
+  - 新增 **单次无缝自重播回绕插值**（`playMode == 0` 末帧即时重播识别），抹平举哑铃、砍树、挖矿等每轮动作末尾的 1 帧顿挫。
+- **合成栏零卡顿 + 全滚动面板/头顶气泡 240Hz**：优化 `CraftingMenu` 配方刷新为 $O(\text{slots})$ 增量查表并延迟隐藏面板重绘；补齐 `TrueScrollArea` 与 `FollowText` 对话气泡 240Hz 同步（严守 ShowMe / Insight 零冲突红线）。
+- **单人 / 无洞穴本地建房三件套**：主进程本地建房时自动启用客户端内置 **`O(N log N)` `FastAStar` 寻路**、**`155 MB/s` `FastDataDumper` 序列化**与 **`libdeflate` `compress2`**，大幅削减单人档清晨自动存档冻屏与巨型围墙基地卡顿。
+- **GLES2 状态镜像缓存 (`gl_state_cache.h`)**：过滤 ANGLE 冗余 `glBindTexture` / `glUseProgram` / `glActiveTexture` 状态切换，降低大基地渲染线程开销。
+
+### 2. 操作低延迟全面打通
+- **D3D9Ex 1 帧低延迟队列（DST 版 Reflex）**：拦截 ANGLE `applyTextures` 现场设置 `SetMaximumFrameLatency(1)`（支持局内开关随时还原为原版 `3`）。
+- **240Hz 战斗与交互低延迟**：支持关延迟补偿下 `Ctrl+LMB` 修饰键急甩防漏、走位取消攻击方向守卫、WASD/攻击边沿即时发包，全面兼容纯原版公共服与 `HyperCore Server` 60Hz 逻辑刻。
+
+### 3. 画质精修与局内实时微调面板
+- **局内悬浮侧边微调面板 (`hs_panel.lua` / `c_hsmenu()`)**：不暂停游戏、不遮挡视野，支持 4 组预设（「原版纯净 / 护眼高清 / 柔和绘本 / 自定义」）+ **9 项独立画质开关**（新增 **原生纹理防虚化 `Mip LOD -0.45`** 与 **暗夜/洞穴护眼层次 `31.5 LUT`**）+ **0ms 无重载热切 `0.5× ⇄ 1.0×` 光照图 + 篝火 8-bit 防色带** + 一键恢复原版纯净。
+- **旧版 `bin64\dinput8.dll` 智能更新提示条**：利用 `HyperSmooth_Version()` 自动校验工坊 Lua 与本地手工 DLL 版本；若玩家工坊已升级但 `bin64\dinput8.dll` 仍停留在旧版（如导致玻璃雨崩溃的 `v2.2.0`），进世界轻量提示 1 次并在侧边面板顶部常驻醒目琥珀黄更新条。
+
+### 4. 红队安全加固与 LuaJIT2 零冲突兼容
+- **全量 R3.1 红队安全收口**：`ThreadFreezeGuard` 退出码严格白名单 Fail-Closed、`FastAStar` 64 位单调代数 `gen` 根除同槽位 ABA、多 OpenGL 上下文 Shader 溢出表查重与 `glGetProgramiv` 完整门控、无锁 `exchange(0)` 帧计数与 `>=500ms` 严重卡顿归因捕获、全部跳板 W^X 只读锁定 (`PAGE_EXECUTE_READ`)。
+- **`DontStarveLuaJIT2` (工坊 `3444078585`) 自动兼容**：冷启动自动识别 `lua51DS.dll` / `Injector.dll` / 本地 `bin64\Winmm.dll` 代理并自动跳过 `mimalloc lua_newstate` 钩子，LuaJIT2 玩家开箱即用无需手改 `.ini`。
+- **配套开源一键安装/更新工具（`tools/一键安装与更新.bat`）**：自动探测 Steam 多盘库 / WeGame 路径、防游戏占用、旧 DLL 自动备份、SHA256 逐字节校验与一键卸载恢复纯净原版。
 
 ---
 
 ## 实测性能数据 / Verified Benchmarks
 
-测试环境：`Windows 10 Pro x64 · Intel i7-12700KF · RTX 4060 · 32GB RAM · 240Hz 显示器 · DST 64-bit Build 762172`
+测试环境：`Windows 10/11 x64 · Intel i7-12700KF · RTX 4060 · 32GB RAM · 240Hz · DST 64-bit Build 762172`
 
-| 优化项 / Benchmark | 原版 / Vanilla | HyperSmooth v2.4.0 | 实测收益 / Gain |
+| 优化项 / Benchmark | 原版 / Vanilla | HyperSmooth v2.6.0 | 实测收益 / Gain |
 | :--- | :---: | :---: | :---: |
-| 进图 `LOAD BE` 资产解压加载 | `10.05s` | **`4.0s`** | **提速 2.5×** |
-| `std::vector::_Insert_n` 清零热点 | `2.86s` | **`0.69s`** | **提速 4.1×** |
-| Zip 解压吞吐 (`libdeflate v1.23`) | ~330 MB/s | **`830+ MB/s`** (`12,960/12,960` 100% 命中) | **3.32 GB 仅约 4 秒** |
-| 联机洞穴 ⇄ 地面折返资源重载 | 重复卸载并重载 | **`0.0 MB` 零重载** | **纯客户端跳过重读** |
-| 2D 骨骼动画 & 关延迟补偿位移 | 锁定 30Hz 阶梯跳动 | **真 240Hz 三通道骨骼 + 世界坐标插值** | **300×18 骨骼匹配 `292 -> 67 µs` (4.3× 提速)** |
-| 单帧增量 Lua GC 最大尖峰 | `1.00ms` + 突发 `60~200ms` 全量冻屏 | **`0.30~1.60ms`** + 并发平滑避让 + 紧急兜底 | **尖峰压低 3×，Boss 战 Full-GC = 0** |
-| **v2.4.0 RTSS 240Hz 稳帧器实测** | 满核忙等 (`100%` 单核占用) | **`240.0 FPS` / `1%L 221.6~239.1` / 抖动 `0.023ms`** | **85~90% 等待 0% CPU，帧时间刀切级平稳** |
-| **v2.4.0 局内 60Hz 实机压测** | 30Hz + 10ms RakNet 停顿 + 纹理/网格尖峰 | **`234~238 FPS` / `P99 4.3~5.0ms` / `anim 0.01~0.24ms`** | **`301K+` 零拷贝空间查询 + 14 次纹理分片零冻屏** |
+| 进图 `LOAD BE` 资产解压加载 | `10.05s` | **`4.0s`** | **提速 2.5×**（`libdeflate v1.23` + `rep stosb`） |
+| 联机洞穴 ⇄ 地面折返资源重载 | 重复卸载并重载 | **`0.0 MB` 零重载** | **跨 `SimReset` 资产保活** |
+| 全场景 240Hz 补帧覆盖 | 30Hz 骨骼/粒子/光源阶梯 | **骨骼 + VFX 粒子 + 光源 + 镜头 + 气泡全 240Hz** | 300×18 骨骼匹配 `292 → 67 µs` (**4.3× 提速**) |
+| RTSS 240Hz 内核稳帧器 | 满核忙等 (`100%` 单核) | **`240.0 FPS` / `1%L 237.9+` / 抖动 `0.002ms`** | **~82% 等待 0% CPU** |
+| D3D9Ex 渲染管线队列延迟 | 默认 `3` 帧队列 | **`1` 帧硬件 Reflex 队列** | **直降 `8~33ms` 端到端输入延迟** |
+| 单人/本地建房巨型围墙寻路 | 原版 $O(S^2 \log S)$ | **`FastAStar` $O(N \log N)$** | **提速 25×+** |
+| 护眼画质精修（默认原版纯净） | 原版 0.5× 光照/1×AF | **9 项独立开关 · 0ms 热切 `1.0×` 光照** | **RTX 4060 2K 240Hz `Busy ~2.6ms`，VRAM 零暴涨** |
 
 ---
 
-## 玩家安装指南 / Player Installation
+## 玩家安装与更新指南 / Player Installation
 
-### 第一步：安装客户端 Mod
-- **方式 A（Steam 创意工坊）**：直接在 Steam 创意工坊订阅并启用 **HyperSmooth 240FPS & FastLoad**。
-- **方式 B（本地解压安装）**：将压缩包中的 `mods/dst_smooth_highfps` 文件夹复制到游戏根目录的 `mods/` 下（例如 `...\Steam\steamapps\common\Don't Starve Together\mods\dst_smooth_highfps`），进入游戏在「客户端模组」中勾选启用。
+### 第一步：订阅客户端 Mod
+- **Steam 创意工坊**：订阅并启用 **HyperSmooth 240FPS & FastLoad**（或在本地将 `workshop_mod/dst_smooth_highfps` 复制至游戏 `mods/dst_smooth_highfps`）。
 
-### 第二步：安装原生引擎伴侣插件（解锁 240 帧、RTSS 稳帧、mimalloc、骨骼补帧与 2.5 倍加载）
-1. 前往本仓库 **[Releases 页面](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)** 下载最新版 `DST_HyperSmooth_v2.5.0_Release.zip`（或单独下载 `dinput8.dll`）。
-2. 将压缩包中的 `bin64/dinput8.dll` 复制到游戏根目录的 **`bin64/`** 文件夹内（与 `dontstarve_steam_x64.exe` 同目录）。
-3. 正常从 Steam 启动 64 位《饥荒联机版》即可自动生效！
-4. 首次启动后，插件会在 `bin64/` 下自动生成配置文件 `dst_fps.ini` 和运行日志 `dst_fps_plugin.log`（仅在加载完成时输出一条精简汇总，无持续刷屏）。
+### 第二步：安装 / 更新 `bin64/dinput8.dll`（Steam 工坊不会自动更新 DLL，大版本升级请务必同步！）
+- **方式 A（推荐 · 一键傻瓜安装/更新）**：
+  1. 下载并**解压**最新版 `DST_HyperSmooth_v2.6.0_Release.zip`；
+  2. 先关闭饥荒游戏，双击压缩包根目录的 **`一键安装与更新.bat`**，按提示回车即自动完成路径探测、旧版备份、新版覆盖与 SHA256 校验（卸载选 `2` 即可 100% 恢复原版）。
+- **方式 B（手动安装）**：
+  1. 将压缩包中的 `bin64/dinput8.dll` 复制到游戏根目录的 **`bin64/`**（与 `dontstarve_steam_x64.exe` 同目录），覆盖旧文件；
+  2. 正常启动 64 位《饥荒联机版》，局内按 `c_hsmenu()` 看到顶部绿条 `已直连 bin64/dinput8.dll v2.6.0` 即代表全部就绪！
 
-> **如何卸载 / Uninstall**  
-> 直接删除 `bin64/dinput8.dll`（及生成的 `dst_fps.ini`、`dst_fps_plugin.log`）并在游戏内取消勾选 Mod 即可 100% 恢复原版，不留任何残留。
-
----
-
-## 局内调节与自定义热键 / In-Game Controls & Custom Hotkeys
-
-- **推荐方式（零冲突 · 原生习惯）**：主界面或游戏局内直接按 **`ESC` -> 设置 -> 画面**：
-  - 直接调整官方 **`刷新率`** 选项即可 0ms 实时切换 `60 / 120 / 144 / 165 / 240 / 360 / 无限制`（窗口化与全屏均已解锁可用！）。
-  - 同页右列下方可直接开关 **`240帧骨骼补帧`** 与 **`帧率显示 HUD`**，点原生 **「应用」** 即持久生效。
-- **真·全按键自由录制热键**（默认全部禁用零冲突；启用并应用后可在 Mod 配置页或 **`ESC -> 设置 -> 控制` 页面底部** 直接点击并按下任意键盘按键或鼠标中键/侧键 4/侧键 5 实时改绑）：
-
-| 配置项 | 功能说明 | 可自由绑定范围 |
-| :---: | :--- | :--- |
-| **循环切换帧率热键** | 局内循环切换 `60 -> 120 -> 144 -> 165 -> 240 -> 360 -> 无限制` | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
-| **开关骨骼补帧热键** | 局内实时开关 **真 240 帧骨骼与位移补帧**（同屏 A/B 盲测） | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
-| **开关帧率 HUD 热键** | 局内一键显示/隐藏右上角实时 FPS / 1% Low HUD | `禁用(默认) / 全键盘任意键 / 鼠标中键与侧键 4、5` |
+> **兼容提示**：
+> - **LuaJIT2 玩家**：`v2.6.0` 已自动识别 `DontStarveLuaJIT2` 并避让内存分配器冲突，无需手动改 `.ini`（建议在 LuaJIT 配置中避免同时开启功能重叠的 `plugin_fps_render`）。
+> - **双显卡笔记本**：若游戏内帧数停在 `150 FPS` 左右，在显卡控制面板切为 **独显直连** 即可跑满 `240+ FPS`。
 
 ---
 
-## 原生插件配置参考 (`bin64/dst_fps.ini`)
+## 局内调节与控制台指令 / In-Game Controls
 
-若安装了 Steam 创意工坊 Mod，游戏内 `ESC -> 设置 -> 画面` 与自定义热键通过 0ms 原生内存桥接即时联动；若单独使用 `dinput8.dll`，可直接编辑 `bin64/dst_fps.ini`（保存后 1 秒内热生效）：
-
-```ini
-[FPS]
-target_fps=240
-
-[OPTIMIZE]
-high_res_timer=1
-boost_priority=1
-prewarm_bundles=1
-rtss_frame_pacer=1
-hybrid_frame_pacer=1
-fast_mimalloc_lua=1
-fast_vector_fill=1
-fast_libdeflate_zip=1
-fast_zlib_inflate=1
-smooth_skeletal_anim=1
-world_pos_interp=1
-raknet_zero_stall=1
-low_latency_gpu_sync=1
-smooth_lua_gc=1
-fast_spatial_query=1
-timeslice_tex_upload=1
-```
+- **`ESC -> 设置 -> 画面`**：直接调整官方 `刷新率`（`60~360 / 无限制`，全屏与窗口均已解锁）以及右列下方 `240帧骨骼补帧` / `帧率显示 HUD` / `画质增强`。
+- **局内实时悬浮面板**：控制台输入 `c_hsmenu()`（或在 `ESC -> 设置 -> 控制` 底部录制任意快捷键/鼠标侧键）随时滑出右侧半透明微调面板。
+- **常用诊断指令**：`c_hsopt("off")` 一键恢复原版、`c_hsvisual()` 查看画质与显存遥测、`c_hslatency()` 查看 D3D9Ex / 急甩防漏 / 合成表 / 本地建房加速指标、`c_hsbench()` 常驻耗时监测。
 
 ---
 
-## 进阶说明与已知引擎特性 / Technical Notes
+## 安全性与开源构建 / Safety & Build
 
-- **关闭延迟补偿时的世界坐标插值 (`world_pos_interp=1`)**：经反汇编验证，开延迟补偿时由本地 `Locomotor` 在 `WallUpdate` 连续推进位置；关闭延迟补偿后远程客户端仅有服务端快照按 30Hz/60Hz 写入的离散坐标，因此在 `dinput8.dll` v2.4.0 中以渲染端纯视觉连续插值（带瞬移/传送/上船熔断保护）填补帧间阶梯，丝滑且 100% 不触碰任何服务端逻辑判定。
-- **异步纹理时间片 (`timeslice_tex_upload=1`)**：不强行篡改游戏 `texture_streaming` 策略，而是仅在局内实际发生按需异步纹理上传爆发时按 `1.2ms/帧` 分帧消化，读图期间全速无限制，兼顾零白块与 Boss 并发防冻屏。
-- **避免重复订阅同类功能 Mod**：若同时启用两份功能重叠的 Mod（如多份 Global Positions），会额外拖慢进图并增加内存开销，建议保持精简。
-
----
-
-## 作者发布指南 / Steam Workshop Upload Steps
-
-1. 确保 `mods/dst_smooth_highfps/` 内完整包含 4 个文件：`modinfo.lua`、`modmain.lua`、`modicon.tex`、`modicon.xml`。
-2. 在 Steam 库 -> 工具中启动 **Don't Starve Mod Tools**，打开 **Mod Uploader**。
-3. 选择本地目录 `mods/dst_smooth_highfps`，预览图上传本发布包根目录自带的 **`workshop_preview.png`** (`512x512`)。
-4. 在工坊简介中附上 `bin64/dinput8.dll` 的下载链接（例如 GitHub Release / 网盘链接），即可供所有玩家一键搭配使用！
-
----
-
-## 安全性与兼容性声明 / Safety & Compatibility
-
-- **零磁盘篡改与完整 6/6 透传**：`dinput8.dll` 完整无锁透传 `System32\dinput8.dll` 全部 6 个导出函数，仅对 `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe` 生效（其他进程 0 线程 0 日志纯透传）；不 Hook D3D9/OpenGL 虚表（100% 兼容 Steam 覆盖层 / RTSS / NVIDIA 滤镜），所有跳板执行 W^X 只读固化 (`PAGE_EXECUTE_READ`)，运行时零 `.text` 写入。
-- **跨更新安全 (Fail-Closed)**：若未来游戏更新导致某条特征码变化，对应模块会自动安全跳过而不崩溃（主世界骨骼插值严格受 `ALT_RENDERPATH` 特征码熔断保护）；通用 x86-64 编译，零第三方 C++ 运行时依赖（纯 Windows UCRT），SIMD 由 `libdeflate` 运行时动态检测。
-- **纯客户端合规**：不修改任何联机同步数据、判定逻辑或服务端行为。
+- **零磁盘篡改与严格隔离**：完整无锁透传 `System32\dinput8.dll` 全部 6 个导出函数；严格按进程名隔离，仅在 `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe` 生效；全部代码跳板执行 W^X 只读固化 (`PAGE_EXECUTE_READ`)，运行时零 `.text` 写入，跨版本 AOB 均具备 Fail-Closed 熔断保护。
+- **纯开源构建**：使用 Zig (`x86_64-windows-gnu`, `-std=c++20 -O3`) 运行 `tools/build_native.ps1` 即可零警告编译零依赖纯 UCRT `dinput8.dll`。
