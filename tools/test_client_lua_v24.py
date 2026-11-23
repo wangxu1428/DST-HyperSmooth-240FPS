@@ -875,7 +875,7 @@ AddSimPostInit(function()
             function w:SetHAnchor() end
             function w:SetVAnchor() end
             function w:SetScaleMode() end
-            function w:SetPosition() end
+            function w:SetPosition(x, y, z) self._pos = { x, y, z } end
             function w:ScaleToSize() end
             function w:SetTint() end
             function w:SetColour() end
@@ -957,6 +957,10 @@ AddSimPostInit(function()
         assert(type(env4.HS_TogglePanel) == "function" and type(env4.HS_PanelApi) == "table", "HS_PanelApi / HS_TogglePanel missing!")
         fakeG4.c_hsmenu(true)
         assert(#mock_hud.children == 1 and mock_hud.children[1].visible == true, "Live panel failed to build & show on PlayerHUD!")
+        assert(mock_hud.children[1]._pos == nil, "Proportional anchor root MUST remain at (0,0,0) to prevent raw-pixel clipping!")
+        local body = mock_hud.children[1].children[1]
+        assert(body ~= nil and body._pos ~= nil and body._pos[1] <= -210,
+               "Panel body proportional X offset missing or too far right: " .. tostring(body and body._pos and body._pos[1]))
         -- Toggle 1.0x LightMap via panel API -> sets native_full_lm=true & light_dither=1.0!
         env4.HS_PanelApi.ToggleVisualFlag("full_lm")
         assert(native_full_lm == true and native_hd2d ~= nil and math.abs(native_hd2d[7] - 1.0) < 1e-4, "Panel full_lm toggle failed!")
@@ -1522,6 +1526,162 @@ AddSimPostInit(function()
         print("[CLIENT_V24_TEST] 11. TrueScrollArea 240Hz + FollowText 240Hz + FastDataDumper Fail-Reasons + RPC 30->60->30 PASS")
     end
 
+    -- =========================================================================
+    -- TEST 12: MapScreen 240Hz Zoom Norm & Stationary Throttle + Placer & DeployHelper
+    -- =========================================================================
+    do
+        local class_hooks = {}
+        local comp_hooks = {}
+        local sim_post = {}
+        local mock_tick = 500
+        local mock_time = 10.0
+        local mock_mx, mock_my = 400, 300
+        local mock_hud_ent = nil
+        local mock_world_ent = nil
+        local deploy_raw_calls = 0
+
+        local fakeG12 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
+            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            math = G.math, string = G.string, table = G.table,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error, debug = G.debug,
+            GetTimeRealSeconds = function() return mock_time end,
+            TheFrontEnd = { GetHUDScale = function() return 1.0 end },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+                GetTick = function() return mock_tick end,
+                GetTickTime = function() return 1/30 end,
+                GetPosition = function() return mock_mx, mock_my end,
+            },
+            TheInput = {
+                OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end,
+                GetHUDEntityUnderMouse = function() return mock_hud_ent end,
+                GetWorldEntityUnderMouse = function() return mock_world_ent end,
+            },
+            TriggerDeployHelpers = function(x, y, z, range, recipe, placerinst)
+                deploy_raw_calls = deploy_raw_calls + 1
+            end,
+            require = function() return {} end,
+        }
+        local env12 = {
+            GLOBAL = fakeG12,
+            GetModConfigData = function(k)
+                if k == "smooth_ui_240hz" or k == "reduce_240hz_churn" then return true end
+                return false
+            end,
+            AddClassPostConstruct = function(cls, fn) class_hooks[cls] = fn end,
+            AddComponentPostInit = function(c, fn) comp_hooks[c] = fn end,
+            AddPrefabPostInit = function() end,
+            AddSimPostInit = function(fn) sim_post[#sim_post + 1] = fn end,
+            AddClientModRPCHandler = function() end,
+        }
+        local fn_m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fn_m, env12)
+        fn_m()
+        for _, fn in ipairs(sim_post) do fn() end
+
+        -- 12a) MapScreen zoom scaling (dt=1/240 -> 0.25x, dt=1/60 -> 1.0x, orig_sens ALWAYS restored!)
+        assert(type(class_hooks["screens/mapscreen"]) == "function", "mapscreen hook missing!")
+        local sens_seen_240, sens_seen_60 = nil, nil
+        local autoaim_calls, mapact_calls = 0, 0
+        local ms = {
+            zoomsensitivity = 15,
+            zoom_target_time = 0,
+            decorationdata = { dirty = false, alwaysdirty = false },
+            minimap = { GetZoom = function() return 2.5 end },
+            GetWorldPositionAtCursor = function() return 10, 0, 20 end,
+            AutoAimToStaticDecorations = function(s, x, y, z) autoaim_calls = autoaim_calls + 1; return x, y, z end,
+            UpdateMapActions = function(s, x, y, z) mapact_calls = mapact_calls + 1; return { action = "LOOK" }, nil end,
+            UpdateMapActionsDecorations = function() end,
+            OnControl = function() return true end,
+            OnMinimapMoved = function() end,
+            OnBecomeActive = function() end,
+            OnUpdate = function(s, dt)
+                if math.abs(dt - 1/240) < 1e-4 then sens_seen_240 = s.zoomsensitivity end
+                if math.abs(dt - 1/60) < 1e-4 then sens_seen_60 = s.zoomsensitivity end
+                local x, y, z = s:GetWorldPositionAtCursor()
+                local ax, ay, az = s:AutoAimToStaticDecorations(x, y, z)
+                local lmb, rmb = s:UpdateMapActions(ax, ay, az)
+                s:UpdateMapActionsDecorations(x, y, z, lmb, rmb)
+            end,
+        }
+        class_hooks["screens/mapscreen"](ms)
+        ms:OnUpdate(1/60)
+        assert(math.abs(sens_seen_60 - 15.0) < 1e-4 and ms.zoomsensitivity == 15, "MapScreen 60Hz zoomsensitivity wrong!")
+        ms.zoom_target_time = 0
+        mock_time = mock_time + 0.004
+        ms:OnUpdate(1/240) -- stationary -> throttle hit!
+        assert(math.abs(sens_seen_240 - 3.75) < 1e-3 and ms.zoomsensitivity == 15, "MapScreen 240Hz zoomsensitivity scaling/restore wrong!")
+        mock_time = mock_time + 0.004
+        ms:OnUpdate(1/240)
+        assert(autoaim_calls == 1 and mapact_calls == 1, "Stationary MapScreen should skip redundant 240Hz scans: got " .. autoaim_calls .. "/" .. mapact_calls)
+        assert((fakeG12.HS_MAP_SKIP_COUNT or 0) >= 2, "HS_MAP_SKIP_COUNT not incremented!")
+        -- Mouse move or OnControl or 34ms elapsed must recompute immediately
+        mock_mx = 405
+        mock_time = mock_time + 0.004
+        ms:OnUpdate(1/240)
+        assert(autoaim_calls == 2 and mapact_calls == 2, "Mouse movement on MapScreen must bypass throttle!")
+        mock_time = mock_time + 0.040
+        ms:OnUpdate(1/240)
+        assert(autoaim_calls == 3 and mapact_calls == 3, ">33.3ms expiry on MapScreen must refresh!")
+        -- Error inside wrapped MapScreen:OnUpdate MUST still restore zoomsensitivity!
+        local saved_inner = ms.AutoAimToStaticDecorations
+        ms.AutoAimToStaticDecorations = function() error("boom") end
+        mock_time = mock_time + 0.040
+        local ok_err = G.pcall(ms.OnUpdate, ms, 1/240)
+        assert(not ok_err and ms.zoomsensitivity == 15, "zoomsensitivity leaked after MapScreen error!")
+        ms.AutoAimToStaticDecorations = saved_inner
+
+        -- 12b) Placer:TestCanBuild same-tick pose memoization + invalidation
+        assert(type(comp_hooks["placer"]) == "function", "placer hook missing!")
+        local px, py, pz, prot = 4.0, 0.0, 8.0, 0.0
+        local active_item_obj = { prefab = "boards" }
+        local tcb_calls = 0
+        local pl = {
+            axisalignedplacementtoggle = false,
+            builder = { inst = { replica = { inventory = { GetActiveItem = function() return active_item_obj end } } } },
+            inst = { Transform = { GetWorldPosition = function() return px, py, pz end, GetRotation = function() return prot end } },
+            TestCanBuild = function(s)
+                tcb_calls = tcb_calls + 1
+                return px >= 0, (mock_hud_ent ~= nil)
+            end,
+        }
+        comp_hooks["placer"](pl)
+        local c1, b1 = pl:TestCanBuild()
+        local c2, b2 = pl:TestCanBuild()
+        local c3, b3 = pl:TestCanBuild()
+        assert(c1 == true and b1 == false and c2 == true and c3 == true and tcb_calls == 1,
+               "Placer:TestCanBuild failed same-tick identical-pose memo: calls=" .. tcb_calls)
+        assert((fakeG12.HS_PLACER_SKIP_COUNT or 0) == 2, "HS_PLACER_SKIP_COUNT wrong!")
+        px = 4.02 -- move > 0.001u
+        pl:TestCanBuild()
+        assert(tcb_calls == 2, "Placer pose move must invalidate cache!")
+        mock_hud_ent = {} -- hover HUD mid-tick
+        local c4, b4 = pl:TestCanBuild()
+        assert(tcb_calls == 3 and b4 == true, "HUD hover change must invalidate Placer cache!")
+        mock_hud_ent = nil
+        mock_tick = mock_tick + 1 -- next sim tick
+        pl:TestCanBuild()
+        assert(tcb_calls == 4, "Next sim tick must invalidate Placer cache!")
+
+        -- 12c) TriggerDeployHelpers same-tick dedup + move/tick/expiry pass-through
+        local rec_a = { name = "wall_stone" }
+        local pinst = {}
+        fakeG12.TriggerDeployHelpers(10, 0, 10, 64, rec_a, pinst)
+        fakeG12.TriggerDeployHelpers(10.05, 0, 10.05, 64, rec_a, pinst)
+        fakeG12.TriggerDeployHelpers(10.10, 0, 10.10, 64, rec_a, pinst)
+        assert(deploy_raw_calls == 1 and (fakeG12.HS_DEPLOY_SKIP_COUNT or 0) == 2,
+               "TriggerDeployHelpers dedup failed: raw=" .. deploy_raw_calls)
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst) -- >0.25u move
+        assert(deploy_raw_calls == 2, "TriggerDeployHelpers >0.25u move must pass through!")
+        mock_tick = mock_tick + 1
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst) -- next tick
+        assert(deploy_raw_calls == 3, "TriggerDeployHelpers next tick must pass through!")
+
+        print("[CLIENT_V24_TEST] 12. MapScreen 240Hz Zoom/Throttle + Placer:TestCanBuild + TriggerDeployHelpers PASS")
+    end
+
     print("[CLIENT_V24_TEST] ALL_PASS")
     G.c_shutdown(false)
 end)
@@ -1558,7 +1718,8 @@ def main():
         exe = os.path.join(BIN64, "dontstarve_dedicated_server_nullrenderer_x64.exe")
         proc = subprocess.run(
             [exe, "-persistent_storage_root", STORAGE, "-conf_dir", "DoNotStarveTogether",
-             "-cluster", CLUSTER_NAME, "-shard", "Master", "-offline", "-port", "11016"],
+             "-cluster", CLUSTER_NAME, "-shard", "Master", "-offline", "-port", "11016",
+             "-steam_master_server_port", "27029", "-steam_authentication_port", "8779"],
             cwd=BIN64, capture_output=True, text=True, timeout=60
         )
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")

@@ -44,6 +44,7 @@
 #include "libdeflate.h"
 #include "mimalloc.h"
 #include "gl_state_cache.h"
+#include "fs_neg_cache.h"
 #include "fast_astar.h"
 #include "fast_astar_manager.h"
 #include "fast_dumper.h"
@@ -98,6 +99,28 @@ using GlBlendFunc_t = void (WINAPI*)(uint32_t sfactor, uint32_t dfactor);
 using GlDepthMask_t = void (WINAPI*)(uint8_t flag);
 using GlEnable_t = void (WINAPI*)(uint32_t cap);
 using GlDisable_t = void (WINAPI*)(uint32_t cap);
+using GlBindBuffer_t = void (WINAPI*)(uint32_t target, uint32_t buffer);
+using GlDeleteBuffers_t = void (WINAPI*)(int32_t n, const uint32_t* buffers);
+using GlBlendEquation_t = void (WINAPI*)(uint32_t mode);
+using GlColorMask_t = void (WINAPI*)(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+using GlCullFace_t = void (WINAPI*)(uint32_t mode);
+using GlDepthFunc_t = void (WINAPI*)(uint32_t func);
+using GlEnableVertexAttribArray_t = void (WINAPI*)(uint32_t index);
+using GlDisableVertexAttribArray_t = void (WINAPI*)(uint32_t index);
+using GlFrontFace_t = void (WINAPI*)(uint32_t mode);
+using GlScissor_t = void (WINAPI*)(int32_t x, int32_t y, int32_t width, int32_t height);
+using GlViewport_t = void (WINAPI*)(int32_t x, int32_t y, int32_t width, int32_t height);
+using GlUniform1f_t = void (WINAPI*)(int32_t location, float x);
+using GlUniform1i_t = void (WINAPI*)(int32_t location, int32_t x);
+using GlUniform2fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* v);
+using GlUniform3fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* v);
+using GlUniformMatrix3fv_t = void (WINAPI*)(int32_t location, int32_t count, uint8_t transpose, const float* value);
+using GlUniformMatrix4fv_t = void (WINAPI*)(int32_t location, int32_t count, uint8_t transpose, const float* value);
+using GetFileAttributesW_t = DWORD (WINAPI*)(LPCWSTR lpFileName);
+using MoveFileExW_t = BOOL (WINAPI*)(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
+using CopyFileW_t = BOOL (WINAPI*)(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, BOOL bFailIfExists);
+using DeleteFileW_t = BOOL (WINAPI*)(LPCWSTR lpFileName);
+using CreateDirectoryW_t = BOOL (WINAPI*)(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
 using GameRender_t = void (*)(void* self, void* renderData);
 using PostProcessorRender_t = void (*)(void* pp, void* renderData, uint32_t primaryTexHandle);
 using CreateDXGIFactory1_t = HRESULT (WINAPI*)(REFIID riid, void** ppFactory);
@@ -138,6 +161,9 @@ std::atomic<bool> g_optD3d9ExLowLatency{true};
 std::atomic<bool> g_optFastSpatialQuery{true};
 std::atomic<bool> g_optTexTimeSlice{true};
 std::atomic<bool> g_optGlStateCache{true};
+std::atomic<bool> g_optGlUniformCache{true};
+std::atomic<bool> g_optFsNegCache{true};
+std::atomic<bool> g_optAdaptiveDeJitter{true};
 std::atomic<uint32_t> g_glCacheResetGen{1};
 std::atomic<uint32_t> g_displayRefreshHz{0};
 std::atomic<int>  g_visualAnisoLevel{1};
@@ -229,8 +255,21 @@ GlUniform4fv_t        g_fnGlUniform4fv = nullptr;
 bool                  g_hd2dIatHooked = false;
 bool                  g_glCacheIatHooked = false;
 std::atomic<bool>     g_glCacheActive{false};
+std::atomic<bool>     g_glUniformCacheActive{false};
 bool                  g_eglSwapIatHooked = false;
 bool                  g_renderPerfHooked = false;
+
+hs_fs_neg::NegativeStatCache g_fsNegCache;
+GetFileAttributesW_t  g_origGetFileAttributesW = nullptr;
+MoveFileExW_t         g_origMoveFileExW = nullptr;
+CopyFileW_t           g_origCopyFileW = nullptr;
+DeleteFileW_t         g_origDeleteFileW = nullptr;
+CreateDirectoryW_t    g_origCreateDirectoryW = nullptr;
+std::atomic<bool>     g_fsNegCacheActive{false};
+volatile LONG64       g_fsNegQueries = 0;
+volatile LONG64       g_fsNegHits = 0;
+volatile LONG64       g_deJitterHits = 0;
+std::atomic<uint32_t> g_deJitterPeakUs{0};
 
 // Cold-start patch indices (status flags flip ONLY after ApplyPendingPatchesSafely confirms applied!)
 size_t g_vfxPmPatchIdx         = static_cast<size_t>(-1);
@@ -250,10 +289,30 @@ GlBindTexture_t       g_origGlBindTexture = nullptr;
 GlDeleteTextures_t    g_origGlDeleteTextures = nullptr;
 GlBlendFunc_t         g_origGlBlendFunc = nullptr;
 GlDepthMask_t         g_origGlDepthMask = nullptr;
-GlEnable_t            g_origGlEnable = nullptr;
-GlDisable_t           g_origGlDisable = nullptr;
-volatile LONG64       g_glCacheCalls = 0;
-volatile LONG64       g_glCacheHits = 0;
+GlEnable_t                   g_origGlEnable = nullptr;
+GlDisable_t                  g_origGlDisable = nullptr;
+GlBindBuffer_t               g_origGlBindBuffer = nullptr;
+GlDeleteBuffers_t            g_origGlDeleteBuffers = nullptr;
+GlBlendEquation_t            g_origGlBlendEquation = nullptr;
+GlColorMask_t                g_origGlColorMask = nullptr;
+GlCullFace_t                 g_origGlCullFace = nullptr;
+GlDepthFunc_t                g_origGlDepthFunc = nullptr;
+GlEnableVertexAttribArray_t  g_origGlEnableVertexAttribArray = nullptr;
+GlDisableVertexAttribArray_t g_origGlDisableVertexAttribArray = nullptr;
+GlFrontFace_t                g_origGlFrontFace = nullptr;
+GlScissor_t                  g_origGlScissor = nullptr;
+GlViewport_t                 g_origGlViewport = nullptr;
+GlUniform1f_t                g_origGlUniform1f = nullptr;
+GlUniform1i_t                g_origGlUniform1i = nullptr;
+GlUniform2fv_t               g_origGlUniform2fv = nullptr;
+GlUniform3fv_t               g_origGlUniform3fv = nullptr;
+GlUniform4fv_t               g_origGlUniform4fv = nullptr;
+GlUniformMatrix3fv_t         g_origGlUniformMatrix3fv = nullptr;
+GlUniformMatrix4fv_t         g_origGlUniformMatrix4fv = nullptr;
+volatile LONG64              g_glCacheCalls = 0;
+volatile LONG64              g_glCacheHits = 0;
+volatile LONG64              g_glUniCalls = 0;
+volatile LONG64              g_glUniHits = 0;
 GameRender_t          g_origGameRender = nullptr;
 PostProcessorRender_t g_origPostProcessorRender = nullptr;
 std::atomic<float>    g_emaWorldRenderUs{0.0f};
@@ -1370,6 +1429,7 @@ struct EntityPosTrack {
     int64_t   seg_start_qpc = 0;    // prev render frame timestamp -> eliminates dt=0 duplicate frame!
     int64_t   seen_qpc = 0;
     float     period = 1.0f / 30.0f;
+    float     jitter = 0.0f;
     uint32_t  sim_gen = 0;
     uint8_t   fast_streak = 0;
     uint8_t   settled = 1;
@@ -1409,6 +1469,7 @@ struct ThreadLocalAnimState {
     int64_t  batchPosInterp = 0;
     int64_t  batchPosBypass = 0;
     int64_t  batchShedFrames = 0;
+    int64_t  batchDeJitterHits = 0;
 
     ThreadLocalAnimState() : tracks(kTrackSlots), posTracks(kTrackSlots) {}
 
@@ -1425,6 +1486,7 @@ struct ThreadLocalAnimState {
         if (batchPosInterp)    { InterlockedAdd64(&g_worldPosInterpCount, batchPosInterp); batchPosInterp = 0; }
         if (batchPosBypass)    { InterlockedAdd64(&g_worldPosBypassCount, batchPosBypass); batchPosBypass = 0; }
         if (batchShedFrames)   { InterlockedAdd64(&g_animSwarmShedFrames, batchShedFrames); batchShedFrames = 0; }
+        if (batchDeJitterHits) { InterlockedAdd64(&g_deJitterHits, batchDeJitterHits);     batchDeJitterHits = 0; }
     }
 
     int64_t GetFrameQpc() {
@@ -1533,6 +1595,7 @@ static bool InterpolateWorldPosCore(float* pX, float* pY, float* pZ, uintptr_t k
         tr.last_raw_z = tr.prev_z = tr.curr_z = tr.rend_z = rawZ;
         tr.update_qpc = nowQpc;
         tr.seg_start_qpc = nowQpc;
+        tr.jitter = 0.0f;
         tr.settled = 1;
         tr.valid = 1;
     };
@@ -1546,6 +1609,7 @@ static bool InterpolateWorldPosCore(float* pX, float* pY, float* pZ, uintptr_t k
     }
     if (tr.sim_gen != curSimGen) {
         tr.period = (curSimHz == 60) ? (1.0f / 60.0f) : (1.0f / 30.0f);
+        tr.jitter = 0.0f;
         tr.sim_gen = curSimGen;
         tr.fast_streak = 0;
     }
@@ -1579,8 +1643,10 @@ static bool InterpolateWorldPosCore(float* pX, float* pY, float* pZ, uintptr_t k
             return false;
         }
 
-        // Adaptive snapshot cadence EMA (auto-locks onto 16.7ms / 33.3ms / 66.7ms per entity!)
+        // Adaptive snapshot cadence EMA + De-Jitter EWMA (auto-locks onto 16.7ms / 33.3ms / 66.7ms!)
         if (elapsed >= 0.011f && elapsed <= 0.110f) {
+            const float dev = std::min(fabsf(elapsed - tr.period), 0.060f);
+            tr.jitter = tr.jitter * 0.85f + dev * 0.15f;
             tr.period = tr.period * 0.72f + elapsed * 0.28f;
             if (tr.period < 0.015f) tr.period = 0.015f;
             if (tr.period > 0.095f) tr.period = 0.095f;
@@ -1617,9 +1683,17 @@ static bool InterpolateWorldPosCore(float* pX, float* pY, float* pZ, uintptr_t k
         tr.settled = 0;
     }
 
-    float effPeriod = tr.period * 1.03f; // +3% jitter cushion avoids 1-frame micro-stalls on +/-0.5ms net jitter
+    float effPeriod = tr.period * 1.03f; // +3% base cushion (+ adaptive online jitter buffer when jitter > 2.5ms)
+    if (g_optAdaptiveDeJitter.load(std::memory_order_relaxed) && tr.jitter > 0.0025f) {
+        const float jitterPad = std::min((tr.jitter - 0.0025f) * 1.25f, tr.period * 0.45f);
+        effPeriod += jitterPad;
+        ++tls.batchDeJitterHits;
+        const uint32_t jUs = static_cast<uint32_t>(tr.jitter * 1000000.0f);
+        uint32_t prevPeak = g_deJitterPeakUs.load(std::memory_order_relaxed);
+        while (jUs > prevPeak && !g_deJitterPeakUs.compare_exchange_weak(prevPeak, jUs, std::memory_order_relaxed)) {}
+    }
     if (effPeriod < 0.015f) effPeriod = 0.015f;
-    if (effPeriod > 0.098f) effPeriod = 0.098f;
+    if (effPeriod > 0.125f) effPeriod = 0.125f;
 
     const float dt = static_cast<float>(static_cast<double>(nowQpc - tr.seg_start_qpc) * g_qpcInvFreq);
     float alpha = dt / effPeriod;
@@ -4640,17 +4714,31 @@ static inline hs_gl_cache::ThreadState& GetSyncedGlCache() {
 }
 
 static inline void FlushGlCacheStatsIfReady(hs_gl_cache::ThreadState& st) {
-    if (st.batchCalls >= 256u) {
-        InterlockedAdd64(&g_glCacheCalls, static_cast<LONG64>(st.batchCalls));
-        InterlockedAdd64(&g_glCacheHits,  static_cast<LONG64>(st.batchHits));
-        st.batchCalls = 0;
-        st.batchHits  = 0;
+    if (st.batchCalls >= 256u || st.batchUniCalls >= 256u) {
+        if (st.batchCalls) {
+            InterlockedAdd64(&g_glCacheCalls, static_cast<LONG64>(st.batchCalls));
+            InterlockedAdd64(&g_glCacheHits,  static_cast<LONG64>(st.batchHits));
+            st.batchCalls = 0;
+            st.batchHits  = 0;
+        }
+        if (st.batchUniCalls) {
+            InterlockedAdd64(&g_glUniCalls, static_cast<LONG64>(st.batchUniCalls));
+            InterlockedAdd64(&g_glUniHits,  static_cast<LONG64>(st.batchUniHits));
+            st.batchUniCalls = 0;
+            st.batchUniHits  = 0;
+        }
     }
 }
 
 static inline bool IsGlCacheOperational() {
     return g_glCacheActive.load(std::memory_order_acquire) &&
            g_optGlStateCache.load(std::memory_order_relaxed);
+}
+
+static inline bool IsGlUniformCacheOperational() {
+    return IsGlCacheOperational() &&
+           g_glUniformCacheActive.load(std::memory_order_acquire) &&
+           g_optGlUniformCache.load(std::memory_order_relaxed);
 }
 
 static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, void* ctx) {
@@ -4746,6 +4834,198 @@ static void WINAPI HookGlDisable(uint32_t cap) {
         if (!call) return;
     }
     g_origGlDisable(cap);
+}
+
+static void WINAPI HookGlBindBuffer(uint32_t target, uint32_t buffer) {
+    if (!g_origGlBindBuffer) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallBindBuffer(target, buffer);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlBindBuffer(target, buffer);
+}
+
+static void WINAPI HookGlDeleteBuffers(int32_t n, const uint32_t* buffers) {
+    tl_glCache.OnDeleteBuffers(n, buffers);
+    if (g_origGlDeleteBuffers) g_origGlDeleteBuffers(n, buffers);
+}
+
+static void WINAPI HookGlBlendEquation(uint32_t mode) {
+    if (!g_origGlBlendEquation) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallBlendEquation(mode);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlBlendEquation(mode);
+}
+
+static void WINAPI HookGlColorMask(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    if (!g_origGlColorMask) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallColorMask(r, g, b, a);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlColorMask(r, g, b, a);
+}
+
+static void WINAPI HookGlCullFace(uint32_t mode) {
+    if (!g_origGlCullFace) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallCullFace(mode);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlCullFace(mode);
+}
+
+static void WINAPI HookGlDepthFunc(uint32_t func) {
+    if (!g_origGlDepthFunc) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallDepthFunc(func);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlDepthFunc(func);
+}
+
+static void WINAPI HookGlEnableVertexAttribArray(uint32_t index) {
+    if (!g_origGlEnableVertexAttribArray) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallEnableDisableVertexAttribArray(index, true);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlEnableVertexAttribArray(index);
+}
+
+static void WINAPI HookGlDisableVertexAttribArray(uint32_t index) {
+    if (!g_origGlDisableVertexAttribArray) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallEnableDisableVertexAttribArray(index, false);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlDisableVertexAttribArray(index);
+}
+
+static void WINAPI HookGlFrontFace(uint32_t mode) {
+    if (!g_origGlFrontFace) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallFrontFace(mode);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlFrontFace(mode);
+}
+
+static void WINAPI HookGlScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (!g_origGlScissor) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallScissor(x, y, width, height);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlScissor(x, y, width, height);
+}
+
+static void WINAPI HookGlViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (!g_origGlViewport) return;
+    if (IsGlCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallViewport(x, y, width, height);
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlViewport(x, y, width, height);
+}
+
+static void WINAPI HookGlUniform1f(int32_t location, float x) {
+    if (!g_origGlUniform1f) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, 1, 0, hs_gl_cache::UNI_1F, &x, sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniform1f(location, x);
+}
+
+static void WINAPI HookGlUniform1i(int32_t location, int32_t x) {
+    if (!g_origGlUniform1i) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, 1, 0, hs_gl_cache::UNI_1I, &x, sizeof(int32_t));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniform1i(location, x);
+}
+
+static void WINAPI HookGlUniform2fv(int32_t location, int32_t count, const float* v) {
+    if (!g_origGlUniform2fv) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_2FV, v, 2 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniform2fv(location, count, v);
+}
+
+static void WINAPI HookGlUniform3fv(int32_t location, int32_t count, const float* v) {
+    if (!g_origGlUniform3fv) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_3FV, v, 3 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniform3fv(location, count, v);
+}
+
+static void WINAPI HookGlUniform4fv(int32_t location, int32_t count, const float* v) {
+    if (!g_origGlUniform4fv) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_4FV, v, 4 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniform4fv(location, count, v);
+}
+
+static void WINAPI HookGlUniformMatrix3fv(int32_t location, int32_t count, uint8_t transpose, const float* value) {
+    if (!g_origGlUniformMatrix3fv) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, transpose, hs_gl_cache::UNI_MAT3, value, 9 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniformMatrix3fv(location, count, transpose, value);
+}
+
+static void WINAPI HookGlUniformMatrix4fv(int32_t location, int32_t count, uint8_t transpose, const float* value) {
+    if (!g_origGlUniformMatrix4fv) return;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, transpose, hs_gl_cache::UNI_MAT4, value, 16 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    g_origGlUniformMatrix4fv(location, count, transpose, value);
 }
 
 // Context-scoped program slot helpers (fast O(1) array for primary context + overflow vector for multi-context)
@@ -4894,9 +5174,18 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             AcquireSRWLockShared(&g_hd2dStateLock);
             st = g_hd2dState;
             ReleaseSRWLockShared(&g_hd2dStateLock);
-            if (locP >= 0) g_fnGlUniform4fv(locP, 1, st.params);
-            if (locS >= 0) g_fnGlUniform4fv(locS, 1, st.sun);
-            if (locT >= 0) g_fnGlUniform4fv(locT, 1, st.tint);
+            if (locP >= 0) {
+                g_fnGlUniform4fv(locP, 1, st.params);
+                tl_glCache.InvalidateUniform(program, locP);
+            }
+            if (locS >= 0) {
+                g_fnGlUniform4fv(locS, 1, st.sun);
+                tl_glCache.InvalidateUniform(program, locS);
+            }
+            if (locT >= 0) {
+                g_fnGlUniform4fv(locT, 1, st.tint);
+                tl_glCache.InvalidateUniform(program, locT);
+            }
             AcquireSRWLockExclusive(&g_hd2dProgLock);
             if (Hd2dProgSlot* slot = FindProgSlotLocked(curCtx, program)) {
                 slot->lastGen = curGen;
@@ -5202,8 +5491,8 @@ static void InstallGlIatHooks() {
         g_eglSwapIatHooked = okSw;
         LogMsg("[PERF][EGL] libEGL IAT hooks (makeCurrent=%d swapBuffers=%d)", okMc ? 1 : 0, okSw ? 1 : 0);
 
-        // ANGLE 1.0 (D3D9) Redundant GL State-Mirror Cache Deduplication
-        // Fail-closed: ALL 11 required hooks (eglMakeCurrent + link/use/deleteProgram + 7 state hooks) MUST succeed!
+        // ANGLE 1.0 (D3D9) Redundant GL State-Mirror & Uniform Shadow Cache Deduplication
+        // Fail-closed: ALL 11 core hooks (eglMakeCurrent + link/use/deleteProgram + 7 state hooks) MUST succeed!
         if (g_optGlStateCache.load(std::memory_order_relaxed) && okMc && okLnk && okUse && okDel) {
             bool okAt = PatchExeIatEntry("libGLESv2.dll",  1, "glActiveTexture",  reinterpret_cast<void*>(&HookGlActiveTexture),  g_origGlActiveTexture);
             bool okBt = PatchExeIatEntry("libGLESv2.dll",  7, "glBindTexture",    reinterpret_cast<void*>(&HookGlBindTexture),    g_origGlBindTexture);
@@ -5217,6 +5506,43 @@ static void InstallGlIatHooks() {
             g_glCacheActive.store(g_glCacheIatHooked, std::memory_order_release);
             if (!g_glCacheIatHooked) {
                 g_optGlStateCache.store(false, std::memory_order_release);
+            } else {
+                // Extended buffer / vertex-attrib / raster state deduplication (fail-closed pairs)
+                bool okBb = false, okDb = false;
+                if (FindExeIatSlot("libGLESv2.dll", 4, "glBindBuffer") &&
+                    FindExeIatSlot("libGLESv2.dll", 29, "glDeleteBuffers")) {
+                    okBb = PatchExeIatEntry("libGLESv2.dll",  4, "glBindBuffer",    reinterpret_cast<void*>(&HookGlBindBuffer),    g_origGlBindBuffer);
+                    okDb = PatchExeIatEntry("libGLESv2.dll", 29, "glDeleteBuffers", reinterpret_cast<void*>(&HookGlDeleteBuffers), g_origGlDeleteBuffers);
+                }
+                bool okEv = false, okDv = false;
+                if (FindExeIatSlot("libGLESv2.dll", 44, "glEnableVertexAttribArray") &&
+                    FindExeIatSlot("libGLESv2.dll", 40, "glDisableVertexAttribArray")) {
+                    okEv = PatchExeIatEntry("libGLESv2.dll", 44, "glEnableVertexAttribArray",  reinterpret_cast<void*>(&HookGlEnableVertexAttribArray),  g_origGlEnableVertexAttribArray);
+                    okDv = PatchExeIatEntry("libGLESv2.dll", 40, "glDisableVertexAttribArray", reinterpret_cast<void*>(&HookGlDisableVertexAttribArray), g_origGlDisableVertexAttribArray);
+                }
+                bool okBe = PatchExeIatEntry("libGLESv2.dll",  9, "glBlendEquation", reinterpret_cast<void*>(&HookGlBlendEquation), g_origGlBlendEquation);
+                bool okCm = PatchExeIatEntry("libGLESv2.dll", 20, "glColorMask",     reinterpret_cast<void*>(&HookGlColorMask),     g_origGlColorMask);
+                bool okCf = PatchExeIatEntry("libGLESv2.dll", 28, "glCullFace",      reinterpret_cast<void*>(&HookGlCullFace),      g_origGlCullFace);
+                bool okDf = PatchExeIatEntry("libGLESv2.dll", 36, "glDepthFunc",     reinterpret_cast<void*>(&HookGlDepthFunc),     g_origGlDepthFunc);
+                bool okFf = PatchExeIatEntry("libGLESv2.dll", 49, "glFrontFace",     reinterpret_cast<void*>(&HookGlFrontFace),     g_origGlFrontFace);
+                bool okSc = PatchExeIatEntry("libGLESv2.dll", 97, "glScissor",       reinterpret_cast<void*>(&HookGlScissor),       g_origGlScissor);
+                bool okVp = PatchExeIatEntry("libGLESv2.dll", 142,"glViewport",      reinterpret_cast<void*>(&HookGlViewport),      g_origGlViewport);
+
+                bool okUni = false;
+                if (g_optGlUniformCache.load(std::memory_order_relaxed)) {
+                    bool u1f = PatchExeIatEntry("libGLESv2.dll", 112, "glUniform1f",        reinterpret_cast<void*>(&HookGlUniform1f),        g_origGlUniform1f);
+                    bool u1i = PatchExeIatEntry("libGLESv2.dll", 114, "glUniform1i",        reinterpret_cast<void*>(&HookGlUniform1i),        g_origGlUniform1i);
+                    bool u2  = PatchExeIatEntry("libGLESv2.dll", 117, "glUniform2fv",       reinterpret_cast<void*>(&HookGlUniform2fv),       g_origGlUniform2fv);
+                    bool u3  = PatchExeIatEntry("libGLESv2.dll", 121, "glUniform3fv",       reinterpret_cast<void*>(&HookGlUniform3fv),       g_origGlUniform3fv);
+                    bool u4  = PatchExeIatEntry("libGLESv2.dll", 125, "glUniform4fv",       reinterpret_cast<void*>(&HookGlUniform4fv),       g_origGlUniform4fv);
+                    bool um3 = PatchExeIatEntry("libGLESv2.dll", 129, "glUniformMatrix3fv", reinterpret_cast<void*>(&HookGlUniformMatrix3fv), g_origGlUniformMatrix3fv);
+                    bool um4 = PatchExeIatEntry("libGLESv2.dll", 130, "glUniformMatrix4fv", reinterpret_cast<void*>(&HookGlUniformMatrix4fv), g_origGlUniformMatrix4fv);
+                    okUni = (u1f && u1i && u2 && u3 && u4 && um3 && um4);
+                    g_glUniformCacheActive.store(okUni, std::memory_order_release);
+                    if (!okUni) g_optGlUniformCache.store(false, std::memory_order_release);
+                }
+                LogMsg("[PERF][GLCACHE+] Extended state(buf=%d attr=%d eq=%d cm=%d cf=%d df=%d ff=%d sc=%d vp=%d) | UniformShadow=%d",
+                       (okBb && okDb)?1:0, (okEv && okDv)?1:0, okBe?1:0, okCm?1:0, okCf?1:0, okDf?1:0, okFf?1:0, okSc?1:0, okVp?1:0, okUni?1:0);
             }
             LogMsg("[PERF][GLCACHE] ANGLE State-Mirror IAT hooks (mc=%d lnk=%d use=%d del=%d at=%d bt=%d dt=%d bf=%d dm=%d en=%d di=%d) -> active=%d",
                    okMc?1:0, okLnk?1:0, okUse?1:0, okDel?1:0,
@@ -5230,6 +5556,70 @@ static void InstallGlIatHooks() {
                    okMc?1:0, okLnk?1:0, okUse?1:0, okDel?1:0);
         }
     }
+}
+
+static DWORD WINAPI HookFsGetFileAttributesW(LPCWSTR lpFileName) {
+    if (!g_origGetFileAttributesW) return INVALID_FILE_ATTRIBUTES;
+    if (g_fsNegCacheActive.load(std::memory_order_acquire) &&
+        g_optFsNegCache.load(std::memory_order_relaxed)) {
+        uint64_t h1 = 0, h2 = 0;
+        if (hs_fs_neg::IsCacheableReadOnlyAssetPath(lpFileName, &h1, &h2)) {
+            InterlockedIncrement64(&g_fsNegQueries);
+            const uint64_t now = static_cast<uint64_t>(NowQpc());
+            if (g_fsNegCache.Lookup(h1, h2, now)) {
+                InterlockedIncrement64(&g_fsNegHits);
+                SetLastError(ERROR_FILE_NOT_FOUND);
+                return INVALID_FILE_ATTRIBUTES;
+            }
+            const DWORD res = g_origGetFileAttributesW(lpFileName);
+            const DWORD err = GetLastError();
+            if (res == INVALID_FILE_ATTRIBUTES &&
+                (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)) {
+                g_fsNegCache.Insert(h1, h2, now, static_cast<uint64_t>(g_qpcFreq) * 15ULL);
+            }
+            SetLastError(err);
+            return res;
+        }
+    }
+    return g_origGetFileAttributesW(lpFileName);
+}
+
+static BOOL WINAPI HookFsMoveFileExW(LPCWSTR a, LPCWSTR b, DWORD f) {
+    g_fsNegCache.InvalidateAll();
+    return g_origMoveFileExW ? g_origMoveFileExW(a, b, f) : FALSE;
+}
+
+static BOOL WINAPI HookFsCopyFileW(LPCWSTR a, LPCWSTR b, BOOL f) {
+    g_fsNegCache.InvalidateAll();
+    return g_origCopyFileW ? g_origCopyFileW(a, b, f) : FALSE;
+}
+
+static BOOL WINAPI HookFsDeleteFileW(LPCWSTR a) {
+    g_fsNegCache.InvalidateAll();
+    return g_origDeleteFileW ? g_origDeleteFileW(a) : FALSE;
+}
+
+static BOOL WINAPI HookFsCreateDirectoryW(LPCWSTR a, LPSECURITY_ATTRIBUTES sa) {
+    g_fsNegCache.InvalidateAll();
+    return g_origCreateDirectoryW ? g_origCreateDirectoryW(a, sa) : FALSE;
+}
+
+static void InstallFsNegCacheHooks() {
+    if (!g_optFsNegCache.load(std::memory_order_relaxed)) return;
+    // Fail-closed: require ALL 4 write-invalidation hooks before enabling negative stat cache!
+    bool okMv = PatchExeIatEntry("KERNEL32.dll", 0, "MoveFileExW",      reinterpret_cast<void*>(&HookFsMoveFileExW),      g_origMoveFileExW);
+    bool okCp = PatchExeIatEntry("KERNEL32.dll", 0, "CopyFileW",        reinterpret_cast<void*>(&HookFsCopyFileW),        g_origCopyFileW);
+    bool okDl = PatchExeIatEntry("KERNEL32.dll", 0, "DeleteFileW",      reinterpret_cast<void*>(&HookFsDeleteFileW),      g_origDeleteFileW);
+    bool okMd = PatchExeIatEntry("KERNEL32.dll", 0, "CreateDirectoryW", reinterpret_cast<void*>(&HookFsCreateDirectoryW), g_origCreateDirectoryW);
+    bool okGa = false;
+    if (okMv && okCp && okDl && okMd) {
+        okGa = PatchExeIatEntry("KERNEL32.dll", 0, "GetFileAttributesW", reinterpret_cast<void*>(&HookFsGetFileAttributesW), g_origGetFileAttributesW);
+    }
+    const bool active = (okMv && okCp && okDl && okMd && okGa);
+    g_fsNegCacheActive.store(active, std::memory_order_release);
+    if (!active) g_optFsNegCache.store(false, std::memory_order_release);
+    LogMsg("[PERF][FSNEG] KERNEL32 Mod/Data Negative Stat Cache (ga=%d mv=%d cp=%d dl=%d md=%d) -> active=%d",
+           okGa?1:0, okMv?1:0, okCp?1:0, okDl?1:0, okMd?1:0, active?1:0);
 }
 
 int LuaHyperSmoothSetVisual(void* L) {
@@ -5833,6 +6223,19 @@ static int LuaHyperSmoothGetHostPerf(void* L) {
     return 14;
 }
 
+int LuaHyperSmoothGetRenderOptStats(void* L) {
+    if (!g_luaPushNumber) return 0;
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_glCacheCalls, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_glCacheHits, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_glUniCalls, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_glUniHits, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_fsNegQueries, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_fsNegHits, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_deJitterHits, 0, 0)));
+    g_luaPushNumber(L, static_cast<double>(g_deJitterPeakUs.load(std::memory_order_relaxed)) * 0.001);
+    return 8;
+}
+
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
     g_luaPushString(L, "DST-HyperSmooth/2.6.0");
@@ -5853,6 +6256,7 @@ void RegisterHyperSmoothLuaApi(void* L) {
     reg("HyperSmooth_GetStatus", &LuaHyperSmoothGetStatus);
     reg("HyperSmooth_GetFrameStats", &LuaHyperSmoothGetFrameStats);
     reg("HyperSmooth_GetLatencyStats", &LuaHyperSmoothGetLatencyStats);
+    reg("HyperSmooth_GetRenderOptStats", &LuaHyperSmoothGetRenderOptStats);
     reg("HyperSmooth_SetSimTickRate", &LuaHyperSmoothSetSimTickRate);
     reg("HyperSmooth_GetSimTickRate", &LuaHyperSmoothGetSimTickRate);
     reg("HyperSmooth_SetVisual", &LuaHyperSmoothSetVisual);
@@ -6100,6 +6504,9 @@ void EnsureDefaultIni() {
         "fast_spatial_query=1\n"
         "timeslice_tex_upload=1\n"
         "gl_state_cache=1\n"
+        "gl_uniform_cache=1\n"
+        "enable_fs_neg_cache=1\n"
+        "adaptive_dejitter=1\n"
         "\n"
         "[VISUAL]\n"
         "; Player-First Default: 100%% Vanilla Pure (all visual enhancements strictly opt-in)\n"
@@ -6272,6 +6679,9 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optFastSpatial = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1) != 0;
     bool optTexTimeSlice = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1) != 0;
     bool optGlStateCache = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1) != 0;
+    bool optGlUniformCache = ReadIniInt(L"OPTIMIZE", L"gl_uniform_cache", 1) != 0;
+    bool optFsNegCache = ReadIniInt(L"OPTIMIZE", L"enable_fs_neg_cache", 1) != 0;
+    bool optDeJitter = ReadIniInt(L"OPTIMIZE", L"adaptive_dejitter", 1) != 0;
     {
         DEVMODEW dm{};
         dm.dmSize = sizeof(dm);
@@ -6301,14 +6711,18 @@ DWORD WINAPI WorkerProc(LPVOID) {
     g_optFastSpatialQuery.store(optFastSpatial, std::memory_order_relaxed);
     g_optTexTimeSlice.store(optTexTimeSlice, std::memory_order_relaxed);
     g_optGlStateCache.store(optGlStateCache, std::memory_order_relaxed);
+    g_optGlUniformCache.store(optGlUniformCache, std::memory_order_relaxed);
+    g_optFsNegCache.store(optFsNegCache, std::memory_order_relaxed);
+    g_optAdaptiveDeJitter.store(optDeJitter, std::memory_order_relaxed);
     g_visualAnisoLevel.store(optAniso, std::memory_order_relaxed);
     g_visualFullresLightmap.store(optFullresLm, std::memory_order_relaxed);
     g_visualMipLodBias.store(optMipSharp ? -0.45f : 0.0f, std::memory_order_relaxed);
     g_optHd2dWorldShaders.store(optHd2dWorld, std::memory_order_release);
 
-    // Install libGLESv2 PE IAT hooks FIRST (at ~t=+1ms, BEFORE AOB scan) so glShaderSource
-    // / glLinkProgram / glUseProgram are guaranteed live before DST compiles shaders.zip!
+    // Install libGLESv2 + KERNEL32 PE IAT hooks FIRST (at ~t=+1ms, BEFORE AOB scan) so glShaderSource
+    // / glLinkProgram / glUseProgram and Mod Negative Stat Cache are live before DST loads bundles/shaders!
     InstallGlIatHooks();
+    InstallFsNegCacheHooks();
 
     if (optTimer && timeBeginPeriod(1) == TIMERR_NOERROR) {
         g_timerBoosted = true;
@@ -6486,17 +6900,26 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 LONG64 glCalls = InterlockedCompareExchange64(&g_glCacheCalls, 0, 0);
                 LONG64 glHits  = InterlockedCompareExchange64(&g_glCacheHits, 0, 0);
                 double glHitPct = (glCalls > 0) ? (100.0 * static_cast<double>(glHits) / static_cast<double>(glCalls)) : 0.0;
+                LONG64 uniCalls = InterlockedCompareExchange64(&g_glUniCalls, 0, 0);
+                LONG64 uniHits  = InterlockedCompareExchange64(&g_glUniHits, 0, 0);
+                double uniPct = (uniCalls > 0) ? (100.0 * static_cast<double>(uniHits) / static_cast<double>(uniCalls)) : 0.0;
+                LONG64 fsQ = InterlockedCompareExchange64(&g_fsNegQueries, 0, 0);
+                LONG64 fsH = InterlockedCompareExchange64(&g_fsNegHits, 0, 0);
+                LONG64 djH = InterlockedCompareExchange64(&g_deJitterHits, 0, 0);
+                double djPk = static_cast<double>(g_deJitterPeakUs.load(std::memory_order_relaxed)) * 0.001;
                 double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
                 g_frameRing.ComputeStats(avgFps, low1Fps, p99Ms, jitterMs);
-                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz disp=%uHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | vfx240=%lld (%lld pts) | light240=%lld | pos240=%lld (byp=%lld) | d3d9ex_lat=%u/%u | glCache=%.1f%% (%lld/%lld) swap=%.2fms | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx mip=%.2f hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
+                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz disp=%uHz | libdeflate=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld swap, %lld shed) | vfx240=%lld (%lld pts) | light240=%lld | pos240=%lld (byp=%lld deJit=%lld/%.2fms) | d3d9ex_lat=%u/%u | glCache=%.1f%% (%lld/%lld) glUni=%.1f%% (%lld/%lld) fsNeg=%lld/%lld swap=%.2fms | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx mip=%.2f hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld.",
                        avgFps, low1Fps, p99Ms, jitterMs, g_clientSimTickRate.load(std::memory_order_relaxed),
                        g_displayRefreshHz.load(std::memory_order_relaxed),
                        hits, static_cast<double>(bytes) / (1024.0 * 1024.0), interp, bones, p2, shed,
                        vfxCmds, vfxPts, light240,
-                       posInterp, posBypass,
+                       posInterp, posBypass, djH, djPk,
                        g_d3d9ExCurLatency.load(std::memory_order_relaxed),
                        g_d3d9ExOrigLatency.load(std::memory_order_relaxed),
                        glHitPct, glHits, glCalls,
+                       uniPct, uniHits, uniCalls,
+                       fsH, fsQ,
                        static_cast<double>(g_emaSwapUs.load(std::memory_order_relaxed)) * 0.001,
                        spQ, spC, texUp, texSl,
                        g_visualAnisoLevel.load(std::memory_order_relaxed),
@@ -6559,6 +6982,9 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 int spq = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1);
                 int texs = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1);
                 int glsc = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1);
+                int gluc = ReadIniInt(L"OPTIMIZE", L"gl_uniform_cache", 1);
+                int fsnc = ReadIniInt(L"OPTIMIZE", L"enable_fs_neg_cache", 1);
+                int adjt = ReadIniInt(L"OPTIMIZE", L"adaptive_dejitter", 1);
                 int af = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
                 if (af < 1) af = 1;
                 if (af > 16) af = 16;
@@ -6575,9 +7001,13 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 g_optFastSpatialQuery.store(spq != 0, std::memory_order_relaxed);
                 g_optTexTimeSlice.store(texs != 0, std::memory_order_relaxed);
                 const bool wantGlsc = (glsc != 0) && g_glCacheActive.load(std::memory_order_acquire);
-                if (g_optGlStateCache.exchange(wantGlsc, std::memory_order_relaxed) != wantGlsc) {
+                const bool wantGluc = (gluc != 0) && g_glUniformCacheActive.load(std::memory_order_acquire);
+                if (g_optGlStateCache.exchange(wantGlsc, std::memory_order_relaxed) != wantGlsc ||
+                    g_optGlUniformCache.exchange(wantGluc, std::memory_order_relaxed) != wantGluc) {
                     g_glCacheResetGen.fetch_add(1, std::memory_order_release);
                 }
+                g_optFsNegCache.store((fsnc != 0) && g_fsNegCacheActive.load(std::memory_order_acquire), std::memory_order_relaxed);
+                g_optAdaptiveDeJitter.store(adjt != 0, std::memory_order_relaxed);
                 g_visualAnisoLevel.store(af, std::memory_order_relaxed);
                 const bool prevIniLm = g_visualFullresLightmap.exchange(flm != 0, std::memory_order_relaxed);
                 g_visualMipLodBias.store(mips ? -0.45f : 0.0f, std::memory_order_relaxed);

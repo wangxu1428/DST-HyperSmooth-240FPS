@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 #include "../native_plugin/gl_state_cache.h"
+#include "../native_plugin/fs_neg_cache.h"
 #include "../native_plugin/fast_astar_manager.h"
 
 #define CHECK(cond) do { \
@@ -1383,6 +1384,135 @@ int main() {
         std::printf("[PASS] 17. Wolfgang Dumbbell rigid-layer (arm_carry vs tree_leaf_fx) + one-shot self-replay wrap verified\n");
     }
 
-    std::printf("ALL 17 CLIENT v2.6.0 RED-TEAM, RTSS PACER, VFX240, D3D9EX REFLEX, MIPBIAS, PARTICLE-MATCHER, ASTAR & GL-CACHE TESTS PASSED!\n");
+    // [18] Extended GL State + Uniform Shadow Cache + Mod Negative Stat Cache + Adaptive De-Jitter Interp
+    {
+        hs_gl_cache::ThreadState gl;
+        gl.OnMakeCurrent(reinterpret_cast<void*>(0x1234));
+        // Buffer bind / delete aliasing
+        CHECK(gl.ShouldCallBindBuffer(hs_gl_cache::kGlArrayBuffer, 10));
+        CHECK(!gl.ShouldCallBindBuffer(hs_gl_cache::kGlArrayBuffer, 10));
+        CHECK(gl.ShouldCallBindBuffer(hs_gl_cache::kGlElementArrayBuffer, 10));
+        CHECK(!gl.ShouldCallBindBuffer(hs_gl_cache::kGlElementArrayBuffer, 10));
+        CHECK(gl.ShouldCallBindBuffer(0x9999u, 10)); // unknown target pass-through
+        uint32_t delBuf = 10;
+        gl.OnDeleteBuffers(1, &delBuf);
+        CHECK(gl.ShouldCallBindBuffer(hs_gl_cache::kGlArrayBuffer, 10));
+        CHECK(gl.ShouldCallBindBuffer(hs_gl_cache::kGlElementArrayBuffer, 10));
+
+        // Vertex attrib mask 0..15 + >=16 pass-through
+        CHECK(gl.ShouldCallEnableDisableVertexAttribArray(3, true));
+        CHECK(!gl.ShouldCallEnableDisableVertexAttribArray(3, true));
+        CHECK(gl.ShouldCallEnableDisableVertexAttribArray(3, false));
+        CHECK(!gl.ShouldCallEnableDisableVertexAttribArray(3, false));
+        CHECK(gl.ShouldCallEnableDisableVertexAttribArray(16, true));
+        CHECK(gl.ShouldCallEnableDisableVertexAttribArray(16, true));
+
+        // Raster / viewport / scissor / colorMask
+        CHECK(gl.ShouldCallBlendEquation(0x8006u));
+        CHECK(!gl.ShouldCallBlendEquation(0x8006u));
+        CHECK(gl.ShouldCallCullFace(0x0405u));
+        CHECK(!gl.ShouldCallCullFace(0x0405u));
+        CHECK(gl.ShouldCallDepthFunc(0x0203u));
+        CHECK(!gl.ShouldCallDepthFunc(0x0203u));
+        CHECK(gl.ShouldCallFrontFace(0x0901u));
+        CHECK(!gl.ShouldCallFrontFace(0x0901u));
+        CHECK(gl.ShouldCallColorMask(1, 1, 1, 0));
+        CHECK(!gl.ShouldCallColorMask(1, 1, 1, 0));
+        CHECK(gl.ShouldCallViewport(0, 0, 1920, 1080));
+        CHECK(!gl.ShouldCallViewport(0, 0, 1920, 1080));
+        CHECK(gl.ShouldCallViewport(0, 0, -1, 1080)); // negative invalidates & passes
+        CHECK(gl.ShouldCallViewport(0, 0, 1920, 1080));
+        CHECK(gl.ShouldCallScissor(10, 20, 100, 200));
+        CHECK(!gl.ShouldCallScissor(10, 20, 100, 200));
+
+        // Per-program uniform shadow cache
+        CHECK(gl.ShouldCallUseProgramChecked(5, true));
+        int32_t u1i = 2;
+        CHECK(gl.ShouldCallUniform(0, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4));
+        CHECK(!gl.ShouldCallUniform(0, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4));
+        float posZero = +0.0f, negZero = -0.0f;
+        CHECK(gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &posZero, 4));
+        CHECK(!gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &posZero, 4));
+        CHECK(gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &negZero, 4)); // bit-exact -0.0f miss!
+        float v4[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        float mat4[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(!gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64));
+        CHECK(!gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64));
+        // Bypass cases: count>1, transpose!=0, loc>=64
+        CHECK(gl.ShouldCallUniform(2, 2, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(gl.ShouldCallUniform(3, 1, 1, hs_gl_cache::UNI_MAT4, mat4, 64));
+        CHECK(gl.ShouldCallUniform(64, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4));
+        // InvalidateUniform (HD2D raw write sync)
+        gl.InvalidateUniform(5, 2);
+        CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        // Switch program 5 -> 6 -> 5 retains per-program uniform state cleanly!
+        CHECK(gl.ShouldCallUseProgramChecked(6, true));
+        CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(gl.ShouldCallUseProgramChecked(5, true));
+        CHECK(!gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        // OnDeleteOrLinkProgram + eglMakeCurrent reset wipes state cleanly
+        gl.OnDeleteOrLinkProgram(5);
+        CHECK(gl.ShouldCallUseProgramChecked(5, true));
+        CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        // Stress LRU bucket eviction across >16 programs sharing same hash mod 64
+        for (uint32_t k = 0; k < 20; ++k) {
+            uint32_t pid = 100u + k * hs_gl_cache::kMaxUniProgs;
+            CHECK(gl.ShouldCallUseProgramChecked(pid, true));
+            CHECK(gl.ShouldCallUniform(0, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4));
+        }
+        CHECK(gl.ShouldCallUseProgramChecked(100u, true));
+        CHECK(gl.ShouldCallUniform(0, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4)); // was evicted -> MUST miss & zero!
+        gl.OnMakeCurrent(reinterpret_cast<void*>(0x5678));
+        CHECK(gl.ShouldCallViewport(0, 0, 1920, 1080));
+
+        // Mod/Data Read-Only Negative Stat Cache allowlist & invalidation
+        uint64_t h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:/Steam/DST/mods/workshop-123/images/foo.TEX", &h1, &h2));
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"d:\\steam\\dst\\mods\\workshop-123\\images\\foo.tex", &h3, &h4));
+        CHECK(h1 == h3 && h2 == h4);
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"../data/anim/wilson.zip"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"C:\\Users\\Docs\\Klei\\DoNotStarveTogether\\save\\session.tex"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\DST\\mods\\modoverrides.lua"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\DST\\mods\\workshop-1\\cluster.lua"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\DST\\bin64\\dinput8.dll"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPath(L"D:\\DST\\mods\\workshop-1\\temp.tmp"));
+        hs_fs_neg::NegativeStatCache ncache;
+        ncache.Insert(h1, h2, 1000ULL, 500ULL);
+        CHECK(ncache.Lookup(h1, h2, 1200ULL));
+        CHECK(!ncache.Lookup(h1, h2, 1500ULL)); // expired at exact TTL!
+        ncache.Insert(h1, h2, 2000ULL, 500ULL);
+        CHECK(ncache.Lookup(h1, h2, 2100ULL));
+        ncache.InvalidateAll(); // write-op epoch bump!
+        CHECK(!ncache.Lookup(h1, h2, 2100ULL));
+
+        // Adaptive De-Jitter Entity Interp (0ms steady vs smooth jitter expansion)
+        auto evalDeJitter = [](const std::vector<float>& arrivals, float& outJitter, float& outEffPeriod) {
+            float period = 1.0f / 30.0f;
+            float jitter = 0.0f;
+            for (float el : arrivals) {
+                float dev = std::min(std::fabs(el - period), 0.060f);
+                jitter = jitter * 0.85f + dev * 0.15f;
+                period = period * 0.72f + el * 0.28f;
+            }
+            outJitter = jitter;
+            outEffPeriod = period * 1.03f;
+            if (jitter > 0.0025f) {
+                outEffPeriod += std::min((jitter - 0.0025f) * 1.25f, period * 0.45f);
+            }
+        };
+        float jitSteady = 0, effSteady = 0, jitJit = 0, effJit = 0;
+        evalDeJitter(std::vector<float>(20, 0.033333f), jitSteady, effSteady);
+        CHECK(jitSteady < 0.001f && std::fabs(effSteady - 0.033333f * 1.03f) < 0.0005f);
+        std::vector<float> noisy;
+        for (int i = 0; i < 20; ++i) noisy.push_back((i & 1) ? 0.045f : 0.022f);
+        evalDeJitter(noisy, jitJit, effJit);
+        CHECK(jitJit > 0.006f && effJit > 0.038f && effJit < 0.125f);
+
+        std::printf("[PASS] 18. GL Extended+Uniform Cache, Mod FS Negative Stat Cache & Adaptive De-Jitter Interp verified\n");
+    }
+
+    std::printf("ALL 18 CLIENT RED-TEAM, RTSS PACER, VFX240, D3D9EX REFLEX, GL-UNIFORM, FS-NEG, DEJITTER, ASTAR & GL-CACHE TESTS PASSED!\n");
     return 0;
 }

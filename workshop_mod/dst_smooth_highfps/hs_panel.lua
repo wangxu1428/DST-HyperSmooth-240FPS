@@ -49,26 +49,29 @@ local function CreateLiveCustomizerPanel(hud)
     if G.SCALEMODE_PROPORTIONAL and root.SetScaleMode then
         root:SetScaleMode(G.SCALEMODE_PROPORTIONAL)
     end
-    root:SetPosition(-196, -12, 0)
     root:Hide()
 
     local W, H = 368, 580
+    -- Position inner child container inside SCALEMODE_PROPORTIONAL anchor so offsets use
+    -- resolution-independent virtual 720p units instead of unscaled raw screen pixels.
+    local panel = root:AddChild(Widget("HyperSmoothLivePanelBody"))
+    panel:SetPosition(-232, -20, 0)
 
     -- Subtle warm charcoal translucent backdrop + crisp border frame
-    local border = root:AddChild(Image("images/global.xml", "square.tex"))
+    local border = panel:AddChild(Image("images/global.xml", "square.tex"))
     border:ScaleToSize(W + 4, H + 4)
     border:SetTint(0.76, 0.62, 0.34, 0.62)
 
-    local bg = root:AddChild(Image("images/global.xml", "square.tex"))
+    local bg = panel:AddChild(Image("images/global.xml", "square.tex"))
     bg:ScaleToSize(W, H)
     bg:SetTint(0.07, 0.07, 0.09, 0.88)
 
     -- Header bar
-    local title = root:AddChild(Text(FONT_BODY, 23, is_zh and "HyperSmooth v2.6.0 实时微调" or "HyperSmooth v2.6.0 Live Panel"))
+    local title = panel:AddChild(Text(FONT_BODY, 23, is_zh and "HyperSmooth v2.6.0 实时微调" or "HyperSmooth v2.6.0 Live Panel"))
     title:SetPosition(-18, H * 0.5 - 24, 0)
     title:SetColour(0.96, 0.85, 0.56, 1.0)
 
-    local close_btn = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+    local close_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     close_btn.scale_on_focus = false
     close_btn.move_on_click = false
     close_btn:ForceImageSize(34, 28)
@@ -85,28 +88,28 @@ local function CreateLiveCustomizerPanel(hud)
     end)
 
     -- Native bin64/dinput8.dll Version & Update Alert Strip ("更新条")
-    local dll_bg = root:AddChild(Image("images/global.xml", "square.tex"))
+    local dll_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
     dll_bg:ScaleToSize(W - 22, 26)
     dll_bg:SetPosition(0, H * 0.5 - 55, 0)
     dll_bg:SetTint(0.08, 0.18, 0.13, 0.86)
 
-    local dll_txt = root:AddChild(Text(FONT_BODY, 15, ""))
+    local dll_txt = panel:AddChild(Text(FONT_BODY, 15, ""))
     dll_txt:SetRegionSize(W - 30, 24)
     dll_txt:SetPosition(0, H * 0.5 - 55, 0)
     dll_txt:SetColour(0.50, 1.0, 0.68, 0.96)
     dll_txt:SetClickable(false)
 
     -- Live Telemetry Strip (2 compact lines)
-    local tele_bg = root:AddChild(Image("images/global.xml", "square.tex"))
+    local tele_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
     tele_bg:ScaleToSize(W - 22, 46)
     tele_bg:SetPosition(0, H * 0.5 - 96, 0)
     tele_bg:SetTint(0.03, 0.04, 0.06, 0.72)
 
-    local tele1 = root:AddChild(Text(FONT_NUM, 16, ""))
+    local tele1 = panel:AddChild(Text(FONT_NUM, 16, ""))
     tele1:SetPosition(0, H * 0.5 - 86, 0)
     tele1:SetColour(0.50, 1.0, 0.68, 0.96)
 
-    local tele2 = root:AddChild(Text(FONT_NUM, 15, ""))
+    local tele2 = panel:AddChild(Text(FONT_NUM, 15, ""))
     tele2:SetPosition(0, H * 0.5 - 106, 0)
     tele2:SetColour(0.78, 0.86, 0.96, 0.92)
 
@@ -129,12 +132,12 @@ local function CreateLiveCustomizerPanel(hud)
     for i = 1, #preset_defs do
         local pd = preset_defs[i]
         local px = start_x + (i - 1) * (pill_w + 5)
-        local pbg = root:AddChild(Image("images/global.xml", "square.tex"))
+        local pbg = panel:AddChild(Image("images/global.xml", "square.tex"))
         pbg:ScaleToSize(pill_w, 28)
         pbg:SetPosition(px, preset_y, 0)
         pbg:SetTint(0.14, 0.14, 0.18, 0.90)
 
-        local pb = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        local pb = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
         pb.scale_on_focus = false
         pb.move_on_click = false
         pb:ForceImageSize(pill_w, 28)
@@ -181,12 +184,12 @@ local function CreateLiveCustomizerPanel(hud)
         local rv = vis_rows[i]
         local ry = top_row_y - (i - 1) * row_step
 
-        local rbg = root:AddChild(Image("images/global.xml", "square.tex"))
+        local rbg = panel:AddChild(Image("images/global.xml", "square.tex"))
         rbg:ScaleToSize(W - 22, 25)
         rbg:SetPosition(0, ry, 0)
         rbg:SetTint(0.11, 0.12, 0.15, 0.72)
 
-        local rbtn = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        local rbtn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
         rbtn.scale_on_focus = false
         rbtn.move_on_click = false
         rbtn:ForceImageSize(W - 22, 25)
@@ -196,13 +199,13 @@ local function CreateLiveCustomizerPanel(hud)
             if panel_refresh_fn then panel_refresh_fn() end
         end)
 
-        local rlbl = root:AddChild(Text(FONT_BODY, 17, rv.label))
+        local rlbl = panel:AddChild(Text(FONT_BODY, 17, rv.label))
         rlbl:SetRegionSize(276, 24)
         rlbl:SetHAlign(G.ANCHOR_LEFT)
         rlbl:SetPosition(-28, ry, 0)
         rlbl:SetClickable(false)
 
-        local rval = root:AddChild(Text(FONT_NUM, 16, ""))
+        local rval = panel:AddChild(Text(FONT_NUM, 16, ""))
         rval:SetRegionSize(60, 24)
         rval:SetHAlign(G.ANCHOR_RIGHT)
         rval:SetPosition(136, ry, 0)
@@ -212,7 +215,7 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     -- Divider + 2 Core Engine Switches (240Hz Smoothness + Low Latency)
-    local div = root:AddChild(Image("images/global.xml", "square.tex"))
+    local div = panel:AddChild(Image("images/global.xml", "square.tex"))
     div:ScaleToSize(W - 26, 2)
     div:SetPosition(0, top_row_y - #vis_rows * row_step + 4, 0)
     div:SetTint(0.76, 0.62, 0.34, 0.38)
@@ -230,12 +233,12 @@ local function CreateLiveCustomizerPanel(hud)
         local ev = eng_rows[i]
         local ry = eng_top_y - (i - 1) * 30
 
-        local rbg = root:AddChild(Image("images/global.xml", "square.tex"))
+        local rbg = panel:AddChild(Image("images/global.xml", "square.tex"))
         rbg:ScaleToSize(W - 22, 26)
         rbg:SetPosition(0, ry, 0)
         rbg:SetTint(0.10, 0.14, 0.17, 0.78)
 
-        local rbtn = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        local rbtn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
         rbtn.scale_on_focus = false
         rbtn.move_on_click = false
         rbtn:ForceImageSize(W - 22, 26)
@@ -249,13 +252,13 @@ local function CreateLiveCustomizerPanel(hud)
             if panel_refresh_fn then panel_refresh_fn() end
         end)
 
-        local rlbl = root:AddChild(Text(FONT_BODY, 17, ev.label))
+        local rlbl = panel:AddChild(Text(FONT_BODY, 17, ev.label))
         rlbl:SetRegionSize(276, 24)
         rlbl:SetHAlign(G.ANCHOR_LEFT)
         rlbl:SetPosition(-28, ry, 0)
         rlbl:SetClickable(false)
 
-        local rval = root:AddChild(Text(FONT_NUM, 16, ""))
+        local rval = panel:AddChild(Text(FONT_NUM, 16, ""))
         rval:SetRegionSize(60, 24)
         rval:SetHAlign(G.ANCHOR_RIGHT)
         rval:SetPosition(136, ry, 0)
@@ -266,12 +269,12 @@ local function CreateLiveCustomizerPanel(hud)
 
     -- Bottom Action Bar: 1-Click Vanilla Pure Restore + Hide
     local bot_y = -H * 0.5 + 26
-    local reset_bg = root:AddChild(Image("images/global.xml", "square.tex"))
+    local reset_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
     reset_bg:ScaleToSize(188, 30)
     reset_bg:SetPosition(-76, bot_y, 0)
     reset_bg:SetTint(0.32, 0.24, 0.12, 0.92)
 
-    local reset_btn = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+    local reset_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     reset_btn.scale_on_focus = false
     reset_btn.move_on_click = false
     reset_btn:ForceImageSize(188, 30)
@@ -286,12 +289,12 @@ local function CreateLiveCustomizerPanel(hud)
         if panel_refresh_fn then panel_refresh_fn() end
     end)
 
-    local hide_bg = root:AddChild(Image("images/global.xml", "square.tex"))
+    local hide_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
     hide_bg:ScaleToSize(134, 30)
     hide_bg:SetPosition(96, bot_y, 0)
     hide_bg:SetTint(0.16, 0.16, 0.20, 0.92)
 
-    local hide_btn = root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+    local hide_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     hide_btn.scale_on_focus = false
     hide_btn.move_on_click = false
     hide_btn:ForceImageSize(134, 30)

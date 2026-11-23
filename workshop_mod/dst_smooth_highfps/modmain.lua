@@ -116,6 +116,9 @@ local latency_stats = {
     craft_ui_deferred = 0,
     followtext_240    = 0,
     host_fastdumps    = 0,
+    map_skip          = 0,
+    placer_skip       = 0,
+    deploy_skip       = 0,
 }
 local last_hud_avg_fps  = 0
 local last_hud_low1_fps = 0
@@ -556,7 +559,7 @@ local function PrintLatencyReport()
     local fnL = rawget(GLOBAL, "HyperSmooth_GetLatencyStats")
     local fnH = rawget(GLOBAL, "HyperSmooth_GetHostPerf")
     local luaLine = string.format(
-        "[HyperSmooth Latency] LowLat=%s | Lua(WASD_instant=%d, WalkCancel=%d, FlickRefresh=%d, FlickRescued=%d, ModClickRescued=%d, Cam240=%d, FollowText240=%d) | CraftZeroStall(rebuilds=%d hasSaved=%d uiDeferred=%d)",
+        "[HyperSmooth Latency] LowLat=%s | Lua(WASD_instant=%d, WalkCancel=%d, FlickRefresh=%d, FlickRescued=%d, ModClickRescued=%d, Cam240=%d, FollowText240=%d) | CraftZeroStall(rebuilds=%d hasSaved=%d uiDeferred=%d) | UiSkip(map=%d placer=%d deploy=%d)",
         tostring(current_low_latency),
         latency_stats.wasd_instant_rpcs,
         latency_stats.walk_cancels,
@@ -567,7 +570,10 @@ local function PrintLatencyReport()
         latency_stats.followtext_240,
         latency_stats.craft_rebuilds,
         latency_stats.craft_has_saved,
-        latency_stats.craft_ui_deferred)
+        latency_stats.craft_ui_deferred,
+        latency_stats.map_skip,
+        latency_stats.placer_skip,
+        latency_stats.deploy_skip)
     if type(fnL) == "function" then
         local ok, exAct, curLat, origLat, gpuMs, gpuDrains, vfxOk, vfxCmds, vfxPts, mipOk, mipVal, lightOk, lightPts, lmSwapOk = pcall(fnL)
         if ok then
@@ -588,6 +594,17 @@ local function PrintLatencyReport()
                         tostring(fdOk == true), fdCalls or 0, fdMB or 0, fdMs or 0, fdFb or 0,
                         tostring(c2Ok == true), c2Calls or 0, c2MB or 0, c2Ms or 0,
                         tostring(asOk == true), asInits or 0, asSteps or 0, asMs or 0, asFb or 0))
+                end
+            end
+            local fnR = rawget(GLOBAL, "HyperSmooth_GetRenderOptStats")
+            if type(fnR) == "function" then
+                local okR, glC, glH, uC, uH, fsQ, fsH, djH, djPk = pcall(fnR)
+                if okR then
+                    local glPct = (glC and glC > 0) and (100.0 * (glH or 0) / glC) or 0.0
+                    local uPct = (uC and uC > 0) and (100.0 * (uH or 0) / uC) or 0.0
+                    GLOBAL.print(string.format(
+                        "[HyperSmooth RenderOpt] GLState=%.1f%% (%d/%d) | GLUniform=%.1f%% (%d/%d) | FsNeg=%d/%d | DeJitter=%d (peak=%.2fms)",
+                        glPct, glH or 0, glC or 0, uPct, uH or 0, uC or 0, fsH or 0, fsQ or 0, djH or 0, djPk or 0.0))
                 end
             end
             return
@@ -1279,17 +1296,236 @@ if SMOOTH_UI_240HZ then
         if not old_OnUpdate then
             return
         end
+
+        local in_onupdate = false
+        local frame_skip = false
+        local hs_ctrl_gen = 0
+        local hs_moved_gen = 0
+        local hs_clock = 0.0
+        local last_eval_t = -1.0
+        local last_mx, last_my = nil, nil
+        local last_zoom = nil
+        local last_moved_gen = -1
+        local last_ctrl_gen = -1
+        local last_wx, last_wy, last_wz = nil, nil, nil
+        local last_aax, last_aay, last_aaz = nil, nil, nil
+        local last_lmb, last_rmb = nil, nil
+        local has_cached_actions = false
+
+        local old_OnControl = self.OnControl
+        if type(old_OnControl) == "function" then
+            self.OnControl = function(scr, control, down, ...)
+                hs_ctrl_gen = hs_ctrl_gen + 1
+                frame_skip = false
+                return old_OnControl(scr, control, down, ...)
+            end
+        end
+
+        local old_OnMinimapMoved = self.OnMinimapMoved
+        if type(old_OnMinimapMoved) == "function" then
+            self.OnMinimapMoved = function(scr, ...)
+                hs_moved_gen = hs_moved_gen + 1
+                return old_OnMinimapMoved(scr, ...)
+            end
+        end
+
+        local old_OnBecomeActive = self.OnBecomeActive
+        if type(old_OnBecomeActive) == "function" then
+            self.OnBecomeActive = function(scr, ...)
+                last_eval_t = -1.0
+                has_cached_actions = false
+                hs_ctrl_gen = hs_ctrl_gen + 1
+                return old_OnBecomeActive(scr, ...)
+            end
+        end
+
+        local old_AutoAim = self.AutoAimToStaticDecorations
+        if type(old_AutoAim) == "function" then
+            self.AutoAimToStaticDecorations = function(scr, x, y, z, ...)
+                local dd = scr.decorationdata
+                local zoom = (scr.minimap and scr.minimap.GetZoom) and scr.minimap:GetZoom() or nil
+                if in_onupdate and frame_skip
+                    and (dd == nil or (not dd.dirty and not dd.alwaysdirty))
+                    and zoom == last_zoom
+                    and x == last_wx and y == last_wy and z == last_wz
+                    and last_aax ~= nil then
+                    return last_aax, last_aay, last_aaz
+                end
+                local aax, aay, aaz = old_AutoAim(scr, x, y, z, ...)
+                last_wx, last_wy, last_wz = x, y, z
+                last_aax, last_aay, last_aaz = aax, aay, aaz
+                return aax, aay, aaz
+            end
+        end
+
+        local old_UpdateMapActions = self.UpdateMapActions
+        if type(old_UpdateMapActions) == "function" then
+            self.UpdateMapActions = function(scr, aax, aay, aaz, ...)
+                local dd = scr.decorationdata
+                local zoom = (scr.minimap and scr.minimap.GetZoom) and scr.minimap:GetZoom() or nil
+                if in_onupdate and frame_skip and has_cached_actions
+                    and (dd == nil or (not dd.dirty and not dd.alwaysdirty))
+                    and zoom == last_zoom
+                    and aax == last_aax and aaz == last_aaz then
+                    return last_lmb, last_rmb
+                end
+                local lmb, rmb = old_UpdateMapActions(scr, aax, aay, aaz, ...)
+                last_lmb, last_rmb = lmb, rmb
+                has_cached_actions = true
+                last_eval_t = hs_clock
+                last_zoom = zoom
+                last_moved_gen = hs_moved_gen
+                last_ctrl_gen = hs_ctrl_gen
+                return lmb, rmb
+            end
+        end
+
         self.OnUpdate = function(scr, dt)
+            local step_dt = (type(dt) == "number" and dt >= 0 and dt < 1.0) and dt or 0.0
+            hs_clock = hs_clock + step_dt
+            local GetTimeRealSeconds = rawget(GLOBAL, "GetTimeRealSeconds")
+            if type(GetTimeRealSeconds) == "function" then
+                local real_t = GetTimeRealSeconds()
+                if type(real_t) == "number" and real_t > 0 then
+                    hs_clock = real_t
+                end
+            end
+
+            local sim = rawget(GLOBAL, "TheSim")
+            local mx, my = nil, nil
+            if sim and type(sim.GetPosition) == "function" then
+                mx, my = sim:GetPosition()
+            end
+            local zoom = (scr.minimap and scr.minimap.GetZoom) and scr.minimap:GetZoom() or nil
+            local dd = scr.decorationdata
+            local stationary = (not scr.zoom_target_time or scr.zoom_target_time <= 0)
+                and (dd == nil or (not dd.dirty and not dd.alwaysdirty))
+                and mx == last_mx and my == last_my
+                and zoom == last_zoom
+                and hs_moved_gen == last_moved_gen
+                and hs_ctrl_gen == last_ctrl_gen
+                and has_cached_actions
+                and last_eval_t >= 0.0
+                and (hs_clock - last_eval_t) >= 0.0
+                and (hs_clock - last_eval_t) < 0.0333
+                and last_wx ~= nil
+
+            in_onupdate = true
+            frame_skip = stationary
+            if stationary then
+                latency_stats.map_skip = latency_stats.map_skip + 1
+                rawset(GLOBAL, "HS_MAP_SKIP_COUNT", latency_stats.map_skip)
+            else
+                last_mx, last_my = mx, my
+            end
+
             local orig_sens = scr.zoomsensitivity
-            if orig_sens and dt and dt > 0 and dt < 0.25 then
-                scr.zoomsensitivity = orig_sens * (dt * 60.0)
-                old_OnUpdate(scr, dt)
+            local ok, err
+            if type(orig_sens) == "number" and type(dt) == "number" and dt > 0 and dt < 0.25 then
+                local factor = dt * 60.0
+                if factor > 2.0 then factor = 2.0 end
+                scr.zoomsensitivity = orig_sens * factor
+                ok, err = pcall(old_OnUpdate, scr, dt)
                 scr.zoomsensitivity = orig_sens
             else
-                old_OnUpdate(scr, dt)
+                ok, err = pcall(old_OnUpdate, scr, dt)
+            end
+
+            in_onupdate = false
+            frame_skip = false
+            if not ok then
+                GLOBAL.error(err)
             end
         end
     end)
+
+    AddComponentPostInit("placer", function(self)
+        local old_TestCanBuild = self.TestCanBuild
+        if type(old_TestCanBuild) ~= "function" then
+            return
+        end
+        self.TestCanBuild = function(cmp, ...)
+            local sim = rawget(GLOBAL, "TheSim")
+            local tick = (sim and type(sim.GetTick) == "function") and sim:GetTick() or nil
+            local inst = cmp.inst
+            local tf = inst and inst.Transform or nil
+            if tick ~= nil and tf and type(tf.GetWorldPosition) == "function" then
+                local x, y, z = tf:GetWorldPosition()
+                if type(x) == "number" and type(z) == "number" then
+                    local rot = (type(tf.GetRotation) == "function") and tf:GetRotation() or 0
+                    local qx = math.floor(x * 1000 + 0.5)
+                    local qy = math.floor((type(y) == "number" and y or 0) * 1000 + 0.5)
+                    local qz = math.floor(z * 1000 + 0.5)
+                    local qrot = math.floor((type(rot) == "number" and rot or 0) * 100 + 0.5)
+                    local inp = rawget(GLOBAL, "TheInput")
+                    local hud_ent = (inp and type(inp.GetHUDEntityUnderMouse) == "function") and inp:GetHUDEntityUnderMouse() or nil
+                    local world_ent = (inp and type(inp.GetWorldEntityUnderMouse) == "function") and inp:GetWorldEntityUnderMouse() or nil
+                    local builder = cmp.builder
+                    local inv_rep = builder and builder.inst and builder.inst.replica and builder.inst.replica.inventory or nil
+                    local active_item = (inv_rep and type(inv_rep.GetActiveItem) == "function") and inv_rep:GetActiveItem() or nil
+                    local mode_toggle = cmp.axisalignedplacementtoggle and true or false
+                    if cmp._hs_tcb_tick == tick
+                        and cmp._hs_tcb_qx == qx and cmp._hs_tcb_qy == qy and cmp._hs_tcb_qz == qz
+                        and cmp._hs_tcb_qrot == qrot
+                        and cmp._hs_tcb_hud == hud_ent and cmp._hs_tcb_went == world_ent
+                        and cmp._hs_tcb_act == active_item and cmp._hs_tcb_tog == mode_toggle then
+                        latency_stats.placer_skip = latency_stats.placer_skip + 1
+                        rawset(GLOBAL, "HS_PLACER_SKIP_COUNT", latency_stats.placer_skip)
+                        return cmp._hs_tcb_can, cmp._hs_tcb_blocked
+                    end
+                    local can_build, mouse_blocked = old_TestCanBuild(cmp, ...)
+                    cmp._hs_tcb_tick = tick
+                    cmp._hs_tcb_qx = qx
+                    cmp._hs_tcb_qy = qy
+                    cmp._hs_tcb_qz = qz
+                    cmp._hs_tcb_qrot = qrot
+                    cmp._hs_tcb_hud = hud_ent
+                    cmp._hs_tcb_went = world_ent
+                    cmp._hs_tcb_act = active_item
+                    cmp._hs_tcb_tog = mode_toggle
+                    cmp._hs_tcb_can = can_build
+                    cmp._hs_tcb_blocked = mouse_blocked
+                    return can_build, mouse_blocked
+                end
+            end
+            return old_TestCanBuild(cmp, ...)
+        end
+    end)
+
+    local function InstallDeployHelperDedup()
+        local orig_fn = rawget(GLOBAL, "TriggerDeployHelpers")
+        if type(orig_fn) ~= "function" or rawget(GLOBAL, "_HS_DEPLOY_WRAPPED") then
+            return
+        end
+        rawset(GLOBAL, "_HS_DEPLOY_WRAPPED", true)
+        local last_tick = -1
+        local last_x, last_z, last_range = 0, 0, -1
+        local last_recipe, last_placer = nil, nil
+        local last_t = -1.0
+        rawset(GLOBAL, "TriggerDeployHelpers", function(x, y, z, range, recipe, placerinst, ...)
+            local sim = rawget(GLOBAL, "TheSim")
+            local tick = (sim and type(sim.GetTick) == "function") and sim:GetTick() or nil
+            if tick ~= nil and type(x) == "number" and type(z) == "number" then
+                local GetTimeRealSeconds = rawget(GLOBAL, "GetTimeRealSeconds")
+                local now = (type(GetTimeRealSeconds) == "function") and (GetTimeRealSeconds() or 0.0) or 0.0
+                if tick == last_tick
+                    and range == last_range and recipe == last_recipe and placerinst == last_placer
+                    and ((x - last_x) * (x - last_x) + (z - last_z) * (z - last_z)) < 0.0625
+                    and (now - last_t) >= 0.0 and (now - last_t) < 0.020 then
+                    latency_stats.deploy_skip = latency_stats.deploy_skip + 1
+                    rawset(GLOBAL, "HS_DEPLOY_SKIP_COUNT", latency_stats.deploy_skip)
+                    return
+                end
+                last_tick = tick
+                last_x, last_z, last_range = x, z, range
+                last_recipe, last_placer = recipe, placerinst
+                last_t = now
+            end
+            return orig_fn(x, y, z, range, recipe, placerinst, ...)
+        end)
+    end
+    InstallDeployHelperDedup()
+    AddSimPostInit(InstallDeployHelperDedup)
 
     local _dbg_getinfo = (type(GLOBAL.debug) == "table" and type(GLOBAL.debug.getinfo) == "function") and GLOBAL.debug.getinfo or nil
     local function IsVanillaComponentFn(fn, file_pat)
@@ -2833,6 +3069,9 @@ HS_PanelApi = {
             light_ok         = light_ok,
             lm_scale         = lm_scale,
             flick_rescues    = latency_stats.flick_rescues,
+            map_skip         = latency_stats.map_skip,
+            placer_skip      = latency_stats.placer_skip,
+            deploy_skip      = latency_stats.deploy_skip,
         }
     end,
 }
