@@ -35,6 +35,9 @@
 
 #include "iphlpapi_names.h"
 #include "fast_dumper.h"
+#include "fast_astar.h"
+#include "fast_astar_manager.h"
+#include "anti_stw_gc.h"
 #include "libdeflate.h"
 #include "mimalloc.h"
 
@@ -120,6 +123,9 @@ struct Config {
     int    log_interval_ticks      = 300; // log summary every 10s (300 ticks) when profiler active
     int    sim_tick_rate           = 30;  // 30 (stock vanilla) or 60 (opt-in HyperCore/HyperSmooth dual-side 60Hz)
     bool   enable_raknet_instant_wake = true; // 0ms event-driven RakNet UDP wakeup (eliminates 10ms WaitOnEvent stall)
+    bool   enable_fast_astar       = true; // O(N log N) flat-hash + binary-heap A* Pathfinder engine (v1.3.0)
+    bool   enable_anti_stw_gc      = true; // Smooths startup/mod LUA_GCCOLLECT nukes into bounded incremental drain
+    bool   enable_fast_load        = true; // SIMD libdeflate unzReadCurrentFile + 64-bit inflate_fast + rep stosb VecFill
 };
 
 Config       g_cfg;
@@ -224,6 +230,9 @@ void LoadIniConfig() {
         else if (std::strcmp(k, "log_interval_ticks") == 0)      g_cfg.log_interval_ticks = std::max(0, std::atoi(v));
         else if (std::strcmp(k, "sim_tick_rate") == 0)           g_cfg.sim_tick_rate = (std::atoi(v) == 60) ? 60 : 30;
         else if (std::strcmp(k, "enable_raknet_instant_wake") == 0) g_cfg.enable_raknet_instant_wake = std::atoi(v) != 0;
+        else if (std::strcmp(k, "enable_fast_astar") == 0)       g_cfg.enable_fast_astar = std::atoi(v) != 0;
+        else if (std::strcmp(k, "enable_anti_stw_gc") == 0)      g_cfg.enable_anti_stw_gc = std::atoi(v) != 0;
+        else if (std::strcmp(k, "enable_fast_load") == 0)        g_cfg.enable_fast_load = std::atoi(v) != 0;
     }
     std::fclose(f);
 }
@@ -243,6 +252,7 @@ struct Telemetry {
     std::atomic<uint64_t> gc_us_sum{0};
     std::atomic<uint64_t> gc_us_max{0};
     std::atomic<uint64_t> gc_full_count{0};
+    std::atomic<uint64_t> gc_stw_blocked{0};
     std::atomic<int32_t>  gc_last_kb{0};
     std::atomic<int32_t>  gc_last_budget_us{0};
 
@@ -251,6 +261,14 @@ struct Telemetry {
     std::atomic<uint64_t> spatial_queries{0};
     std::atomic<uint64_t> spatial_zerocopy_hits{0};
     std::atomic<uint64_t> spatial_cells_visited{0};
+    std::atomic<uint64_t> light_spatial_queries{0};
+
+    std::atomic<uint64_t> astar_inits{0};
+    std::atomic<uint64_t> astar_steps{0};
+    std::atomic<uint64_t> astar_us_sum{0};
+    std::atomic<uint64_t> astar_completed{0};
+    std::atomic<uint64_t> astar_failed{0};
+    std::atomic<uint64_t> astar_fallbacks{0};
 
     std::atomic<uint64_t> mi_allocs{0};
     std::atomic<uint64_t> mi_reallocs{0};
@@ -263,8 +281,14 @@ struct Telemetry {
 
     std::atomic<uint64_t> deflate_calls{0};
     std::atomic<uint64_t> deflate_us_sum{0};
+    std::atomic<uint64_t> deflate_main_calls{0};
+    std::atomic<uint64_t> deflate_main_us_sum{0};
     std::atomic<uint64_t> deflate_in_bytes{0};
     std::atomic<uint64_t> deflate_out_bytes{0};
+
+    std::atomic<uint64_t> unz_hits{0};
+    std::atomic<uint64_t> unz_bytes{0};
+    std::atomic<uint64_t> unz_us_sum{0};
 
     std::atomic<uint64_t> serialize_world_calls{0};
     std::atomic<uint64_t> serialize_world_us_sum{0};
@@ -281,12 +305,14 @@ struct Telemetry {
 
     void Reset() {
         ticks_total = 0; tick_us_sum = 0; tick_us_max = 0; tick_overrun_count = 0;
-        gc_calls = 0; gc_us_sum = 0; gc_us_max = 0; gc_full_count = 0;
+        gc_calls = 0; gc_us_sum = 0; gc_us_max = 0; gc_full_count = 0; gc_stw_blocked = 0;
         find_entities_calls = 0; find_entities_us_sum = 0;
-        spatial_queries = 0; spatial_zerocopy_hits = 0; spatial_cells_visited = 0;
+        spatial_queries = 0; spatial_zerocopy_hits = 0; spatial_cells_visited = 0; light_spatial_queries = 0;
+        astar_inits = 0; astar_steps = 0; astar_us_sum = 0; astar_completed = 0; astar_failed = 0; astar_fallbacks = 0;
         mi_allocs = 0; mi_reallocs = 0; mi_frees = 0;
         fastdump_calls = 0; fastdump_us_sum = 0; fastdump_bytes_sum = 0; fastdump_fallbacks = 0;
-        deflate_calls = 0; deflate_us_sum = 0; deflate_in_bytes = 0; deflate_out_bytes = 0;
+        deflate_calls = 0; deflate_us_sum = 0; deflate_main_calls = 0; deflate_main_us_sum = 0; deflate_in_bytes = 0; deflate_out_bytes = 0;
+        unz_hits = 0; unz_bytes = 0; unz_us_sum = 0;
         serialize_world_calls = 0; serialize_world_us_sum = 0;
         AcquireSRWLockExclusive(&tick_ring_lock);
         tick_ring_pos = 0; tick_ring_filled = 0;
@@ -440,7 +466,10 @@ bool RestoreHookBytes(uint8_t* target, const uint8_t* savedBytes, size_t len) {
     if (!VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
     std::memcpy(target, savedBytes, len);
     DWORD dummy = 0;
-    VirtualProtect(target, len, oldProt, &dummy);
+    if (!VirtualProtect(target, len, oldProt, &dummy)) {
+        LogMsg("[HOOK] WARN: RestoreHookBytes failed restoring page protection 0x%lX @ %p (err=%lu)",
+               static_cast<unsigned long>(oldProt), target, static_cast<unsigned long>(GetLastError()));
+    }
     FlushInstructionCache(GetCurrentProcess(), target, len);
     return true;
 }
@@ -504,13 +533,69 @@ bool InstallHookOrdered(uint8_t* target, void* detour, size_t stolenLen, void** 
     return true;
 }
 
-void FinalizeTrampolineSlabWX() {
-    if (!g_trampSlab) return;
+uint8_t* FindUniqueMaskedCallsite(const uint8_t* pre, size_t preLen,
+                                  const uint8_t* post, size_t postLen,
+                                  const char* name) {
+    const size_t total = preLen + 4 + postLen;
+    if (!g_textStart || g_textSize < total) return nullptr;
+    uint8_t* hit = nullptr;
+    size_t count = 0;
+    for (size_t off = 0; off <= g_textSize - total; ++off) {
+        if (g_textStart[off] == pre[0] &&
+            std::memcmp(g_textStart + off, pre, preLen) == 0 &&
+            std::memcmp(g_textStart + off + preLen + 4, post, postLen) == 0) {
+            hit = g_textStart + off + preLen - 1; // points to 0xE8
+            ++count;
+            if (count > 1) break;
+        }
+    }
+    if (count != 1) {
+        LogMsg("[AOB] WARN: callsite %s matched %zu times (expected 1) - skipped safely", name, count);
+        return nullptr;
+    }
+    return hit;
+}
+
+bool InstallRel32CallRelay(uint8_t* callSite, void* detour) {
+    if (!callSite || callSite[0] != 0xE8 || !detour || !g_trampSlab) return false;
+    const size_t needed = 16;
+    if (g_trampUsed + needed > kTrampSlabSize) return false;
+    const size_t prevUsed = g_trampUsed;
+    uint8_t* relay = g_trampSlab + g_trampUsed;
+    g_trampUsed = (g_trampUsed + 14 + 15) & ~size_t(15);
+
+    const intptr_t diff = reinterpret_cast<intptr_t>(relay) - reinterpret_cast<intptr_t>(callSite + 5);
+    if (diff < INT32_MIN || diff > INT32_MAX) {
+        g_trampUsed = prevUsed;
+        return false;
+    }
+    WriteAbsJmp14(relay, detour);
+    FlushInstructionCache(GetCurrentProcess(), relay, 14);
+    std::atomic_thread_fence(std::memory_order_release);
+
+    const int32_t rel = static_cast<int32_t>(diff);
+    if (!RestoreHookBytes(callSite + 1, reinterpret_cast<const uint8_t*>(&rel), 4)) {
+        g_trampUsed = prevUsed;
+        return false;
+    }
+    return true;
+}
+
+bool IsInTextSection(const uint8_t* p) {
+    return p && g_textStart && p >= g_textStart && static_cast<size_t>(p - g_textStart) < g_textSize;
+}
+
+bool FinalizeTrampolineSlabWX() {
+    if (!g_trampSlab) return false;
     DWORD oldProt = 0;
     if (VirtualProtect(g_trampSlab, kTrampSlabSize, PAGE_EXECUTE_READ, &oldProt)) {
         LogMsg("[HOOK] Locked trampoline slab W^X -> PAGE_EXECUTE_READ (%zu/%zu bytes used)",
                g_trampUsed, kTrampSlabSize);
+        return true;
     }
+    LogMsg("[ERROR][HOOK] Failed locking trampoline slab W^X -> PAGE_EXECUTE_READ (err=%lu)!",
+           static_cast<unsigned long>(GetLastError()));
+    return false;
 }
 
 // =============================================================================
@@ -523,6 +608,7 @@ using CollectGarbage_t     = void (*)(void* sim);
 using SetGcBudget_t        = void (*)(float sec);
 using LuaAlloc_t           = void* (*)(void* ud, void* ptr, size_t osize, size_t nsize);
 using LuaNewState_t        = void* (*)(LuaAlloc_t f, void* ud);
+using LuaClose_t           = void (*)(void* L);
 using LuaOpenLibs_t        = void (*)(void* L);
 using TrackLuaMem_t        = void (*)(void* sim, uint32_t osize, uint32_t nsize);
 using EntityMgrFind_t      = void (*)(void* mgr, const float* pos3, float radius, void* mustTags,
@@ -537,6 +623,7 @@ SimUpdate_t        g_origSimUpdate         = nullptr;
 CollectGarbage_t   g_origCollectGarbage    = nullptr;
 SetGcBudget_t      g_setGcBudget           = nullptr;
 LuaNewState_t      g_origLuaNewState       = nullptr;
+LuaClose_t         g_origLuaClose          = nullptr;
 LuaOpenLibs_t      g_origLuaOpenLibs       = nullptr;
 TrackLuaMem_t      g_trackLuaMem           = nullptr;
 uint8_t*           g_simLuaAllocAddr       = nullptr;
@@ -647,12 +734,15 @@ void HookEntityMgrFindEntities(void* mgr, const float* pos3, float radius,
     g_origEntityMgrFind(mgr, pos3, radius, mustTags, cantTags, oneOfTags, outVec);
 }
 
-void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* visitor) {
+void RunZeroCopySpatialQuery(void* grid, const float* posXZ, float radius, void* visitor,
+                             EntityVisitor_t vis, SpatialGridQuery_t orig, bool isLightQuery) {
     g_stats.spatial_queries.fetch_add(1, std::memory_order_relaxed);
+    if (isLightQuery) {
+        g_stats.light_spatial_queries.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    // Hermetic safety gate: ONLY take zero-copy path for verified read-only FindEntities!
-    if (!g_cfg.enable_spatial_zerocopy || !tl_inReadOnlyFindEntities || !g_entityVisitor || !grid || !posXZ) {
-        g_origSpatialGridQuery(grid, posXZ, radius, visitor);
+    if (!g_cfg.enable_spatial_zerocopy || !vis || !grid || !posXZ) {
+        if (orig) orig(grid, posXZ, radius, visitor);
         return;
     }
 
@@ -671,7 +761,7 @@ void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* vi
     // Exact vanilla parity: fall back cleanly to Klei's original SpatialGrid::Query.
     if (!std::isfinite(x) || !std::isfinite(z) || !std::isfinite(radius) ||
         radius < 0.0f || radius > 100000.0f) {
-        g_origSpatialGridQuery(grid, posXZ, radius, visitor);
+        if (orig) orig(grid, posXZ, radius, visitor);
         return;
     }
 
@@ -745,7 +835,7 @@ void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* vi
                 void** p = cur->ent_begin;
                 void** e = cur->ent_end;
                 while (p < e) {
-                    if (!g_entityVisitor(visitor, *p)) {
+                    if (!vis(visitor, *p)) {
                         g_stats.spatial_cells_visited.fetch_add(visited_cells, std::memory_order_relaxed);
                         return;
                     }
@@ -758,9 +848,209 @@ void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* vi
     g_stats.spatial_cells_visited.fetch_add(visited_cells, std::memory_order_relaxed);
 }
 
+void HookSpatialGridQuery(void* grid, const float* posXZ, float radius, void* visitor) {
+    if (!tl_inReadOnlyFindEntities) {
+        g_stats.spatial_queries.fetch_add(1, std::memory_order_relaxed);
+        g_origSpatialGridQuery(grid, posXZ, radius, visitor);
+        return;
+    }
+    RunZeroCopySpatialQuery(grid, posXZ, radius, visitor, g_entityVisitor, g_origSpatialGridQuery, false);
+}
+
+// 4 additional hot read-only server SpatialGrid::Query template instantiations (v1.3.0)
+// complementing Module 5's FindEntities_CachedTag (5/5 total read-only server sites!):
+//   [0] FindEntities / CountEntities (direct-tag)
+//   [1] FindEntities_Registered      (combat / mobs / farms / boats)
+//   [2] LightWatcher::GetLightAtPoint Intensity (mega-base multi-light hot path!)
+//   [3] LightWatcher::GetLightAtPoint RGB
+static constexpr size_t kNumDirectSqSites = 4;
+SpatialGridQuery_t g_origDirectSq[kNumDirectSqSites] = {};
+EntityVisitor_t    g_directSqVisitor[kNumDirectSqSites] = {};
+
+template <size_t Slot>
+void HookDirectSpatialQuery(void* grid, const float* posXZ, float radius, void* visitor) {
+    RunZeroCopySpatialQuery(grid, posXZ, radius, visitor,
+                            g_directSqVisitor[Slot], g_origDirectSq[Slot], Slot >= 2);
+}
+
 // =============================================================================
-// Module 3: 30Hz Adaptive Slack-Based Incremental GC
+// Module 6 (v1.3.0): O(N log N) Flat-Hash + Binary-Heap Pathfinder AStar Engine
 // =============================================================================
+using AStarReset_t = void (*)(void* astar);
+using AStarInit_t  = void (*)(void* astar, void* ctx);
+using AStarStep_t  = uint32_t (*)(void* astar, uint32_t maxSteps);
+
+AStarReset_t g_origAStarReset = nullptr;
+AStarInit_t  g_origAStarInit  = nullptr;
+AStarStep_t  g_origAStarStep  = nullptr;
+fast_astar::EngineCallbacks g_astarCb{};
+bool g_astarReady = false;
+
+static void ClearKleiPathVec(void* pathVec) {
+    if (!pathVec) return;
+    auto* pv = reinterpret_cast<uint8_t*>(pathVec);
+    // MSVC90 std::vector<TileCoord>: +0x08=begin, +0x10=end (exact match with Klei 0x1400b2adc..0x1400b2b1e)
+    *reinterpret_cast<void**>(pv + 0x10) = *reinterpret_cast<void**>(pv + 0x08);
+}
+
+// Lock-guarded O(1) flat pointer table (AStar* -> SearchState*) + warm object pool (0 heap churn)
+fast_astar::StateManager<64u> g_astarMgr;
+
+void HookAStarReset(void* astar) {
+    if (astar) {
+        g_astarMgr.DetachAndRecycle(astar);
+    }
+    if (g_origAStarReset) {
+        g_origAStarReset(astar);
+    }
+}
+
+void HookAStarInit(void* astar, void* ctx) {
+    if (!g_cfg.enable_fast_astar || !g_astarReady || !astar || !ctx) {
+        if (astar) g_astarMgr.DetachAndRecycle(astar);
+        if (g_origAStarInit) g_origAStarInit(astar, ctx);
+        return;
+    }
+
+    // Clear any legacy Klei open/closed nodes and reset AStar fields cleanly
+    if (g_origAStarReset) g_origAStarReset(astar);
+
+    auto* ab = reinterpret_cast<uint8_t*>(astar);
+    *reinterpret_cast<void**>(ab + 0x50)   = ctx;
+    *reinterpret_cast<float*>(ab + 0x78)   = 0.0f;
+    *reinterpret_cast<int32_t*>(ab + 0x08) = 0;
+
+    auto handle = g_astarMgr.AcquireAndBind(astar);
+    if (!handle) {
+        g_stats.astar_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        if (g_origAStarInit) g_origAStarInit(astar, ctx);
+        return;
+    }
+
+    const auto* cb = reinterpret_cast<const uint8_t*>(ctx);
+    fast_astar::TileCoord start{};
+    std::memcpy(&start, cb + 0x30, sizeof(fast_astar::TileCoord));
+    const float h = g_astarCb.heuristic(ctx, &start);
+    handle->Init(start, h);
+    g_stats.astar_inits.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t HookAStarStep(void* astar, uint32_t maxSteps) {
+    if (!astar) return 0u;
+    auto* ab = reinterpret_cast<uint8_t*>(astar);
+    if (*reinterpret_cast<int32_t*>(ab + 0x08) != 0) {
+        return 0u;
+    }
+
+    auto handle = g_astarMgr.AcquireRef(astar);
+    if (!handle || !g_cfg.enable_fast_astar || !g_astarReady) {
+        handle.Release();
+        g_stats.astar_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return g_origAStarStep ? g_origAStarStep(astar, maxSteps) : 0u;
+    }
+
+    auto* slotPtr = handle.Slot();
+    const uint64_t slotGen = handle.Gen();
+    void* ctx = *reinterpret_cast<void**>(ab + 0x50);
+    if (!ctx) {
+        handle.Release();
+        g_astarMgr.DetachIfMatch(astar, slotPtr, slotGen);
+        *reinterpret_cast<int32_t*>(ab + 0x08) = 2;
+        return 0u;
+    }
+
+    fast_astar::TileCoord goal{};
+    std::memcpy(&goal, reinterpret_cast<const uint8_t*>(ctx) + 0x3C, sizeof(fast_astar::TileCoord));
+
+    const int64_t t0 = NowQpc();
+    int32_t outStatus = 0;
+    const uint32_t steps = handle->Step(ctx, goal, maxSteps, g_astarCb, ab + 0x58, outStatus);
+    const double us = QpcDeltaUs(t0, NowQpc());
+
+    *reinterpret_cast<float*>(ab + 0x78) += static_cast<float>(us * 1e-6);
+    g_stats.astar_steps.fetch_add(steps, std::memory_order_relaxed);
+    g_stats.astar_us_sum.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+
+    if (outStatus != 0) {
+        *reinterpret_cast<int32_t*>(ab + 0x08) = outStatus;
+        handle.Release();
+        g_astarMgr.DetachIfMatch(astar, slotPtr, slotGen);
+        if (outStatus == 1) {
+            g_stats.astar_completed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_stats.astar_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return steps;
+}
+
+// =============================================================================
+// Module 3: Adaptive Slack-Based Incremental GC + Anti-STW Full-GC Shield
+// =============================================================================
+using LuaGcFn_t = int (*)(void* L, int what, int data);
+LuaGcFn_t                 g_origLuaGc = nullptr;
+std::atomic<void*>        g_activeSimLuaState{nullptr};
+std::atomic<void*>        g_activeSimGlobalState{nullptr}; // L->l_G (offset +0x20 in Lua 5.1.4 x64)
+std::atomic<bool>         g_simStartedForGc{false};
+std::atomic<bool>         g_gcPastWarmup{false};
+std::atomic<DWORD>        g_mainSimThreadId{0};
+anti_stw_gc::State        g_gcPolicyState;
+std::atomic<uint32_t>     g_pendingExternalCatchup{0};
+
+static inline void* ExtractLuaGlobalState(void* L) noexcept {
+    if (!L) return nullptr;
+    return *reinterpret_cast<void* const*>(static_cast<const uint8_t*>(L) + 0x20);
+}
+
+void ResetGcLifecycleForVmTeardown(void* closingL) {
+    void* activeL = g_activeSimLuaState.load(std::memory_order_acquire);
+    void* activeG = g_activeSimGlobalState.load(std::memory_order_acquire);
+    void* closingG = ExtractLuaGlobalState(closingL);
+    if (!closingL || closingL == activeL || (activeG && closingG == activeG)) {
+        g_simStartedForGc.store(false, std::memory_order_release);
+        g_gcPastWarmup.store(false, std::memory_order_release);
+        g_activeSimLuaState.store(nullptr, std::memory_order_release);
+        g_activeSimGlobalState.store(nullptr, std::memory_order_release);
+        g_pendingExternalCatchup.store(0, std::memory_order_release);
+    }
+}
+
+void HookLuaClose(void* L) {
+    ResetGcLifecycleForVmTeardown(L);
+    if (g_origLuaClose) {
+        g_origLuaClose(L);
+    }
+}
+
+int HookLuaGc(void* L, int what, int data) {
+    if (!g_origLuaGc) return 0;
+    // Intercept external Lua/Mod explicit collectgarbage("collect") nukes ONLY during steady-state
+    // active Simulation gameplay on the main sim thread, past startup warmup, on the exact Sim VM!
+    const DWORD mainTid = g_mainSimThreadId.load(std::memory_order_acquire);
+    const void* activeG = g_activeSimGlobalState.load(std::memory_order_acquire);
+    if (what == 2 /*LUA_GCCOLLECT*/ &&
+        g_cfg.enable_anti_stw_gc &&
+        g_setGcBudget != nullptr &&
+        mainTid != 0 && GetCurrentThreadId() == mainTid &&
+        g_simStartedForGc.load(std::memory_order_acquire) &&
+        g_gcPastWarmup.load(std::memory_order_acquire) &&
+        L != nullptr &&
+        activeG != nullptr &&
+        ExtractLuaGlobalState(L) == activeG) {
+        const int64_t t0 = NowQpc();
+        const bool is60Hz = (g_activeSimTickRate.load(std::memory_order_relaxed) == 60);
+        g_setGcBudget(is60Hz ? 0.0020f : 0.0030f);
+        g_origLuaGc(L, 5 /*LUA_GCSTEP*/, 0);
+        g_pendingExternalCatchup.store(90, std::memory_order_release);
+        g_stats.gc_stw_blocked.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
+        g_stats.gc_us_sum.fetch_add(us, std::memory_order_relaxed);
+        g_stats.cur_tick_gc_us += us;
+        return 0;
+    }
+    return g_origLuaGc(L, what, data);
+}
+
 void HookCollectGarbage(void* sim) {
     const int64_t t0 = NowQpc();
     g_stats.gc_calls.fetch_add(1, std::memory_order_relaxed);
@@ -781,78 +1071,48 @@ void HookCollectGarbage(void* sim) {
         g_origCollectGarbage(sim);
         return;
     }
+    g_activeSimLuaState.store(L, std::memory_order_release);
+    g_activeSimGlobalState.store(ExtractLuaGlobalState(L), std::memory_order_release);
+
+    const uint32_t extArm = g_pendingExternalCatchup.exchange(0, std::memory_order_acquire);
+    if (extArm > 0) {
+        g_gcPolicyState.ArmForcedCatchup(extArm);
+    }
 
     int32_t* pThresholdKb = reinterpret_cast<int32_t*>(simBytes + 0x24C);
     const int32_t curKb = g_lua.gc(L, 3 /*LUA_GCCOUNT*/, 0);
     g_stats.gc_last_kb.store(curKb, std::memory_order_relaxed);
 
-    // Track true post-cycle live working set (updated whenever a GC cycle completes or VM resets)
-    static void* s_lastL = nullptr;
-    static int32_t s_liveSetKb = 0;
-    if (L != s_lastL || s_liveSetKb <= 0 || curKb < s_liveSetKb) {
-        s_lastL = L;
-        s_liveSetKb = curKb;
-    }
+    anti_stw_gc::Config pcfg{};
+    pcfg.gc_spare_target_ms  = g_cfg.gc_spare_target_ms;
+    pcfg.gc_calm_max_ms      = g_cfg.gc_calm_max_ms;
+    pcfg.gc_busy_min_ms      = g_cfg.gc_busy_min_ms;
+    pcfg.gc_emergency_add_mb = g_cfg.gc_emergency_add_mb;
+    pcfg.enable_anti_stw_gc  = g_cfg.enable_anti_stw_gc;
 
-    // Ensure emergency threshold is comfortably above live working set so STW full GC
-    // only fires on genuine runaway leaks, while incremental GC does the steady work.
-    const int32_t emergencyFloor = std::max<int32_t>(
-        s_liveSetKb * 2,
-        s_liveSetKb + g_cfg.gc_emergency_add_mb * 1024);
-    if (*pThresholdKb < emergencyFloor) {
-        *pThresholdKb = emergencyFloor;
-    } else if (curKb > *pThresholdKb) {
-        // Genuine emergency full-GC needed
+    const bool is60Hz = (g_activeSimTickRate.load(std::memory_order_relaxed) == 60);
+    const anti_stw_gc::Decision dec = g_gcPolicyState.Evaluate(
+        L, curKb, *pThresholdKb, g_stats.last_tick_non_gc_ms, is60Hz, pcfg);
+    g_gcPastWarmup.store(g_gcPolicyState.IsPastWarmup(), std::memory_order_release);
+    *pThresholdKb = dec.new_threshold_kb;
+
+    if (dec.run_hard_full_gc) {
+        // Last-resort runaway OOM circuit-breaker (calls direct unhooked g_lua.gc)
         g_lua.gc(L, 2 /*LUA_GCCOLLECT*/, 0);
         g_stats.gc_full_count.fetch_add(1, std::memory_order_relaxed);
         const int32_t postKb = g_lua.gc(L, 3 /*LUA_GCCOUNT*/, 0);
-        s_liveSetKb = postKb;
+        g_gcPolicyState.OnHardFullGcCompleted(postKb);
         *pThresholdKb = std::max<int32_t>(postKb * 2, postKb + g_cfg.gc_emergency_add_mb * 1024);
         g_stats.gc_last_kb.store(postKb, std::memory_order_relaxed);
     }
 
-    // Pressure-driven 30Hz Adaptive GC (respects gc_spare_target_ms & prevents busy-tick starvation):
-    // - Computes actual tick headroom: spareMs = max(0, gc_spare_target_ms - nonGcMs).
-    // - Low pressure (<32MB excess): 0.55ms (45% lighter than vanilla 1.0ms, zero idle table re-marking).
-    // - Moderate/High pressure (>=32MB..>=96MB): smoothly ramps up to 2.5ms using up to 25% of
-    //   available tick headroom even on 14~22ms combat ticks, preventing STW memory cliffs.
-    // - Saturated ticks (spareMs < 4.0ms): clamps down to gc_busy_min_ms (0.4ms) to avoid overruns.
-    const bool is60Hz = (g_activeSimTickRate.load(std::memory_order_relaxed) == 60);
-    const double nonGcMs = g_stats.last_tick_non_gc_ms;
-    const double effectiveTargetMs = is60Hz
-        ? std::min<double>(13.5, static_cast<double>(g_cfg.gc_spare_target_ms) * 0.5)
-        : static_cast<double>(g_cfg.gc_spare_target_ms);
-    const double spareMs = std::max(0.0, effectiveTargetMs - nonGcMs);
-    const double excessMb = (curKb > s_liveSetKb)
-        ? (static_cast<double>(curKb - s_liveSetKb) / 1024.0)
-        : 0.0;
-
-    const float idleBaseMs = is60Hz ? 0.30f : 0.55f;
-    const float busyMinMs  = is60Hz ? std::min(g_cfg.gc_busy_min_ms, 0.25f) : g_cfg.gc_busy_min_ms;
-    float budgetMs = idleBaseMs;
-    if (spareMs < (is60Hz ? 2.5 : 4.0)) {
-        budgetMs = busyMinMs;
-    } else if (excessMb >= 96.0) {
-        const double allowed = std::min<double>(g_cfg.gc_calm_max_ms, std::max(is60Hz ? 0.6 : 1.0, spareMs * 0.25));
-        budgetMs = static_cast<float>(std::min(is60Hz ? 1.5 : 2.5, allowed));
-    } else if (excessMb >= 32.0) {
-        const double frac = (excessMb - 32.0) / 64.0;
-        const double want = (is60Hz ? 0.45 : 0.85) + frac * (is60Hz ? 0.65 : 1.15);
-        const double capBySpare = std::max<double>(busyMinMs, spareMs * 0.20);
-        budgetMs = static_cast<float>(std::min(want, capBySpare));
-    } else if (nonGcMs >= (is60Hz ? 9.5 : 18.0)) {
-        budgetMs = busyMinMs;
-    } else {
-        budgetMs = idleBaseMs;
-    }
-
-    g_stats.gc_last_budget_us.store(static_cast<int32_t>(budgetMs * 1000.0f), std::memory_order_relaxed);
-    g_setGcBudget(budgetMs * 0.001f);
+    g_stats.gc_last_budget_us.store(static_cast<int32_t>(dec.step_budget_ms * 1000.0f), std::memory_order_relaxed);
+    g_setGcBudget(dec.step_budget_ms * 0.001f);
     const int cycleDone = g_lua.gc(L, 5 /*LUA_GCSTEP*/, 0);
     if (cycleDone != 0) {
         const int32_t postKb = g_lua.gc(L, 3 /*LUA_GCCOUNT*/, 0);
+        g_gcPolicyState.OnCycleCompleted(postKb);
         if (postKb > 0) {
-            s_liveSetKb = postKb;
             g_stats.gc_last_kb.store(postKb, std::memory_order_relaxed);
         }
     }
@@ -893,9 +1153,14 @@ int HookCompress2(uint8_t* dest, uint32_t* destLen,
             size_t outSz = libdeflate_zlib_compress(tl_deflate.comp, source, sourceLen, dest, *destLen);
             if (outSz > 0 && outSz <= *destLen) {
                 *destLen = static_cast<uint32_t>(outSz);
+                const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
                 g_stats.deflate_out_bytes.fetch_add(outSz, std::memory_order_relaxed);
-                g_stats.deflate_us_sum.fetch_add(static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc())),
-                                                 std::memory_order_relaxed);
+                g_stats.deflate_us_sum.fetch_add(us, std::memory_order_relaxed);
+                const DWORD mainTid = g_mainSimThreadId.load(std::memory_order_relaxed);
+                if (mainTid != 0 && GetCurrentThreadId() == mainTid) {
+                    g_stats.deflate_main_calls.fetch_add(1, std::memory_order_relaxed);
+                    g_stats.deflate_main_us_sum.fetch_add(us, std::memory_order_relaxed);
+                }
                 return 0; // Z_OK
             }
         }
@@ -905,9 +1170,273 @@ int HookCompress2(uint8_t* dest, uint32_t* destLen,
     if (rc == 0 && destLen) {
         g_stats.deflate_out_bytes.fetch_add(*destLen, std::memory_order_relaxed);
     }
-    g_stats.deflate_us_sum.fetch_add(static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc())),
-                                     std::memory_order_relaxed);
+    const uint64_t us = static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc()));
+    g_stats.deflate_us_sum.fetch_add(us, std::memory_order_relaxed);
+    const DWORD mainTid = g_mainSimThreadId.load(std::memory_order_relaxed);
+    if (mainTid != 0 && GetCurrentThreadId() == mainTid) {
+        g_stats.deflate_main_calls.fetch_add(1, std::memory_order_relaxed);
+        g_stats.deflate_main_us_sum.fetch_add(us, std::memory_order_relaxed);
+    }
     return rc;
+}
+
+// =============================================================================
+// Module 4C: Server FastLoad Engine (libdeflate v1.23 unzReadCurrentFile + 64-bit inflate_fast)
+// Exact binary parity verified against dontstarve_dedicated_server_nullrenderer_x64.exe (0/309 insn diffs).
+// =============================================================================
+using UnzReadCurrentFile_t = int (*)(void* file, void* buf, uint32_t len);
+using ZReadFileFunc_t      = uint32_t (*)(void* opaque, void* stream, void* buf, uint32_t size);
+using ZSeekFileFunc_t      = int32_t (*)(void* opaque, void* stream, uint32_t offset, int origin);
+
+UnzReadCurrentFile_t g_origUnzRead = nullptr;
+
+struct ServerUnzReadInfo {
+    void* read_buffer;              // +0x00
+    const uint8_t* next_in;         // +0x08
+    uint32_t avail_in;              // +0x10
+    uint32_t total_in;              // +0x14
+    uint8_t* next_out;              // +0x18
+    uint32_t avail_out;             // +0x20
+    uint32_t total_out;             // +0x24
+    uint8_t pad_stream[0x38];       // +0x28..+0x5F
+    uint32_t pos_in_zipfile;        // +0x60
+    uint8_t pad_mid[0x18];          // +0x64..+0x7B
+    uint32_t rest_read_compressed;  // +0x7C
+    uint32_t rest_read_uncompressed;// +0x80
+    uint8_t pad_io[0x14];           // +0x84..+0x97
+    ZReadFileFunc_t zread_file;     // +0x98
+    uint8_t pad_io2[0x10];          // +0xA0..+0xAF
+    ZSeekFileFunc_t zseek_file;     // +0xB0
+    uint8_t pad_io3[0x10];          // +0xB8..+0xC7
+    void* opaque;                   // +0xC8
+    void* filestream;               // +0xD0
+    int32_t compression_method;     // +0xD8
+    uint32_t byte_before_zipfile;   // +0xDC
+    int32_t raw;                    // +0xE0
+};
+
+struct TlsDecompCtx {
+    libdeflate_decompressor* decomp = nullptr;
+    std::vector<uint8_t> compBuf;
+    ~TlsDecompCtx() {
+        if (decomp) { libdeflate_free_decompressor(decomp); decomp = nullptr; }
+    }
+};
+
+extern "C" int HookUnzReadCurrentFile(void* file, void* buf, uint32_t len) {
+    if (!file) return -102; // UNZ_PARAMERROR (mirrors Klei prologue check before trampoline +0x16)
+    auto* pinfo = *reinterpret_cast<ServerUnzReadInfo**>(static_cast<uint8_t*>(file) + 0xC8);
+    if (!pinfo || !pinfo->read_buffer || len == 0 || !buf) {
+        return g_origUnzRead(file, buf, len);
+    }
+
+    const uint32_t compSize   = pinfo->rest_read_compressed;
+    const uint32_t uncompSize = pinfo->rest_read_uncompressed;
+
+    if (pinfo->compression_method == 8 && pinfo->raw == 0 &&
+        pinfo->avail_in == 0 && pinfo->total_out == 0 &&
+        compSize > 0 && compSize <= (64u * 1024u * 1024u) &&
+        uncompSize > 0 && uncompSize <= static_cast<uint32_t>(INT32_MAX) && len >= uncompSize &&
+        pinfo->zseek_file && pinfo->zread_file) {
+
+        const int64_t t0 = NowQpc();
+        thread_local TlsDecompCtx tls;
+        if (!tls.decomp) tls.decomp = libdeflate_alloc_decompressor();
+        if (tls.decomp) {
+            if (tls.compBuf.size() < compSize) tls.compBuf.resize(compSize);
+            const uint32_t offset = pinfo->pos_in_zipfile + pinfo->byte_before_zipfile;
+            if (pinfo->zseek_file(pinfo->opaque, pinfo->filestream, offset, 0) == 0 &&
+                pinfo->zread_file(pinfo->opaque, pinfo->filestream, tls.compBuf.data(), compSize) == compSize) {
+                size_t actualOut = 0;
+                if (libdeflate_deflate_decompress(tls.decomp, tls.compBuf.data(), compSize,
+                                                  buf, uncompSize, &actualOut) == LIBDEFLATE_SUCCESS &&
+                    actualOut == uncompSize) {
+                    pinfo->pos_in_zipfile += compSize;
+                    pinfo->rest_read_compressed = 0;
+                    pinfo->rest_read_uncompressed = 0;
+                    pinfo->next_out = static_cast<uint8_t*>(buf) + uncompSize;
+                    pinfo->avail_out = 0;
+                    pinfo->total_out += uncompSize;
+                    g_stats.unz_hits.fetch_add(1, std::memory_order_relaxed);
+                    g_stats.unz_bytes.fetch_add(uncompSize, std::memory_order_relaxed);
+                    g_stats.unz_us_sum.fetch_add(static_cast<uint64_t>(QpcDeltaUs(t0, NowQpc())), std::memory_order_relaxed);
+                    return static_cast<int>(uncompSize);
+                }
+            }
+        }
+    } else if ((pinfo->compression_method == 0 || pinfo->raw != 0) &&
+               pinfo->avail_in == 0 && uncompSize > 0 && uncompSize <= static_cast<uint32_t>(INT32_MAX) &&
+               uncompSize == compSize && len >= uncompSize &&
+               pinfo->zseek_file && pinfo->zread_file) {
+        const uint32_t offset = pinfo->pos_in_zipfile + pinfo->byte_before_zipfile;
+        if (pinfo->zseek_file(pinfo->opaque, pinfo->filestream, offset, 0) == 0 &&
+            pinfo->zread_file(pinfo->opaque, pinfo->filestream, buf, uncompSize) == uncompSize) {
+            pinfo->pos_in_zipfile += uncompSize;
+            pinfo->rest_read_compressed = 0;
+            pinfo->rest_read_uncompressed = 0;
+            pinfo->next_out = static_cast<uint8_t*>(buf) + uncompSize;
+            pinfo->avail_out = 0;
+            pinfo->total_out += uncompSize;
+            return static_cast<int>(uncompSize);
+        }
+    }
+
+    return g_origUnzRead(file, buf, len);
+}
+
+struct ZlibCode { uint8_t op; uint8_t bits; uint16_t val; };
+struct ZlibInflateState {
+    int32_t mode;
+    uint8_t pad0[0x28];
+    uint32_t wsize;
+    uint32_t whave;
+    uint32_t write;
+    uint8_t* window;
+    uint32_t hold;
+    uint32_t bits;
+    uint8_t pad1[0x10];
+    const ZlibCode* lcode;
+    const ZlibCode* dcode;
+    uint32_t lenbits;
+    uint32_t distbits;
+};
+struct ZlibStream {
+    const uint8_t* next_in;
+    uint32_t avail_in;
+    uint32_t pad0;
+    uint8_t* next_out;
+    uint32_t avail_out;
+    uint32_t pad1;
+    const char* msg;
+    ZlibInflateState* state;
+};
+
+static inline void FastCopyMatch(uint8_t* out, const uint8_t* from, uint32_t len, uint32_t dist) {
+    if (dist >= 16) {
+        while (len >= 16) { std::memcpy(out, from, 16); out += 16; from += 16; len -= 16; }
+        if (len >= 8) { std::memcpy(out, from, 8); out += 8; from += 8; len -= 8; }
+        while (len--) *out++ = *from++;
+    } else if (dist >= 8) {
+        while (len >= 8) { std::memcpy(out, from, 8); out += 8; from += 8; len -= 8; }
+        while (len--) *out++ = *from++;
+    } else if (dist == 1) {
+        uint8_t b = *from;
+        uint64_t v = static_cast<uint64_t>(b) * 0x0101010101010101ULL;
+        while (len >= 8) { std::memcpy(out, &v, 8); out += 8; len -= 8; }
+        while (len--) *out++ = b;
+    } else {
+        while (len--) *out++ = *from++;
+    }
+}
+
+extern "C" void HookInflateFast(ZlibStream* strm, uint32_t start) {
+    ZlibInflateState* state = strm->state;
+    const uint8_t* in = strm->next_in;
+    const uint8_t* in_end = in + strm->avail_in;
+    const uint8_t* last = in + (strm->avail_in - 5);
+    uint8_t* out = strm->next_out;
+    uint8_t* out_end = out + strm->avail_out;
+    uint8_t* beg = out - (start - strm->avail_out);
+    uint8_t* end = out + (strm->avail_out - 257);
+
+    uint32_t wsize = state->wsize, whave = state->whave, write = state->write;
+    uint8_t* window = state->window;
+    uint64_t hold = static_cast<uint64_t>(state->hold);
+    uint32_t bits = state->bits;
+    const ZlibCode* lcode = state->lcode;
+    const ZlibCode* dcode = state->dcode;
+    uint64_t lmask = (1ULL << state->lenbits) - 1;
+    uint64_t dmask = (1ULL << state->distbits) - 1;
+
+    do {
+        if (bits < 15) {
+            uint32_t chunk;
+            std::memcpy(&chunk, in, 4);
+            hold |= static_cast<uint64_t>(chunk) << bits;
+            in += 4;
+            bits += 32;
+        }
+        ZlibCode here = lcode[hold & lmask];
+    dolen:
+        uint32_t op = here.bits;
+        hold >>= op;
+        bits -= op;
+        op = here.op;
+        if (op == 0) {
+            *out++ = static_cast<uint8_t>(here.val);
+        } else if (op & 16) {
+            uint32_t len = here.val;
+            op &= 15;
+            if (op) {
+                if (bits < op && in < in_end) { hold |= static_cast<uint64_t>(*in++) << bits; bits += 8; }
+                len += static_cast<uint32_t>(hold & ((1ULL << op) - 1));
+                hold >>= op;
+                bits -= op;
+            }
+            if (bits < 15) {
+                if (in + 4 <= in_end) {
+                    uint32_t chunk; std::memcpy(&chunk, in, 4);
+                    hold |= static_cast<uint64_t>(chunk) << bits; in += 4; bits += 32;
+                } else {
+                    while (bits < 15 && in < in_end) { hold |= static_cast<uint64_t>(*in++) << bits; bits += 8; }
+                }
+            }
+            here = dcode[hold & dmask];
+        dodist:
+            op = here.bits; hold >>= op; bits -= op; op = here.op;
+            if (op & 16) {
+                uint32_t dist = here.val;
+                op &= 15;
+                if (bits < op) {
+                    if (in < in_end) { hold |= static_cast<uint64_t>(*in++) << bits; bits += 8; }
+                    if (bits < op && in < in_end) { hold |= static_cast<uint64_t>(*in++) << bits; bits += 8; }
+                }
+                dist += static_cast<uint32_t>(hold & ((1ULL << op) - 1));
+                hold >>= op; bits -= op;
+                uint32_t avail_back = static_cast<uint32_t>(out - beg);
+                if (dist > avail_back) {
+                    uint32_t back = dist - avail_back;
+                    if (back > whave) { strm->msg = "invalid distance too far back"; state->mode = 27; break; }
+                    const uint8_t* from = window;
+                    if (write == 0) {
+                        from += wsize - back;
+                        if (back < len) { len -= back; std::memcpy(out, from, back); out += back; from = out - dist; }
+                    } else if (write < back) {
+                        from += wsize + write - back; back -= write;
+                        if (back < len) {
+                            len -= back; std::memcpy(out, from, back); out += back; from = window;
+                            if (write < len) { uint32_t wlen = write; len -= wlen; std::memcpy(out, from, wlen); out += wlen; from = out - dist; }
+                        }
+                    } else {
+                        from += write - back;
+                        if (back < len) { len -= back; std::memcpy(out, from, back); out += back; from = out - dist; }
+                    }
+                    if (from >= window && from < window + wsize) { std::memcpy(out, from, len); out += len; }
+                    else { FastCopyMatch(out, from, len, dist); out += len; }
+                } else {
+                    FastCopyMatch(out, out - dist, len, dist);
+                    out += len;
+                }
+            } else if ((op & 64) == 0) {
+                here = dcode[here.val + (hold & ((1ULL << op) - 1))]; goto dodist;
+            } else { strm->msg = "invalid distance code"; state->mode = 27; break; }
+        } else if ((op & 64) == 0) {
+            here = lcode[here.val + (hold & ((1ULL << op) - 1))]; goto dolen;
+        } else if (op & 32) {
+            state->mode = 11; break;
+        } else { strm->msg = "invalid literal/length code"; state->mode = 27; break; }
+    } while (in < last && out < end);
+
+    uint32_t extra_bytes = bits >> 3;
+    in -= extra_bytes;
+    bits -= extra_bytes << 3;
+    hold &= (1ULL << bits) - 1;
+    strm->next_in = in;
+    strm->next_out = out;
+    strm->avail_in = static_cast<uint32_t>(in_end - in);
+    strm->avail_out = static_cast<uint32_t>(out_end - out);
+    state->hold = static_cast<uint32_t>(hold);
+    state->bits = bits;
 }
 
 // =============================================================================
@@ -917,9 +1446,12 @@ thread_local fast_dumper::GrowBuf tl_dumpBuf;
 
 int Lua_HyperCore_FastDump(void* L) {
     if (!g_cfg.enable_fast_dumper || !g_lua.ReadyForFastDump()) {
-        g_lua.pushnil(L);
-        g_lua.pushstring(L, "disabled");
-        return 2;
+        if (g_lua.pushnil && g_lua.pushstring) {
+            g_lua.pushnil(L);
+            g_lua.pushstring(L, "disabled");
+            return 2;
+        }
+        return 0;
     }
 
     const int64_t t0 = NowQpc();
@@ -981,6 +1513,7 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("gc_us_sum",             static_cast<double>(g_stats.gc_us_sum.load()));
     setNum("gc_max_us",             static_cast<double>(g_stats.gc_us_max.load()));
     setNum("gc_full_count",         static_cast<double>(g_stats.gc_full_count.load()));
+    setNum("gc_stw_blocked",        static_cast<double>(g_stats.gc_stw_blocked.load()));
     setNum("gc_last_kb",            static_cast<double>(g_stats.gc_last_kb.load()));
     setNum("gc_last_budget_us",     static_cast<double>(g_stats.gc_last_budget_us.load()));
     setNum("find_entities_calls",   static_cast<double>(g_stats.find_entities_calls.load()));
@@ -988,6 +1521,13 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("spatial_queries",       static_cast<double>(g_stats.spatial_queries.load()));
     setNum("spatial_zerocopy_hits", static_cast<double>(g_stats.spatial_zerocopy_hits.load()));
     setNum("spatial_cells_visited", static_cast<double>(g_stats.spatial_cells_visited.load()));
+    setNum("light_spatial_queries", static_cast<double>(g_stats.light_spatial_queries.load()));
+    setNum("astar_inits",           static_cast<double>(g_stats.astar_inits.load()));
+    setNum("astar_steps",           static_cast<double>(g_stats.astar_steps.load()));
+    setNum("astar_us_sum",          static_cast<double>(g_stats.astar_us_sum.load()));
+    setNum("astar_completed",       static_cast<double>(g_stats.astar_completed.load()));
+    setNum("astar_failed",          static_cast<double>(g_stats.astar_failed.load()));
+    setNum("astar_fallbacks",       static_cast<double>(g_stats.astar_fallbacks.load()));
     setNum("mi_allocs",             static_cast<double>(g_stats.mi_allocs.load()));
     setNum("mi_reallocs",           static_cast<double>(g_stats.mi_reallocs.load()));
     setNum("mi_frees",              static_cast<double>(g_stats.mi_frees.load()));
@@ -997,6 +1537,8 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("fastdump_fallbacks",    static_cast<double>(g_stats.fastdump_fallbacks.load()));
     setNum("deflate_calls",         static_cast<double>(g_stats.deflate_calls.load()));
     setNum("deflate_us_sum",        static_cast<double>(g_stats.deflate_us_sum.load()));
+    setNum("deflate_main_calls",    static_cast<double>(g_stats.deflate_main_calls.load()));
+    setNum("deflate_main_us_sum",   static_cast<double>(g_stats.deflate_main_us_sum.load()));
     setNum("deflate_in_bytes",      static_cast<double>(g_stats.deflate_in_bytes.load()));
     setNum("deflate_out_bytes",     static_cast<double>(g_stats.deflate_out_bytes.load()));
     setNum("serialize_world_calls", static_cast<double>(g_stats.serialize_world_calls.load()));
@@ -1005,8 +1547,10 @@ int Lua_HyperCore_GetStats(void* L) {
     setBool("opt_mimalloc",         g_cfg.enable_mimalloc);
     setBool("opt_spatial_zerocopy", g_cfg.enable_spatial_zerocopy);
     setBool("opt_adaptive_gc",      g_cfg.enable_adaptive_gc);
+    setBool("opt_anti_stw_gc",      g_cfg.enable_anti_stw_gc);
     setBool("opt_libdeflate",       g_cfg.enable_libdeflate);
     setBool("opt_fast_dumper",      g_cfg.enable_fast_dumper);
+    setBool("opt_fast_astar",       g_cfg.enable_fast_astar && g_astarReady);
     setNum("sim_tick_rate",         static_cast<double>(g_activeSimTickRate.load(std::memory_order_relaxed)));
     return 1;
 }
@@ -1016,12 +1560,31 @@ int Lua_HyperCore_ResetStats(void* /*L*/) {
     return 0;
 }
 
+SRWLOCK  g_simTickLock         = SRWLOCK_INIT;
+uint32_t g_savedPre60NetRate   = 0; // saved before first 30->60 transition (0 = unset)
+bool     g_hasSavedPre60NetRate = false;
+
 bool PatchFloatProtected(float* ptr, float val) {
     if (!ptr) return false;
     DWORD oldProt = 0, dummy = 0;
     if (!VirtualProtect(ptr, sizeof(float), PAGE_READWRITE, &oldProt)) return false;
     *ptr = val;
-    VirtualProtect(ptr, sizeof(float), oldProt, &dummy);
+    if (!VirtualProtect(ptr, sizeof(float), oldProt, &dummy)) {
+        LogMsg("[WARN] PatchFloatProtected @ %p failed restoring prot 0x%lX",
+               static_cast<void*>(ptr), static_cast<unsigned long>(oldProt));
+    }
+    return true;
+}
+
+bool PatchDoubleProtected(double* ptr, double val) {
+    if (!ptr) return false;
+    DWORD oldProt = 0, dummy = 0;
+    if (!VirtualProtect(ptr, sizeof(double), PAGE_READWRITE, &oldProt)) return false;
+    *ptr = val;
+    if (!VirtualProtect(ptr, sizeof(double), oldProt, &dummy)) {
+        LogMsg("[WARN] PatchDoubleProtected @ %p failed restoring prot 0x%lX",
+               static_cast<void*>(ptr), static_cast<unsigned long>(oldProt));
+    }
     return true;
 }
 
@@ -1032,28 +1595,54 @@ void SyncServerNetworkTickRateForSimHz(int hz) {
     void* replicaMgr = *reinterpret_cast<void**>(netMgr + 0x288);
     if (!replicaMgr) return;
 
-    uint32_t curRate = *reinterpret_cast<uint32_t*>(netMgr + 0xD8);
+    const uint32_t curRate = *reinterpret_cast<uint32_t*>(netMgr + 0xD8);
     uint32_t desiredRate = curRate;
     if (hz == 60) {
+        // Snapshot pre-60Hz rate ONCE so switching 60 -> 30 restores exact vanilla/custom rate!
+        if (!g_hasSavedPre60NetRate) {
+            g_savedPre60NetRate = (curRate != 0) ? curRate : 15u;
+            g_hasSavedPre60NetRate = true;
+        }
         // Default 15Hz -> upgrade to native 60Hz (U=60(1)) so server snapshots match 60Hz SimTick
         // AND joining clients automatically disable RakNet download throttling (1000/60 <= 16.67ms -> D=0)!
         // Respect explicit admin cluster.ini overrides (e.g., 20/30/60).
         desiredRate = (curRate == 0 || curRate == 15) ? 60u : curRate;
         g_netTickSynced60.store(true, std::memory_order_release);
     } else {
-        if (desiredRate == 0) desiredRate = 15u;
+        desiredRate = g_hasSavedPre60NetRate ? g_savedPre60NetRate : ((curRate != 0) ? curRate : 15u);
+        g_hasSavedPre60NetRate = false;
+        g_savedPre60NetRate = 0;
         g_netTickSynced60.store(false, std::memory_order_release);
     }
     g_fnSetNetTickRate(netMgr, desiredRate);
-    uint8_t ticksPerSnap = *(static_cast<uint8_t*>(replicaMgr) + 0x89D);
+    const uint8_t ticksPerSnap = *(static_cast<uint8_t*>(replicaMgr) + 0x89D);
     LogMsg("[SIMTICK] Synced Server NetworkTickRate -> U=%u(%u) for %dHz SimTick",
            desiredRate, static_cast<unsigned>(ticksPerSnap), hz);
 }
 
 bool ApplySimTickRate(int hz) {
     if (hz != 30 && hz != 60) return false;
+
+    AcquireSRWLockExclusive(&g_simTickLock);
+    struct UnlockGuard {
+        SRWLOCK* lk;
+        ~UnlockGuard() { ReleaseSRWLockExclusive(lk); }
+    } guard{&g_simTickLock};
+
     if (!g_simTickFloatPtr || !g_simTickDoublePtr) return false;
-    if (g_activeSimTickRate.load(std::memory_order_acquire) == hz) {
+    // Fail-closed: activating 60Hz requires ALL 4 subsystem constants + netTickScale verified!
+    if (hz == 60 &&
+        (!g_simAnimShaderTickPtr || !g_simPathfinderTickPtr ||
+         !g_simSpatialTickPtr || !g_simTimeDiffTickPtr || !g_netTickScalePtr)) {
+        LogMsg("[SIMTICK] Refused Server 60Hz (incomplete subsystem pointers: anim=%d path=%d spat=%d diff=%d netScale=%d)",
+               g_simAnimShaderTickPtr != nullptr, g_simPathfinderTickPtr != nullptr,
+               g_simSpatialTickPtr != nullptr, g_simTimeDiffTickPtr != nullptr,
+               g_netTickScalePtr != nullptr);
+        return false;
+    }
+
+    const int prevHz = g_activeSimTickRate.load(std::memory_order_acquire);
+    if (prevHz == hz) {
         if (hz == 60 && !g_netTickSynced60.load(std::memory_order_acquire)) {
             SyncServerNetworkTickRateForSimHz(60);
         }
@@ -1062,23 +1651,55 @@ bool ApplySimTickRate(int hz) {
 
     const float newF = 1.0f / static_cast<float>(hz);
     const double newD = 1.0 / static_cast<double>(hz);
+    const float newNetScale = (hz == 60) ? 60.499998f : 30.499998f;
 
-    if (!PatchFloatProtected(g_simTickFloatPtr, newF)) return false;
+    // Transactional snapshot before mutating ANY constant
+    struct FloatPatchEntry {
+        float* ptr;
+        float  prevVal;
+        float  newVal;
+        bool   written;
+    };
+    FloatPatchEntry fEntries[6] = {
+        { g_simTickFloatPtr,      g_simTickFloatPtr      ? *g_simTickFloatPtr      : 0.0f, newF,        false },
+        { g_simAnimShaderTickPtr, g_simAnimShaderTickPtr ? *g_simAnimShaderTickPtr : 0.0f, newF,        false },
+        { g_simPathfinderTickPtr, g_simPathfinderTickPtr ? *g_simPathfinderTickPtr : 0.0f, newF,        false },
+        { g_simSpatialTickPtr,    g_simSpatialTickPtr    ? *g_simSpatialTickPtr    : 0.0f, newF,        false },
+        { g_simTimeDiffTickPtr,   g_simTimeDiffTickPtr   ? *g_simTimeDiffTickPtr   : 0.0f, newF,        false },
+        { g_netTickScalePtr,      g_netTickScalePtr      ? *g_netTickScalePtr      : 0.0f, newNetScale, false },
+    };
+    const double savedD = *g_simTickDoublePtr;
+    bool dWritten = false;
 
-    DWORD oldD = 0, dummy = 0;
-    if (!VirtualProtect(g_simTickDoublePtr, sizeof(double), PAGE_READWRITE, &oldD)) return false;
-    *g_simTickDoublePtr = newD;
-    VirtualProtect(g_simTickDoublePtr, sizeof(double), oldD, &dummy);
+    auto rollbackAll = [&]() {
+        if (dWritten) {
+            PatchDoubleProtected(g_simTickDoublePtr, savedD);
+        }
+        for (int i = 5; i >= 0; --i) {
+            if (fEntries[i].written && fEntries[i].ptr) {
+                PatchFloatProtected(fEntries[i].ptr, fEntries[i].prevVal);
+            }
+        }
+    };
 
-    // Patch ALL secondary exclusive mTick*(1/30) subsystems (AnimRenderer, PathFinder, EntityMgr, LightWatcher/Charlie)
+    if (!PatchDoubleProtected(g_simTickDoublePtr, newD)) {
+        rollbackAll();
+        return false;
+    }
+    dWritten = true;
+
     int extras = 0;
-    if (PatchFloatProtected(g_simAnimShaderTickPtr, newF)) ++extras;
-    if (PatchFloatProtected(g_simPathfinderTickPtr, newF)) ++extras;
-    if (PatchFloatProtected(g_simSpatialTickPtr, newF))    ++extras;
-    if (PatchFloatProtected(g_simTimeDiffTickPtr, newF))   ++extras;
-
-    // Patch SetNetworkTickRate 30.5f -> 60.5f so ticksPerSnapshot divides 60Hz cleanly!
-    bool netScaleOk = PatchFloatProtected(g_netTickScalePtr, (hz == 60) ? 60.499998f : 30.499998f);
+    for (int i = 0; i < 6; ++i) {
+        if (!fEntries[i].ptr) continue;
+        if (!PatchFloatProtected(fEntries[i].ptr, fEntries[i].newVal)) {
+            rollbackAll();
+            LogMsg("[SIMTICK] Server %dHz patch failed at slot %d -> rolled back atomically to %dHz", hz, i, prevHz);
+            return false;
+        }
+        fEntries[i].written = true;
+        if (i >= 1 && i <= 4) ++extras;
+    }
+    const bool netScaleOk = fEntries[5].written;
 
     g_activeSimTickRate.store(hz, std::memory_order_release);
     LogMsg("[SIMTICK] Server Simulation tick rate -> %d Hz (dt=%.6fs, subsys=%d/4, netScale=%s)",
@@ -1180,11 +1801,13 @@ void HookServerFrameLimiterWait(void* flPtr, uint8_t bSleep) {
 }
 
 int Lua_HyperCore_GetSimTickRate(void* L) {
+    if (!g_lua.pushnumber) return 0;
     g_lua.pushnumber(L, static_cast<double>(g_activeSimTickRate.load(std::memory_order_acquire)));
     return 1;
 }
 
 int Lua_HyperCore_SetSimTickRate(void* L) {
+    if (!g_lua.gettop || !g_lua.tonumber || !g_lua.pushboolean) return 0;
     int hz = (g_lua.gettop(L) >= 1) ? static_cast<int>(g_lua.tonumber(L, 1)) : 30;
     bool ok = ApplySimTickRate(hz);
     g_lua.pushboolean(L, ok ? 1 : 0);
@@ -1192,27 +1815,40 @@ int Lua_HyperCore_SetSimTickRate(void* L) {
 }
 
 int Lua_HyperCore_Version(void* L) {
-    g_lua.pushstring(L, "DST-HyperCore-Server/1.2.0");
+    if (!g_lua.pushstring) return 0;
+    g_lua.pushstring(L, "DST-HyperCore-Server/1.3.0");
     return 1;
 }
 
 void RegisterHyperCoreLuaGlobals(void* L) {
-    if (!L || !g_lua.ReadyForRegister()) return;
+    if (!L || !g_lua.pushcclosure || !g_lua.setfield) return;
     auto regFn = [&](const char* name, int (*fn)(void*)) {
         g_lua.pushcclosure(L, fn, 0);
         g_lua.setfield(L, HC_LUA_GLOBALSINDEX, name);
     };
-    regFn("HyperCore_FastDump",       &Lua_HyperCore_FastDump);
-    regFn("HyperCore_GetStats",       &Lua_HyperCore_GetStats);
-    regFn("HyperCore_ResetStats",     &Lua_HyperCore_ResetStats);
-    regFn("HyperCore_Version",        &Lua_HyperCore_Version);
-    regFn("HyperCore_GetSimTickRate", &Lua_HyperCore_GetSimTickRate);
-    regFn("HyperCore_SetSimTickRate", &Lua_HyperCore_SetSimTickRate);
-    LogMsg("[LUA] Registered HyperCore native APIs into Lua VM %p (sim_tick=%dHz)",
-           L, g_activeSimTickRate.load(std::memory_order_relaxed));
+    // Gate EVERY exported Lua function individually by its exact required C API pointers!
+    const bool regFastDump = g_lua.ReadyForFastDump();
+    const bool regStats    = g_lua.ReadyForRegister();
+    const bool regVersion  = (g_lua.pushstring != nullptr);
+    const bool regGetSim   = (g_lua.pushnumber != nullptr);
+    const bool regSetSim   = (g_lua.gettop != nullptr && g_lua.tonumber != nullptr && g_lua.pushboolean != nullptr);
+
+    if (regFastDump) regFn("HyperCore_FastDump",       &Lua_HyperCore_FastDump);
+    if (regStats)    regFn("HyperCore_GetStats",       &Lua_HyperCore_GetStats);
+    regFn("HyperCore_ResetStats",                      &Lua_HyperCore_ResetStats);
+    if (regVersion)  regFn("HyperCore_Version",        &Lua_HyperCore_Version);
+    if (regGetSim)   regFn("HyperCore_GetSimTickRate", &Lua_HyperCore_GetSimTickRate);
+    if (regSetSim)   regFn("HyperCore_SetSimTickRate", &Lua_HyperCore_SetSimTickRate);
+
+    LogMsg("[LUA] Registered HyperCore APIs into Lua VM %p (fastDump=%d stats=%d ver=%d getSim=%d setSim=%d sim=%dHz)",
+           L, regFastDump ? 1 : 0, regStats ? 1 : 0, regVersion ? 1 : 0,
+           regGetSim ? 1 : 0, regSetSim ? 1 : 0, g_activeSimTickRate.load(std::memory_order_relaxed));
 }
 
 void HookLuaOpenLibs(void* L) {
+    // New Lua VM initializing: pause anti-STW external GC interception until Simulation ticks past warmup!
+    g_simStartedForGc.store(false, std::memory_order_release);
+    g_gcPastWarmup.store(false, std::memory_order_release);
     g_origLuaOpenLibs(L);
     RegisterHyperCoreLuaGlobals(L);
 }
@@ -1228,8 +1864,9 @@ void LogTelemetrySummary(const char* tag) {
     const uint64_t feUs = g_stats.find_entities_us_sum.load();
     const uint64_t gcUs = g_stats.gc_us_sum.load();
     LogMsg("[%s] ticks=%llu | tick_us(avg=%.0f p95=%.0f p99=%.0f max=%llu overruns=%llu) | "
-           "GC(us/t=%.0f max=%llu full=%llu kb=%d) | FindEnts(calls=%llu us/t=%.0f zc=%llu cells=%llu) | "
-           "FastDump(calls=%llu ms=%.1f MB=%.2f fb=%llu) | Deflate(calls=%llu ms=%.1f in=%.2fMB out=%.2fMB)",
+           "GC(us/t=%.0f max=%llu full=%llu stwBlk=%llu kb=%d) | FindEnts(calls=%llu us/t=%.0f zc=%llu light=%llu cells=%llu) | "
+           "AStar(inits=%llu steps=%llu us=%llu ok=%llu fail=%llu) | "
+           "FastDump(calls=%llu ms=%.1f MB=%.2f fb=%llu) | Ser(calls=%llu ms=%.1f) | Deflate(calls=%llu main=%llu ms=%.1f in=%.2fMB out=%.2fMB) | FastLoad(unz=%llu MB=%.1f ms=%.1f)",
            tag,
            static_cast<unsigned long long>(ticks),
            avg, p95, p99,
@@ -1238,19 +1875,32 @@ void LogTelemetrySummary(const char* tag) {
            ticks ? static_cast<double>(gcUs) / ticks : 0.0,
            static_cast<unsigned long long>(g_stats.gc_us_max.load()),
            static_cast<unsigned long long>(g_stats.gc_full_count.load()),
+           static_cast<unsigned long long>(g_stats.gc_stw_blocked.load()),
            g_stats.gc_last_kb.load(),
            static_cast<unsigned long long>(feCalls),
            ticks ? static_cast<double>(feUs) / ticks : 0.0,
            static_cast<unsigned long long>(g_stats.spatial_zerocopy_hits.load()),
+           static_cast<unsigned long long>(g_stats.light_spatial_queries.load()),
            static_cast<unsigned long long>(g_stats.spatial_cells_visited.load()),
+           static_cast<unsigned long long>(g_stats.astar_inits.load()),
+           static_cast<unsigned long long>(g_stats.astar_steps.load()),
+           static_cast<unsigned long long>(g_stats.astar_us_sum.load()),
+           static_cast<unsigned long long>(g_stats.astar_completed.load()),
+           static_cast<unsigned long long>(g_stats.astar_failed.load()),
            static_cast<unsigned long long>(g_stats.fastdump_calls.load()),
            g_stats.fastdump_us_sum.load() / 1000.0,
            g_stats.fastdump_bytes_sum.load() / (1024.0 * 1024.0),
            static_cast<unsigned long long>(g_stats.fastdump_fallbacks.load()),
+           static_cast<unsigned long long>(g_stats.serialize_world_calls.load()),
+           g_stats.serialize_world_us_sum.load() / 1000.0,
            static_cast<unsigned long long>(g_stats.deflate_calls.load()),
+           static_cast<unsigned long long>(g_stats.deflate_main_calls.load()),
            g_stats.deflate_us_sum.load() / 1000.0,
            g_stats.deflate_in_bytes.load() / (1024.0 * 1024.0),
-           g_stats.deflate_out_bytes.load() / (1024.0 * 1024.0));
+           g_stats.deflate_out_bytes.load() / (1024.0 * 1024.0),
+           static_cast<unsigned long long>(g_stats.unz_hits.load()),
+           g_stats.unz_bytes.load() / (1024.0 * 1024.0),
+           g_stats.unz_us_sum.load() / 1000.0);
 }
 
 DWORD WINAPI HttpMetricsThread(LPVOID);
@@ -1272,6 +1922,12 @@ void InitRuntimeServicesOnce() {
 uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
     if (!g_runtimeInitDone.load(std::memory_order_relaxed)) {
         InitRuntimeServicesOnce();
+    }
+    if (g_mainSimThreadId.load(std::memory_order_relaxed) == 0) {
+        g_mainSimThreadId.store(GetCurrentThreadId(), std::memory_order_release);
+    }
+    if (!g_simStartedForGc.load(std::memory_order_relaxed)) {
+        g_simStartedForGc.store(true, std::memory_order_release);
     }
     if (g_activeSimTickRate.load(std::memory_order_relaxed) == 60 &&
         !g_netTickSynced60.load(std::memory_order_relaxed)) {
@@ -1385,17 +2041,19 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
         double avg = 0, p95 = 0, p99 = 0;
         g_stats.ComputePercentiles(avg, p95, p99);
 
-        char body[1024];
+        char body[1536];
         int blen = std::snprintf(body, sizeof(body),
-            "{\"version\":\"DST-HyperCore-Server/1.2.0\","
+            "{\"version\":\"DST-HyperCore-Server/1.3.0\","
             "\"sim_tick_rate\":%d,"
             "\"ticks\":%llu,\"tick_avg_us\":%.1f,\"tick_p95_us\":%.1f,\"tick_p99_us\":%.1f,"
             "\"tick_max_us\":%llu,\"tick_overruns\":%llu,"
-            "\"gc_calls\":%llu,\"gc_us_sum\":%llu,\"gc_max_us\":%llu,\"gc_full\":%llu,\"gc_kb\":%d,"
+            "\"gc_calls\":%llu,\"gc_us_sum\":%llu,\"gc_max_us\":%llu,\"gc_full\":%llu,\"gc_stw_blocked\":%llu,\"gc_kb\":%d,"
             "\"find_entities_calls\":%llu,\"find_entities_us_sum\":%llu,"
-            "\"spatial_queries\":%llu,\"spatial_zerocopy\":%llu,\"spatial_cells\":%llu,"
+            "\"spatial_queries\":%llu,\"spatial_zerocopy\":%llu,\"light_spatial_queries\":%llu,\"spatial_cells\":%llu,"
+            "\"astar_inits\":%llu,\"astar_steps\":%llu,\"astar_us_sum\":%llu,\"astar_completed\":%llu,\"astar_failed\":%llu,"
             "\"fastdump_calls\":%llu,\"fastdump_us_sum\":%llu,\"fastdump_bytes\":%llu,"
-            "\"deflate_calls\":%llu,\"deflate_us_sum\":%llu,\"deflate_in\":%llu,\"deflate_out\":%llu}",
+            "\"serialize_calls\":%llu,\"serialize_us_sum\":%llu,"
+            "\"deflate_calls\":%llu,\"deflate_main_calls\":%llu,\"deflate_us_sum\":%llu,\"deflate_in\":%llu,\"deflate_out\":%llu}",
             g_activeSimTickRate.load(std::memory_order_relaxed),
             static_cast<unsigned long long>(g_stats.ticks_total.load()), avg, p95, p99,
             static_cast<unsigned long long>(g_stats.tick_us_max.load()),
@@ -1404,16 +2062,26 @@ DWORD WINAPI HttpMetricsThread(LPVOID) {
             static_cast<unsigned long long>(g_stats.gc_us_sum.load()),
             static_cast<unsigned long long>(g_stats.gc_us_max.load()),
             static_cast<unsigned long long>(g_stats.gc_full_count.load()),
+            static_cast<unsigned long long>(g_stats.gc_stw_blocked.load()),
             g_stats.gc_last_kb.load(),
             static_cast<unsigned long long>(g_stats.find_entities_calls.load()),
             static_cast<unsigned long long>(g_stats.find_entities_us_sum.load()),
             static_cast<unsigned long long>(g_stats.spatial_queries.load()),
             static_cast<unsigned long long>(g_stats.spatial_zerocopy_hits.load()),
+            static_cast<unsigned long long>(g_stats.light_spatial_queries.load()),
             static_cast<unsigned long long>(g_stats.spatial_cells_visited.load()),
+            static_cast<unsigned long long>(g_stats.astar_inits.load()),
+            static_cast<unsigned long long>(g_stats.astar_steps.load()),
+            static_cast<unsigned long long>(g_stats.astar_us_sum.load()),
+            static_cast<unsigned long long>(g_stats.astar_completed.load()),
+            static_cast<unsigned long long>(g_stats.astar_failed.load()),
             static_cast<unsigned long long>(g_stats.fastdump_calls.load()),
             static_cast<unsigned long long>(g_stats.fastdump_us_sum.load()),
             static_cast<unsigned long long>(g_stats.fastdump_bytes_sum.load()),
+            static_cast<unsigned long long>(g_stats.serialize_world_calls.load()),
+            static_cast<unsigned long long>(g_stats.serialize_world_us_sum.load()),
             static_cast<unsigned long long>(g_stats.deflate_calls.load()),
+            static_cast<unsigned long long>(g_stats.deflate_main_calls.load()),
             static_cast<unsigned long long>(g_stats.deflate_us_sum.load()),
             static_cast<unsigned long long>(g_stats.deflate_in_bytes.load()),
             static_cast<unsigned long long>(g_stats.deflate_out_bytes.load()));
@@ -1589,6 +2257,11 @@ constexpr int16_t kAobLuaNext[] = {
     0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, -1, -1, -1, -1, 0x4C, 0x8B,
     0x43, 0x10, 0x48, 0x8B, 0x10, 0x49, 0x83, 0xE8, 0x10, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1, 0x85, 0xC0, 0x74
 };
+// Lua 5.1.4 lua_close (21-byte RIP-free prologue, verified unique 1-match at RVA 0x422d50)
+constexpr int16_t kAobLuaClose[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x41, 0x20,
+    0x48, 0x8B, 0x98, 0xB0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCB, 0x48, 0x8B, 0x53, 0x40
+};
 // Exclusive Simulation::Update fixed-timestep loader (verified unique 1-match on Server & Client!)
 constexpr int16_t kAobSimUpdateTick[] = {
     0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1, 0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1,
@@ -1652,6 +2325,40 @@ constexpr int16_t kAobRakNetSendBufWake[] = {
 constexpr int16_t kAobRakNetSendBufListWake[] = {
     0x85, 0xFF, 0x75, 0x0C, 0x49, 0x8D, 0x8D, 0xD0, 0x06, 0x00, 0x00, 0xE8, -1, -1, -1, -1
 };
+// Verified unique 1-match Pathfinder AStar::Reset, AStar::Init, AStar::Step AOBs (v1.3.0)
+constexpr int16_t kAobAStarReset[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+    0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x79, 0x40, 0x48, 0x8B, 0x59, 0x38, 0x33, 0xED, 0x48, 0x8B
+};
+constexpr int16_t kAobAStarInit[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48,
+    0x8B, 0xDA, 0x48, 0x8B, 0xF1, 0xE8, -1, -1, -1, -1, 0x33, 0xFF, 0x48, 0x89, 0x5E, 0x50
+};
+constexpr int16_t kAobAStarStep[] = {
+    0x89, 0x54, 0x24, 0x10, 0x57, 0x41, 0x54, 0x48, 0x81, 0xEC, 0xB8, 0x00, 0x00, 0x00, 0x83, 0x79,
+    0x08, 0x00, 0x8B, 0xFA, 0x4C, 0x8B, 0xE1, 0x74, 0x0D, 0x33, 0xC0, 0x48, 0x81, 0xC4, 0xB8, 0x00
+};
+// Verified unique 1-match Server FastLoad AOBs (100% instruction parity with client)
+constexpr int16_t kAobUnzReadCurrentFile[] = {
+    0x40, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xF6, 0x48, 0x85, 0xC9, 0x75, 0x09, 0x8D, 0x46, 0x9A,
+    0x48, 0x83, 0xC4, 0x20, 0x5E, 0xC3, 0x48, 0x89, 0x7C, 0x24, 0x38, 0x48, 0x8B, 0xB9, 0xC8, 0x00,
+    0x00, 0x00, 0x48, 0x85
+};
+constexpr int16_t kAobInflateFast[] = {
+    0x48, 0x89, 0x4C, 0x24, 0x08, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41,
+    0x57, 0x48, 0x83, 0xEC, 0x38, 0x4C, 0x8B, 0x51, 0x28, 0x44, 0x8B, 0x71, 0x08, 0x48, 0x8B, 0x31,
+    0x4C, 0x8B, 0x41, 0x10
+};
+constexpr int16_t kAobVecFillA[] = {
+    0x48, 0x8B, 0xCB, 0x48, 0x89, 0x5C, 0x24, 0x20, 0x48, 0x8B, 0xD6, 0x48, 0x89, 0x54, 0x24, 0x28,
+    0x48, 0x85, 0xC9, 0x74, 0x19, 0x41, 0x0F, 0xB6, 0x45, 0x00, 0x88, 0x02, 0x48, 0xFF, 0xC9, 0x48,
+    0x89, 0x4C, 0x24, 0x20, 0x48, 0xFF, 0xC2, 0x48, 0x89, 0x54, 0x24, 0x28, 0xEB, 0xE2
+};
+constexpr int16_t kAobVecFillB[] = {
+    0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0x89, 0x4C, 0x24, 0x40, 0x0F, 0x1F, 0x40, 0x00, 0x48, 0x85,
+    0xC0, 0x74, 0x15, 0x44, 0x88, 0x21, 0x48, 0xFF, 0xC8, 0x48, 0x89, 0x44, 0x24, 0x38, 0x48, 0xFF,
+    0xC1, 0x48, 0x89, 0x4C, 0x24, 0x40, 0xEB, 0xE6
+};
 
 #define FIND_AOB(arr) FindUniqueAob(arr, sizeof(arr) / sizeof(arr[0]), #arr)
 
@@ -1678,6 +2385,8 @@ std::wstring DetectShardLogSuffix() {
     return pidBuf;
 }
 
+bool g_initOutsideLoaderLock = false;
+
 void InitServerHooks() {
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -1699,12 +2408,13 @@ void InitServerHooks() {
     if (FILE* f = _wfopen(g_logPath.c_str(), L"w")) std::fclose(f);
 
     LoadIniConfig();
-    LogMsg("=== DST HyperCore Server Native Engine v1.2.0 Boot (PID=%lu) ===",
-           static_cast<unsigned long>(GetCurrentProcessId()));
-    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_dumper=%d sim_tick=%dHz http=%d",
+    LogMsg("=== DST HyperCore Server Native Engine v1.3.0 Boot (PID=%lu, outsideLoaderLock=%d) ===",
+           static_cast<unsigned long>(GetCurrentProcessId()), g_initOutsideLoaderLock ? 1 : 0);
+    LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) fast_load=%d fast_dumper=%d fast_astar=%d sim_tick=%dHz http=%d",
            g_cfg.enable_profiler, g_cfg.enable_mimalloc, g_cfg.enable_spatial_zerocopy,
            g_cfg.enable_adaptive_gc, g_cfg.enable_libdeflate, g_cfg.libdeflate_level,
-           g_cfg.enable_fast_dumper, g_cfg.sim_tick_rate, g_cfg.enable_http_metrics);
+           g_cfg.enable_fast_load, g_cfg.enable_fast_dumper, g_cfg.enable_fast_astar,
+           g_cfg.sim_tick_rate, g_cfg.enable_http_metrics);
 
     if (!InitTextSection() || !InitTrampolineSlab()) {
         LogMsg("[ERROR] Failed to initialize .text scanner or near-module trampoline slab!");
@@ -1754,6 +2464,13 @@ void InitServerHooks() {
         LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
     }
 
+    // 2B. Hook lua_close (21-byte RIP-free prologue) -> reset Anti-STW GC lifecycle on VM teardown
+    if (uint8_t* pLuaClose = FIND_AOB(kAobLuaClose)) {
+        bool ok = InstallHookOrdered(pLuaClose, reinterpret_cast<void*>(&HookLuaClose), 21,
+                                     reinterpret_cast<void**>(&g_origLuaClose));
+        LogMsg("[HOOK] lua_close (GC lifecycle reset) @ %p -> %s", pLuaClose, ok ? "OK" : "FAIL");
+    }
+
     // 3. Hook Simulation::Update (Profiler + Adaptive GC feedback + outside-DllMain runtime init)
     if (uint8_t* pSimUpd = FIND_AOB(kAobSimUpdate)) {
         const RelocItem rel = {11, 5, 1}; // call __chkstk at +11
@@ -1769,6 +2486,18 @@ void InitServerHooks() {
                                      reinterpret_cast<void**>(&g_origCollectGarbage));
         LogMsg("[HOOK] Simulation::CollectGarbage @ %p (SetGcBudget=%p) -> %s",
                pGC, g_setGcBudget, ok ? "OK" : "FAIL");
+    }
+
+    // 4B. Hook lua_gc (15-byte RIP-free prologue) -> Anti-STW Full-GC Shield for external Lua/Mod collectgarbage("collect")
+    if (g_cfg.enable_anti_stw_gc && g_lua.gc) {
+        auto* pLuaGc = reinterpret_cast<uint8_t*>(g_lua.gc);
+        bool ok = InstallHookOrdered(pLuaGc, reinterpret_cast<void*>(&HookLuaGc), 15,
+                                     reinterpret_cast<void**>(&g_origLuaGc));
+        if (ok && g_origLuaGc) {
+            // Internal calls inside HookCollectGarbage bypass HookLuaGc via the unhooked trampoline
+            g_lua.gc = g_origLuaGc;
+        }
+        LogMsg("[HOOK] lua_gc (Anti-STW Shield) @ %p -> %s", pLuaGc, ok ? "OK" : "FAIL");
     }
 
     // 5. Paired, Fail-Closed, Independently AOB-Verified SpatialGrid::Query Hook with Rollback!
@@ -1789,15 +2518,142 @@ void InitServerHooks() {
                 ok2 = InstallHookOrdered(pSpatialQuery, reinterpret_cast<void*>(&HookSpatialGridQuery), 17,
                                          reinterpret_cast<void**>(&g_origSpatialGridQuery));
                 if (!ok2) {
-                    // Paired rollback: never leave partial EntityManager hook installed
-                    RestoreHookBytes(pEMFind, savedEM, 20);
-                    g_origEntityMgrFind = nullptr;
+                    // Paired rollback: keep g_origEntityMgrFind valid if restore ever fails so pass-through never null-derefs!
+                    const bool restored = RestoreHookBytes(pEMFind, savedEM, 20);
+                    if (restored) {
+                        g_origEntityMgrFind = nullptr;
+                    } else {
+                        LogMsg("[CRITICAL][HOOK] SpatialGrid rollback RestoreHookBytes failed @ %p; retaining pass-through trampoline", pEMFind);
+                    }
                 }
             }
             LogMsg("[HOOK] SpatialGrid::Query @ %p (Visitor=%p, AOB=VERIFIED) -> %s",
                    pSpatialQuery, pVisitor, (ok1 && ok2) ? "OK" : "FAIL (rolled back)");
         } else {
             LogMsg("[HOOK] SpatialGrid::Query skipped (Fail-Closed AOB verify: sq=%d ev=%d)", sqOk, evOk);
+        }
+    }
+
+    // 5B. Remaining 4 Hot Read-Only Server SpatialGrid::Query Callsites (5/5 total with Module 5!)
+    if (g_cfg.enable_spatial_zerocopy) {
+        constexpr int16_t kSqPrologue17[17] = {
+            0x48, 0x8B, 0xC4, 0x48, 0x89, 0x50, 0x10, 0x53, 0x55, 0x56, 0x57, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57
+        };
+        struct DirectSqSite {
+            const char* name;
+            uint8_t pre[17];
+            uint8_t post[12];
+            void*   detour;
+        };
+        static const DirectSqSite kDirectSites[kNumDirectSqSites] = {
+            {
+                "FindEntities_DirectTag",
+                {0x8B, 0xFA, 0x4D, 0x8D, 0x4B, 0xC8, 0xF3, 0x41, 0x0F, 0x11, 0x43, 0x38, 0x49, 0x8D, 0x53, 0x38, 0xE8},
+                {0x48, 0x8B, 0x53, 0x10, 0x48, 0x8B, 0x4B, 0x08, 0x4C, 0x8B, 0xC2, 0x4C},
+                reinterpret_cast<void*>(&HookDirectSpatialQuery<0>)
+            },
+            {
+                "FindEntities_Registered",
+                {0x03, 0xC2, 0x0F, 0xB6, 0xC0, 0x2B, 0xC2, 0x48, 0x8D, 0x54, 0x24, 0x30, 0x88, 0x44, 0x24, 0x40, 0xE8},
+                {0x48, 0x8B, 0x53, 0x10, 0x48, 0x8B, 0x4B, 0x08, 0x4C, 0x8B, 0xC2, 0x4C},
+                reinterpret_cast<void*>(&HookDirectSpatialQuery<1>)
+            },
+            {
+                "LightWatcher_Intensity",
+                {0xF3, 0x0F, 0x10, 0x10, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x60, 0xF3, 0x0F, 0x11, 0x4C, 0x24, 0x64, 0xE8},
+                {0x48, 0x83, 0xC4, 0x48, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC},
+                reinterpret_cast<void*>(&HookDirectSpatialQuery<2>)
+            },
+            {
+                "LightWatcher_RGB",
+                {0xF3, 0x0F, 0x10, 0x10, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x78, 0xF3, 0x0F, 0x11, 0x4C, 0x24, 0x7C, 0xE8},
+                {0xF3, 0x0F, 0x10, 0x6C, 0x24, 0x60, 0x0F, 0x2F, 0xEE, 0x76, 0x28, 0xF3},
+                reinterpret_cast<void*>(&HookDirectSpatialQuery<3>)
+            },
+        };
+        int sqDirectOk = 0;
+        for (size_t i = 0; i < kNumDirectSqSites; ++i) {
+            uint8_t* cs = FindUniqueMaskedCallsite(kDirectSites[i].pre, 17, kDirectSites[i].post, 12, kDirectSites[i].name);
+            uint8_t* sq = cs ? ResolveRel32Call(cs) : nullptr;
+            const bool sqProlOk = sq && VerifyAobAt(sq, kSqPrologue17, 17);
+            uint8_t* vis = sqProlOk ? ResolveRel32Call(sq + 0x239) : nullptr;
+            if (cs && sqProlOk && IsInTextSection(vis)) {
+                g_origDirectSq[i]    = reinterpret_cast<SpatialGridQuery_t>(sq);
+                g_directSqVisitor[i] = reinterpret_cast<EntityVisitor_t>(vis);
+                if (InstallRel32CallRelay(cs, kDirectSites[i].detour)) {
+                    ++sqDirectOk;
+                    LogMsg("[HOOK] SpatialGrid::Query[%zu] %s @ %p (SQ=%p Vis=%p) -> OK",
+                           i, kDirectSites[i].name, cs, sq, vis);
+                } else {
+                    g_origDirectSq[i] = nullptr;
+                    g_directSqVisitor[i] = nullptr;
+                    LogMsg("[HOOK] SpatialGrid::Query[%zu] %s relay patch FAILED", i, kDirectSites[i].name);
+                }
+            } else {
+                LogMsg("[HOOK] SpatialGrid::Query[%zu] %s skipped (Fail-Closed: cs=%p prol=%d vis=%p)",
+                       i, kDirectSites[i].name, cs, sqProlOk, vis);
+            }
+        }
+        LogMsg("[SPATIAL] Direct Zero-Copy SpatialGrid sites active: %d/%zu (+1 CachedTag = %d/5 total)",
+               sqDirectOk, kNumDirectSqSites, sqDirectOk + (g_origSpatialGridQuery ? 1 : 0));
+    }
+
+    // 5C. O(N log N) Flat-Hash + Binary-Heap Pathfinder AStar Engine (paired rollback on partial failure!)
+    if (g_cfg.enable_fast_astar) {
+        uint8_t* pReset = FIND_AOB(kAobAStarReset);
+        uint8_t* pInit  = FIND_AOB(kAobAStarInit);
+        uint8_t* pStep  = FIND_AOB(kAobAStarStep);
+        if (pReset && pInit && pStep) {
+            uint8_t* initReset = ResolveRel32Call(pInit + 21);
+            uint8_t* stepReset = ResolveRel32Call(pStep + 0x479);
+            uint8_t* pReserve  = ResolveRel32Call(pStep + 0x068);
+            uint8_t* pNbType2  = ResolveRel32Call(pStep + 0x1C9);
+            uint8_t* pNbNorm   = ResolveRel32Call(pStep + 0x1D9);
+            uint8_t* pHeur1    = ResolveRel32Call(pStep + 0x32F);
+            uint8_t* pHeur2    = ResolveRel32Call(pStep + 0x3B6);
+            uint8_t* pPushPath = ResolveRel32Call(pStep + 0x469);
+            uint8_t* pFreeMem  = ResolveRel32Call(pStep + 0x4E5);
+
+            const bool xcheck = (initReset == pReset) && (stepReset == pReset) &&
+                                (pHeur1 != nullptr && pHeur1 == pHeur2) &&
+                                IsInTextSection(pReserve) && IsInTextSection(pNbType2) &&
+                                IsInTextSection(pNbNorm)  && IsInTextSection(pHeur1) &&
+                                IsInTextSection(pPushPath) && IsInTextSection(pFreeMem);
+            if (xcheck) {
+                g_astarCb.reserveNeighbors   = reinterpret_cast<decltype(g_astarCb.reserveNeighbors)>(pReserve);
+                g_astarCb.getNeighborsNormal = reinterpret_cast<decltype(g_astarCb.getNeighborsNormal)>(pNbNorm);
+                g_astarCb.getNeighborsType2  = reinterpret_cast<decltype(g_astarCb.getNeighborsType2)>(pNbType2);
+                g_astarCb.heuristic          = reinterpret_cast<decltype(g_astarCb.heuristic)>(pHeur1);
+                g_astarCb.clearPath          = &ClearKleiPathVec;
+                g_astarCb.pushPathNode       = reinterpret_cast<decltype(g_astarCb.pushPathNode)>(pPushPath);
+                g_astarCb.freeMem            = reinterpret_cast<decltype(g_astarCb.freeMem)>(pFreeMem);
+
+                uint8_t savedR[15] = {}, savedI[15] = {};
+                bool okR = InstallHookOrdered(pReset, reinterpret_cast<void*>(&HookAStarReset), 15,
+                                              reinterpret_cast<void**>(&g_origAStarReset), nullptr, 0, savedR);
+                bool okI = okR && InstallHookOrdered(pInit, reinterpret_cast<void*>(&HookAStarInit), 15,
+                                                     reinterpret_cast<void**>(&g_origAStarInit), nullptr, 0, savedI);
+                bool okS = okI && InstallHookOrdered(pStep, reinterpret_cast<void*>(&HookAStarStep), 14,
+                                                     reinterpret_cast<void**>(&g_origAStarStep));
+                if (okR && okI && okS) {
+                    g_astarReady = true;
+                    LogMsg("[HOOK] Pathfinder FastAStar O(N log N) @ (Reset=%p Init=%p Step=%p Nb=%p/%p Heur=%p) -> OK",
+                           pReset, pInit, pStep, pNbNorm, pNbType2, pHeur1);
+                } else {
+                    const bool restI = !okI || RestoreHookBytes(pInit, savedI, 15);
+                    const bool restR = !okR || RestoreHookBytes(pReset, savedR, 15);
+                    // Only clear g_orig* trampolines whose patched prologues were verified restored;
+                    // if restore failed, keep g_orig* intact with g_astarReady=false so hooks safely pass through!
+                    if (restR) g_origAStarReset = nullptr;
+                    if (restI) g_origAStarInit  = nullptr;
+                    if (!okS)  g_origAStarStep  = nullptr;
+                    LogMsg("[HOOK] Pathfinder FastAStar partial install failed (okR=%d okI=%d okS=%d, restR=%d restI=%d) -> %s",
+                           okR, okI, okS, restR, restI, (restR && restI) ? "rolled back cleanly" : "PASS-THROUGH RETAINED");
+                }
+            } else {
+                LogMsg("[HOOK] Pathfinder FastAStar skipped (Fail-Closed cross-check failed: ir=%p sr=%p h1=%p h2=%p)",
+                       initReset, stepReset, pHeur1, pHeur2);
+            }
         }
     }
 
@@ -1886,23 +2742,195 @@ void InitServerHooks() {
             constexpr uint8_t kOrig2[2] = { 0x75, 0x0C };
             bool ok1 = RestoreHookBytes(pWake1 + 3, kNop2, 2);
             bool ok2 = false;
+            bool rolledBack = true;
             if (ok1) {
                 ok2 = RestoreHookBytes(pWake2 + 2, kNop2, 2);
                 if (!ok2) {
                     // Paired rollback: never leave partial RakNet patch installed
-                    RestoreHookBytes(pWake1 + 3, kOrig2, 2);
+                    rolledBack = RestoreHookBytes(pWake1 + 3, kOrig2, 2);
                 }
             }
             LogMsg("[NET] RakNet Zero-Stall Event Wakeup @ (%p, %p, SetEvent=%p) -> %s",
-                   pWake1 + 3, pWake2 + 2, setEv1, (ok1 && ok2) ? "OK (0ms snapshot dispatch)" : "FAIL (rolled back)");
+                   pWake1 + 3, pWake2 + 2, setEv1,
+                   (ok1 && ok2) ? "OK (0ms snapshot dispatch)"
+                                : (rolledBack ? "FAIL (rolled back)" : "FAIL (CRITICAL: rollback failed!)"));
         } else {
             LogMsg("[NET] RakNet Zero-Stall skipped (Fail-Closed cross-check: p1=%p p2=%p ev1=%p ev2=%p)",
                    pWake1, pWake2, setEv1, setEv2);
         }
     }
 
+    // 11. Server FastLoad Engine (libdeflate v1.23 unzReadCurrentFile + 64-bit inflate_fast + HW rep stosb VecFill)
+    //     Uses the shared W^X near-module trampoline slab locked to PAGE_EXECUTE_READ right below!
+    if (g_cfg.enable_fast_load) {
+        if (uint8_t* pUnz = FIND_AOB(kAobUnzReadCurrentFile)) {
+            g_trampUsed = (g_trampUsed + 15u) & ~static_cast<size_t>(15u);
+            if (g_trampSlab && g_trampUsed + 32u <= kTrampSlabSize) {
+                uint8_t* tramp = g_trampSlab + g_trampUsed;
+                g_trampUsed += 32u;
+                constexpr uint8_t kUnzPrefix[8] = { 0x40, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xF6 };
+                std::memcpy(tramp, kUnzPrefix, 8);
+                WriteAbsJmp14(tramp + 8, pUnz + 0x16);
+                FlushInstructionCache(GetCurrentProcess(), tramp, 22);
+                std::atomic_thread_fence(std::memory_order_release);
+                g_origUnzRead = reinterpret_cast<UnzReadCurrentFile_t>(tramp);
+                uint8_t jmp[14];
+                WriteAbsJmp14(jmp, reinterpret_cast<const void*>(&HookUnzReadCurrentFile));
+                bool ok = RestoreHookBytes(pUnz, jmp, 14);
+                LogMsg("[FASTLOAD] minizip unzReadCurrentFile @ %p -> libdeflate v1.23 (W^X slab) -> %s",
+                       pUnz, ok ? "OK" : "FAIL");
+            }
+        }
+        if (uint8_t* pInf = FIND_AOB(kAobInflateFast)) {
+            uint8_t jmp[14];
+            WriteAbsJmp14(jmp, reinterpret_cast<const void*>(&HookInflateFast));
+            bool ok = RestoreHookBytes(pInf, jmp, 14);
+            LogMsg("[FASTLOAD] zlib 1.2.3 inflate_fast @ %p -> 64-bit HookInflateFast -> %s",
+                   pInf, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pA = FIND_AOB(kAobVecFillA)) {
+            constexpr size_t kLenA = sizeof(kAobVecFillA) / sizeof(kAobVecFillA[0]);
+            uint8_t patchA[kLenA];
+            std::memset(patchA, 0x90, kLenA);
+            constexpr uint8_t codeA[] = { 0x57, 0x48, 0x89, 0xF7, 0x48, 0x89, 0xD9, 0x41, 0x0F, 0xB6, 0x45, 0x00, 0xF3, 0xAA, 0x5F };
+            std::memcpy(patchA, codeA, sizeof(codeA));
+            bool ok = RestoreHookBytes(pA, patchA, kLenA);
+            LogMsg("[FASTLOAD] std::vector::_Insert_n Loop A @ %p -> HW rep stosb (%zuB) -> %s", pA, kLenA, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pB = FIND_AOB(kAobVecFillB)) {
+            constexpr size_t kLenB = sizeof(kAobVecFillB) / sizeof(kAobVecFillB[0]);
+            uint8_t patchB[kLenB];
+            std::memset(patchB, 0x90, kLenB);
+            constexpr uint8_t codeB[] = { 0x57, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xC1, 0x44, 0x89, 0xE0, 0xF3, 0xAA, 0x5F };
+            std::memcpy(patchB, codeB, sizeof(codeB));
+            bool ok = RestoreHookBytes(pB, patchB, kLenB);
+            LogMsg("[FASTLOAD] std::vector::_Insert_n Loop B @ %p -> HW rep stosb (%zuB) -> %s", pB, kLenB, ok ? "OK" : "FAIL");
+        }
+    }
+
     // Lock trampoline slab to PAGE_EXECUTE_READ (100% W^X compliant, zero permanent RWX pages!)
-    FinalizeTrampolineSlabWX();
+    if (!FinalizeTrampolineSlabWX()) {
+        LogMsg("[WARN][HOOK] Continuing with non-RX trampoline slab (W^X lock failed)");
+    }
+}
+
+// =============================================================================
+// Outside-Loader-Lock Entry-Point Deferred Initialization
+// =============================================================================
+// Avoids ALL file I/O, INI parsing, CRT stdio, and .text scanning inside DllMain!
+// Patches only the 5-byte tail `jmp __scrt_common_main_seh` at mainCRTStartup+0x0d
+// to a W^X RX near-module stub that executes InitServerHooks() on the single main
+// thread AFTER Windows releases the Loader Lock and BEFORE main()/lua_newstate()!
+uint8_t* g_epJmpSite = nullptr;
+uint8_t  g_epSaved5[5] = {};
+std::atomic<bool> g_epInitRan{false};
+
+extern "C" void DeferredEntryPointInit() {
+    if (g_epInitRan.exchange(true, std::memory_order_acq_rel)) return;
+    if (g_epJmpSite) {
+        DWORD oldProt = 0, dummy = 0;
+        if (VirtualProtect(g_epJmpSite, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+            std::memcpy(g_epJmpSite, g_epSaved5, 5);
+            VirtualProtect(g_epJmpSite, 5, oldProt, &dummy);
+            FlushInstructionCache(GetCurrentProcess(), g_epJmpSite, 5);
+        }
+    }
+    g_initOutsideLoaderLock = true;
+    InitServerHooks();
+}
+
+bool TryInstallDeferredEntryPointInit() {
+    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!base) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const uint32_t epRva = nt->OptionalHeader.AddressOfEntryPoint;
+    if (epRva == 0) return false;
+
+    uint8_t* ep = base + epRva;
+    // Strict fail-closed verification of MSVC x64 mainCRTStartup:
+    //   +0x00: 48 83 EC 28        sub rsp, 0x28
+    //   +0x04: E8 xx xx xx xx     call __security_init_cookie
+    //   +0x09: 48 83 C4 28        add rsp, 0x28
+    //   +0x0d: E9 yy yy yy yy     jmp __scrt_common_main_seh
+    if (!(ep[0] == 0x48 && ep[1] == 0x83 && ep[2] == 0xEC && ep[3] == 0x28 &&
+          ep[4] == 0xE8 &&
+          ep[9] == 0x48 && ep[10] == 0x83 && ep[11] == 0xC4 && ep[12] == 0x28 &&
+          ep[13] == 0xE9)) {
+        return false;
+    }
+
+    uint8_t* jmpSite = ep + 13;
+    int32_t origDisp = 0;
+    std::memcpy(&origDisp, jmpSite + 1, 4);
+    uint8_t* origTarget = jmpSite + 5 + origDisp;
+
+    // Allocate a single near-module page within +-1.5GB of jmpSite (pure VirtualAlloc, safe in DllMain!)
+    uintptr_t anchor = reinterpret_cast<uintptr_t>(jmpSite) & ~uintptr_t(0xFFFF);
+    uint8_t* stub = nullptr;
+    for (int dir = 0; dir < 2 && !stub; ++dir) {
+        for (uintptr_t off = 0x100000; off < 0x58000000ULL; off += 0x10000) {
+            uintptr_t cand = (dir == 0) ? (anchor + off) : (anchor > off ? anchor - off : 0);
+            if (cand < 0x10000000ULL) continue;
+            intptr_t relCheck = static_cast<intptr_t>(cand) - reinterpret_cast<intptr_t>(jmpSite + 5);
+            if (relCheck < INT32_MIN || relCheck > INT32_MAX) continue;
+            void* p = VirtualAlloc(reinterpret_cast<void*>(cand), 4096,
+                                   MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (p) {
+                stub = static_cast<uint8_t*>(p);
+                break;
+            }
+        }
+    }
+    if (!stub) return false;
+
+    const intptr_t newDisp64 = reinterpret_cast<intptr_t>(stub) - reinterpret_cast<intptr_t>(jmpSite + 5);
+    if (newDisp64 < INT32_MIN || newDisp64 > INT32_MAX) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // Build 34-byte Win64 ABI-compliant stub:
+    //   sub rsp, 0x28 ; movabs rax, &DeferredEntryPointInit ; call rax ; add rsp, 0x28 ; jmp [rip+0] ; dq origTarget
+    uint8_t code[34] = {
+        0x48, 0x83, 0xEC, 0x28,
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,
+        0xFF, 0xD0,
+        0x48, 0x83, 0xC4, 0x28,
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+        0,0,0,0,0,0,0,0
+    };
+    const uint64_t fnAddr = reinterpret_cast<uint64_t>(&DeferredEntryPointInit);
+    const uint64_t tgtAddr = reinterpret_cast<uint64_t>(origTarget);
+    std::memcpy(code + 6, &fnAddr, 8);
+    std::memcpy(code + 26, &tgtAddr, 8);
+    std::memcpy(stub, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), stub, sizeof(code));
+
+    DWORD stubOldProt = 0;
+    if (!VirtualProtect(stub, 4096, PAGE_EXECUTE_READ, &stubOldProt)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_epJmpSite = jmpSite;
+    std::memcpy(g_epSaved5, jmpSite, 5);
+    std::atomic_thread_fence(std::memory_order_release);
+
+    DWORD epOldProt = 0, dummy = 0;
+    if (!VirtualProtect(jmpSite, 5, PAGE_EXECUTE_READWRITE, &epOldProt)) {
+        g_epJmpSite = nullptr;
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return false;
+    }
+    const int32_t newDisp = static_cast<int32_t>(newDisp64);
+    jmpSite[0] = 0xE9;
+    std::memcpy(jmpSite + 1, &newDisp, 4);
+    VirtualProtect(jmpSite, 5, epOldProt, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), jmpSite, 5);
+    return true;
 }
 
 bool IsDedicatedServerHost() {
@@ -1929,7 +2957,12 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID lpReserved) {
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                 reinterpret_cast<LPCWSTR>(&DllMain), &pinned);
             g_isServerProcess = true;
-            InitServerHooks();
+            // Defer ALL file I/O, INI parsing, .text scanning, and hook installation until
+            // mainCRTStartup runs OUTSIDE the Windows Loader Lock (before main/lua_newstate)!
+            if (!TryInstallDeferredEntryPointInit()) {
+                // Fail-safe fallback only if a future compiler alters mainCRTStartup prologue
+                InitServerHooks();
+            }
         }
     } else if (reason == DLL_PROCESS_DETACH) {
         // Strict Win32 DllMain contract: on process termination (lpReserved != nullptr),

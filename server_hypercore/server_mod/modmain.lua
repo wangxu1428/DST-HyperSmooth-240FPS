@@ -88,7 +88,7 @@ end
 
 local _hcVersion = rawget(G, "HyperCore_Version")
 local has_native = (type(_hcVersion) == "function")
-print(string.format("[HyperCore Server] Loaded v1.2.1 | NativeDLL=%s | SimTick=%dHz | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
+print(string.format("[HyperCore Server] Loaded v1.3.0 | NativeDLL=%s | SimTick=%dHz | FastDump=%s MermFix=%s StaggerWake=%s LazyPerish=%s AutoStack=%s WildBeefaloCap=%d",
     has_native and _hcVersion() or "none",
     active_sim_hz,
     tostring(OPT_FAST_DUMPER), tostring(OPT_MERM_RETARGET), tostring(OPT_STAGGERED_WAKE),
@@ -109,9 +109,14 @@ if OPT_FAST_DUMPER and type(_nativeFastDumpFn) == "function" then
                 HC_LUA_STATS.fastdump_hits = HC_LUA_STATS.fastdump_hits + 1
                 return dumped
             end
-            -- On cycle/node-cap/OOM/corrupt_number or unsupported type (function/userdata/depth>128),
-            -- fall back cleanly to vanilla DataDumper for exact vanilla semantics & error diagnostics.
             HC_LUA_STATS.fastdump_fallbacks = HC_LUA_STATS.fastdump_fallbacks + 1
+            if err == "buffer_limit_exceeded" or err == "corrupt_number" then
+                print("[HyperCore FastDataDumper] Refusing unsafe vanilla fallback: " .. tostring(err))
+                G.error("[HyperCore FastDataDumper] Aborted unsafe serialization (" .. tostring(err) .. ")", 2)
+            elseif err == "cycle_detected" or err == "node_limit_exceeded" or err == "depth_limit" or err == "stack_limit" then
+                print("[HyperCore FastDataDumper] Safety limit (" .. tostring(err) .. "); downgrading to cycle-safe slow DataDumper")
+                return _origDataDumper(value, varname, false, ident)
+            end
         end
         return _origDataDumper(value, varname, fastmode, ident)
     end
@@ -314,10 +319,72 @@ if OPT_LAZY_PERISHABLE then
         end
     end
 
+    -- Pure read-only environmental integral snapshot (ZERO state mutation; safe inside GetPercent / OnSave)
+    local function PeekEnvIntegral()
+        local ng = EnvIntegral.normal_ground
+        local ni = EnvIntegral.normal_indoor
+        local nf = EnvIntegral.frozen_mult_int
+        local na = EnvIntegral.acid_extra_pct
+        local world = G.TheWorld
+        if world == nil or world.state == nil or not EnvIntegral.initialized then
+            return ng, ni, nf, na
+        end
+        local dt = G.GetTime() - EnvIntegral.last_t
+        if dt <= 0 then
+            return ng, ni, nf, na
+        end
+        local st = world.state
+        local temp = st.temperature or 20
+        local T = G.TUNING
+        local temp_mult = 1.0
+        local frozen_temp_mult = 1.0
+        if temp < 0 then
+            temp_mult = T.PERISH_WINTER_MULT or 0.75
+            frozen_temp_mult = T.PERISH_COLD_FROZEN_MULT or 0.0
+        elseif temp > (T.OVERHEAT_TEMP or 70) then
+            temp_mult = T.PERISH_SUMMER_MULT or 1.25
+            frozen_temp_mult = temp_mult
+        end
+        local global_mult = T.PERISH_GLOBAL_MULT or 1.0
+        local base_step = dt * temp_mult * global_mult
+        local frozen_step = dt * frozen_temp_mult * global_mult
+        local wet_mult = (st.israining and (T.PERISH_WET_MULT or 1.3)) or 1.0
+        ni = ni + base_step
+        nf = nf + frozen_step
+        ng = ng + base_step * wet_mult
+        if st.isacidraining then
+            local rate = st.precipitationrate or 0
+            na = na + rate * (T.ACIDRAIN_PERISHABLE_ROT_PERCENT or 0) * dt
+        end
+        return ng, ni, nf, na
+    end
+
+    -- Deduplicated weak-key queue of expired lazy items observed during OnSave();
+    -- drained outside OnSave() so OnSave() has ZERO scheduler/entity side effects!
+    local PendingExpiredLazy = G.setmetatable({}, { __mode = "k" })
+
+    local function DrainPendingExpiredLazy()
+        if G.next(PendingExpiredLazy) == nil then return end
+        local snapshot = {}
+        local n = 0
+        for ent, comp in G.pairs(PendingExpiredLazy) do
+            PendingExpiredLazy[ent] = nil
+            n = n + 1
+            snapshot[n] = { ent = ent, comp = comp }
+        end
+        for i = 1, n do
+            local item = snapshot[i]
+            if item.ent ~= nil and item.ent:IsValid() and item.comp ~= nil and item.comp._hc_lazy_active then
+                item.comp._HC_SyncLazy(true)
+            end
+        end
+    end
+
     AddSimPostInit(function()
         if G.TheWorld ~= nil and G.TheWorld.ismastersim then
             StepEnvIntegral()
             G.TheWorld:DoPeriodicTask(5, StepEnvIntegral)
+            G.TheWorld:DoPeriodicTask(1, DrainPendingExpiredLazy)
         end
     end)
 
@@ -369,25 +436,34 @@ if OPT_LAZY_PERISHABLE then
     AddComponentPostInit("perishable", function(self, inst)
         if not (G.TheWorld and G.TheWorld.ismastersim) then return end
 
-        -- Pure side-effect-free decay estimator (safe inside GetPercent / OnSave / POPULATING)
-        local function ComputeLazyDelta()
-            StepEnvIntegral()
+        -- Decay estimator: read_only=true uses pure PeekEnvIntegral() with ZERO global mutation!
+        local function ComputeLazyDelta(read_only)
+            local ng, ni, nf, na
+            if read_only then
+                ng, ni, nf, na = PeekEnvIntegral()
+            else
+                StepEnvIntegral()
+                ng = EnvIntegral.normal_ground
+                ni = EnvIntegral.normal_indoor
+                nf = EnvIntegral.frozen_mult_int
+                na = EnvIntegral.acid_extra_pct
+            end
             local local_mult = self.localPerishMultiplyer or 1.0
             local owner_mult = self._hc_lazy_owner_mult or 1.0
             local delta_decay = 0
             if not self._hc_lazy_is_indoor then
                 local dg = self._hc_lazy_is_frozen
-                    and (EnvIntegral.frozen_mult_int - (self._hc_lazy_snap_frozen or EnvIntegral.frozen_mult_int))
-                    or  (EnvIntegral.normal_ground - (self._hc_lazy_snap_ground or EnvIntegral.normal_ground))
+                    and (nf - (self._hc_lazy_snap_frozen or nf))
+                    or  (ng - (self._hc_lazy_snap_ground or ng))
                 delta_decay = dg * owner_mult * local_mult
-                local dacid = EnvIntegral.acid_extra_pct - (self._hc_lazy_snap_acid or EnvIntegral.acid_extra_pct)
+                local dacid = na - (self._hc_lazy_snap_acid or na)
                 if dacid > 0 and self.perishtime ~= nil and self.perishtime > 0 then
                     delta_decay = delta_decay + self.perishtime * dacid
                 end
             else
                 local di = self._hc_lazy_is_frozen
-                    and (EnvIntegral.frozen_mult_int - (self._hc_lazy_snap_frozen or EnvIntegral.frozen_mult_int))
-                    or  (EnvIntegral.normal_indoor - (self._hc_lazy_snap_indoor or EnvIntegral.normal_indoor))
+                    and (nf - (self._hc_lazy_snap_frozen or nf))
+                    or  (ni - (self._hc_lazy_snap_indoor or ni))
                 delta_decay = di * owner_mult * local_mult
             end
             return delta_decay
@@ -395,7 +471,7 @@ if OPT_LAZY_PERISHABLE then
 
         local function ComputeLazyRemaining()
             if self.perishremainingtime == nil then return nil end
-            local delta_decay = ComputeLazyDelta()
+            local delta_decay = ComputeLazyDelta(true)
             local max_t = self.perishtime or self.perishremainingtime
             return math.min(max_t, self.perishremainingtime - delta_decay)
         end
@@ -494,8 +570,9 @@ if OPT_LAZY_PERISHABLE then
         local _origStartPerishing = self.StartPerishing
         function self:StartPerishing()
             if self._hc_lazy_active then
-                self._hc_lazy_active = nil
-                HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
+                -- Settle accumulated lazy decay FIRST so StartPerishing never drops elapsed decay!
+                SyncLazyMode(false)
+                if not inst:IsValid() then return end
             end
             return _origStartPerishing(self)
         end
@@ -503,8 +580,9 @@ if OPT_LAZY_PERISHABLE then
         local _origStopPerishing = self.StopPerishing
         function self:StopPerishing()
             if self._hc_lazy_active then
-                self._hc_lazy_active = nil
-                HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
+                -- Settle accumulated lazy decay FIRST so StopPerishing never jumps freshness backward!
+                SyncLazyMode(false)
+                if not inst:IsValid() then return end
             end
             return _origStopPerishing(self)
         end
@@ -546,7 +624,7 @@ if OPT_LAZY_PERISHABLE then
         end
 
         -- 100% SIDE-EFFECT-FREE OnSave():
-        -- NEVER calls Perish() / inst:Remove() / SpawnPrefab() during world serialization,
+        -- NEVER calls Perish() / inst:Remove() / SpawnPrefab() / DoTaskInTime() during serialization,
         -- NEVER writes negative `time`, and NEVER writes `paused=true` for lazy-paused items!
         local _origOnSave = self.OnSave
         function self:OnSave()
@@ -557,11 +635,8 @@ if OPT_LAZY_PERISHABLE then
                 data.paused = nil -- ZERO LOCK-IN: never persist lazy pause as vanilla paused=true
                 if rem ~= nil and rem <= 0 then
                     data.time = 0.01
-                    inst:DoTaskInTime(0, function()
-                        if inst:IsValid() and self._hc_lazy_active then
-                            SyncLazyMode(true)
-                        end
-                    end)
+                    -- Deduplicated weak-key mark; drained outside OnSave() by DrainPendingExpiredLazy()
+                    PendingExpiredLazy[inst] = self
                 elseif rem ~= nil then
                     data.time = rem
                 end
@@ -575,6 +650,7 @@ if OPT_LAZY_PERISHABLE then
         -- so Perishable:OnLoad -> stackable:OnLoad NEVER crashes on world startup!
         local _origOnLoad = self.OnLoad
         function self:OnLoad(data, ...)
+            PendingExpiredLazy[inst] = nil
             if self._hc_lazy_active then
                 self._hc_lazy_active = nil
                 HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
@@ -587,6 +663,7 @@ if OPT_LAZY_PERISHABLE then
 
         local _origOnRemove = self.OnRemoveEntity
         function self:OnRemoveEntity()
+            PendingExpiredLazy[inst] = nil
             if self._hc_lazy_active then
                 self._hc_lazy_active = nil
                 HC_LUA_STATS.perish_paused_now = math.max(0, HC_LUA_STATS.perish_paused_now - 1)
@@ -797,7 +874,7 @@ end
 -- Console X-Ray Readout: c_hyperstats()
 -- =============================================================================
 rawset(G, "c_hyperstats", function()
-    print(string.format("=== DST HyperCore Server v1.2.0 X-Ray Stats (SimTick=%dHz) ===", HC_LUA_STATS.sim_tick_rate))
+    print(string.format("=== DST HyperCore Server v1.3.0 X-Ray Stats (SimTick=%dHz) ===", HC_LUA_STATS.sim_tick_rate))
     local _getStats = rawget(G, "HyperCore_GetStats")
     if type(_getStats) == "function" then
         local s = _getStats()
@@ -806,8 +883,11 @@ rawset(G, "c_hyperstats", function()
             s.ticks_total, s.tick_avg_us, s.tick_p95_us, s.tick_p99_us, s.tick_max_us, s.tick_overruns))
         print(string.format("  [Native] GC: avg=%.0fus/t max=%.0fus full=%d kb=%d budget=%dus",
             s.gc_us_sum / ticks, s.gc_max_us, s.gc_full_count, s.gc_last_kb, s.gc_last_budget_us))
-        print(string.format("  [Native] FindEntities: calls=%d avg=%.0fus/t | SpatialZC=%d cells=%d",
-            s.find_entities_calls, s.find_entities_us_sum / ticks, s.spatial_zerocopy_hits, s.spatial_cells_visited))
+        print(string.format("  [Native] SpatialZC: FindEnts=%d (avg=%.0fus/t) | TotalZC=%d LightZC=%d cells=%d",
+            s.find_entities_calls, s.find_entities_us_sum / ticks, s.spatial_zerocopy_hits, s.light_spatial_queries or 0, s.spatial_cells_visited))
+        print(string.format("  [Native] FastAStar(%s): inits=%d steps=%d total=%.2fms ok=%d fail=%d fb=%d",
+            tostring(s.opt_fast_astar == true), s.astar_inits or 0, s.astar_steps or 0, (s.astar_us_sum or 0) / 1000,
+            s.astar_completed or 0, s.astar_failed or 0, s.astar_fallbacks or 0))
         print(string.format("  [Native] FastDump: calls=%d total=%.2fms MB=%.2f fallbacks=%d",
             s.fastdump_calls, s.fastdump_us_sum / 1000, s.fastdump_bytes_sum / (1024*1024), s.fastdump_fallbacks))
         print(string.format("  [Native] libdeflate: calls=%d total=%.2fms in=%.2fMB out=%.2fMB",

@@ -22,7 +22,9 @@ BENCH_RT    = os.path.join(SERVER_REPO, "bench_runtime")
 BIN64       = os.path.join(BENCH_RT, "bin64")
 MODS_DIR    = os.path.join(BENCH_RT, "mods")
 STORAGE     = os.path.join(BENCH_RT, "storage")
-CLUSTER_DIR = os.path.join(STORAGE, "DoNotStarveTogether", "BenchCluster")
+BASE_BACKUP = os.path.join(BENCH_RT, "base_world_backup")
+CLUSTER_NAME = "PerishSafetyCluster"
+CLUSTER_DIR = os.path.join(STORAGE, "DoNotStarveTogether", CLUSTER_NAME)
 
 HARNESS_NAME = "perish_savesafety_test"
 HARNESS_DIR  = os.path.join(MODS_DIR, HARNESS_NAME)
@@ -112,8 +114,23 @@ AddSimPostInit(function()
             assert(p._hc_lazy_active == true, "FAIL: GetPercent() mutated lazy state!")
             print("[PERISH_SAFETY_TEST] 2. Pure read-only GetPercent() on expired lazy item PASS")
 
-            -- TEST 2: OnSave() / GetSaveRecord() MUST NOT call Perish()/Remove(), MUST NOT write negative time or paused=true!
-            local rec = m:GetSaveRecord()
+            -- TEST 2: OnSave() / GetSaveRecord() MUST NOT call Perish()/Remove(), MUST NOT write negative time or paused=true,
+            --         AND repeated OnSave() calls MUST schedule ZERO DoTaskInTime tasks on the entity (#08)!
+            local function count_pending(ent)
+                local c = 0
+                if ent.pendingtasks ~= nil then
+                    for _ in G.pairs(ent.pendingtasks) do c = c + 1 end
+                end
+                return c
+            end
+            local tasks_before = count_pending(m)
+            local rec = nil
+            for _ = 1, 5 do
+                rec = m:GetSaveRecord()
+            end
+            local tasks_after = count_pending(m)
+            assert(tasks_after == tasks_before,
+                   "FAIL (#08): OnSave() mutated entity pendingtasks (" .. tostring(tasks_before) .. " -> " .. tostring(tasks_after) .. ")!")
             assert(m:IsValid(), "FAIL: OnSave()/GetSaveRecord() destroyed entity mid-save!")
             assert(rec ~= nil and rec.data ~= nil and rec.data.perishable ~= nil, "Missing perishable save data")
             assert(rec.data.perishable.time ~= nil and rec.data.perishable.time > 0,
@@ -122,7 +139,7 @@ AddSimPostInit(function()
                    "FAIL: OnSave() leaked paused=true into save!")
             assert(rec.data.stackable ~= nil and rec.data.stackable.stack == 2,
                    "FAIL: OnSave() corrupted stackable record!")
-            print("[PERISH_SAFETY_TEST] 3. Side-effect-free OnSave() (time=" .. tostring(rec.data.perishable.time) .. ", paused=nil, valid=true) PASS")
+            print("[PERISH_SAFETY_TEST] 3. Side-effect-free 5x OnSave() (time=" .. tostring(rec.data.perishable.time) .. ", paused=nil, +0 tasks, valid=true) PASS")
 
             -- TEST 4: Mutator (AddTime) after expiry MUST cleanly perish without crashing _orig on dead entity!
             p:AddTime(5)
@@ -154,6 +171,42 @@ AddSimPostInit(function()
             box:Remove()
             print("[PERISH_SAFETY_TEST] 5. Container:Open() multi-expiry snapshot safety PASS (3/3 spoiled cleanly)")
 
+            -- TEST 6 (#08): StopPerishing() on lazy-paused item MUST settle accumulated decay first!
+            local m6 = G.SpawnPrefab("monstermeat")
+            m6.Transform:SetPosition(150, 0, 150)
+            local p6 = m6.components.perishable
+            p6:SetPercent(0.80)
+            p6:StartPerishing()
+            p6._HC_EnterLazy()
+            assert(p6._hc_lazy_active == true, "TEST 6: expected lazy active")
+            local pre_stop_time = p6.perishremainingtime
+            fake_time = fake_time + 600 -- 600s elapsed while lazy-paused
+            p6:StopPerishing()
+            assert(p6._hc_lazy_active == nil, "TEST 6: expected lazy cleared")
+            assert(p6.perishremainingtime < pre_stop_time - 400,
+                   "FAIL (#08): StopPerishing() dropped accumulated lazy decay! before=" .. tostring(pre_stop_time) .. " after=" .. tostring(p6.perishremainingtime))
+            assert(not p6:IsPerishing(), "TEST 6: expected stopped after StopPerishing()")
+            m6:Remove()
+            print("[PERISH_SAFETY_TEST] 6. StopPerishing() settles accumulated lazy decay PASS (" .. string.format("%.1f -> %.1f", pre_stop_time, p6.perishremainingtime) .. ")")
+
+            -- TEST 7 (#08): StartPerishing() on lazy-paused item MUST settle accumulated decay first!
+            local m7 = G.SpawnPrefab("monstermeat")
+            m7.Transform:SetPosition(160, 0, 160)
+            local p7 = m7.components.perishable
+            p7:SetPercent(0.80)
+            p7:StartPerishing()
+            p7._HC_EnterLazy()
+            assert(p7._hc_lazy_active == true, "TEST 7: expected lazy active")
+            local pre_start_time = p7.perishremainingtime
+            fake_time = fake_time + 600
+            p7:StartPerishing()
+            assert(p7._hc_lazy_active == nil, "TEST 7: expected lazy cleared")
+            assert(p7.perishremainingtime < pre_start_time - 400,
+                   "FAIL (#08): StartPerishing() dropped accumulated lazy decay! before=" .. tostring(pre_start_time) .. " after=" .. tostring(p7.perishremainingtime))
+            assert(p7:IsPerishing(), "TEST 7: expected actively perishing after StartPerishing()")
+            m7:Remove()
+            print("[PERISH_SAFETY_TEST] 7. StartPerishing() settles accumulated lazy decay PASS (" .. string.format("%.1f -> %.1f", pre_start_time, p7.perishremainingtime) .. ")")
+
             G.rawset(G, "GetTime", orig_GetTime)
         end
 
@@ -165,7 +218,13 @@ end)
 
 
 def main():
-    # Sync fixed server_mod into bench_runtime/mods/hypercore_server
+    assert os.path.isdir(BASE_BACKUP), f"Missing {BASE_BACKUP}"
+    if os.path.exists(CLUSTER_DIR):
+        shutil.rmtree(CLUSTER_DIR)
+    shutil.copytree(BASE_BACKUP, CLUSTER_DIR)
+
+    # Sync fresh native iphlpapi.dll + fixed server_mod into bench_runtime
+    shutil.copy2(os.path.join(SERVER_REPO, "native_plugin", "iphlpapi.dll"), os.path.join(BIN64, "iphlpapi.dll"))
     dst_hc = os.path.join(MODS_DIR, "hypercore_server")
     os.makedirs(dst_hc, exist_ok=True)
     for fn in ("modinfo.lua", "modmain.lua"):
@@ -178,7 +237,6 @@ def main():
         f.write(HARNESS_MODMAIN)
 
     overrides_path = os.path.join(CLUSTER_DIR, "Master", "modoverrides.lua")
-    backup = open(overrides_path, "r", encoding="utf-8").read() if os.path.exists(overrides_path) else None
     try:
         with open(overrides_path, "w", encoding="utf-8") as f:
             f.write(
@@ -192,8 +250,8 @@ def main():
 
         exe = os.path.join(BIN64, "dontstarve_dedicated_server_nullrenderer_x64.exe")
         proc = subprocess.run(
-            [exe, "-console", "-offline", "-port", "11015", "-persistent_storage_root", STORAGE,
-             "-cluster", "BenchCluster", "-shard", "Master"],
+            [exe, "-console", "-offline", "-port", "11017", "-persistent_storage_root", STORAGE,
+             "-cluster", CLUSTER_NAME, "-shard", "Master"],
             cwd=BIN64,
             capture_output=True,
             text=True,
@@ -210,10 +268,8 @@ def main():
             print("\n".join(out.splitlines()[-60:]))
             sys.exit(1)
     finally:
-        if backup is not None:
-            with open(overrides_path, "w", encoding="utf-8") as f:
-                f.write(backup)
         shutil.rmtree(HARNESS_DIR, ignore_errors=True)
+        shutil.rmtree(CLUSTER_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":
