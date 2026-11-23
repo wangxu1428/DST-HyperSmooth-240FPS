@@ -36,7 +36,7 @@ description = [[
 注意：默认 30Hz 模式下 100% 纯服务端生效，客户端无需下载；随时取消勾选即可无损退回原版，零存档残留！
 ]]
 author = "Hakimi Tech Lab"
-version = "1.3.0"
+version = "1.3.0.1"
 forumthread = ""
 api_version = 10
 
