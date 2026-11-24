@@ -41,6 +41,8 @@ struct LuaApiTable {
     void        (*setfield)(void* L, int idx, const char* k) = nullptr;
     int         (*gc)(void* L, int what, int data) = nullptr;
     int         (*next)(void* L, int idx) = nullptr;
+    void        (*rawset)(void* L, int idx) = nullptr;
+    void        (*rawseti)(void* L, int idx, int n) = nullptr;
 
     bool ReadyForFastDump() const {
         return checkstack && gettop && settop && type && tonumber && toboolean &&
@@ -48,6 +50,11 @@ struct LuaApiTable {
     }
     bool ReadyForRegister() const {
         return pushcclosure && setfield && createtable && pushnumber && pushstring && pushboolean;
+    }
+    bool ReadyForFastJson() const {
+        return checkstack && gettop && settop && pushvalue && type && tonumber && toboolean &&
+               tolstring && topointer && pushnil && pushnumber && pushlstring && pushstring &&
+               pushboolean && createtable && next && rawset && rawseti;
     }
 };
 

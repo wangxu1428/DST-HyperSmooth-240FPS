@@ -21,11 +21,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <thread>
 #include <vector>
 #include "../native_plugin/gl_state_cache.h"
 #include "../native_plugin/fs_neg_cache.h"
 #include "../native_plugin/fast_astar_manager.h"
+#include "../native_plugin/fast_json.h"
+#include "../native_plugin/native_gl_bridge.h"
+#include "../native_plugin/vb_pool.h"
+#include "../native_plugin/rpc_qos.h"
+#include "../native_plugin/klei_save_codec.h"
+#include "../native_plugin/async_save_commit.h"
+#include "../native_plugin/ui_batcher.h"
+#include "../native_plugin/sprite_batcher.h"
+#include "../third_party/libdeflate-1.23/libdeflate.h"
 
 #define CHECK(cond) do { \
     if (!(cond)) { \
@@ -1513,6 +1523,1751 @@ int main() {
         std::printf("[PASS] 18. GL Extended+Uniform Cache, Mod FS Negative Stat Cache & Adaptive De-Jitter Interp verified\n");
     }
 
-    std::printf("ALL 18 CLIENT RED-TEAM, RTSS PACER, VFX240, D3D9EX REFLEX, GL-UNIFORM, FS-NEG, DEJITTER, ASTAR & GL-CACHE TESTS PASSED!\n");
+    // [19] v2.7.0: FS Neg v2.7 fixes + FastJson C++ parity & fail-closed fallback
+    {
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"scripts\\prefabs\\log.lua"));
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"images\\livinglog.tex"));
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPath(L"..\\mods\\workshop-123\\anim\\foo.zip"));
+        CHECK(hs_fs_neg::IsCacheableReadOnlyAssetPathA("anim/dynamic/wilson.zip"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPathA("client_log.txt"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPathA("mods\\..\\save\\secret.tex"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPathA("mods\\workshop-1\\my_log.tex"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPathA("data\\persistent_cache.bin"));
+        CHECK(!hs_fs_neg::IsCacheableReadOnlyAssetPathA("mods\\\xE4\xB8\xAD\\a.tex"));
+
+        struct JVal {
+            int type = HC_LUA_TNIL; bool b = false; double num = 0; std::string str; struct JTbl* tbl = nullptr;
+            static JVal Bool(bool v) { JVal x; x.type = HC_LUA_TBOOLEAN; x.b = v; return x; }
+            static JVal Num(double v) { JVal x; x.type = HC_LUA_TNUMBER; x.num = v; return x; }
+            static JVal Str(std::string s) { JVal x; x.type = HC_LUA_TSTRING; x.str = std::move(s); return x; }
+            static JVal Tbl(struct JTbl* t) { JVal x; x.type = HC_LUA_TTABLE; x.tbl = t; return x; }
+        };
+        struct JTbl { std::vector<std::pair<JVal, JVal>> e; };
+        struct JState {
+            std::vector<JVal> st;
+            std::vector<std::unique_ptr<JTbl>> own;
+            int abs(int idx) const { return idx > 0 ? idx - 1 : static_cast<int>(st.size()) + idx; }
+        };
+        LuaApiTable japi{};
+        japi.checkstack  = [](void*, int) { return 1; };
+        japi.gettop      = [](void* L) { return static_cast<int>(static_cast<JState*>(L)->st.size()); };
+        japi.settop      = [](void* L, int idx) {
+            auto* S = static_cast<JState*>(L);
+            if (idx >= 0) S->st.resize(static_cast<size_t>(idx));
+            else S->st.resize(S->st.size() + static_cast<size_t>(idx) + 1);
+        };
+        japi.pushvalue   = [](void* L, int idx) { auto* S = static_cast<JState*>(L); S->st.push_back(S->st[S->abs(idx)]); };
+        japi.type        = [](void* L, int idx) {
+            auto* S = static_cast<JState*>(L); int i = S->abs(idx);
+            return (i < 0 || i >= static_cast<int>(S->st.size())) ? HC_LUA_TNIL : S->st[i].type;
+        };
+        japi.tonumber    = [](void* L, int idx) { auto* S = static_cast<JState*>(L); return S->st[S->abs(idx)].num; };
+        japi.toboolean   = [](void* L, int idx) {
+            auto* S = static_cast<JState*>(L); const auto& v = S->st[S->abs(idx)];
+            return v.type == HC_LUA_TNIL ? 0 : (v.type == HC_LUA_TBOOLEAN ? (v.b ? 1 : 0) : 1);
+        };
+        japi.tolstring   = [](void* L, int idx, size_t* n) -> const char* {
+            auto* S = static_cast<JState*>(L); const auto& v = S->st[S->abs(idx)];
+            if (n) *n = v.str.size(); return v.str.c_str();
+        };
+        japi.topointer   = [](void* L, int idx) -> const void* {
+            auto* S = static_cast<JState*>(L); const auto& v = S->st[S->abs(idx)];
+            return v.type == HC_LUA_TTABLE ? v.tbl : nullptr;
+        };
+        japi.pushnil     = [](void* L) { static_cast<JState*>(L)->st.push_back(JVal{}); };
+        japi.pushnumber  = [](void* L, double v) { static_cast<JState*>(L)->st.push_back(JVal::Num(v)); };
+        japi.pushlstring = [](void* L, const char* s, size_t l) { static_cast<JState*>(L)->st.push_back(JVal::Str(std::string(s, l))); };
+        japi.pushstring  = [](void* L, const char* s) { static_cast<JState*>(L)->st.push_back(JVal::Str(s)); };
+        japi.pushboolean = [](void* L, int b) { static_cast<JState*>(L)->st.push_back(JVal::Bool(b != 0)); };
+        japi.createtable = [](void* L, int, int) {
+            auto* S = static_cast<JState*>(L); S->own.push_back(std::make_unique<JTbl>()); S->st.push_back(JVal::Tbl(S->own.back().get()));
+        };
+        japi.next        = [](void* L, int idx) -> int {
+            auto* S = static_cast<JState*>(L); JTbl* t = S->st[S->abs(idx)].tbl;
+            JVal k = S->st.back(); S->st.pop_back();
+            if (!t || t->e.empty()) return 0;
+            size_t ni = 0;
+            if (k.type != HC_LUA_TNIL) {
+                bool ok = false;
+                for (size_t i = 0; i < t->e.size(); ++i) {
+                    const auto& a = t->e[i].first;
+                    if (a.type == k.type && a.b == k.b && a.num == k.num && a.str == k.str && a.tbl == k.tbl) { ni = i + 1; ok = true; break; }
+                }
+                if (!ok || ni >= t->e.size()) return 0;
+            }
+            S->st.push_back(t->e[ni].first); S->st.push_back(t->e[ni].second); return 1;
+        };
+        japi.rawset      = [](void* L, int idx) {
+            auto* S = static_cast<JState*>(L); JTbl* t = S->st[S->abs(idx)].tbl;
+            JVal v = S->st.back(); S->st.pop_back(); JVal k = S->st.back(); S->st.pop_back();
+            if (v.type != HC_LUA_TNIL) t->e.emplace_back(std::move(k), std::move(v));
+        };
+        japi.rawseti     = [](void* L, int idx, int n) {
+            auto* S = static_cast<JState*>(L); JTbl* t = S->st[S->abs(idx)].tbl;
+            JVal v = S->st.back(); S->st.pop_back();
+            if (v.type != HC_LUA_TNIL) t->e.emplace_back(JVal::Num(static_cast<double>(n)), std::move(v));
+        };
+        CHECK(japi.ReadyForFastJson());
+
+        JState js;
+        JTbl arr; arr.e = { {JVal::Num(1), JVal::Str("a'b")}, {JVal::Num(2), JVal::Num(42)} };
+        js.st.push_back(JVal::Tbl(&arr));
+        fast_json::JsonOutBuf jb;
+        CHECK(fast_json::EncodeRoot(&js, japi, 1, jb, false) == fast_dumper::Status::Ok);
+        CHECK(std::string(jb.data, jb.len) == "[\"a\\'b\",42]");
+        CHECK(fast_json::EncodeRoot(&js, japi, 1, jb, true) == fast_dumper::Status::Ok);
+        CHECK(std::string(jb.data, jb.len) == "[\"a'b\",42]");
+
+        size_t npos = 0;
+        const char* sample = "[1,null,3]";
+        CHECK(fast_json::DecodeRoot(&js, japi, sample, std::strlen(sample), &npos) == fast_dumper::Status::Ok);
+        CHECK(npos == std::strlen(sample) + 1);
+        JTbl* decA = js.st.back().tbl;
+        CHECK(decA->e.size() == 2 && decA->e[0].first.num == 1 && decA->e[1].first.num == 3 && decA->e[1].second.num == 30 - 27);
+
+        std::printf("[PASS] 19. Client v2.7 FsNeg roots/log-fix + FastJson parity verified\n");
+    }
+
+    // 20. Native WGL OpenGL ES 2.0 Direct Bridge (v2.8.0 Stage 1 Live GPU & 140 Vanilla + HD-2D .ksh Verification)
+    {
+        CHECK(hs_native_gl::ParseBackendMode(L"d3d9") == hs_native_gl::BackendMode::D3D9);
+        CHECK(hs_native_gl::ParseBackendMode(L"  ANGLE  ") == hs_native_gl::BackendMode::D3D9);
+        CHECK(hs_native_gl::ParseBackendMode(L"opengl") == hs_native_gl::BackendMode::OpenGL);
+        CHECK(hs_native_gl::ParseBackendMode(L"es2") == hs_native_gl::BackendMode::OpenGL);
+        CHECK(hs_native_gl::ParseBackendMode(L"auto") == hs_native_gl::BackendMode::Auto);
+        CHECK(hs_native_gl::ParseBackendMode(L"") == hs_native_gl::BackendMode::Auto);
+
+        hs_native_gl::WglRuntime rt{};
+        auto d3d9Probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::D3D9, rt);
+        CHECK(!d3d9Probe.supported && d3d9Probe.reason == "configured_d3d9");
+
+        auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+        CHECK(probe.supported);
+        CHECK(probe.reason == "ok");
+        CHECK(probe.resolvedProcs == 76);
+        CHECK(probe.hasAniso);
+        CHECK(probe.hasMapBufferRange);
+
+        HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_test_es2", WS_POPUP,
+                                    0, 0, 64, 64, nullptr, nullptr, nullptr, nullptr);
+        CHECK(hwnd != nullptr);
+        HDC hdc = nullptr;
+        HGLRC rc = nullptr;
+        CHECK(hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc));
+        CHECK(hdc != nullptr && rc != nullptr);
+        CHECK(rt.pWglMakeCurrent(hdc, rc) != FALSE);
+
+        void* procs[76]{};
+        hs_native_gl::OptionalGlProcs opt{};
+        CHECK(hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) == 76);
+        for (size_t i = 0; i < 76; ++i) CHECK(procs[i] != nullptr);
+        CHECK(opt.glMapBufferRange && opt.glUnmapBuffer && opt.glBufferSubData &&
+              opt.glTexParameterf && opt.glGetFloatv);
+
+        auto findProc = [&](const char* name) -> void* {
+            for (size_t i = 0; i < 76; ++i) {
+                if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+            }
+            return nullptr;
+        };
+
+        using GlGetErr_t        = uint32_t (WINAPI*)();
+        using GlCreateShdr_t    = uint32_t (WINAPI*)(uint32_t);
+        using GlShaderSrc_t     = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+        using GlCompileShdr_t   = void (WINAPI*)(uint32_t);
+        using GlGetShdrIv_t     = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+        using GlGetShdrLog_t    = void (WINAPI*)(uint32_t, int32_t, int32_t*, char*);
+        using GlDeleteShdr_t    = void (WINAPI*)(uint32_t);
+        using GlCreateProg_t    = uint32_t (WINAPI*)();
+        using GlAttachShdr_t    = void (WINAPI*)(uint32_t, uint32_t);
+        using GlLinkProg_t      = void (WINAPI*)(uint32_t);
+        using GlGetProgIv_t     = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+        using GlDeleteProg_t    = void (WINAPI*)(uint32_t);
+        using GlGenTex_t        = void (WINAPI*)(int32_t, uint32_t*);
+        using GlBindTex_t       = void (WINAPI*)(uint32_t, uint32_t);
+        using GlDelTex_t        = void (WINAPI*)(int32_t, const uint32_t*);
+        using GlPixelStorei_t   = void (WINAPI*)(uint32_t, int32_t);
+        using GlTexImg2D_t      = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+        using GlCompTexImg2D_t  = void (WINAPI*)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t, const void*);
+        using GlTexParami_t     = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+        using GlGenFbo_t        = void (WINAPI*)(int32_t, uint32_t*);
+        using GlBindFbo_t       = void (WINAPI*)(uint32_t, uint32_t);
+        using GlFboTex2D_t      = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+        using GlFboRbo_t        = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t);
+        using GlCheckFbo_t      = uint32_t (WINAPI*)(uint32_t);
+        using GlDelFbo_t        = void (WINAPI*)(int32_t, const uint32_t*);
+        using GlGenRbo_t        = void (WINAPI*)(int32_t, uint32_t*);
+        using GlBindRbo_t       = void (WINAPI*)(uint32_t, uint32_t);
+        using GlRboStorage_t    = void (WINAPI*)(uint32_t, uint32_t, int32_t, int32_t);
+        using GlDelRbo_t        = void (WINAPI*)(int32_t, const uint32_t*);
+        using GlGenBufs_t       = void (WINAPI*)(int32_t, uint32_t*);
+        using GlBindBuf_t       = void (WINAPI*)(uint32_t, uint32_t);
+        using GlBufData_t       = void (WINAPI*)(uint32_t, ptrdiff_t, const void*, uint32_t);
+        using GlDelBufs_t       = void (WINAPI*)(int32_t, const uint32_t*);
+
+        auto pGetErr       = reinterpret_cast<GlGetErr_t>(findProc("glGetError"));
+        auto pCreateShader = reinterpret_cast<GlCreateShdr_t>(findProc("glCreateShader"));
+        auto pShaderSrc    = reinterpret_cast<GlShaderSrc_t>(findProc("glShaderSource"));
+        auto pCompile      = reinterpret_cast<GlCompileShdr_t>(findProc("glCompileShader"));
+        auto pGetShaderIv  = reinterpret_cast<GlGetShdrIv_t>(findProc("glGetShaderiv"));
+        auto pGetShaderLog = reinterpret_cast<GlGetShdrLog_t>(findProc("glGetShaderInfoLog"));
+        auto pDelShader    = reinterpret_cast<GlDeleteShdr_t>(findProc("glDeleteShader"));
+        auto pCreateProg   = reinterpret_cast<GlCreateProg_t>(findProc("glCreateProgram"));
+        auto pAttach       = reinterpret_cast<GlAttachShdr_t>(findProc("glAttachShader"));
+        auto pLink         = reinterpret_cast<GlLinkProg_t>(findProc("glLinkProgram"));
+        auto pGetProgIv    = reinterpret_cast<GlGetProgIv_t>(findProc("glGetProgramiv"));
+        auto pDelProg      = reinterpret_cast<GlDeleteProg_t>(findProc("glDeleteProgram"));
+        auto pGenTex       = reinterpret_cast<GlGenTex_t>(findProc("glGenTextures"));
+        auto pBindTex      = reinterpret_cast<GlBindTex_t>(findProc("glBindTexture"));
+        auto pDelTex       = reinterpret_cast<GlDelTex_t>(findProc("glDeleteTextures"));
+        auto pPixelStorei  = reinterpret_cast<GlPixelStorei_t>(findProc("glPixelStorei"));
+        auto pTexImg2D     = reinterpret_cast<GlTexImg2D_t>(findProc("glTexImage2D"));
+        auto pCompTex2D    = reinterpret_cast<GlCompTexImg2D_t>(findProc("glCompressedTexImage2D"));
+        auto pTexParami    = reinterpret_cast<GlTexParami_t>(findProc("glTexParameteri"));
+        auto pTexParamf    = reinterpret_cast<hs_native_gl::GlTexParameterf_t>(opt.glTexParameterf);
+        auto pGetFloatv    = reinterpret_cast<hs_native_gl::GlGetFloatv_t>(opt.glGetFloatv);
+        auto pGenFbo       = reinterpret_cast<GlGenFbo_t>(findProc("glGenFramebuffers"));
+        auto pBindFbo      = reinterpret_cast<GlBindFbo_t>(findProc("glBindFramebuffer"));
+        auto pFboTex2D     = reinterpret_cast<GlFboTex2D_t>(findProc("glFramebufferTexture2D"));
+        auto pFboRbo       = reinterpret_cast<GlFboRbo_t>(findProc("glFramebufferRenderbuffer"));
+        auto pCheckFbo     = reinterpret_cast<GlCheckFbo_t>(findProc("glCheckFramebufferStatus"));
+        auto pDelFbo       = reinterpret_cast<GlDelFbo_t>(findProc("glDeleteFramebuffers"));
+        auto pGenRbo       = reinterpret_cast<GlGenRbo_t>(findProc("glGenRenderbuffers"));
+        auto pBindRbo      = reinterpret_cast<GlBindRbo_t>(findProc("glBindRenderbuffer"));
+        auto pRboStorage   = reinterpret_cast<GlRboStorage_t>(findProc("glRenderbufferStorage"));
+        auto pDelRbo       = reinterpret_cast<GlDelRbo_t>(findProc("glDeleteRenderbuffers"));
+        auto pGenBufs      = reinterpret_cast<GlGenBufs_t>(findProc("glGenBuffers"));
+        auto pBindBuf      = reinterpret_cast<GlBindBuf_t>(findProc("glBindBuffer"));
+        auto pBufData      = reinterpret_cast<GlBufData_t>(findProc("glBufferData"));
+        auto pDelBufs      = reinterpret_cast<GlDelBufs_t>(findProc("glDeleteBuffers"));
+        auto pMapRange     = reinterpret_cast<hs_vb_pool::GlBufferOps::MapBufferRange_t>(opt.glMapBufferRange);
+        auto pUnmapBuf     = reinterpret_cast<hs_vb_pool::GlBufferOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+
+        auto compileOneShader = [&](const char* label, uint32_t type, const std::string& src) -> uint32_t {
+            uint32_t sh = pCreateShader(type);
+            CHECK(sh != 0);
+            const char* ptr = src.c_str();
+            int32_t len = static_cast<int32_t>(src.size());
+            pShaderSrc(sh, 1, &ptr, &len);
+            pCompile(sh);
+            int32_t ok = 0;
+            pGetShaderIv(sh, 0x8B81 /*GL_COMPILE_STATUS*/, &ok);
+            if (ok != 1) {
+                char logBuf[1024]{};
+                int32_t logLen = 0;
+                pGetShaderLog(sh, sizeof(logBuf) - 1, &logLen, logBuf);
+                std::fprintf(stderr, "[SHADER COMPILE ERR] %s (type=0x%x): %s\n", label, type, logBuf);
+            }
+            CHECK(ok == 1);
+            CHECK(pGetErr() == 0);
+            return sh;
+        };
+
+        auto transformHd2dTest = [&](const std::string& src, std::string& outSrc) -> bool {
+            if (src.find("gl_FragColor") == std::string::npos || src.find("HS_HD2D_PARAMS") != std::string::npos) return false;
+            size_t p = src.find("precision mediump float;");
+            if (p == std::string::npos) p = src.find("precision highp float;");
+            size_t uOff = 0;
+            if (p != std::string::npos) {
+                size_t e = src.find("#endif", p);
+                if (e != std::string::npos) {
+                    size_t nl = src.find('\n', e);
+                    uOff = (nl == std::string::npos) ? (e + 6) : (nl + 1);
+                }
+            }
+            static constexpr const char* kUni = "\nuniform vec4 HS_HD2D_PARAMS;\nuniform vec4 HS_HD2D_SUN;\nuniform vec4 HS_HD2D_TINT;\n";
+            if (src.find("OCEAN_UV0_PARAMS") != std::string::npos && src.find("LIGHTMAP_TEXTURE") != std::string::npos &&
+                src.find("gl_FragColor = vec4( colour.rgb, alpha );") != std::string::npos) {
+                size_t posLm = src.find("colour.rgb *= CalculateLightingContribution();");
+                size_t posEnc = src.find("float encoding_factor = 2.0;");
+                if (posLm != std::string::npos && posEnc != std::string::npos && posEnc > posLm) {
+                    std::string s = src;
+                    s.insert(uOff, kUni);
+                    s.insert(s.find("float encoding_factor = 2.0;"), "\tif (HS_HD2D_PARAMS.y > 0.001) { colour.rgb += vec3(0.01) * HS_HD2D_TINT.rgb; }\n");
+                    outSrc = std::move(s);
+                    return true;
+                }
+            }
+            if (src.find("NOISE_REPEAT_SIZE") != std::string::npos && src.find("BASE_TEXTURE") != std::string::npos &&
+                src.find("NOISE_TEXTURE") != std::string::npos &&
+                src.find("base_colour.rgb *= CalculateLightingContribution();") != std::string::npos) {
+                std::string s = src;
+                s.insert(uOff, kUni);
+                static constexpr const char* kGroundLm = "base_colour.rgb *= CalculateLightingContribution();";
+                size_t posL = s.find(kGroundLm);
+                s.insert(posL + std::strlen(kGroundLm), "\n\tif (HS_HD2D_PARAMS.y > 0.001 && HS_HD2D_TINT.a > 0.005) { base_colour.rgb *= 0.96 + 0.0 * HS_HD2D_SUN.x; }");
+                outSrc = std::move(s);
+                return true;
+            }
+            static constexpr const char* kAnimA = "gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );";
+            if (src.find(kAnimA) != std::string::npos && src.find("OCEAN_BLEND_PARAMS") != std::string::npos &&
+                src.find("UI_CC") != std::string::npos && src.find("#define BLOOM\r") == std::string::npos &&
+                src.find("#define BLOOM\n") == std::string::npos && src.find("#define UI_CC\r") == std::string::npos &&
+                src.find("#define UI_CC\n") == std::string::npos) {
+                std::string s = src;
+                s.insert(uOff, kUni);
+                size_t pos = s.find(kAnimA);
+                s.insert(pos + std::strlen(kAnimA), "\n\t\tif (HS_HD2D_PARAMS.x > 0.001) { gl_FragColor.rgb *= (1.0 - 0.01 * clamp(HS_HD2D_TINT.a, 0.0, 1.0)); }");
+                outSrc = std::move(s);
+                return true;
+            }
+            static constexpr const char* kCcA = "vec3 intermediate = colour.rgb * vec3( CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0, CUBE_DIMENSION - 1.0 );";
+            if (src.find("#define SRC_IMAGE SAMPLER[0]") != std::string::npos && src.find("#define COLOUR_CUBE SAMPLER[1]") != std::string::npos &&
+                src.find("UI_CC") == std::string::npos && src.find(kCcA) != std::string::npos &&
+                src.find("min( intermediate.r + 0.5, 31.0 )") != std::string::npos) {
+                std::string s = src;
+                s.insert(uOff, kUni);
+                size_t posCc = s.find(kCcA);
+                s.insert(posCc, "colour.rgb = min(colour.rgb * (1.0 + 0.01 * HS_HD2D_PARAMS.z), vec3(1.0));\n\t");
+                outSrc = std::move(s);
+                return true;
+            }
+            if (src.find("LIGHT_POS") != std::string::npos && src.find("LIGHT_PARAMETERS") != std::string::npos &&
+                src.find("LIGHT_CONSTANTS") != std::string::npos && src.find("gl_FragColor = vec4( colour, 1 );") != std::string::npos) {
+                std::string s = src;
+                s.insert(uOff, kUni);
+                size_t posL = s.find("gl_FragColor = vec4( colour, 1 );");
+                s.insert(posL, "if (HS_HD2D_SUN.z > 0.001) { colour = clamp(colour, vec3(0.0), vec3(1.0)); }\n\t");
+                outSrc = std::move(s);
+                return true;
+            }
+            return false;
+        };
+
+        // Load and compile ALL vanilla .ksh shaders + HD-2D variants from shaders.zip
+        const char* shaderZipPath = "D:\\steam\\steamapps\\common\\Don't Starve Together\\data\\databundles\\shaders.zip";
+        FILE* zf = std::fopen(shaderZipPath, "rb");
+        CHECK(zf != nullptr);
+        std::fseek(zf, 0, SEEK_END);
+        long zlen = std::ftell(zf);
+        std::fseek(zf, 0, SEEK_SET);
+        CHECK(zlen > 22);
+        std::vector<uint8_t> zbuf(static_cast<size_t>(zlen));
+        CHECK(std::fread(zbuf.data(), 1, zbuf.size(), zf) == zbuf.size());
+        std::fclose(zf);
+
+        auto r16 = [](const uint8_t* p) -> uint16_t { uint16_t v; std::memcpy(&v, p, 2); return v; };
+        auto r32 = [](const uint8_t* p) -> uint32_t { uint32_t v; std::memcpy(&v, p, 4); return v; };
+        size_t eocd = SIZE_MAX;
+        const size_t minSearch = (zbuf.size() > 65560u) ? (zbuf.size() - 65560u) : 0u;
+        for (size_t pos = zbuf.size() - 22; ; --pos) {
+            if (r32(&zbuf[pos]) == 0x06054B50u) { eocd = pos; break; }
+            if (pos == minSearch) break;
+        }
+        CHECK(eocd != SIZE_MAX);
+        uint16_t cdCount = r16(&zbuf[eocd + 10]);
+        uint32_t cdOff   = r32(&zbuf[eocd + 16]);
+        CHECK(cdCount >= 70);
+
+        libdeflate_decompressor* decomp = libdeflate_alloc_decompressor();
+        CHECK(decomp != nullptr);
+        int vanillaShadersCompiled = 0;
+        int hd2dLinked = 0;
+        size_t curCd = cdOff;
+        for (uint16_t ei = 0; ei < cdCount; ++ei) {
+            CHECK(curCd + 46 <= zbuf.size() && r32(&zbuf[curCd]) == 0x02014B50u);
+            uint16_t method     = r16(&zbuf[curCd + 10]);
+            uint32_t compSz     = r32(&zbuf[curCd + 20]);
+            uint32_t uncompSz   = r32(&zbuf[curCd + 24]);
+            uint16_t fnLen      = r16(&zbuf[curCd + 28]);
+            uint16_t exLen      = r16(&zbuf[curCd + 30]);
+            uint16_t cmLen      = r16(&zbuf[curCd + 32]);
+            uint32_t localOff   = r32(&zbuf[curCd + 42]);
+            curCd += 46u + fnLen + exLen + cmLen;
+
+            CHECK(localOff + 30 <= zbuf.size() && r32(&zbuf[localOff]) == 0x04034B50u);
+            uint16_t lfFn = r16(&zbuf[localOff + 26]);
+            uint16_t lfEx = r16(&zbuf[localOff + 28]);
+            const uint8_t* payload = &zbuf[localOff + 30u + lfFn + lfEx];
+            std::vector<uint8_t> ksh(uncompSz);
+            if (method == 0u) {
+                std::memcpy(ksh.data(), payload, uncompSz);
+            } else {
+                CHECK(method == 8u);
+                size_t act = 0;
+                CHECK(libdeflate_deflate_decompress(decomp, payload, compSz, ksh.data(), uncompSz, &act) == LIBDEFLATE_SUCCESS);
+                CHECK(act == uncompSz);
+            }
+
+            size_t koff = 0;
+            auto kU32 = [&]() -> uint32_t { CHECK(koff + 4 <= ksh.size()); uint32_t v = r32(&ksh[koff]); koff += 4; return v; };
+            auto kStr = [&]() -> std::string { uint32_t l = kU32(); CHECK(koff + l <= ksh.size()); std::string s(reinterpret_cast<const char*>(&ksh[koff]), l); koff += l; return s; };
+            std::string bundleName = kStr();
+            uint32_t nUni = kU32();
+            for (uint32_t ui = 0; ui < nUni; ++ui) {
+                kStr();
+                CHECK(koff + 12 <= ksh.size());
+                uint32_t typ = r32(&ksh[koff + 4]);
+                koff += 12;
+                if (typ != 43u) {
+                    uint32_t fc = kU32();
+                    koff += static_cast<size_t>(fc) * 4u;
+                }
+            }
+            std::string vsName = kStr(); std::string vsSrc = kStr();
+            std::string psName = kStr(); std::string psSrc = kStr();
+
+            uint32_t vsObj = compileOneShader((bundleName + ":" + vsName).c_str(), 0x8B31u /*GL_VERTEX_SHADER*/, vsSrc);
+            uint32_t psObj = compileOneShader((bundleName + ":" + psName).c_str(), 0x8B30u /*GL_FRAGMENT_SHADER*/, psSrc);
+            vanillaShadersCompiled += 2;
+
+            std::string hdPs;
+            if (transformHd2dTest(psSrc, hdPs)) {
+                uint32_t hdObj = compileOneShader((bundleName + ":HD2D:" + psName).c_str(), 0x8B30u, hdPs);
+                uint32_t prog = pCreateProg();
+                CHECK(prog != 0);
+                pAttach(prog, vsObj);
+                pAttach(prog, hdObj);
+                pLink(prog);
+                int32_t linkOk = 0;
+                pGetProgIv(prog, 0x8B82 /*GL_LINK_STATUS*/, &linkOk);
+                CHECK(linkOk == 1 && pGetErr() == 0);
+                pDelProg(prog);
+                pDelShader(hdObj);
+                ++hd2dLinked;
+            }
+            pDelShader(vsObj);
+            pDelShader(psObj);
+        }
+        libdeflate_free_decompressor(decomp);
+        CHECK(vanillaShadersCompiled >= 140);
+        CHECK(hd2dLinked >= 8);
+
+        // Texture format & Anisotropy checks (ES2)
+        pPixelStorei(0x0CF5u /*GL_UNPACK_ALIGNMENT*/, 1);
+        uint32_t tex = 0;
+        pGenTex(1, &tex);
+        CHECK(tex != 0);
+        pBindTex(0x0DE1u, tex);
+        uint8_t pixBuf[64]{};
+        for (uint32_t fmt : { 0x1908u /*RGBA*/, 0x1907u /*RGB*/, 0x1906u /*ALPHA*/, 0x1909u /*LUMINANCE*/, 0x190Au /*LUMINANCE_ALPHA*/, 0x80E1u /*BGRA_EXT*/ }) {
+            pTexImg2D(0x0DE1u, 0, static_cast<int32_t>(fmt), 4, 4, 0, fmt, 0x1401u, pixBuf);
+            CHECK(pGetErr() == 0);
+        }
+        pCompTex2D(0x0DE1u, 0, 0x83F1u /*DXT1*/, 4, 4, 0, 8, pixBuf);
+        CHECK(pGetErr() == 0);
+        pCompTex2D(0x0DE1u, 0, 0x83F3u /*DXT5*/, 4, 4, 0, 16, pixBuf);
+        CHECK(pGetErr() == 0);
+
+        float maxAf = 0.0f;
+        pGetFloatv(0x84FFu /*GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT*/, &maxAf);
+        CHECK(maxAf >= 16.0f && pGetErr() == 0);
+        pTexParami(0x0DE1u, 0x2801u, 0x2703u);
+        pTexParamf(0x0DE1u, 0x84FEu, 16.0f);
+        CHECK(pGetErr() == 0);
+
+        // FBO + Renderbuffer checks (DEPTH24_STENCIL8, DEPTH16, STENCIL8)
+        uint32_t fbo = 0, fboColorTex = 0, rbo = 0;
+        pGenTex(1, &fboColorTex);
+        pBindTex(0x0DE1u, fboColorTex);
+        pTexImg2D(0x0DE1u, 0, 0x1908, 16, 16, 0, 0x1908u, 0x1401u, nullptr);
+        pGenFbo(1, &fbo);
+        pBindFbo(0x8D40u, fbo);
+        pFboTex2D(0x8D40u, 0x8CE0u, 0x0DE1u, fboColorTex, 0);
+        pGenRbo(1, &rbo);
+        pBindRbo(0x8D41u, rbo);
+
+        pRboStorage(0x8D41u, 0x88F0u /*DEPTH24_STENCIL8_OES*/, 16, 16);
+        pFboRbo(0x8D40u, 0x8D00u, 0x8D41u, rbo);
+        pFboRbo(0x8D40u, 0x8D20u, 0x8D41u, rbo);
+        CHECK(pCheckFbo(0x8D40u) == 0x8CD5u && pGetErr() == 0);
+
+        pFboRbo(0x8D40u, 0x8D20u, 0x8D41u, 0);
+        pRboStorage(0x8D41u, 0x81A5u /*DEPTH_COMPONENT16*/, 16, 16);
+        pFboRbo(0x8D40u, 0x8D00u, 0x8D41u, rbo);
+        CHECK(pCheckFbo(0x8D40u) == 0x8CD5u && pGetErr() == 0);
+
+        pFboRbo(0x8D40u, 0x8D00u, 0x8D41u, 0);
+        pRboStorage(0x8D41u, 0x8D48u /*STENCIL_INDEX8*/, 16, 16);
+        pFboRbo(0x8D40u, 0x8D20u, 0x8D41u, rbo);
+        CHECK(pCheckFbo(0x8D40u) == 0x8CD5u && pGetErr() == 0);
+
+        pBindFbo(0x8D40u, 0);
+        pDelRbo(1, &rbo);
+        pDelFbo(1, &fbo);
+        pDelTex(1, &fboColorTex);
+        pDelTex(1, &tex);
+
+        // glMapBufferRange / glUnmapBuffer verification
+        uint32_t vbo = 0;
+        pGenBufs(1, &vbo);
+        pBindBuf(0x8892u, vbo);
+        pBufData(0x8892u, 256, nullptr, 0x88E0u);
+        void* mapped = pMapRange(0x8892u, 0, 256, hs_vb_pool::kMapWriteInvalidateUnsync);
+        CHECK(mapped != nullptr);
+        std::memset(mapped, 0x5A, 256);
+        CHECK(pUnmapBuf(0x8892u) != 0);
+        CHECK(pGetErr() == 0);
+        pBindBuf(0x8892u, 0);
+        pDelBufs(1, &vbo);
+
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        std::printf("[PASS] 20. Native WGL ES2 verified (%s, %d/76 procs, %d vanilla + %d HD-2D shaders, FBO/S3TC/BGRA/AF/MapRange OK)\n",
+                    probe.renderer.c_str(), probe.resolvedProcs, vanillaShadersCompiled, hd2dLinked);
+    }
+
+    // 21. VbPool Dual-Track Buffer Pool Unit & Live RTX 4060 GPU Verification (v2.8.0 Stage 1)
+    {
+        using hs_vb_pool::VbPool;
+        CHECK(VbPool::BucketCapacity(0) == 256);
+        CHECK(VbPool::BucketCapacity(256) == 256);
+        CHECK(VbPool::BucketCapacity(257) == 512);
+        CHECK(VbPool::BucketCapacity(65536) == 65536);
+        CHECK(VbPool::BucketCapacity(65537) == 131072);
+        CHECK(VbPool::BucketCapacity(2u * 1024u * 1024u) == 2u * 1024u * 1024u);
+        CHECK(VbPool::BucketCapacity(2u * 1024u * 1024u + 1u) == 0);
+
+        size_t sz = 0; uint32_t glU = 0;
+        CHECK(!VbPool::IsPoolable(hs_vb_pool::kGlArrayBuffer, 9u, 16u, 10u, sz, glU));
+        CHECK(!VbPool::IsPoolable(hs_vb_pool::kGlArrayBuffer, 10u, 0u, 10u, sz, glU));
+        CHECK(!VbPool::IsPoolable(hs_vb_pool::kGlArrayBuffer, 10u, 16u, 0u, sz, glU));
+        CHECK(!VbPool::IsPoolable(0x0DE1u, 10u, 16u, 10u, sz, glU));
+        CHECK(!VbPool::IsPoolable(hs_vb_pool::kGlArrayBuffer, 10u, 1024u, 2049u, sz, glU));
+        CHECK(VbPool::IsPoolable(hs_vb_pool::kGlArrayBuffer, 10u, 24u, 100u, sz, glU) && sz == 2400u && glU == hs_vb_pool::kGlStreamDraw);
+        CHECK(VbPool::IsPoolable(hs_vb_pool::kGlElementArrayBuffer, 12u, 2u, 512u, sz, glU) && sz == 1024u && glU == hs_vb_pool::kGlDynamicDraw);
+
+        struct MockGlCtx {
+            uint32_t nextId = 1;
+            std::vector<uint32_t> deletedIds;
+            std::vector<uint8_t> mapScratch = std::vector<uint8_t>(2u * 1024u * 1024u);
+            ptrdiff_t lastAllocCap = 0;
+            int subDataCalls = 0, mapCalls = 0;
+        };
+        static MockGlCtx* s_mk = nullptr;
+        auto wireMock = [](VbPool& pool, MockGlCtx& mk) {
+            s_mk = &mk;
+            hs_vb_pool::GlBufferOps mops{};
+            mops.glGenBuffers = [](int32_t n, uint32_t* b) {
+                for (int32_t i = 0; i < n; ++i) b[i] = s_mk->nextId++;
+            };
+            mops.glBindBuffer = [](uint32_t, uint32_t) {};
+            mops.glBufferData = [](uint32_t, ptrdiff_t s, const void*, uint32_t) { s_mk->lastAllocCap = s; };
+            mops.glBufferSubData = [](uint32_t, ptrdiff_t, ptrdiff_t, const void*) { ++s_mk->subDataCalls; };
+            mops.glDeleteBuffers = [](int32_t n, const uint32_t* b) {
+                for (int32_t i = 0; i < n; ++i) s_mk->deletedIds.push_back(b[i]);
+            };
+            mops.glMapBufferRange = [](uint32_t, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                ++s_mk->mapCalls;
+                return s_mk->mapScratch.data();
+            };
+            mops.glUnmapBuffer = [](uint32_t) -> uint8_t { return 1u; };
+            pool.SetOps(mops);
+        };
+
+        {
+            MockGlCtx mk{};
+            VbPool pool;
+            wireMock(pool, mk);
+            uint8_t payload[300]{};
+            uint32_t id1 = 0, id2 = 0, id3 = 0, id4 = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id1));
+            CHECK(id1 == 1 && mk.lastAllocCap == 512);
+            CHECK(pool.TryRecycle(id1));
+            auto st = pool.GetStats();
+            CHECK(st.pooledCount == 1 && st.pooledBytes == 512 && st.misses == 1 && st.hits == 0);
+
+            // Age 0 & Age 1 must miss (2-frame GPU safety fence); stagger id1 (frame 0) and id2 (frame 1)
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id2));
+            CHECK(id2 == 2 && pool.GetStats().hits == 0);
+            pool.OnEndFrame(); // Age 1 for id1
+            CHECK(pool.TryRecycle(id2)); // Age 0 for id2
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id3));
+            CHECK(id3 == 3 && pool.GetStats().hits == 0);
+            pool.OnEndFrame(); // Age 2 for id1, Age 1 for id2!
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id4));
+            CHECK(id4 == id1);
+            st = pool.GetStats();
+            CHECK(st.hits == 1 && st.pooledCount == 1 && st.pooledBytes == 512);
+            pool.OnEndFrame(); // Age 2 for id2!
+            uint32_t id5 = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, false, id5));
+            st = pool.GetStats();
+            CHECK(id5 == id2 && st.hits == 2 && st.pooledCount == 0 && st.pooledBytes == 0 && mk.subDataCalls >= 1 && mk.mapCalls >= 1);
+            CHECK(pool.TryRecycle(id3) && pool.TryRecycle(id4) && pool.TryRecycle(id5));
+
+            // Idle eviction (>600 frames at 60-frame cadence)
+            for (int f = 0; f < 660; ++f) pool.OnEndFrame();
+            st = pool.GetStats();
+            CHECK(st.evicted == 3 && st.pooledCount == 0 && st.pooledBytes == 0 && mk.deletedIds.size() == 3);
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries());
+        }
+
+        // Regression: 600 consecutive recycle + 2-frame age + hit cycles (> kMaxPooledCount 512)
+        {
+            MockGlCtx mk{};
+            VbPool pool;
+            wireMock(pool, mk);
+            uint8_t d[128]{};
+            uint32_t got = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, got));
+            CHECK(pool.TryRecycle(got));
+            pool.OnEndFrame();
+            pool.OnEndFrame();
+            for (int i = 0; i < 600; ++i) {
+                got = 0;
+                CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, got));
+                CHECK(pool.TryRecycle(got));
+                pool.OnEndFrame();
+                pool.OnEndFrame();
+            }
+            uint32_t finalId = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, finalId));
+            auto st = pool.GetStats();
+            CHECK(st.hits == 601 && st.misses == 1 && st.evicted == 0 && st.pooledCount == 0 && st.pooledBytes == 0);
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries());
+        }
+
+        // Cap enforcement (512 count & 32MB bytes)
+        {
+            MockGlCtx mk{};
+            VbPool pool;
+            wireMock(pool, mk);
+            std::vector<uint32_t> ids(513);
+            for (int i = 0; i < 513; ++i) {
+                CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, nullptr, false, ids[i]));
+            }
+            for (int i = 0; i < 512; ++i) CHECK(pool.TryRecycle(ids[i]));
+            CHECK(!pool.TryRecycle(ids[512]));
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries() && mk.deletedIds.size() == 512);
+        }
+        {
+            MockGlCtx mk{};
+            VbPool pool;
+            wireMock(pool, mk);
+            std::vector<uint32_t> ids(17);
+            for (int i = 0; i < 17; ++i) {
+                CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlDynamicDraw, 2u * 1024u * 1024u, nullptr, false, ids[i]));
+            }
+            for (int i = 0; i < 16; ++i) CHECK(pool.TryRecycle(ids[i]));
+            CHECK(!pool.TryRecycle(ids[16]));
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries() && mk.deletedIds.size() == 16);
+        }
+
+        // Live RTX 4060 ES2 GPU VbPool roundtrip (MapBufferRange + glBufferSubData paths)
+        {
+            hs_native_gl::WglRuntime rt{};
+            HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_test_vb", WS_POPUP, 0, 0, 32, 32, nullptr, nullptr, nullptr, nullptr);
+            CHECK(hwnd != nullptr);
+            HDC hdc = nullptr;
+            HGLRC rc = nullptr;
+            CHECK(hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) && rt.pWglMakeCurrent(hdc, rc));
+            void* procs[76]{};
+            hs_native_gl::OptionalGlProcs opt{};
+            CHECK(hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) == 76);
+            auto findP = [&](const char* name) -> void* {
+                for (size_t i = 0; i < 76; ++i) if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+                return nullptr;
+            };
+            auto pErr = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glGetError"));
+            hs_vb_pool::GlBufferOps gops{};
+            gops.glGenBuffers    = reinterpret_cast<hs_vb_pool::GlBufferOps::GenBuffers_t>(findP("glGenBuffers"));
+            gops.glBindBuffer    = reinterpret_cast<hs_vb_pool::GlBufferOps::BindBuffer_t>(findP("glBindBuffer"));
+            gops.glBufferData    = reinterpret_cast<hs_vb_pool::GlBufferOps::BufferData_t>(findP("glBufferData"));
+            gops.glBufferSubData = reinterpret_cast<hs_vb_pool::GlBufferOps::BufferSubData_t>(opt.glBufferSubData);
+            gops.glDeleteBuffers = reinterpret_cast<hs_vb_pool::GlBufferOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+            gops.glMapBufferRange = reinterpret_cast<hs_vb_pool::GlBufferOps::MapBufferRange_t>(opt.glMapBufferRange);
+            gops.glUnmapBuffer    = reinterpret_cast<hs_vb_pool::GlBufferOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+
+            VbPool livePool;
+            livePool.SetOps(gops);
+            uint8_t vtx[256]{};
+            for (int i = 0; i < 256; ++i) vtx[i] = static_cast<uint8_t>(i);
+            uint32_t id1 = 0, id2 = 0, id3 = 0;
+            CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, true, id1));
+            CHECK(livePool.TryRecycle(id1));
+            livePool.OnEndFrame();
+            livePool.OnEndFrame();
+            CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, true, id2));
+            CHECK(id2 == id1 && livePool.GetStats().hits == 1 && pErr() == 0);
+            CHECK(livePool.TryRecycle(id2));
+            livePool.OnEndFrame();
+            livePool.OnEndFrame();
+            CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, false, id3));
+            CHECK(id3 == id1 && livePool.GetStats().hits == 2 && pErr() == 0);
+            livePool.ResetAndRelease(true);
+            CHECK(!livePool.HasEntries() && pErr() == 0);
+
+            rt.pWglMakeCurrent(nullptr, nullptr);
+            rt.pWglDeleteContext(rc);
+            ReleaseDC(hwnd, hdc);
+            DestroyWindow(hwnd);
+        }
+
+        std::printf("[PASS] 21. VbPool dual-track unit + cap/evict + 600-cycle regression + live RTX 4060 GPU verified\n");
+    }
+
+    // [22] v2.8.0: Causal 3-channel RPC QoS + Klei Codec + AsyncSaveQueue::TryEnqueueCompress
+    {
+        hs_rpc_qos::Classifier qos;
+        // srv id=4 (AttackButton -> 0), id=59 (bit 27 in srv1), id=68 (bit 4 in srv2)
+        // cli id=1 (ShowPopup -> bit 1 in cli0), id=8 (RecieveChatHistory -> bit 8 in cli0), id=15 (TryToTeachScrapbookData -> 0)
+        const uint32_t srv0 = 0u;
+        const uint32_t srv1 = (1u << 27);
+        const uint32_t srv2 = (1u << 4);
+        const uint32_t cli0 = (1u << 1) | (1u << 8);
+        qos.SetMasks(static_cast<uint64_t>(srv0) | (static_cast<uint64_t>(srv1) << 32),
+                     static_cast<uint64_t>(srv2),
+                     static_cast<uint64_t>(cli0), 0ULL);
+
+        uint8_t bsCombat[4] = { 4, 0, 0, 0 };
+        auto r1 = qos.Classify("RPC", bsCombat, 32u, 2, 3, 0);
+        CHECK(r1.priority == 0 && r1.orderingChannel == 0 && r1.promotedImmediate && !r1.movedOffCh0);
+
+        uint8_t bsSocialHi[4] = { 59, 0, 0, 0 };
+        auto r2 = qos.Classify("RPC", bsSocialHi, 32u, 2, 3, 0);
+        CHECK(r2.priority == 1 && r2.orderingChannel == 1 && !r2.promotedImmediate && r2.movedOffCh0);
+
+        uint8_t bsSocial68[4] = { 68, 0, 0, 0 };
+        auto r3 = qos.Classify("RPC", bsSocial68, 32u, 2, 3, 0);
+        CHECK(r3.priority == 1 && r3.orderingChannel == 1 && r3.movedOffCh0);
+
+        uint8_t bsScrapbook[4] = { 15, 0, 0, 0 };
+        auto r4 = qos.Classify("ClientRPC", bsScrapbook, 32u, 2, 3, 0);
+        CHECK(r4.priority == 0 && r4.orderingChannel == 0 && r4.promotedImmediate && !r4.movedOffCh0);
+
+        uint8_t bsChatHist[4] = { 8, 0, 0, 0 };
+        auto r5 = qos.Classify("ClientRPC", bsChatHist, 32u, 1, 3, 0);
+        CHECK(r5.priority == 2 && r5.orderingChannel == 2 && r5.movedOffCh0);
+
+        uint8_t bsModSmall[4] = { 1, 0, 0, 0 };
+        auto r6 = qos.Classify("ModRPC", bsModSmall, 128u, 2, 3, 0);
+        CHECK(r6.priority == 0 && r6.orderingChannel == 0 && r6.promotedImmediate);
+        auto r7 = qos.Classify("ModRPC", bsModSmall, 4096u, 2, 3, 0);
+        CHECK(r7.priority == 2 && r7.orderingChannel == 0 && !r7.promotedImmediate);
+
+        // Fail-closed: non-Ch0 or non-RELIABLE_ORDERED must remain untouched
+        auto r8 = qos.Classify("RPC", bsCombat, 32u, 2, 3, 1);
+        CHECK(r8.priority == 2 && r8.orderingChannel == 1 && !r8.promotedImmediate);
+        auto r9 = qos.Classify("RPC", bsCombat, 32u, 2, 1, 0);
+        CHECK(r9.priority == 2 && r9.orderingChannel == 0 && !r9.promotedImmediate);
+        CHECK(qos.TotalCalls() == 9 && qos.ImmCount() == 3 && qos.OffCh0Count() == 3);
+
+        // Codec token & roundtrip check
+        char tok[32]{};
+        klei_save_codec::FormatDeferRawToken(0x123456789ABCDEF0ULL, tok);
+        std::string wrapped = std::string("KLEI     1 ") + tok;
+        CHECK(wrapped.size() == klei_save_codec::kDeferEncodedTokenLen);
+        CHECK(klei_save_codec::MatchDeferEncodedToken(wrapped.data(), wrapped.size(), 0x123456789ABCDEF0ULL));
+        CHECK(!klei_save_codec::MatchDeferEncodedToken(wrapped.data(), wrapped.size(), 0x123456789ABCDEF1ULL));
+
+        std::vector<uint8_t> raw(16384u);
+        for (size_t i = 0; i < raw.size(); ++i) raw[i] = static_cast<uint8_t>('A' + (i % 26));
+        std::vector<uint8_t> enc;
+        CHECK(klei_save_codec::EncodeKleiZlibBase64(raw.data(), raw.size(), 5, enc));
+        CHECK(enc.size() > 11u && std::memcmp(enc.data(), "KLEI     1D", 11u) == 0);
+        std::vector<uint8_t> dec;
+        CHECK(klei_save_codec::DecodeKleiZlibBase64(enc.data(), enc.size(), dec));
+        CHECK(dec == raw);
+
+        // AsyncSaveQueue::TryEnqueueCompress + barrier + CommitSyncAtomic
+        wchar_t tmpDir[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tmpDir);
+        std::wstring testFile = std::wstring(tmpDir) + L"hs_redteam_async_save_test.dat";
+        DeleteFileW(testFile.c_str());
+
+        hc_async_save::AsyncSaveQueue q;
+        std::vector<uint8_t> rawCopy = raw;
+        CHECK(q.TryEnqueueCompress(testFile.c_str(), std::move(rawCopy), 5));
+        q.FlushPendingForPath(testFile.c_str());
+        CHECK(q.CompressedCount() == 1 && q.CommittedCount() == 1 && q.ErrorCount() == 0);
+
+        FILE* rf = _wfopen(testFile.c_str(), L"rb");
+        CHECK(rf != nullptr);
+        std::fseek(rf, 0, SEEK_END);
+        const long fsz = std::ftell(rf);
+        std::fseek(rf, 0, SEEK_SET);
+        CHECK(fsz > 11);
+        std::vector<uint8_t> diskBuf(static_cast<size_t>(fsz));
+        CHECK(std::fread(diskBuf.data(), 1, diskBuf.size(), rf) == diskBuf.size());
+        std::fclose(rf);
+
+        std::vector<uint8_t> decDisk;
+        CHECK(klei_save_codec::DecodeKleiZlibBase64(diskBuf.data(), diskBuf.size(), decDisk));
+        CHECK(decDisk == raw);
+
+        const char syncPayload[] = "KLEI     1 sync_fallback_ok";
+        CHECK(q.CommitSyncAtomic(testFile.c_str(), syncPayload, sizeof(syncPayload) - 1));
+        DeleteFileW(testFile.c_str());
+        q.ShutdownAndFlush();
+
+        std::printf("[PASS] 22. RPC QoS 32-bit masks + Klei Codec + AsyncSave TryEnqueueCompress/CommitSyncAtomic verified\n");
+    }
+
+    // [23] Multi-Texture 8-Slot 2D Sprite Draw-Call Batcher (Shader Transform + Mock GL + Live GPU FBO Readback)
+    {
+        using namespace hs_sprite_batch;
+
+        // 23a. Shader source transformer verification (exact anim.ksh structure + GL_ES guard + reject list)
+        const std::string kAnimVs =
+            "#ifdef SKINNED\n"
+            "\tuniform mat4 pv;\n"
+            "#else\n"
+            "\tuniform mat4 MatrixP;\n"
+            "\tuniform mat4 MatrixV;\n"
+            "\tuniform mat4 MatrixW;\n"
+            "#endif\n"
+            "uniform vec4 TIMEPARAMS;\n"
+            "uniform vec3 FLOAT_PARAMS;\n"
+            "attribute vec4 POS2D_UV;\n"
+            "varying vec3 PS_TEXCOORD;\n"
+            "varying vec3 PS_POS;\n"
+            "void main() {\n"
+            "#ifdef SKINNED\n"
+            "\tvec4 world_pos = vec4(0.0);\n"
+            "\tvec3 TEXCOORD0 = vec3(0.0);\n"
+            "#else\n"
+            "\tvec3 POSITION = vec3(POS2D_UV.xy, 0);\n"
+            "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+            "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+            "\tvec3 object_pos = POSITION.xyz;\n"
+            "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+            "\tif(FLOAT_PARAMS.z > 0.0) { world_pos.y += sin(MatrixW[3][0] + MatrixW[3][2] + TIMEPARAMS.x * 3.0) * 0.025; }\n"
+            "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+            "\tgl_Position = mtxPV * world_pos;\n"
+            "#endif\n"
+            "\tPS_TEXCOORD = TEXCOORD0;\n"
+            "\tPS_POS = world_pos.xyz;\n"
+            "}\n";
+
+        const std::string kAnimPs =
+            "#if defined( GL_ES )\n"
+            "precision mediump float;\n"
+            "#endif\n"
+            "uniform mat4 MatrixW;\n"
+            "uniform sampler2D SAMPLER[6];\n"
+            "varying vec3 PS_POS;\n"
+            "varying vec3 PS_TEXCOORD;\n"
+            "uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+            "uniform mat4 COLOUR_XFORM;\n"
+            "uniform vec3 PARAMS;\n"
+            "uniform vec3 FLOAT_PARAMS;\n"
+            "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+            "uniform vec4 OCEAN_WORLD_EXTENTS;\n"
+            "#define ALPHA_TEST PARAMS.x\n"
+            "#define LIGHT_OVERRIDE PARAMS.y\n"
+            "#define BLOOM_TOGGLE PARAMS.z\n"
+            "vec3 CalculateLightingContribution() { return texture2D(SAMPLER[3], (PS_POS.xz - LIGHTMAP_WORLD_EXTENTS.xy) * LIGHTMAP_WORLD_EXTENTS.zw).rgb; }\n"
+            "void main() {\n"
+            "    vec4 colour;\n"
+            "#if defined( TRIPLE_ATLAS )\n"
+            "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+            "    else if( PS_TEXCOORD.z < 1.5 ) { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+            "    else { colour.rgba = texture2D( SAMPLER[5], PS_TEXCOORD.xy ); }\n"
+            "#else\n"
+            "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+            "    else { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+            "#endif\n"
+            "    if (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+            "    gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+            "    vec3 light = CalculateLightingContribution();\n"
+            "    gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+            "}\n";
+
+        std::string vsOut, psOut, dummyOut;
+        const char* tag = nullptr;
+        CHECK(TransformAnimBatchShaderSource(kAnimVs, vsOut, tag) && std::strcmp(tag, "ANIM_BATCH_VS") == 0);
+        CHECK(!TransformAnimBatchShaderSource(vsOut, dummyOut, tag)); // idempotent
+        CHECK(TransformAnimBatchShaderSource(kAnimPs, psOut, tag) && std::strcmp(tag, "ANIM_BATCH_FS") == 0);
+        CHECK(!TransformAnimBatchShaderSource(psOut, dummyOut, tag)); // idempotent
+        // Verify HS_BATCH_ACTIVE decl is placed AFTER `#endif` of `#if defined( GL_ES )`!
+        const size_t endifPos = psOut.find("#endif");
+        const size_t declPos  = psOut.find("uniform float HS_BATCH_ACTIVE;");
+        CHECK(endifPos != std::string::npos && declPos != std::string::npos && declPos > endifPos);
+        // Verify all excluded variants are strictly rejected
+        const char* kRejects[] = { "SKINNED", "FADE_OUT", "HAUNT", "HOLO", "UI_HOLO", "UI_CC", "BLOOM" };
+        for (const char* m : kRejects) {
+            std::string badVs = std::string("#define ") + m + "\n" + kAnimVs;
+            std::string badPs = std::string("#define ") + m + "\n" + kAnimPs;
+            CHECK(!TransformAnimBatchShaderSource(badVs, dummyOut, tag));
+            CHECK(!TransformAnimBatchShaderSource(badPs, dummyOut, tag));
+        }
+
+        // 23b. Mock GL multi-texture coalescing, Z-order, deferred MatrixW, ocean-bob bypass & state sync
+        struct MockSbGl {
+            uint32_t nextBuf = 1000;
+            uint32_t boundVbo = 0, boundIbo = 0, activeUnit = 0;
+            uint32_t boundTex[16]{};
+            float    lastBatchActive = 0.0f;
+            float    lastCommittedMatrixW[16]{};
+            int      matWUploads = 0;
+            int      drawCalls = 0;
+            int      postFlushCallbacks = 0;
+            std::vector<BatchedVertex> lastFlushedVerts;
+            std::vector<uint16_t>      lastFlushedIndices;
+            std::unordered_map<uint32_t, std::vector<uint8_t>> gpuBufs;
+        };
+        static MockSbGl* g_mkSb = nullptr;
+        MockSbGl mk{};
+        g_mkSb = &mk;
+
+        GlBatchOps mops{};
+        mops.glGenBuffers = [](int32_t n, uint32_t* bufs) WINAPI {
+            for (int32_t i = 0; i < n; ++i) bufs[i] = g_mkSb->nextBuf++;
+        };
+        mops.glDeleteBuffers = [](int32_t n, const uint32_t* bufs) WINAPI {
+            for (int32_t i = 0; i < n; ++i) g_mkSb->gpuBufs.erase(bufs[i]);
+        };
+        mops.glBindBuffer = [](uint32_t target, uint32_t buf) WINAPI {
+            if (target == kGlArrayBuffer) g_mkSb->boundVbo = buf;
+            else if (target == kGlElementArrayBuffer) g_mkSb->boundIbo = buf;
+        };
+        mops.glBufferData = [](uint32_t target, ptrdiff_t size, const void* data, uint32_t) WINAPI {
+            const uint32_t id = (target == kGlArrayBuffer) ? g_mkSb->boundVbo : g_mkSb->boundIbo;
+            auto& v = g_mkSb->gpuBufs[id];
+            v.resize(static_cast<size_t>(size));
+            if (data && size > 0) std::memcpy(v.data(), data, static_cast<size_t>(size));
+        };
+        mops.glBufferSubData = [](uint32_t target, ptrdiff_t off, ptrdiff_t size, const void* data) WINAPI {
+            const uint32_t id = (target == kGlArrayBuffer) ? g_mkSb->boundVbo : g_mkSb->boundIbo;
+            auto& v = g_mkSb->gpuBufs[id];
+            if (static_cast<size_t>(off + size) <= v.size() && data) {
+                std::memcpy(v.data() + off, data, static_cast<size_t>(size));
+            }
+        };
+        mops.glActiveTexture = [](uint32_t u) WINAPI {
+            if (u >= kGlTexture0 && u < kGlTexture0 + 16u) g_mkSb->activeUnit = u - kGlTexture0;
+        };
+        mops.glBindTexture = [](uint32_t, uint32_t tex) WINAPI {
+            g_mkSb->boundTex[g_mkSb->activeUnit] = tex;
+        };
+        mops.glUniform1f = [](int32_t, float x) WINAPI { g_mkSb->lastBatchActive = x; };
+        mops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+        mops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float* val) WINAPI {
+            ++g_mkSb->matWUploads;
+            std::memcpy(g_mkSb->lastCommittedMatrixW, val, 16 * sizeof(float));
+        };
+        mops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+        mops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+        mops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+        mops.glGetIntegerv = [](uint32_t pname, int32_t* out) WINAPI {
+            if (pname == kGlMaxTextureImageUnits) *out = 16;
+        };
+        mops.glDrawElements = [](uint32_t, int32_t count, uint32_t, const void*) WINAPI {
+            ++g_mkSb->drawCalls;
+            const auto& vb = g_mkSb->gpuBufs[g_mkSb->boundVbo];
+            const auto& ib = g_mkSb->gpuBufs[g_mkSb->boundIbo];
+            g_mkSb->lastFlushedVerts.resize(vb.size() / sizeof(BatchedVertex));
+            if (!vb.empty()) std::memcpy(g_mkSb->lastFlushedVerts.data(), vb.data(), g_mkSb->lastFlushedVerts.size() * sizeof(BatchedVertex));
+            g_mkSb->lastFlushedIndices.resize(static_cast<size_t>(count));
+            if (count > 0 && ib.size() >= static_cast<size_t>(count) * 2) {
+                std::memcpy(g_mkSb->lastFlushedIndices.data(), ib.data(), static_cast<size_t>(count) * 2);
+            }
+        };
+        mops.onPostFlushRestore = [](uint32_t, uint32_t, uint32_t, uint32_t, void*) {
+            ++g_mkSb->postFlushCallbacks;
+        };
+
+        BatchProgInfo prog{};
+        prog.checked        = true;
+        prog.eligible       = true;
+        prog.locBatchActive = 10;
+        prog.locMatrixW     = 11;
+        prog.locFloatParams = 12;
+        prog.locPos2dUv     = 0;
+        prog.locBatchWpos   = 7;
+        prog.locSampler0    = 20;
+        prog.locSampler1    = 21;
+        prog.locSampler5    = 25;
+        for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) prog.locBatchTex[s] = static_cast<int32_t>(30 + s);
+
+        SpriteBatcher sb;
+        sb.SetOps(mops);
+        sb.SetEnabled(true);
+        sb.OnUseProgram(1, &prog);
+        sb.OnEnableDisableVertexAttribArray(0, true);
+
+        const float quadVerts[16] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            1.0f, 0.0f, 1.0f, 0.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            0.0f, 1.0f, 0.0f, 1.0f,
+        };
+        const uint16_t quadIdx[6] = { 0, 1, 2, 0, 2, 3 };
+        sb.OnBindBuffer(kGlArrayBuffer, 50);
+        sb.OnBufferUpload(50, quadVerts, sizeof(quadVerts));
+        sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, nullptr);
+        sb.OnBindBuffer(kGlElementArrayBuffer, 51);
+        sb.OnBufferUpload(51, quadIdx, sizeof(quadIdx));
+
+        // 200 interleaved sprites across 8 distinct textures -> MUST coalesce into 1 single draw call!
+        for (int i = 0; i < 200; ++i) {
+            sb.OnActiveTexture(kGlTexture0);
+            sb.OnBindTexture(kGlTexture2D, static_cast<uint32_t>(100 + (i % 8)));
+            float mtx[16] = { 2,0,0,0,  0,3,0,0,  0,0,1,0,  static_cast<float>(i * 10), 5.0f, static_cast<float>(i), 1 };
+            CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+            // Simulate dynamic VBO re-upload between sprites (must NOT break the batch!)
+            sb.OnBufferUpload(50, quadVerts, sizeof(quadVerts));
+            CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr));
+        }
+        CHECK(mk.drawCalls == 0 && mk.matWUploads == 0 && sb.HasPending());
+        // 9th distinct texture triggers flush #1!
+        sb.OnBindTexture(kGlTexture2D, 999);
+        float mtx9[16] = { 1,0,0,0,  0,1,0,0,  0,0,1,0,  77.0f, 88.0f, 99.0f, 1 };
+        CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx9));
+        CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr));
+        CHECK(mk.drawCalls == 1 && mk.postFlushCallbacks == 1 && mk.lastBatchActive == 0.0f);
+        CHECK(mk.lastFlushedVerts.size() == 800 && mk.lastFlushedIndices.size() == 1200);
+        // Check exact Z-order & affine world transform on sprite #199 vertex 2 (x=1, y=1):
+        // wx = 2*1 + 0*1 + 1990 = 1992, wy = 0*1 + 3*1 + 5 = 8, wz = 199, slot = 199 % 8 = 7
+        const BatchedVertex& vLast = mk.lastFlushedVerts[199 * 4 + 2];
+        CHECK(std::fabs(vLast.wx - 1992.0f) < 1e-4f && std::fabs(vLast.wy - 8.0f) < 1e-4f &&
+              std::fabs(vLast.wz - 199.0f) < 1e-4f && std::fabs(vLast.slot - 7.0f) < 1e-4f);
+
+        // Shared LightMap unit (unit 3) bind MUST flush pending sprite #201!
+        sb.OnActiveTexture(kGlTexture0 + 3u);
+        sb.OnBindTexture(kGlTexture2D, 7777);
+        CHECK(mk.drawCalls == 2 && !sb.HasPending());
+
+        // Ocean-bobbing sprite (FLOAT_PARAMS.z > 0) MUST bypass AND commit deferred MatrixW!
+        sb.OnActiveTexture(kGlTexture0);
+        sb.OnBindTexture(kGlTexture2D, 100);
+        float fpBob[3] = { 0.0f, 0.0f, 1.0f };
+        sb.OnUniform3fv(prog.locFloatParams, 1, fpBob);
+        // Verify FLOAT_PARAMS.z persists across glUseProgram switch & return!
+        sb.OnUseProgram(2, nullptr); // commits sprite 201's deferred MatrixW -> matWUploads == 1
+        CHECK(mk.matWUploads == 1);
+        sb.OnUseProgram(1, &prog);
+        CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx9));
+        CHECK(!sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr));
+        sb.PrepareForUnbatchedDraw();
+        CHECK(mk.matWUploads == 2 && std::fabs(mk.lastCommittedMatrixW[12] - 77.0f) < 1e-4f);
+
+        // Reset FLOAT_PARAMS.z=0 and test client-side pointer + glDrawArrays path
+        float fpZero[3] = { 0.0f, 0.0f, 0.0f };
+        sb.OnUniform3fv(prog.locFloatParams, 1, fpZero);
+        const float triClient[12] = { 0,0,0,0,  1,0,1,0,  0,1,0,1 };
+        sb.OnBindBuffer(kGlArrayBuffer, 0);
+        sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, triClient);
+        CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx9));
+        CHECK(sb.TryBatchDrawArrays(kGlTriangles, 0, 3));
+        sb.SetEnabled(false); // must flush pending + commit deferred MatrixW
+        CHECK(mk.drawCalls == 3 && !sb.HasPending() && mk.matWUploads == 3);
+        sb.ResetContext(reinterpret_cast<void*>(0x1234));
+        CHECK(!sb.HasPending());
+
+        // 23c. Live Hardware GPU WGL ES2 Compile + Link + Multi-Texture FBO Draw + Pixel-Exact Readback!
+        {
+            hs_native_gl::WglRuntime rt{};
+            HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_test_sb", WS_POPUP, 0, 0, 32, 32, nullptr, nullptr, nullptr, nullptr);
+            CHECK(hwnd != nullptr);
+            HDC hdc = nullptr;
+            HGLRC rc = nullptr;
+            CHECK(hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) && rt.pWglMakeCurrent(hdc, rc));
+            void* procs[76]{};
+            hs_native_gl::OptionalGlProcs opt{};
+            CHECK(hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) == 76);
+            auto findP = [&](const char* name) -> void* {
+                for (size_t i = 0; i < 76; ++i) if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+                return nullptr;
+            };
+            using CreateShader_t  = uint32_t (WINAPI*)(uint32_t);
+            using ShaderSource_t  = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+            using CompileShader_t = void (WINAPI*)(uint32_t);
+            using GetShaderiv_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+            using CreateProg_t    = uint32_t (WINAPI*)();
+            using AttachShader_t  = void (WINAPI*)(uint32_t, uint32_t);
+            using BindAttrib_t    = void (WINAPI*)(uint32_t, uint32_t, const char*);
+            using LinkProg_t      = void (WINAPI*)(uint32_t);
+            using GetProgiv_t     = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+            using GetUniLoc_t     = int32_t (WINAPI*)(uint32_t, const char*);
+            using GetAttLoc_t     = int32_t (WINAPI*)(uint32_t, const char*);
+            using UseProg_t       = void (WINAPI*)(uint32_t);
+            using GenTex_t        = void (WINAPI*)(int32_t, uint32_t*);
+            using TexImg2D_t      = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+            using TexParami_t     = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+            using GenFbo_t        = void (WINAPI*)(int32_t, uint32_t*);
+            using BindFbo_t       = void (WINAPI*)(uint32_t, uint32_t);
+            using FboTex2D_t      = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+            using Viewport_t      = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+            using ClearCol_t      = void (WINAPI*)(float, float, float, float);
+            using Clear_t         = void (WINAPI*)(uint32_t);
+            using Uni3fv_t        = void (WINAPI*)(int32_t, int32_t, const float*);
+            using Uni4fv_t        = void (WINAPI*)(int32_t, int32_t, const float*);
+            using ReadPix_t       = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+            using GetErr_t        = uint32_t (WINAPI*)();
+
+            auto pCreateShader  = reinterpret_cast<CreateShader_t>(findP("glCreateShader"));
+            auto pShaderSource  = reinterpret_cast<ShaderSource_t>(findP("glShaderSource"));
+            auto pCompileShader = reinterpret_cast<CompileShader_t>(findP("glCompileShader"));
+            auto pGetShaderiv   = reinterpret_cast<GetShaderiv_t>(findP("glGetShaderiv"));
+            auto pCreateProg    = reinterpret_cast<CreateProg_t>(findP("glCreateProgram"));
+            auto pAttachShader  = reinterpret_cast<AttachShader_t>(findP("glAttachShader"));
+            auto pBindAttrib    = reinterpret_cast<BindAttrib_t>(findP("glBindAttribLocation"));
+            auto pLinkProg      = reinterpret_cast<LinkProg_t>(findP("glLinkProgram"));
+            auto pGetProgiv     = reinterpret_cast<GetProgiv_t>(findP("glGetProgramiv"));
+            auto pGetUniLoc     = reinterpret_cast<GetUniLoc_t>(findP("glGetUniformLocation"));
+            auto pGetAttLoc     = reinterpret_cast<GetAttLoc_t>(findP("glGetAttribLocation"));
+            auto pUseProg       = reinterpret_cast<UseProg_t>(findP("glUseProgram"));
+            auto pGenTex        = reinterpret_cast<GenTex_t>(findP("glGenTextures"));
+            auto pTexImg2D      = reinterpret_cast<TexImg2D_t>(findP("glTexImage2D"));
+            auto pTexParami     = reinterpret_cast<TexParami_t>(findP("glTexParameteri"));
+            auto pGenFbo        = reinterpret_cast<GenFbo_t>(findP("glGenFramebuffers"));
+            auto pBindFbo       = reinterpret_cast<BindFbo_t>(findP("glBindFramebuffer"));
+            auto pFboTex2D      = reinterpret_cast<FboTex2D_t>(findP("glFramebufferTexture2D"));
+            auto pViewport      = reinterpret_cast<Viewport_t>(findP("glViewport"));
+            auto pClearCol      = reinterpret_cast<ClearCol_t>(findP("glClearColor"));
+            auto pClear         = reinterpret_cast<Clear_t>(findP("glClear"));
+            auto pUni3fv        = reinterpret_cast<Uni3fv_t>(findP("glUniform3fv"));
+            auto pUni4fv        = reinterpret_cast<Uni4fv_t>(findP("glUniform4fv"));
+            auto pReadPix       = reinterpret_cast<ReadPix_t>(findP("glReadPixels"));
+            auto pErr           = reinterpret_cast<GetErr_t>(findP("glGetError"));
+
+            GlBatchOps gops{};
+            gops.glGenBuffers               = reinterpret_cast<GlBatchOps::GenBuffers_t>(findP("glGenBuffers"));
+            gops.glDeleteBuffers            = reinterpret_cast<GlBatchOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+            gops.glBindBuffer               = reinterpret_cast<GlBatchOps::BindBuffer_t>(findP("glBindBuffer"));
+            gops.glBufferData               = reinterpret_cast<GlBatchOps::BufferData_t>(findP("glBufferData"));
+            gops.glBufferSubData            = reinterpret_cast<GlBatchOps::BufferSubData_t>(opt.glBufferSubData);
+            gops.glMapBufferRange           = reinterpret_cast<GlBatchOps::MapBufferRange_t>(opt.glMapBufferRange);
+            gops.glUnmapBuffer              = reinterpret_cast<GlBatchOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+            gops.glActiveTexture            = reinterpret_cast<GlBatchOps::ActiveTexture_t>(findP("glActiveTexture"));
+            gops.glBindTexture              = reinterpret_cast<GlBatchOps::BindTexture_t>(findP("glBindTexture"));
+            gops.glUniform1f                = reinterpret_cast<GlBatchOps::Uniform1f_t>(findP("glUniform1f"));
+            gops.glUniform1i                = reinterpret_cast<GlBatchOps::Uniform1i_t>(findP("glUniform1i"));
+            gops.glUniformMatrix4fv         = reinterpret_cast<GlBatchOps::UniformMatrix4fv_t>(findP("glUniformMatrix4fv"));
+            gops.glVertexAttribPointer      = reinterpret_cast<GlBatchOps::VertexAttribPointer_t>(findP("glVertexAttribPointer"));
+            gops.glEnableVertexAttribArray  = reinterpret_cast<GlBatchOps::EnableVertexAttribArray_t>(findP("glEnableVertexAttribArray"));
+            gops.glDisableVertexAttribArray = reinterpret_cast<GlBatchOps::DisableVertexAttribArray_t>(findP("glDisableVertexAttribArray"));
+            gops.glDrawElements             = reinterpret_cast<GlBatchOps::DrawElements_t>(findP("glDrawElements"));
+            gops.glGetIntegerv              = reinterpret_cast<GlBatchOps::GetIntegerv_t>(findP("glGetIntegerv"));
+            gops.glGetBufferParameteriv     = reinterpret_cast<GlBatchOps::GetBufferParameteriv_t>(opt.glGetBufferParameteriv);
+            gops.glGetBufferSubData         = reinterpret_cast<GlBatchOps::GetBufferSubData_t>(opt.glGetBufferSubData);
+            CHECK(gops.glGetBufferParameteriv != nullptr && gops.glGetBufferSubData != nullptr);
+
+            // Compile & link REAL transformed anim VS + PS on hardware GPU!
+            uint32_t vs = pCreateShader(0x8B31u);
+            const char* vsPtr = vsOut.c_str();
+            int32_t vsLen = static_cast<int32_t>(vsOut.size());
+            pShaderSource(vs, 1, &vsPtr, &vsLen);
+            pCompileShader(vs);
+            int32_t okVs = 0; pGetShaderiv(vs, 0x8B81u, &okVs);
+            CHECK(okVs == 1);
+
+            uint32_t ps = pCreateShader(0x8B30u);
+            const char* psPtr = psOut.c_str();
+            int32_t psLen = static_cast<int32_t>(psOut.size());
+            pShaderSource(ps, 1, &psPtr, &psLen);
+            pCompileShader(ps);
+            int32_t okPs = 0; pGetShaderiv(ps, 0x8B81u, &okPs);
+            CHECK(okPs == 1);
+
+            uint32_t prg = pCreateProg();
+            pAttachShader(prg, vs);
+            pAttachShader(prg, ps);
+            pBindAttrib(prg, 0u, "POS2D_UV");
+            pBindAttrib(prg, 5u, "HS_BATCH_CMULT");
+            pBindAttrib(prg, 6u, "HS_BATCH_CADD");
+            pBindAttrib(prg, 7u, "HS_BATCH_WPOS");
+            pLinkProg(prg);
+            int32_t okLink = 0; pGetProgiv(prg, 0x8B82u, &okLink);
+            CHECK(okLink == 1);
+
+            BatchProgInfo liveInfo{};
+            liveInfo.checked        = true;
+            liveInfo.locBatchActive = pGetUniLoc(prg, "HS_BATCH_ACTIVE");
+            liveInfo.locMatrixW     = pGetUniLoc(prg, "MatrixW");
+            liveInfo.locColourXform = pGetUniLoc(prg, "COLOUR_XFORM");
+            liveInfo.locFloatParams = pGetUniLoc(prg, "FLOAT_PARAMS");
+            liveInfo.locPos2dUv     = pGetAttLoc(prg, "POS2D_UV");
+            liveInfo.locBatchWpos   = pGetAttLoc(prg, "HS_BATCH_WPOS");
+            liveInfo.locBatchCMult  = pGetAttLoc(prg, "HS_BATCH_CMULT");
+            liveInfo.locBatchCAdd   = pGetAttLoc(prg, "HS_BATCH_CADD");
+            liveInfo.locSampler0    = pGetUniLoc(prg, "SAMPLER[0]");
+            liveInfo.locSampler1    = pGetUniLoc(prg, "SAMPLER[1]");
+            liveInfo.locSampler5    = pGetUniLoc(prg, "SAMPLER[5]");
+            CHECK(liveInfo.locPos2dUv == 0 && liveInfo.locBatchCMult == 5 && liveInfo.locBatchCAdd == 6 &&
+                  liveInfo.locBatchWpos == 7 && liveInfo.locBatchActive >= 0 &&
+                  liveInfo.locMatrixW >= 0 && liveInfo.locColourXform >= 0);
+            for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) {
+                char uName[24]; std::snprintf(uName, sizeof(uName), "HS_BATCH_TEX%u", s);
+                liveInfo.locBatchTex[s] = pGetUniLoc(prg, uName);
+                CHECK(liveInfo.locBatchTex[s] >= 0);
+            }
+            liveInfo.eligible = true;
+
+            // Create 16x16 FBO + 3 solid 1x1 textures (Red, Green, White LightMap)
+            uint32_t texs[4]{};
+            pGenTex(4, texs);
+            auto make1x1 = [&](uint32_t tid, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+                uint8_t px[4] = { r, g, b, a };
+                gops.glActiveTexture(kGlTexture0);
+                gops.glBindTexture(kGlTexture2D, tid);
+                pTexParami(kGlTexture2D, 0x2801u, 0x2600);
+                pTexParami(kGlTexture2D, 0x2800u, 0x2600);
+                pTexImg2D(kGlTexture2D, 0, 0x1908, 1, 1, 0, 0x1908u, 0x1401u, px);
+            };
+            make1x1(texs[0], 255, 0, 0, 255);     // Red atlas
+            make1x1(texs[1], 0, 255, 0, 255);     // Green atlas
+            make1x1(texs[2], 255, 255, 255, 255); // White lightmap
+            gops.glActiveTexture(kGlTexture0);
+            gops.glBindTexture(kGlTexture2D, texs[3]);
+            pTexParami(kGlTexture2D, 0x2801u, 0x2600);
+            pTexParami(kGlTexture2D, 0x2800u, 0x2600);
+            pTexImg2D(kGlTexture2D, 0, 0x1908, 16, 16, 0, 0x1908u, 0x1401u, nullptr);
+
+            uint32_t fbo = 0;
+            pGenFbo(1, &fbo);
+            pBindFbo(0x8D40u, fbo);
+            pFboTex2D(0x8D40u, 0x8CE0u, kGlTexture2D, texs[3], 0);
+            pViewport(0, 0, 16, 16);
+            pClearCol(0.0f, 0.0f, 0.0f, 1.0f);
+            pClear(0x4000u);
+
+            pUseProg(prg);
+            const float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float params[3] = { 0.0f, 1.0f, 0.0f }; // LIGHT_OVERRIDE = 1.0
+            const float z3[3] = { 0.0f, 0.0f, 0.0f };
+            const float z4[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            gops.glUniformMatrix4fv(pGetUniLoc(prg, "MatrixP"), 1, 0, ident);
+            gops.glUniformMatrix4fv(pGetUniLoc(prg, "MatrixV"), 1, 0, ident);
+            gops.glUniformMatrix4fv(pGetUniLoc(prg, "COLOUR_XFORM"), 1, 0, ident);
+            pUni3fv(pGetUniLoc(prg, "PARAMS"), 1, params);
+            pUni3fv(liveInfo.locFloatParams, 1, z3);
+            pUni4fv(pGetUniLoc(prg, "LIGHTMAP_WORLD_EXTENTS"), 1, z4);
+            gops.glUniform1i(liveInfo.locSampler0, 0);
+            gops.glUniform1i(liveInfo.locSampler1, 1);
+            gops.glUniform1i(pGetUniLoc(prg, "SAMPLER[3]"), 3);
+            gops.glActiveTexture(kGlTexture0 + 3u);
+            gops.glBindTexture(kGlTexture2D, texs[2]);
+
+            // Upload a unit quad VBO + IBO [-1..0] x [-1..1]
+            uint32_t bufs[2]{};
+            gops.glGenBuffers(2, bufs);
+            const float qv[16] = {
+                -1.0f, -1.0f, 0.5f, 0.5f,
+                 0.0f, -1.0f, 0.5f, 0.5f,
+                 0.0f,  1.0f, 0.5f, 0.5f,
+                -1.0f,  1.0f, 0.5f, 0.5f,
+            };
+            const uint16_t qi[6] = { 0, 1, 2, 0, 2, 3 };
+            gops.glBindBuffer(kGlArrayBuffer, bufs[0]);
+            gops.glBufferData(kGlArrayBuffer, sizeof(qv), qv, kGlStreamDraw);
+            gops.glBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            gops.glBufferData(kGlElementArrayBuffer, sizeof(qi), qi, kGlStreamDraw);
+            gops.glEnableVertexAttribArray(0);
+            gops.glVertexAttribPointer(0, 4, kGlFloat, 0, 16, nullptr);
+
+            SpriteBatcher liveSb;
+            liveSb.SetOps(gops);
+            liveSb.SetEnabled(true);
+            liveSb.OnUseProgram(prg, &liveInfo);
+            liveSb.OnEnableDisableVertexAttribArray(0, true);
+            liveSb.OnBindBuffer(kGlArrayBuffer, bufs[0]);
+            liveSb.OnBufferUpload(bufs[0], qv, sizeof(qv));
+            liveSb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, nullptr);
+            liveSb.OnBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            liveSb.OnBufferUpload(bufs[1], qi, sizeof(qi));
+
+            // Sprite 1 (Left half [-1..0], Red tex0, tinted 0.5R + 0.5B via COLOUR_XFORM -> (128, 0, 128)!)
+            // + Sprite 2 (Right half [0..1], Green tex1, identity COLOUR_XFORM -> (0, 255, 0)!)
+            // DIFFERENT textures AND DIFFERENT COLOUR_XFORM tints -> STILL 1 SINGLE BATCHED DRAW!
+            const float tintLeft[16] = {
+                0.5f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.5f,
+                0.0f, 0.0f, 0.0f, 1.0f
+            };
+            liveSb.OnActiveTexture(kGlTexture0);
+            liveSb.OnBindTexture(kGlTexture2D, texs[0]);
+            CHECK(liveSb.TryAbsorbMatrixW(liveInfo.locMatrixW, 1, 0, ident));
+            CHECK(liveSb.TryAbsorbColourXform(liveInfo.locColourXform, 1, 0, tintLeft));
+            CHECK(liveSb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr));
+
+            liveSb.OnBindTexture(kGlTexture2D, texs[1]);
+            const float shiftRight[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 1.0f,0,0,1 };
+            CHECK(liveSb.TryAbsorbMatrixW(liveInfo.locMatrixW, 1, 0, shiftRight));
+            CHECK(liveSb.TryAbsorbColourXform(liveInfo.locColourXform, 1, 0, ident));
+            CHECK(liveSb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr));
+            liveSb.Flush();
+            CHECK(liveSb.GetStats().drawsBatched == 2 && liveSb.GetStats().flushes == 1);
+
+            uint8_t pxLeft[4]{}, pxRight[4]{};
+            pReadPix(3, 8, 1, 1, 0x1908u, 0x1401u, pxLeft);
+            pReadPix(12, 8, 1, 1, 0x1908u, 0x1401u, pxRight);
+            CHECK(pErr() == 0);
+            CHECK(pxLeft[0] >= 126 && pxLeft[0] <= 129 && pxLeft[1] == 0 && pxLeft[2] >= 126 && pxLeft[2] <= 129);
+            CHECK(pxRight[0] == 0 && pxRight[1] == 255 && pxRight[2] == 0);
+
+            // Non-affine COLOUR_XFORM (off-diagonal mix) MUST fail-closed so grayscale/hue-shift stays pixel-exact!
+            float nonAffine[16] = { 1,0.2f,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            CHECK(!liveSb.TryAbsorbColourXform(liveInfo.locColourXform, 1, 0, nonAffine));
+            CHECK(liveSb.TryAbsorbColourXform(liveInfo.locColourXform, 1, 0, ident));
+
+            // Also verify GL_TRIANGLE_STRIP with degenerate stitch (exact DST AnimRenderer format!):
+            // 2 quads stitched via duplicate indices {0,1,3,2, 2,4, 4,5,7,6} -> 4 non-degenerate tris!
+            const float stripVerts[32] = {
+                -1.0f, -1.0f, 0.5f, 0.5f,   0.0f, -1.0f, 0.5f, 0.5f,
+                -1.0f,  1.0f, 0.5f, 0.5f,   0.0f,  1.0f, 0.5f, 0.5f,
+                 0.0f, -1.0f, 2.5f, 0.5f,   1.0f, -1.0f, 2.5f, 0.5f,
+                 0.0f,  1.0f, 2.5f, 0.5f,   1.0f,  1.0f, 2.5f, 0.5f,
+            };
+            const uint16_t stripIdx[10] = { 0, 1, 2, 3, 3, 4, 4, 5, 6, 7 };
+            pClear(0x4000u);
+            gops.glBindBuffer(kGlArrayBuffer, bufs[0]);
+            gops.glBufferData(kGlArrayBuffer, sizeof(stripVerts), stripVerts, kGlStreamDraw);
+            gops.glBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            gops.glBufferData(kGlElementArrayBuffer, sizeof(stripIdx), stripIdx, kGlStreamDraw);
+            liveSb.OnBindBuffer(kGlArrayBuffer, bufs[0]);
+            liveSb.OnBufferUpload(bufs[0], stripVerts, sizeof(stripVerts));
+            liveSb.OnBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            liveSb.OnBufferUpload(bufs[1], stripIdx, sizeof(stripIdx));
+            liveSb.OnActiveTexture(kGlTexture0);
+            liveSb.OnBindTexture(kGlTexture2D, texs[0]); // SAMPLER[0] = Red (left quad, u=0.5)
+            liveSb.OnActiveTexture(kGlTexture0 + 1u);
+            liveSb.OnBindTexture(kGlTexture2D, texs[1]); // SAMPLER[1] = Green (right quad, u=2.5)
+            CHECK(liveSb.TryAbsorbMatrixW(liveInfo.locMatrixW, 1, 0, ident));
+            CHECK(liveSb.TryBatchDrawElements(kGlTriangleStrip, 10, kGlUnsignedShort, nullptr));
+            liveSb.Flush();
+            pReadPix(3, 8, 1, 1, 0x1908u, 0x1401u, pxLeft);
+            pReadPix(12, 8, 1, 1, 0x1908u, 0x1401u, pxRight);
+            CHECK(pErr() == 0);
+            CHECK(pxLeft[0] == 255 && pxLeft[1] == 0 && pxLeft[2] == 0);
+            CHECK(pxRight[0] == 0 && pxRight[1] == 255 && pxRight[2] == 0);
+
+            // Restore unit quad for unbatched vanilla post-flush check
+            gops.glBindBuffer(kGlArrayBuffer, bufs[0]);
+            gops.glBufferData(kGlArrayBuffer, sizeof(qv), qv, kGlStreamDraw);
+            gops.glBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            gops.glBufferData(kGlElementArrayBuffer, sizeof(qi), qi, kGlStreamDraw);
+            liveSb.OnBindBuffer(kGlArrayBuffer, bufs[0]);
+            liveSb.OnBufferUpload(bufs[0], qv, sizeof(qv));
+            liveSb.OnBindBuffer(kGlElementArrayBuffer, bufs[1]);
+            liveSb.OnBufferUpload(bufs[1], qi, sizeof(qi));
+            CHECK(liveSb.TryAbsorbMatrixW(liveInfo.locMatrixW, 1, 0, shiftRight));
+
+            // Verify post-flush state restoration by running an UNBATCHED vanilla draw (Red over Right half)!
+            gops.glActiveTexture(kGlTexture0);
+            gops.glBindTexture(kGlTexture2D, texs[0]);
+            liveSb.PrepareForUnbatchedDraw(); // commits deferred shiftRight MatrixW!
+            gops.glDrawElements(kGlTriangles, 6, kGlUnsignedShort, nullptr);
+            pReadPix(12, 8, 1, 1, 0x1908u, 0x1401u, pxRight);
+            CHECK(pErr() == 0 && pxRight[0] == 255 && pxRight[1] == 0 && pxRight[2] == 0);
+
+            rt.pWglMakeCurrent(nullptr, nullptr);
+            rt.pWglDeleteContext(rc);
+            ReleaseDC(hwnd, hdc);
+            DestroyWindow(hwnd);
+        }
+
+        // 23d. O(1) ShadowBufferCache stress & LRU eviction integrity (zero O(N) scan under VBPool churn)
+        {
+            hs_sprite_batch::ShadowBufferCache sc;
+            std::vector<uint8_t> blk(65536u, 0xA5u);
+            const auto t0 = std::chrono::steady_clock::now();
+            // Push 144 MB (> 128 MB cap) across 2200 static buffers to force continuous O(1) LRU eviction;
+            // keep id=1001 hot via Find() so active on-screen static VBOs are never evicted!
+            for (uint32_t id = 1000u; id < 3200u; ++id) {
+                blk[0] = static_cast<uint8_t>(id & 0xFFu);
+                blk[1] = static_cast<uint8_t>((id >> 8) & 0xFFu);
+                sc.OnUpload(id, blk.data(), blk.size());
+                if (id > 1001u && (id & 255u) == 0u) {
+                    size_t hotSz = 0;
+                    CHECK(sc.Find(1001u, hotSz) != nullptr && hotSz == blk.size());
+                }
+                CHECK(sc.TotalBytes() <= hs_sprite_batch::kMaxShadowCacheBytes);
+            }
+            CHECK(sc.Evicts() > 0u);
+            // Simulate 40,000 VBPool recycle/re-upload cycles on IDs 1..256 + overflow IDs >= 65536
+            uint8_t quad[96]{};
+            for (uint32_t iter = 0; iter < 40000u; ++iter) {
+                const uint32_t id = (iter % 100u == 0u) ? (70000u + (iter % 64u)) : (1u + (iter & 255u));
+                quad[0] = static_cast<uint8_t>(iter & 0xFFu);
+                quad[1] = static_cast<uint8_t>((iter >> 8) & 0xFFu);
+                sc.OnUpload(id, quad, sizeof(quad));
+                if ((iter & 3u) == 0u) sc.OnDelete(id);
+            }
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            CHECK(sc.TotalBytes() <= hs_sprite_batch::kMaxShadowCacheBytes);
+            CHECK(sc.Count() <= hs_sprite_batch::ShadowBufferCache::kMaxEntries);
+            CHECK(elapsedMs < 350);
+
+            // Verify live data integrity on direct + hot static + overflow IDs and nullptr on deleted/evicted IDs
+            quad[0] = 0x5Au; quad[1] = 0xC3u;
+            sc.OnUpload(42u, quad, sizeof(quad));
+            sc.OnUpload(77777u, quad, sizeof(quad));
+            size_t sz = 0;
+            const uint8_t* p42 = sc.Find(42u, sz);
+            CHECK(p42 && sz == sizeof(quad) && p42[0] == 0x5Au && p42[1] == 0xC3u);
+            const uint8_t* pHot = sc.Find(1001u, sz);
+            CHECK(pHot && sz == blk.size() && pHot[0] == static_cast<uint8_t>(1001u & 0xFFu));
+            const uint8_t* pOv = sc.Find(77777u, sz);
+            CHECK(pOv && sz == sizeof(quad) && pOv[0] == 0x5Au && pOv[1] == 0xC3u);
+            sc.OnDelete(42u);
+            CHECK(sc.Find(42u, sz) == nullptr && sz == 0u);
+            CHECK(sc.Find(1000u, sz) == nullptr); // cold id=1000 evicted earlier
+            sc.Clear();
+            CHECK(sc.TotalBytes() == 0u && sc.Count() == 0u);
+        }
+
+        std::printf("[PASS] 23. SpriteBatcher shader-transform + 200->1 multi-tex batch + O(1) ShadowCache LRU + live GPU FBO readback verified\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // [24] Unified UI + Font Uber-Batcher (classifier + live GPU FBO pixel-exact
+    //      interleaved ui.ksh + font_packed_outline.ksh + ui_ctransform.ksh -> 1 DrawCall)
+    // -------------------------------------------------------------------------
+    {
+        using namespace hs_ui_batch;
+        static constexpr const char* kUiVs =
+            "uniform mat4 MatrixPVW;\n"
+            "attribute vec3 POSITION;\n"
+            "attribute vec2 TEXCOORD0;\n"
+            "attribute vec4 DIFFUSE;\n"
+            "varying vec2 PS_TEXCOORD;\n"
+            "varying vec4 PS_COLOUR;\n"
+            "void main() {\n"
+            "  gl_Position = MatrixPVW * vec4( POSITION.xyz, 1.0 );\n"
+            "  PS_TEXCOORD.xy = TEXCOORD0.xy;\n"
+            "  PS_COLOUR.rgba = vec4( DIFFUSE.rgb * DIFFUSE.a, DIFFUSE.a );\n"
+            "}\n";
+        static constexpr const char* kUiBasicFs =
+            "precision mediump float;\n"
+            "uniform sampler2D SAMPLER[1];\n"
+            "varying vec2 PS_TEXCOORD;\n"
+            "varying vec4 PS_COLOUR;\n"
+            "void main() {\n"
+            "  vec4 colour = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+            "  colour.rgba *= PS_COLOUR.rgba;\n"
+            "  gl_FragColor = colour;\n"
+            "}\n";
+        static constexpr const char* kUiCxFs =
+            "precision mediump float;\n"
+            "uniform sampler2D SAMPLER[1];\n"
+            "varying vec2 PS_TEXCOORD;\n"
+            "varying vec4 PS_COLOUR;\n"
+            "uniform mat4 COLOUR_XFORM;\n"
+            "void main() {\n"
+            "  vec4 colour = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+            "  colour.rgba *= PS_COLOUR.rgba;\n"
+            "  colour.rgba = colour.rgba * COLOUR_XFORM;\n"
+            "  gl_FragColor = colour;\n"
+            "}\n";
+        static constexpr const char* kFontVs =
+            "uniform mat4 MatrixP;\n"
+            "uniform mat4 MatrixV;\n"
+            "uniform mat4 MatrixW;\n"
+            "attribute vec3 POSITION;\n"
+            "attribute vec4 DIFFUSE;\n"
+            "attribute vec2 TEXCOORD0;\n"
+            "attribute vec4 TEXCOORD1;\n"
+            "varying vec2 PS_TEXCOORD;\n"
+            "varying vec4 PS_COLOUR;\n"
+            "varying vec4 PS_TEXCOORD1;\n"
+            "void main() {\n"
+            "  mat4 mtxPVW = MatrixP * MatrixV * MatrixW;\n"
+            "  gl_Position = mtxPVW * vec4( POSITION.xyz, 1.0 );\n"
+            "  PS_TEXCOORD.xy = TEXCOORD0.xy;\n"
+            "  PS_COLOUR = vec4( DIFFUSE.rgb * DIFFUSE.a, DIFFUSE.a );\n"
+            "  PS_TEXCOORD1 = TEXCOORD1;\n"
+            "}\n";
+        static constexpr const char* kFontOutlFs =
+            "precision mediump float;\n"
+            "uniform sampler2D SAMPLER[1];\n"
+            "varying vec2 PS_TEXCOORD;\n"
+            "varying vec4 PS_COLOUR;\n"
+            "varying vec4 PS_TEXCOORD1;\n"
+            "void main() {\n"
+            "  vec4 pixel = texture2D( SAMPLER[0], PS_TEXCOORD );\n"
+            "  float val = dot(pixel, PS_TEXCOORD1);\n"
+            "  float glyph = val > 0.5 ? 2.0*val-1.0 : 0.0;\n"
+            "  pixel.rgb = vec3(glyph, glyph, glyph);\n"
+            "  pixel.a   = val > 0.5 ? 1.0 : 2.0*val;\n"
+            "  gl_FragColor = pixel * PS_COLOUR;\n"
+            "}\n";
+
+        CHECK(ClassifyUiShaderSource(kUiVs)       == UiShaderTag::UiVs);
+        CHECK(ClassifyUiShaderSource(kUiBasicFs)  == UiShaderTag::UiBasicFs);
+        CHECK(ClassifyUiShaderSource(kUiCxFs)     == UiShaderTag::UiCTransformFs);
+        CHECK(ClassifyUiShaderSource(kFontVs)     == UiShaderTag::FontVs);
+        CHECK(ClassifyUiShaderSource(kFontOutlFs) == UiShaderTag::FontPackedOutlineFs);
+        CHECK(MatchUiProgKind(UiShaderTag::UiVs,   UiShaderTag::UiBasicFs)           == UiProgKind::UiBasic);
+        CHECK(MatchUiProgKind(UiShaderTag::UiVs,   UiShaderTag::UiCTransformFs)      == UiProgKind::UiCTransform);
+        CHECK(MatchUiProgKind(UiShaderTag::FontVs, UiShaderTag::FontPackedOutlineFs) == UiProgKind::FontPackedOutline);
+        CHECK(MatchUiProgKind(UiShaderTag::UiVs,   UiShaderTag::FontPackedOutlineFs) == UiProgKind::None);
+
+        // Live GPU FBO test: interleave 3 distinct programs (UI + FontPackedOutline + UiCTransform)
+        // across 3 distinct textures into 1 single draw call and verify pixel-exact RGBA readback!
+        hs_native_gl::WglRuntime rt{};
+        const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+        if (probe.supported) {
+            HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_UIBatchTest", WS_POPUP, 0, 0, 64, 64,
+                                        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            CHECK(hwnd != nullptr);
+            HDC hdc = nullptr;
+            HGLRC rc = nullptr;
+            CHECK(hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) && rt.pWglMakeCurrent(hdc, rc));
+
+            void* procs[76]{};
+            hs_native_gl::OptionalGlProcs opt{};
+            CHECK(hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) == 76);
+            auto findP = [&](const char* nm) -> void* {
+                for (size_t i = 0; i < 76; ++i)
+                    if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, nm) == 0) return procs[i];
+                return nullptr;
+            };
+
+            UiGlOps uops{};
+            uops.glCreateShader             = reinterpret_cast<UiGlOps::CreateShader_t>(findP("glCreateShader"));
+            uops.glShaderSource             = reinterpret_cast<UiGlOps::ShaderSource_t>(findP("glShaderSource"));
+            uops.glCompileShader            = reinterpret_cast<UiGlOps::CompileShader_t>(findP("glCompileShader"));
+            uops.glGetShaderiv              = reinterpret_cast<UiGlOps::GetShaderiv_t>(findP("glGetShaderiv"));
+            uops.glDeleteShader             = reinterpret_cast<UiGlOps::DeleteShader_t>(findP("glDeleteShader"));
+            uops.glCreateProgram            = reinterpret_cast<UiGlOps::CreateProgram_t>(findP("glCreateProgram"));
+            uops.glAttachShader             = reinterpret_cast<UiGlOps::AttachShader_t>(findP("glAttachShader"));
+            uops.glBindAttribLocation       = reinterpret_cast<UiGlOps::BindAttribLocation_t>(findP("glBindAttribLocation"));
+            uops.glLinkProgram              = reinterpret_cast<UiGlOps::LinkProgram_t>(findP("glLinkProgram"));
+            uops.glGetProgramiv             = reinterpret_cast<UiGlOps::GetProgramiv_t>(findP("glGetProgramiv"));
+            uops.glDeleteProgram            = reinterpret_cast<UiGlOps::DeleteProgram_t>(findP("glDeleteProgram"));
+            uops.glUseProgram               = reinterpret_cast<UiGlOps::UseProgram_t>(findP("glUseProgram"));
+            uops.glGetUniformLocation       = reinterpret_cast<UiGlOps::GetUniformLocation_t>(findP("glGetUniformLocation"));
+            uops.glGenBuffers               = reinterpret_cast<UiGlOps::GenBuffers_t>(findP("glGenBuffers"));
+            uops.glDeleteBuffers            = reinterpret_cast<UiGlOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+            uops.glBindBuffer               = reinterpret_cast<UiGlOps::BindBuffer_t>(findP("glBindBuffer"));
+            uops.glBufferData               = reinterpret_cast<UiGlOps::BufferData_t>(findP("glBufferData"));
+            uops.glBufferSubData            = reinterpret_cast<UiGlOps::BufferSubData_t>(opt.glBufferSubData);
+            uops.glMapBufferRange           = reinterpret_cast<UiGlOps::MapBufferRange_t>(opt.glMapBufferRange);
+            uops.glUnmapBuffer              = reinterpret_cast<UiGlOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+            uops.glActiveTexture            = reinterpret_cast<UiGlOps::ActiveTexture_t>(findP("glActiveTexture"));
+            uops.glBindTexture              = reinterpret_cast<UiGlOps::BindTexture_t>(findP("glBindTexture"));
+            uops.glUniform1i                = reinterpret_cast<UiGlOps::Uniform1i_t>(findP("glUniform1i"));
+            uops.glUniformMatrix4fv         = reinterpret_cast<UiGlOps::UniformMatrix4fv_t>(findP("glUniformMatrix4fv"));
+            uops.glVertexAttribPointer      = reinterpret_cast<UiGlOps::VertexAttribPointer_t>(findP("glVertexAttribPointer"));
+            uops.glEnableVertexAttribArray  = reinterpret_cast<UiGlOps::EnableVertexAttribArray_t>(findP("glEnableVertexAttribArray"));
+            uops.glDisableVertexAttribArray = reinterpret_cast<UiGlOps::DisableVertexAttribArray_t>(findP("glDisableVertexAttribArray"));
+            uops.glDrawElements             = reinterpret_cast<UiGlOps::DrawElements_t>(findP("glDrawElements"));
+            uops.glGetIntegerv              = reinterpret_cast<UiGlOps::GetIntegerv_t>(findP("glGetIntegerv"));
+            uops.glGetBufferParameteriv     = reinterpret_cast<UiGlOps::GetBufferParameteriv_t>(opt.glGetBufferParameteriv);
+            uops.preferHighp                = true;
+
+            using GlGetErr_t   = uint32_t (WINAPI*)();
+            using GlGenTex_t   = void (WINAPI*)(int32_t, uint32_t*);
+            using GlTexImg_t   = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+            using GlTexPar_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+            using GlGenFbo_t   = void (WINAPI*)(int32_t, uint32_t*);
+            using GlBindFbo_t  = void (WINAPI*)(uint32_t, uint32_t);
+            using GlFboTex_t   = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+            using GlVp_t       = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+            using GlClrCol_t   = void (WINAPI*)(float, float, float, float);
+            using GlClr_t      = void (WINAPI*)(uint32_t);
+            using GlReadPix_t  = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+            using GlGetAttr_t  = int32_t (WINAPI*)(uint32_t, const char*);
+            auto pErr     = reinterpret_cast<GlGetErr_t>(findP("glGetError"));
+            auto pGenTex  = reinterpret_cast<GlGenTex_t>(findP("glGenTextures"));
+            auto pTexImg  = reinterpret_cast<GlTexImg_t>(findP("glTexImage2D"));
+            auto pTexPar  = reinterpret_cast<GlTexPar_t>(findP("glTexParameteri"));
+            auto pGenFbo  = reinterpret_cast<GlGenFbo_t>(findP("glGenFramebuffers"));
+            auto pBindFbo = reinterpret_cast<GlBindFbo_t>(findP("glBindFramebuffer"));
+            auto pFboTex  = reinterpret_cast<GlFboTex_t>(findP("glFramebufferTexture2D"));
+            auto pVp      = reinterpret_cast<GlVp_t>(findP("glViewport"));
+            auto pClrCol  = reinterpret_cast<GlClrCol_t>(findP("glClearColor"));
+            auto pClr     = reinterpret_cast<GlClr_t>(findP("glClear"));
+            auto pReadPix = reinterpret_cast<GlReadPix_t>(findP("glReadPixels"));
+            auto pGetAttr = reinterpret_cast<GlGetAttr_t>(findP("glGetAttribLocation"));
+
+            auto mkProg = [&](const char* vsSrc, const char* fsSrc) -> uint32_t {
+                uint32_t vs = uops.glCreateShader(kGlVertexShader);
+                uops.glShaderSource(vs, 1, &vsSrc, nullptr); uops.glCompileShader(vs);
+                uint32_t fs = uops.glCreateShader(kGlFragmentShader);
+                uops.glShaderSource(fs, 1, &fsSrc, nullptr); uops.glCompileShader(fs);
+                uint32_t p = uops.glCreateProgram();
+                uops.glAttachShader(p, vs); uops.glAttachShader(p, fs);
+                uops.glLinkProgram(p);
+                uops.glDeleteShader(vs); uops.glDeleteShader(fs);
+                return p;
+            };
+            uint32_t pUi   = mkProg(kUiVs, kUiBasicFs);
+            uint32_t pFont = mkProg(kFontVs, kFontOutlFs);
+            uint32_t pUiCx = mkProg(kUiVs, kUiCxFs);
+            CHECK(pUi && pFont && pUiCx);
+
+            auto mkInfo = [&](uint32_t p, UiProgKind k) -> UiProgInfo {
+                UiProgInfo inf{};
+                inf.kind           = k;
+                inf.eligible       = true;
+                inf.locPos         = pGetAttr(p, "POSITION");
+                inf.locUv          = pGetAttr(p, "TEXCOORD0");
+                inf.locDiffuse     = pGetAttr(p, "DIFFUSE");
+                inf.locTc1         = pGetAttr(p, "TEXCOORD1");
+                inf.locMatrixPVW   = uops.glGetUniformLocation(p, "MatrixPVW");
+                inf.locMatrixP     = uops.glGetUniformLocation(p, "MatrixP");
+                inf.locMatrixV     = uops.glGetUniformLocation(p, "MatrixV");
+                inf.locMatrixW     = uops.glGetUniformLocation(p, "MatrixW");
+                inf.locColourXform = uops.glGetUniformLocation(p, "COLOUR_XFORM");
+                inf.locSampler0    = uops.glGetUniformLocation(p, "SAMPLER[0]");
+                if (inf.locSampler0 < 0) inf.locSampler0 = uops.glGetUniformLocation(p, "SAMPLER");
+                return inf;
+            };
+            UiProgInfo infoUi   = mkInfo(pUi,   UiProgKind::UiBasic);
+            UiProgInfo infoFont = mkInfo(pFont, UiProgKind::FontPackedOutline);
+            UiProgInfo infoUiCx = mkInfo(pUiCx, UiProgKind::UiCTransform);
+
+            // 32x16 FBO (left=UI red, middle=FontPackedOutline cyan glyph, right=UiCTransform tinted blue)
+            uint32_t texs[4]{};
+            pGenTex(4, texs);
+            auto initTex = [&](uint32_t id, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+                uint8_t px[4] = { r, g, b, a };
+                uops.glBindTexture(kGlTexture2D, id);
+                pTexPar(kGlTexture2D, 0x2801u, 0x2600);
+                pTexPar(kGlTexture2D, 0x2800u, 0x2600);
+                pTexImg(kGlTexture2D, 0, 0x1908, 1, 1, 0, 0x1908u, 0x1401u, px);
+            };
+            initTex(texs[0], 200, 40,  20, 255); // UI image
+            initTex(texs[1],   0, 255,  0, 255); // Font packed glyph in G channel (val=1.0 -> glyph=1.0, a=1.0)
+            initTex(texs[2], 255, 255, 255, 255); // White UI image tinted via COLOUR_XFORM
+            uops.glBindTexture(kGlTexture2D, texs[3]);
+            pTexImg(kGlTexture2D, 0, 0x1908, 32, 16, 0, 0x1908u, 0x1401u, nullptr);
+            uint32_t fbo = 0;
+            pGenFbo(1, &fbo);
+            pBindFbo(0x8D40u, fbo);
+            pFboTex(0x8D40u, 0x8CE0u, kGlTexture2D, texs[3], 0);
+            pVp(0, 0, 32, 16);
+            pClrCol(0.f, 0.f, 0.f, 1.f);
+            pClr(0x4000u);
+
+            UiBatcher ub;
+            ub.SetOps(uops);
+            ub.SetEnabled(true);
+
+            // Quad vertex layout: pos(3f), uv(2f), diffuse(4f), tc1(4f) = 13 floats = 52 bytes
+            struct V { float x,y,z, u,v, r,g,b,a, t0,t1,t2,t3; };
+            const uint16_t idx[6] = { 0,1,2, 2,1,3 };
+            const float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+            // Draw 1: UI Basic (x in [-1.0, -0.35], red-ish tex * white diffuse)
+            V v1[4] = {
+                { -1.0f,-1.0f,0, 0,0, 1,1,1,1, 0,0,0,0 },
+                { -0.35f,-1.0f,0, 1,0, 1,1,1,1, 0,0,0,0 },
+                { -1.0f, 1.0f,0, 0,1, 1,1,1,1, 0,0,0,0 },
+                { -0.35f, 1.0f,0, 1,1, 1,1,1,1, 0,0,0,0 },
+            };
+            CHECK(!ub.OnUseProgram(pUi, &infoUi));
+            uops.glUseProgram(pUi);
+            ub.OnActiveTexture(kGlTexture0);
+            ub.OnBindTexture(kGlTexture2D, texs[0]);
+            CHECK(ub.TryAbsorbMatrix4(infoUi.locMatrixPVW, 1, 0, ident));
+            ub.OnBindBuffer(kGlArrayBuffer, 0);
+            ub.OnBindBuffer(kGlElementArrayBuffer, 0);
+            ub.OnEnableDisableVertexAttribArray(infoUi.locPos, true);
+            ub.OnEnableDisableVertexAttribArray(infoUi.locUv, true);
+            ub.OnEnableDisableVertexAttribArray(infoUi.locDiffuse, true);
+            ub.OnVertexAttribPointer(infoUi.locPos, 3, kGlFloat, 0, sizeof(V), &v1[0].x);
+            ub.OnVertexAttribPointer(infoUi.locUv, 2, kGlFloat, 0, sizeof(V), &v1[0].u);
+            ub.OnVertexAttribPointer(infoUi.locDiffuse, 4, kGlFloat, 0, sizeof(V), &v1[0].r);
+            CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idx));
+
+            // Draw 2: INTERLEAVED FontPackedOutline (x in [-0.3, 0.3], G-channel glyph * cyan diffuse)
+            // Must NOT flush and MUST defer glUseProgram!
+            V v2[4] = {
+                { -0.3f,-1.0f,0, 0,0, 0.0f,0.8f,1.0f,1.0f, 0,1,0,0 },
+                {  0.3f,-1.0f,0, 1,0, 0.0f,0.8f,1.0f,1.0f, 0,1,0,0 },
+                { -0.3f, 1.0f,0, 0,1, 0.0f,0.8f,1.0f,1.0f, 0,1,0,0 },
+                {  0.3f, 1.0f,0, 1,1, 0.0f,0.8f,1.0f,1.0f, 0,1,0,0 },
+            };
+            CHECK(ub.OnUseProgram(pFont, &infoFont)); // deferred! 0 flush!
+            ub.OnBindTexture(kGlTexture2D, texs[1]);
+            CHECK(ub.TryAbsorbMatrix4(infoFont.locMatrixP, 1, 0, ident));
+            CHECK(ub.TryAbsorbMatrix4(infoFont.locMatrixV, 1, 0, ident));
+            CHECK(ub.TryAbsorbMatrix4(infoFont.locMatrixW, 1, 0, ident));
+            ub.OnEnableDisableVertexAttribArray(infoFont.locPos, true);
+            ub.OnEnableDisableVertexAttribArray(infoFont.locUv, true);
+            ub.OnEnableDisableVertexAttribArray(infoFont.locDiffuse, true);
+            ub.OnEnableDisableVertexAttribArray(infoFont.locTc1, true);
+            ub.OnVertexAttribPointer(infoFont.locPos, 3, kGlFloat, 0, sizeof(V), &v2[0].x);
+            ub.OnVertexAttribPointer(infoFont.locUv, 2, kGlFloat, 0, sizeof(V), &v2[0].u);
+            ub.OnVertexAttribPointer(infoFont.locDiffuse, 4, kGlFloat, 0, sizeof(V), &v2[0].r);
+            ub.OnVertexAttribPointer(infoFont.locTc1, 4, kGlFloat, 0, sizeof(V), &v2[0].t0);
+            CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idx));
+
+            // Draw 3: INTERLEAVED UiCTransform (x in [0.35, 1.0], white tex * diag(0.2, 0.4, 0.8, 1.0))
+            V v3[4] = {
+                { 0.35f,-1.0f,0, 0,0, 1,1,1,1, 0,0,0,0 },
+                { 1.00f,-1.0f,0, 1,0, 1,1,1,1, 0,0,0,0 },
+                { 0.35f, 1.0f,0, 0,1, 1,1,1,1, 0,0,0,0 },
+                { 1.00f, 1.0f,0, 1,1, 1,1,1,1, 0,0,0,0 },
+            };
+            const float diagCx[16] = { 0.2f,0,0,0, 0,0.4f,0,0, 0,0,0.8f,0, 0,0,0,1.0f };
+            CHECK(ub.OnUseProgram(pUiCx, &infoUiCx)); // deferred! 0 flush!
+            ub.OnBindTexture(kGlTexture2D, texs[2]);
+            CHECK(ub.TryAbsorbMatrix4(infoUiCx.locMatrixPVW, 1, 0, ident));
+            CHECK(ub.TryAbsorbMatrix4(infoUiCx.locColourXform, 1, 0, diagCx));
+            ub.OnVertexAttribPointer(infoUiCx.locPos, 3, kGlFloat, 0, sizeof(V), &v3[0].x);
+            ub.OnVertexAttribPointer(infoUiCx.locUv, 2, kGlFloat, 0, sizeof(V), &v3[0].u);
+            ub.OnVertexAttribPointer(infoUiCx.locDiffuse, 4, kGlFloat, 0, sizeof(V), &v3[0].r);
+            CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idx));
+
+            // ALL 3 interleaved draws across 3 different shaders & 3 textures -> 1 SINGLE FLUSH!
+            CHECK(ub.CumulativeStats().drawsBatched == 3 && ub.CumulativeStats().flushes == 0 && ub.CumulativeStats().progSkips == 2);
+            ub.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(ub.CumulativeStats().flushes == 1);
+
+            uint8_t pxL[4]{}, pxM[4]{}, pxR[4]{};
+            pReadPix( 5, 8, 1, 1, 0x1908u, 0x1401u, pxL);
+            pReadPix(16, 8, 1, 1, 0x1908u, 0x1401u, pxM);
+            pReadPix(27, 8, 1, 1, 0x1908u, 0x1401u, pxR);
+            CHECK(pErr() == 0);
+            CHECK(pxL[0] == 200 && pxL[1] == 40 && pxL[2] == 20 && pxL[3] == 255);
+            CHECK(pxM[0] == 0   && std::abs(int(pxM[1]) - 204) <= 2 && pxM[2] == 255 && pxM[3] == 255);
+            CHECK(std::abs(int(pxR[0]) - 51) <= 2 && std::abs(int(pxR[1]) - 102) <= 2 && std::abs(int(pxR[2]) - 204) <= 2 && pxR[3] == 255);
+
+            // Multi-flush AZDO linear-append VRAM race test (16 back-to-back flushes, 0 glFinish between):
+            // Every column MUST retain its exact unique color (proves disjoint vBaseOffset/iBaseOffset append
+            // never clobbers earlier in-flight GPU draws!).
+            pClr(0x4000u);
+            ub.OnUseProgram(pUi, &infoUi);
+            ub.OnBindTexture(kGlTexture2D, texs[2]); // solid white 1x1
+            for (int col = 0; col < 16; ++col) {
+                const float x0 = -1.0f + (static_cast<float>(col) * 2.0f) / 16.0f;
+                const float x1 = -1.0f + (static_cast<float>(col + 1) * 2.0f) / 16.0f;
+                const float cr = static_cast<float>(col * 16 + 8) / 255.0f;
+                const float cg = static_cast<float>((15 - col) * 16 + 8) / 255.0f;
+                const float cb = static_cast<float>(((col * 37) & 0xFF)) / 255.0f;
+                V vc[4] = {
+                    { x0,-1.0f,0, 0,0, cr,cg,cb,1.0f, 0,0,0,0 },
+                    { x1,-1.0f,0, 1,0, cr,cg,cb,1.0f, 0,0,0,0 },
+                    { x0, 1.0f,0, 0,1, cr,cg,cb,1.0f, 0,0,0,0 },
+                    { x1, 1.0f,0, 1,1, cr,cg,cb,1.0f, 0,0,0,0 },
+                };
+                ub.OnVertexAttribPointer(infoUi.locPos, 3, kGlFloat, 0, sizeof(V), &vc[0].x);
+                ub.OnVertexAttribPointer(infoUi.locUv, 2, kGlFloat, 0, sizeof(V), &vc[0].u);
+                ub.OnVertexAttribPointer(infoUi.locDiffuse, 4, kGlFloat, 0, sizeof(V), &vc[0].r);
+                CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idx));
+                ub.Flush(hs_sprite_batch::FlushReason::State);
+            }
+            uint8_t rowPx[32 * 4]{};
+            pReadPix(0, 8, 32, 1, 0x1908u, 0x1401u, rowPx);
+            CHECK(pErr() == 0);
+            for (int col = 0; col < 16; ++col) {
+                const uint8_t* p = &rowPx[(col * 2 + 1) * 4];
+                const int expR = col * 16 + 8;
+                const int expG = (15 - col) * 16 + 8;
+                const int expB = (col * 37) & 0xFF;
+                CHECK(std::abs(int(p[0]) - expR) <= 2 && std::abs(int(p[1]) - expG) <= 2 && std::abs(int(p[2]) - expB) <= 2);
+            }
+            ub.OnUseProgram(pUiCx, &infoUiCx);
+
+            // Verify non-diagonal COLOUR_XFORM fails closed cleanly!
+            const float nonDiag[16] = { 0.3f,0.3f,0.3f,0, 0.6f,0.6f,0.6f,0, 0.1f,0.1f,0.1f,0, 0,0,0,1.0f };
+            CHECK(ub.TryAbsorbMatrix4(infoUiCx.locColourXform, 1, 0, nonDiag));
+            CHECK(!ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idx));
+            CHECK(ub.LastRejectCode() == 7u);
+
+            ub.ResetContextState(true);
+            rt.pWglMakeCurrent(nullptr, nullptr);
+            rt.pWglDeleteContext(rc);
+            ReleaseDC(hwnd, hdc);
+            DestroyWindow(hwnd);
+        }
+        std::printf("[PASS] 24. Unified UI+Font Uber-Batcher (3 interleaved shaders+textures -> 1 DrawCall + live GPU FBO pixel-exact + fail-closed) verified\n");
+    }
+
+    std::printf("ALL 24 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH & ASTAR TESTS PASSED!\n");
     return 0;
 }

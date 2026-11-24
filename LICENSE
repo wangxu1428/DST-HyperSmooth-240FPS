@@ -25,3 +25,7 @@ SOFTWARE.
 Third-Party Notices:
 - Compiled binary releases statically link libdeflate v1.23 (Copyright 2016 Eric Biggers),
   licensed under the MIT License (https://github.com/ebiggers/libdeflate).
+- Bilateral Adaptive Sharpening (YCoCg BCAS), asymmetric ink deconvolution, AURA anti-overshoot,
+  cinematic ACES grading, and identity-LUT ColourCube scaling are adapted from DST-BCAS-Studio
+  (Copyright 2026 Nanmianyi / 楠眠已, https://github.com/Nanmianyi/DST-BCAS-Studio),
+  licensed under the MIT License.

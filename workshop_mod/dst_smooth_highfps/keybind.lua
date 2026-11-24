@@ -57,6 +57,85 @@ local function StringifyKeyCode(keycode)
     return code_to_str[keycode]
 end
 
+local function IsUiZh()
+    if type(HS_IsUiZh) == "function" then
+        return HS_IsUiZh() == true
+    end
+    local lt = G.LanguageTranslator
+    if type(lt) == "table" and type(lt.defaultlang) == "string" and #lt.defaultlang > 0 then
+        local dl = lt.defaultlang
+        if dl == "zh" or dl == "zhr" or dl == "zht" then
+            return true
+        end
+        if dl ~= "en" then
+            return false
+        end
+    end
+    local opt_str = G.STRINGS and G.STRINGS.UI and G.STRINGS.UI.OPTIONS
+    if type(opt_str) == "table" and type(opt_str.ENABLED) == "string" then
+        return opt_str.ENABLED == "启用" or opt_str.ENABLED == "啟用"
+    end
+    return S.CANCEL ~= nil and S.CANCEL ~= "Cancel" and (S.CANCEL == "取消")
+end
+
+local KB_ZH = {
+    hotkey_cycle = {
+        label = "循环切换帧率热键",
+        hover = "点击按任意键盘按键或鼠标中键/侧键自由绑定（也可在 设置 -> 控制 实时改绑，默认禁用零冲突）",
+    },
+    hotkey_skeletal = {
+        label = "开关 240 帧补帧热键",
+        hover = "点击绑定按键或鼠标侧键，局内一键开关 240Hz 全场景补帧（默认禁用零冲突）",
+    },
+    hotkey_hud = {
+        label = "切换帧率 HUD 热键",
+        hover = "点击绑定按键或鼠标侧键，局内按键循环切换右上角 HUD：简洁 -> 详细 -> 隐藏（默认禁用）",
+    },
+    hotkey_visual = {
+        label = "循环切换画质热键",
+        hover = "点击绑定按键或鼠标侧键，局内一键在原版纯净 / 护眼高清 / 柔和绘本间对比（默认禁用）",
+    },
+    hotkey_panel = {
+        label = "开关微调侧栏热键",
+        hover = "点击绑定按键或鼠标侧键，局内不暂停呼出右侧微调面板（也可输入 c_hsmenu()，默认禁用）",
+    },
+}
+
+local KB_EN = {
+    hotkey_cycle = {
+        label = "Cycle Target FPS Hotkey",
+        hover = "Click to bind any key or mouse button (also rebindable in Settings -> Controls; disabled by default)",
+    },
+    hotkey_skeletal = {
+        label = "Toggle 240Hz Interpolation Hotkey",
+        hover = "Click to bind any key or mouse button for instant 240Hz vs 30Hz A/B comparison (disabled by default)",
+    },
+    hotkey_hud = {
+        label = "Cycle FPS HUD Mode Hotkey",
+        hover = "Click to bind any key or mouse button to cycle top-right HUD: Compact -> Detailed -> Hidden (disabled by default)",
+    },
+    hotkey_visual = {
+        label = "Cycle Visual Preset Hotkey",
+        hover = "Click to bind any key or mouse button for 0ms visual preset A/B comparison (disabled by default)",
+    },
+    hotkey_panel = {
+        label = "Toggle In-Game Sidebar Hotkey",
+        hover = "Click to bind any key or mouse button to open the live tuning sidebar (or run c_hsmenu(); disabled by default)",
+    },
+}
+
+local function GetKeyLabel(cfg)
+    local dict = IsUiZh() and KB_ZH or KB_EN
+    local entry = cfg and dict[cfg.name]
+    return (entry and entry.label) or (cfg and cfg.label) or ""
+end
+
+local function GetKeyHover(cfg)
+    local dict = IsUiZh() and KB_ZH or KB_EN
+    local entry = cfg and dict[cfg.name]
+    return (entry and entry.hover) or (cfg and cfg.hover) or ""
+end
+
 local function LocalizeKey(key)
     local num = RawKeyCode(key)
     if num ~= nil and S.INPUTS[1] and S.INPUTS[1][num] then
@@ -65,7 +144,7 @@ local function LocalizeKey(key)
     if S.INPUTS[9] and S.INPUTS[9][2] then
         return S.INPUTS[9][2]
     end
-    return "- None -"
+    return IsUiZh() and "- 无 -" or "- None -"
 end
 
 -- Identify our keybind config entries and hydrate placeholder options
@@ -125,7 +204,7 @@ local BindButton = Class(Widget, function(self, param)
     self.unbinding_btn = self:AddChild(ImageButton("images/global_redux.xml", "close.tex", "close.tex"))
     self.unbinding_btn:SetPosition(param.width / 2 + (param.offset or 10), 0)
     self.unbinding_btn:SetOnClick(function() self:Set("KEY_DISABLED") end)
-    self.unbinding_btn:SetHoverText(S.UNBIND or "Unbind")
+    self.unbinding_btn:SetHoverText(S.UNBIND or (IsUiZh() and "解绑" or "Unbind"))
     self.unbinding_btn:SetScale(0.4, 0.4)
 
     self.focus_forward = self.binding_btn
@@ -154,14 +233,15 @@ function BindButton:PopupKeyBindDialog()
         if snd then snd:PlaySound("dontstarve/HUD/click_move") end
     end
 
+    local ui_zh = IsUiZh()
     local buttons = {}
     for _, key in ipairs({ "\238\132\130", "\238\132\131", "\238\132\132" }) do
         buttons[#buttons + 1] = { text = key, cb = function() Setup(key) end }
     end
-    buttons[#buttons + 1] = { text = S.CANCEL or "Cancel", cb = function() fe:PopScreen() end }
+    buttons[#buttons + 1] = { text = S.CANCEL or (ui_zh and "取消" or "Cancel"), cb = function() fe:PopScreen() end }
 
-    local prompt = (S.CONTROL_SELECT or "Press any key to bind")
-        .. "\n\n" .. string.format(S.DEFAULT_CONTROL_TEXT or "Default: %s", LocalizeKey(self.default))
+    local prompt = (S.CONTROL_SELECT or (ui_zh and "请按任意键绑定" or "Press any key to bind"))
+        .. "\n\n" .. string.format(S.DEFAULT_CONTROL_TEXT or (ui_zh and "默认：%s" or "Default: %s"), LocalizeKey(self.default))
     local dialog = PopupDialogScreen(self.title, prompt, buttons)
 
     dialog.OnRawKey = function(_, keycode, down)
@@ -205,7 +285,7 @@ AddClassPostConstruct("screens/redux/modconfigurationscreen", function(self)
             text_size  = 25,
             text_color = C.GOLD,
             offset     = 0,
-            title      = cfg.label,
+            title      = GetKeyLabel(cfg),
             default    = cfg.default,
             initial    = NormalizeKey(data.initial_value),
             OnSet = function(key)
@@ -239,14 +319,14 @@ local BindEntry = Class(Widget, function(self, parent, cfg)
     local button_height = 48
     local label_width = 375
 
-    self:SetHoverText(cfg.hover or "", { offset_x = -60, offset_y = 60, wordwrap = true })
+    self:SetHoverText(GetKeyHover(cfg), { offset_x = -60, offset_y = 60, wordwrap = true })
     self:SetScale(1, 1, 0.75)
 
     self.bg = self:AddChild(TEMPLATES.ListItemBackground(700, button_height))
     self.bg:SetPosition(-60, 0)
     self.bg:SetScale(1.025, 1)
 
-    self.label = self:AddChild(Text(G.CHATFONT, 28, cfg.label, C.GOLD_UNIMPORTANT))
+    self.label = self:AddChild(Text(G.CHATFONT, 28, GetKeyLabel(cfg), C.GOLD_UNIMPORTANT))
     self.label:SetHAlign(G.ANCHOR_LEFT)
     self.label:SetRegionSize(label_width, 50)
     self.label:SetPosition(x + label_width / 2, 0)
@@ -255,7 +335,7 @@ local BindEntry = Class(Widget, function(self, parent, cfg)
     self[BUTTON_NAME] = self:AddChild(BindButton({
         width     = button_width,
         height    = button_height,
-        title     = cfg.label,
+        title     = GetKeyLabel(cfg),
         default   = cfg.default,
         initial   = pending_keys[cfg],
         OnSet     = function(key) pending_keys[cfg] = key end,
@@ -294,7 +374,8 @@ AddClassPostConstruct("screens/redux/optionsscreen", function(self)
     if not (list and list.items and #kb_configs > 0) then return end
 
     local items = list.items
-    items[#items + 1] = list:AddChild(SectionHeader(modinfo.name or "HyperSmooth 240FPS"))
+    local header_title = IsUiZh() and "HyperSmooth 高刷稳帧" or "HyperSmooth 240FPS"
+    items[#items + 1] = list:AddChild(SectionHeader(header_title))
     for i = 1, #kb_configs do
         local cfg = kb_configs[i]
         pending_keys[cfg] = NormalizeKey(GetModConfigData(cfg.name, true))

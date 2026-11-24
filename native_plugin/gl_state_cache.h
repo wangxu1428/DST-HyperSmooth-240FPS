@@ -153,7 +153,9 @@ struct ThreadState {
         return dst;
     }
 
-    void Reset() {
+    // Lightweight post-SwapBuffers barrier: clears cached GL bindings/caps/program/buffers/textures
+    // while preserving curContext and per-program uniform shadow values (immune to Steam/RTSS/GPU overlays!).
+    void ResetBindingsOnly() noexcept {
         activeUnit        = -1;
         curProgram        = kInvalidId;
         boundArrayBuf     = kInvalidId;
@@ -172,6 +174,10 @@ struct ThreadState {
         scValid           = false;
         for (size_t i = 0; i < kNumCaps; ++i) caps[i] = -1;
         for (uint32_t i = 0; i < kMaxTexUnits; ++i) boundTex2D[i] = kInvalidId;
+    }
+
+    void Reset() {
+        ResetBindingsOnly();
         if (uniTable) {
             std::memset(uniTable, 0, sizeof(UniformTable));
             uniTable->clock = 1;

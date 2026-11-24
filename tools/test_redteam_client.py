@@ -36,7 +36,7 @@ expected_exports = sorted([
 ])
 assert exports == expected_exports, f"Export mismatch: got {exports}, expected {expected_exports}"
 imports = [d.dll.decode().lower() for d in pe.DIRECTORY_ENTRY_IMPORT]
-forbidden = [d for d in imports if any(x in d for x in ("libstdc++", "libgcc", "winpthread", "vcruntime", "msvcp", "d3d9"))]
+forbidden = [d for d in imports if any(x in d for x in ("libstdc++", "libgcc", "winpthread", "vcruntime", "msvcp", "d3d9", "opengl32", "gdi32"))]
 assert not forbidden, f"Forbidden runtime DLL imports: {forbidden}"
 pe.close()
 print(f"[PASS] 1. PE check: exports=6/6 {exports}, pure UCRT imports={imports}")
@@ -328,11 +328,66 @@ if True:
             0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0xE8, 0, 0, 0, 0, 0x4C, 0x8B,
             0x43, 0x10, 0x48, 0x8B, 0x10, 0x49, 0x83, 0xE8, 0x10, 0x48, 0x8B, 0xCB, 0xE8, 0, 0, 0, 0, 0x85, 0xC0, 0x74
         ]), "xxxxxxxxxx????xxxxxxxxxxxxxxx????xxx")),
+        ("v2.7: Client zlib::uncompress", find_exact(bytes([
+            0x40, 0x57, 0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x02, 0x48, 0x8B, 0xFA,
+            0x4C, 0x89, 0x44, 0x24, 0x20, 0x89, 0x44, 0x24, 0x38, 0x33, 0xC0, 0x48, 0x89, 0x4C, 0x24, 0x30
+        ]))),
+        ("v2.7: FastJson lua_createtable", find_exact(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+            0x48, 0x83, 0xEC, 0x20, 0x80, 0xB9, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x41, 0x8B, 0xF0, 0x8B, 0xEA, 0x48, 0x8B, 0xF9
+        ]))),
+        ("v2.7: FastJson lua_rawset", find_masked(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48,
+            0x8B, 0xF9, 0xE8, 0, 0, 0, 0, 0x48, 0x8B, 0x5F, 0x10, 0x48, 0x8B, 0x10, 0x4C, 0x8D,
+            0x43, 0xE0, 0x48, 0x8B, 0xCF, 0x48, 0x8B, 0xF0
+        ]), "xxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxxx")),
+        ("v2.7: FastJson lua_rawseti", find_masked(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x45,
+            0x8B, 0xD0, 0x48, 0x8B, 0xF9, 0xE8, 0, 0, 0, 0, 0x48, 0x8B, 0x10, 0x48, 0x8B, 0x5F,
+            0x10, 0x45, 0x8B, 0xC2
+        ]), "xxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxx")),
+        ("v2.7: ShadowManager::BuildDynamicShadowMesh", find_exact(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x56, 0x57, 0x41, 0x54,
+            0x48, 0x83, 0xEC, 0x50, 0x48, 0x8B, 0x41, 0x20, 0x48, 0x8B, 0xFA, 0x48, 0x8B, 0xF1,
+            0x8B, 0x90, 0xD4, 0x00
+        ]))),
+        ("v2.7: Simulation::luaUpdate callsite", find_masked(bytes([
+            0x48, 0x8B, 0x8B, 0xB0, 0x00, 0x00, 0x00, 0x66, 0x41, 0x0F, 0x28, 0xCB, 0xE8, 0, 0, 0, 0,
+            0x45, 0x33, 0xC0, 0x48, 0x8B, 0xCB, 0x41, 0x8D, 0x50, 0x01, 0xE8, 0, 0, 0, 0,
+            0x48, 0x8D, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
+            0x48, 0x8D, 0x8C, 0x24, 0xA8, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x58, 0x83, 0x14, 0x01, 0x00, 0x00,
+            0xF3, 0x0F, 0x11, 0x83, 0x14, 0x01, 0x00, 0x00, 0xE8, 0, 0, 0, 0,
+            0x80, 0xBB, 0x30, 0x02, 0x00, 0x00, 0x00
+        ]), "xxxxxxxxxxxxx????xxxxxxxxxxx????xxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxx")),
+        ("v2.7: cNetworkManager::Update", find_exact(bytes([
+            0x40, 0x55, 0x41, 0x55, 0x41, 0x56, 0x48, 0x81, 0xEC, 0x30, 0x0A, 0x00, 0x00,
+            0x0F, 0x29, 0xB4, 0x24, 0x00, 0x0A, 0x00, 0x00
+        ]))),
+        ("v2.8: HWBuffer::Init", find_exact(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
+            0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x54, 0x48, 0x83, 0xEC, 0x20, 0x4C, 0x8B, 0xE2, 0x48,
+            0x8D, 0x51, 0x10, 0x48, 0x8B, 0xE9, 0xB9, 0x01, 0x00, 0x00, 0x00
+        ]))),
+        ("v2.8: RakNet::RPC4::Call", find_masked(bytes([
+            0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x48, 0x81, 0xEC, 0x30, 0x03, 0x00, 0x00,
+            0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24,
+            0x20, 0x03, 0x00, 0x00, 0x48, 0x8B, 0x9C, 0x24
+        ]), "xxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxx")),
+        ("v2.8: EncodePersistentString", find_masked(bytes([
+            0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x48, 0x81, 0xEC, 0xD0, 0x00, 0x00, 0x00,
+            0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24, 0xC0, 0x00, 0x00, 0x00,
+            0x48, 0x8B, 0xEA
+        ]), "xxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx")),
+        ("v2.8: WritePersistentFile", find_masked(bytes([
+            0x40, 0x53, 0x55, 0x56, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+            0x48, 0x81, 0xEC, 0xD8, 0x00, 0x00, 0x00,
+            0x48, 0x8B, 0x05, 0, 0, 0, 0, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24, 0xB8
+        ]), "xxxxxxxxxxxxxxxxxxxx????xxxxxxxx")),
     ]
     for name, hits in checks:
         assert len(hits) == 1, f"AOB {name} expected 1 unique match, got {len(hits)}: {[hex(h) for h in hits]}"
         print(f"  [AOB OK] {name:46s} -> {hex(hits[0])}")
-    # Verify libGLESv2.dll + libEGL.dll IAT ordinals for AF, HD-2D Shaders, GL State-Cache & Present Telemetry
+    # Verify ALL 76 libGLESv2.dll + ALL 12 libEGL.dll IAT ordinals in dontstarve_steam_x64.exe
     exe_pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
     gles_ords = set()
     egl_ords = set()
@@ -346,16 +401,45 @@ if True:
             for entry in imp.imports:
                 if entry.ordinal is not None:
                     egl_ords.add(entry.ordinal)
-    for req_ord, req_name in [
-        (109, "glTexParameteri"), (99, "glShaderSource"), (90, "glLinkProgram"),
-        (131, "glUseProgram"), (32, "glDeleteProgram"),
-        (1, "glActiveTexture"), (7, "glBindTexture"), (31, "glDeleteTextures"),
-        (11, "glBlendFunc"), (37, "glDepthMask"), (43, "glEnable"), (39, "glDisable"),
-    ]:
+    expected_gles_ords = [
+        (1, "glActiveTexture"), (2, "glAttachShader"), (3, "glBindAttribLocation"),
+        (4, "glBindBuffer"), (5, "glBindFramebuffer"), (6, "glBindRenderbuffer"),
+        (7, "glBindTexture"), (9, "glBlendEquation"), (11, "glBlendFunc"),
+        (13, "glBufferData"), (15, "glCheckFramebufferStatus"), (16, "glClear"),
+        (17, "glClearColor"), (19, "glClearStencil"), (20, "glColorMask"),
+        (21, "glCompileShader"), (22, "glCompressedTexImage2D"), (26, "glCreateProgram"),
+        (27, "glCreateShader"), (28, "glCullFace"), (29, "glDeleteBuffers"),
+        (30, "glDeleteFramebuffers"), (31, "glDeleteTextures"), (32, "glDeleteProgram"),
+        (33, "glDeleteRenderbuffers"), (34, "glDeleteShader"), (36, "glDepthFunc"),
+        (37, "glDepthMask"), (39, "glDisable"), (40, "glDisableVertexAttribArray"),
+        (41, "glDrawArrays"), (42, "glDrawElements"), (43, "glEnable"),
+        (44, "glEnableVertexAttribArray"), (45, "glFinish"), (47, "glFramebufferRenderbuffer"),
+        (48, "glFramebufferTexture2D"), (49, "glFrontFace"), (50, "glGenBuffers"),
+        (52, "glGenFramebuffers"), (53, "glGenRenderbuffers"), (54, "glGenTextures"),
+        (55, "glGetActiveAttrib"), (58, "glGetAttribLocation"), (61, "glGetError"),
+        (64, "glGetIntegerv"), (65, "glGetProgramiv"), (66, "glGetProgramInfoLog"),
+        (68, "glGetShaderiv"), (69, "glGetShaderInfoLog"), (72, "glGetString"),
+        (77, "glGetUniformLocation"), (90, "glLinkProgram"), (91, "glPixelStorei"),
+        (92, "glPolygonOffset"), (93, "glReadPixels"), (95, "glRenderbufferStorage"),
+        (97, "glScissor"), (99, "glShaderSource"), (100, "glStencilFunc"),
+        (102, "glStencilMask"), (104, "glStencilOp"), (106, "glTexImage2D"),
+        (109, "glTexParameteri"), (112, "glUniform1f"), (113, "glUniform1fv"),
+        (114, "glUniform1i"), (117, "glUniform2fv"), (121, "glUniform3fv"),
+        (125, "glUniform4fv"), (128, "glUniformMatrix2fv"), (129, "glUniformMatrix3fv"),
+        (130, "glUniformMatrix4fv"), (131, "glUseProgram"), (141, "glVertexAttribPointer"),
+        (142, "glViewport"),
+    ]
+    for req_ord, req_name in expected_gles_ords:
         assert req_ord in gles_ords, f"Missing libGLESv2.dll IAT ordinal @{req_ord} ({req_name})!"
-    for req_ord, req_name in [(25, "eglMakeCurrent"), (32, "eglSwapBuffers")]:
+    expected_egl_ords = [
+        (1, "eglGetError"), (2, "eglGetDisplay"), (3, "eglInitialize"),
+        (6, "eglGetConfigs"), (7, "eglChooseConfig"), (8, "eglGetConfigAttrib"),
+        (9, "eglCreateWindowSurface"), (22, "eglSwapInterval"), (23, "eglCreateContext"),
+        (25, "eglMakeCurrent"), (32, "eglSwapBuffers"), (34, "eglGetProcAddress"),
+    ]
+    for req_ord, req_name in expected_egl_ords:
         assert req_ord in egl_ords, f"Missing libEGL.dll IAT ordinal @{req_ord} ({req_name})!"
-    print("  [IAT OK] libGLESv2.dll (12 ordinals) + libEGL.dll (@25/@32) all verified in EXE IAT")
+    print("  [IAT OK] libGLESv2.dll (76/76 ordinals) + libEGL.dll (12/12 ordinals) all verified in EXE IAT")
     exe_pe.close()
     # Verify ANGLE 1.0 libGLESv2.dll AF cap unlock AOB uniqueness
     gles_path = dst_exe.parent / "libGLESv2.dll"
