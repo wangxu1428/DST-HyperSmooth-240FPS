@@ -4,7 +4,7 @@
 
 # Technical Provenance, Independent Development Trail & Licensing Compliance
 
-This document provides a verifiable, three-pillar engineering provenance record for **DST HyperSmooth 240FPS & Visual Studio**:
+This document provides a verifiable, three-pillar engineering provenance record for **DST HyperShade — 240FPS & Visual Engine** (formerly **DST HyperSmooth**):
 1. **Technical Sources**: Peer-reviewed graphics papers, standard textbooks, public industry talks, and API specifications mapped to their exact modules in this repository.
 2. **Independent Development Trail**: Public Git commit timeline, Architecture Decision Records (ADRs), and reproducible automated CPU/GPU test suites.
 3. **Licensing & Asset Ledger**: Complete third-party dependency, open-source adaptation, generated asset, and runtime game resource boundaries (full legal ledger in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) and [`LICENSE`](../LICENSE)).
@@ -23,6 +23,7 @@ This document provides a verifiable, three-pillar engineering provenance record 
 | [`native_plugin/sprite_batcher.h`](../native_plugin/sprite_batcher.h)<br>[`native_plugin/ui_batcher.h`](../native_plugin/ui_batcher.h)<br>[`native_plugin/vb_pool.h`](../native_plugin/vb_pool.h)<br>[`native_plugin/gl_state_cache.h`](../native_plugin/gl_state_cache.h) | 8-slot multi-texture 2D Sprite & UI/Font Uber-Batchers, AZDO linear streaming append ring with lockless buffer orphaning (`GL_MAP_WRITE_BIT \| GL_MAP_INVALIDATE_BUFFER_BIT`), 32 MB dual-track VBO pool, and GL state/uniform shadow cache | • Cass Everitt, Graham Sellers, John McDonald, Tim Foley, *"Approaching Zero Driver Overhead in OpenGL (AZDO)"*, **GDC 2014**<br>• Khronos Group, *OpenGL ES 3.0 Specification*, **§6.3.2 Mapping and Unmapping Buffer Data** |
 | [`native_plugin/native_gl_bridge.h`](../native_plugin/native_gl_bridge.h)<br>`native_plugin/dxgi_flip_present.h` *(upcoming v2.9.x)* | Native WGL OpenGL ES 2.0 bridge, DXGI Flip presentation path, ANGLE D3D9Ex `SetMaximumFrameLatency(1)`, hardware 16× AF unlock, and native `MipLodBias` | • Khronos Group, *OpenGL ES 2.0 / EGL 1.4 / WGL_EXT_create_context_es2_profile* Specifications<br>• Microsoft Learn, *DXGI Flip Model* & *IDirect3DDevice9Ex::SetMaximumFrameLatency* |
 | [`native_plugin/dinput8.cpp`](../native_plugin/dinput8.cpp) (HD-2D world shader section) | Screen-space derivative micro-normals, 3-wave chain-rule ocean glints, 0-tap entity ground-contact AO, and directional rim lighting in GLSL ES 1.00 | • Khronos `GL_OES_standard_derivatives` (`dFdx`/`dFdy`)<br>• Standard Blinn-Phong specular & analytical chain-rule wave normals |
+| `native_plugin/look_matcher.h` *(upcoming v2.9.x)* | HyperShade Visual Closed-Loop engine: Win32 `CF_DIBV5`/`CF_DIB`/`CF_HDROP` validated BMP normalization + OS WIC worker-thread decode/downscale, non-blocking Native OpenGL 3.2 `glBlitFramebuffer` + `GL_PIXEL_PACK_BUFFER` + `glFenceSync` frame capture, dual-mode Oklab feature analyzer with per-feature confidence, and Capability Whitelist regularized optimizer | • Björn Ottosson, *"A perceptual color space for image processing (Oklab)"* (2020, Public Domain)<br>• E. Reinhard, M. Adhikhmin, B. Gooch, P. Shirley, *"Color Transfer between Images"*, **IEEE CG&A 2001**<br>• P. J. Huber, *"Robust Estimation of a Location Parameter"*, **Ann. Math. Stat. 1964**<br>• R. Hooke & T. A. Jeeves, *"Direct Search Solution of Numerical and Statistical Problems"*, **JACM 1961**<br>• Microsoft Learn *Windows Imaging Component (WIC)* & Khronos *OpenGL 3.2 `GL_PIXEL_PACK_BUFFER` / `glFenceSync`* Specifications |
 
 ### 1.2 Post-Process Shader Pipeline (`tools/build_shaders.py`)
 
@@ -70,6 +71,9 @@ Verifiable directly via `git log`:
   - Live debugging proved that combining `GL_MAP_UNSYNCHRONIZED_BIT` with offset-0 reuse across 4 ring slots violated GLES 3.0 §6.3.2 when >4 flushes occurred per frame, overwriting in-flight GPU VRAM. Replaced with a 4 MB / 256 KB linear disjoint append ring using pure `GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT` driver orphaning on wrap-around, plus fixed cross-thread RenderThread small-VBO shadow capture to eliminate `GL_MAP_READ_BIT` stalls.
 - **ADR-3: Open `HS_EXT_V1` Standard & Runtime Coexistence**
   - Formalized [`docs/HS_EXT_V1_SPEC.md`](HS_EXT_V1_SPEC.md) so third-party shader mods interoperate via a documented standard, and implemented `IsExternalBcasActive()` in [`modmain.lua`](../workshop_mod/dst_smooth_highfps/modmain.lua) to yield cleanly whenever standalone `DST-BCAS-Studio` is co-loaded.
+- **ADR-4: HyperShade Visual Closed-Loop & Capability Whitelist Decoupling (`look_matcher.h`, upcoming v2.9.x)**
+  - Separates universal input (`CF_DIBV5/CF_DIB/CF_HDROP` + OS WIC + non-blocking OpenGL PBO, zero extra DLLs), dual-mode perceptual analysis (General statistical Look Matching vs. Same-Scene Robust Huber matching with explicit confidence), and a **Capability Whitelist** that exposes only parameters stably owned and controlled by HyperShade's active rendering pipeline into transactional `HS1-` share codes.
+  - Engineering & compliance boundaries: `HS1-` guarantees **deterministic parameter-state reproduction** (final pixels vary across GPU drivers, resolutions, game scenes, and render backends); the engine never reads, parses, or copies third-party mod shaders, assets, or code—extracting only statistical visual features from user-supplied images to fit HyperShade's own presets, significantly reducing IP risk (not a substitute for formal legal advice).
 
 ### 2.3 Independent Reproducible Verification Suites
 
@@ -77,9 +81,9 @@ Comprehensive automated tests and live-GPU FBO pixel-readback harnesses live ins
 
 | Suite | Coverage | Command |
 | :--- | :--- | :--- |
-| [`tools/test_redteam_client.cpp`](../tools/test_redteam_client.cpp) | **24 (published v2.8.0) / 28 (upcoming v2.9.x)** C++20 unit & live-GPU tests (W^X, RTSS pacer, GC, skeletal/VFX/world-pos smoothing, A\* concurrency, Native WGL ES2, VBPool, SpriteBatcher, UiBatcher, etc.) | Compile with Zig C++20 & run `tools/test_redteam_client.exe` |
+| [`tools/test_redteam_client.cpp`](../tools/test_redteam_client.cpp) | **24 (published v2.8.0) / 29 (upcoming v2.9.x)** C++20 unit, live-GPU & Windows WIC red-team tests (incl. Visual Closed-Loop DIB/V5/Bitfields→WIC, dual-mode Oklab solver, misaligned fallback & whitelist invariants) | Compile with Zig C++20 & run `tools/test_redteam_client.exe` |
 | `tools/test_world_shadow_gpu.cpp` *(upcoming v2.9.x)* | **Dual-backend (Native OpenGL + ANGLE D3D9) live-GPU FBO verification** for World ShadowMask, Multi-Light Point Shadows, Planar Water Reflections, DXGI Flip, Mock-GL state machine, dual-context, and concurrent save stress | Compile with Zig C++20 & run `tools/test_world_shadow_gpu.exe` |
-| [`tools/test_client_lua_v24.py`](../tools/test_client_lua_v24.py) | **18 (published v2.8.0) / 26 (upcoming v2.9.x)** end-to-end tests executed inside the real 64-bit DST Lua 5.1 VM | `python tools/test_client_lua_v24.py` |
+| [`tools/test_client_lua_v24.py`](../tools/test_client_lua_v24.py) | **18 (published v2.8.0) / 29 (upcoming v2.9.x)** end-to-end tests executed inside the real 64-bit DST Lua 5.1 VM (incl. 3,053-widget monkey-click & Visual Closed-Loop `HS1-`/Undo suite) | `python tools/test_client_lua_v24.py` |
 | [`tools/test_redteam_client.py`](../tools/test_redteam_client.py) | PE 6/6 export check, pure UCRT import check, lockless `System32` passthrough, and **58/58** unique client & ANGLE AOB verification | `python tools/test_redteam_client.py` |
 | [`tools/test_spike_blackbox.py`](../tools/test_spike_blackbox.py) | Spike Blackbox ring-buffer & root-cause classification regression tests | `python tools/test_spike_blackbox.py` |
 

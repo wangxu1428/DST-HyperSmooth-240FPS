@@ -71,56 +71,113 @@ public:
             return Classification{ origPriority, origChannel, false, false };
         }
 
-        // DST writes vanilla 7-bit RPC ID as first aligned byte in BitStream.
+        // DST registers all 41 RakNet::RPC4 slots with single-character ASCII uniqueIDs:
+        //   "0" = HandleRPC          (Client -> Server vanilla RPC)
+        //   "1" = HandleModRPC       (Client -> Server ModRPC)
+        //   "2" = HandleClientRPC    (Server -> Client vanilla ClientRPC)
+        //   "3" = HandleClientModRPC (Server -> Client ClientModRPC)
+        //   "4" = HandleShardRPC     (Shard  <-> Shard vanilla ShardRPC)
+        //   "5" = HandleShardModRPC  (Shard  <-> Shard ShardModRPC)
+        //   "6".."X" = Klei native C++ engine RPCs (chat/vote/spawn/resync) -> fail-closed passthrough!
+        // Symbolic aliases ("RPC".."ShardModRPC") are retained for readability/tests.
+        enum class SlotKind : uint8_t {
+            Unknown = 0,
+            ServerRpc,
+            ServerModRpc,
+            ClientRpc,
+            ClientModRpc,
+            ShardRpc,
+        };
+
+        SlotKind kind = SlotKind::Unknown;
+        if (uniqueID[0] != '\0' && uniqueID[1] == '\0') {
+            switch (uniqueID[0]) {
+                case '0': kind = SlotKind::ServerRpc;    break;
+                case '1': kind = SlotKind::ServerModRpc; break;
+                case '2': kind = SlotKind::ClientRpc;    break;
+                case '3': kind = SlotKind::ClientModRpc; break;
+                case '4':
+                case '5': kind = SlotKind::ShardRpc;     break;
+                default:  kind = SlotKind::Unknown;      break;
+            }
+        } else if (std::strcmp(uniqueID, "RPC") == 0) {
+            kind = SlotKind::ServerRpc;
+        } else if (std::strcmp(uniqueID, "ModRPC") == 0) {
+            kind = SlotKind::ServerModRpc;
+        } else if (std::strcmp(uniqueID, "ClientRPC") == 0) {
+            kind = SlotKind::ClientRpc;
+        } else if (std::strcmp(uniqueID, "ClientModRPC") == 0) {
+            kind = SlotKind::ClientModRpc;
+        } else if (std::strcmp(uniqueID, "ShardRPC") == 0 ||
+                   std::strcmp(uniqueID, "ShardModRPC") == 0) {
+            kind = SlotKind::ShardRpc;
+        }
+
+        // DST BitStream wire layout for Slot "0" (HandleRPC) and Slot "2" (HandleClientRPC):
+        //   bit 0 (MSB, 0x80) = 1-bit boolean tick flag
+        //   bits 1..7 (0x7F)  = 7-bit 1-based Lua RPC ID (aligned right via BitStream::ReadBits(7, true))
         const uint8_t rpcId = (bsData != nullptr && bsBits >= 8u)
             ? static_cast<uint8_t>(bsData[0] & 0x7Fu)
             : 0u;
 
         Classification res{ origPriority, origChannel, false, false };
 
-        if (std::strcmp(uniqueID, "RPC") == 0) {
-            if (serverNonCombatMask_.Test(rpcId)) {
-                res.priority          = kHighPriority;
-                res.orderingChannel   = 1u;
-                res.promotedImmediate = false;
-                res.movedOffCh0       = true;
-            } else {
-                res.priority          = kImmediatePriority;
-                res.orderingChannel   = 0u;
-                res.promotedImmediate = (origPriority != kImmediatePriority);
-                res.movedOffCh0       = false;
-            }
-        } else if (std::strcmp(uniqueID, "ModRPC") == 0) {
-            res.orderingChannel = 0u;
-            if (bsBits <= kSmallModRpcMaxBits) {
-                res.priority          = kImmediatePriority;
-                res.promotedImmediate = (origPriority != kImmediatePriority);
-            }
-        } else if (std::strcmp(uniqueID, "ClientRPC") == 0) {
-            if (clientNonEntityMask_.Test(rpcId)) {
-                res.priority          = kMediumPriority;
-                res.orderingChannel   = 2u;
-                res.promotedImmediate = false;
-                res.movedOffCh0       = true;
-            } else {
-                res.priority          = kImmediatePriority;
-                res.orderingChannel   = 0u;
-                res.promotedImmediate = (origPriority != kImmediatePriority);
-                res.movedOffCh0       = false;
-            }
-        } else if (std::strcmp(uniqueID, "ClientModRPC") == 0) {
-            res.orderingChannel = 0u;
-            if (bsBits <= kSmallModRpcMaxBits) {
-                res.priority          = kImmediatePriority;
-                res.promotedImmediate = (origPriority != kImmediatePriority);
-            }
-        } else if (std::strcmp(uniqueID, "ShardRPC") == 0 ||
-                   std::strcmp(uniqueID, "ShardModRPC") == 0) {
-            res.orderingChannel = origChannel;
-            if (bsBits <= kSmallModRpcMaxBits) {
-                res.priority          = kImmediatePriority;
-                res.promotedImmediate = (origPriority != kImmediatePriority);
-            }
+        switch (kind) {
+            case SlotKind::ServerRpc:
+                if (serverNonCombatMask_.Test(rpcId)) {
+                    res.priority          = kHighPriority;
+                    res.orderingChannel   = 1u;
+                    res.promotedImmediate = false;
+                    res.movedOffCh0       = true;
+                } else {
+                    res.priority          = kImmediatePriority;
+                    res.orderingChannel   = 0u;
+                    res.promotedImmediate = (origPriority != kImmediatePriority);
+                    res.movedOffCh0       = false;
+                }
+                break;
+
+            case SlotKind::ServerModRpc:
+                res.orderingChannel = 0u;
+                if (bsBits <= kSmallModRpcMaxBits) {
+                    res.priority          = kImmediatePriority;
+                    res.promotedImmediate = (origPriority != kImmediatePriority);
+                }
+                break;
+
+            case SlotKind::ClientRpc:
+                if (clientNonEntityMask_.Test(rpcId)) {
+                    res.priority          = kMediumPriority;
+                    res.orderingChannel   = 2u;
+                    res.promotedImmediate = false;
+                    res.movedOffCh0       = true;
+                } else {
+                    res.priority          = kImmediatePriority;
+                    res.orderingChannel   = 0u;
+                    res.promotedImmediate = (origPriority != kImmediatePriority);
+                    res.movedOffCh0       = false;
+                }
+                break;
+
+            case SlotKind::ClientModRpc:
+                res.orderingChannel = 0u;
+                if (bsBits <= kSmallModRpcMaxBits) {
+                    res.priority          = kImmediatePriority;
+                    res.promotedImmediate = (origPriority != kImmediatePriority);
+                }
+                break;
+
+            case SlotKind::ShardRpc:
+                res.orderingChannel = origChannel;
+                if (bsBits <= kSmallModRpcMaxBits) {
+                    res.priority          = kImmediatePriority;
+                    res.promotedImmediate = (origPriority != kImmediatePriority);
+                }
+                break;
+
+            case SlotKind::Unknown:
+            default:
+                break;
         }
 
         if (res.promotedImmediate) {

@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DST HyperSmooth / HyperCore Installer
+title DST HyperShade (HyperSmooth) / HyperCore Installer
 set "HS_SELF=%~f0"
 set "HS_DIR=%~dp0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText($env:HS_SELF,[Text.Encoding]::UTF8); $m='#===PS_'+'START==='; $i=$c.IndexOf($m); if($i -lt 0){exit 1}; &([scriptblock]::Create($c.Substring($i)))"
@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 function Write-Banner {
     Write-Host ""
     Write-Host "==================================================================" -ForegroundColor Cyan
-    Write-Host "  饥荒联机版 (DST) HyperSmooth & HyperCore 一键安装/更新/卸载工具" -ForegroundColor Yellow
+    Write-Host "  饥荒联机版 (DST) HyperShade（原 HyperSmooth）& HyperCore 一键安装工具" -ForegroundColor Yellow
     Write-Host "  纯开源透明脚本 · 自动识别 Steam/WeGame 路径 · SHA256 逐字节校验" -ForegroundColor Gray
     Write-Host "==================================================================" -ForegroundColor Cyan
     Write-Host ""

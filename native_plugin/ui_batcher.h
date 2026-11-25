@@ -348,11 +348,31 @@ public:
         streamIbo_        = 0u;
         streamVboCursor_  = 0u;
         streamIboCursor_  = 0u;
+        streamVboShrunk_  = false;
+        streamIboShrunk_  = false;
         gpuReady_         = false;
         gpuInitFailed_    = false;
         uberProg_         = 0u;
         uberFailed_       = false;
         maxTexSlots_      = kMaxUiTexSlots;
+        vertCount_        = 0;
+        indexCount_       = 0;
+        batchTexCount_    = 0;
+        dstProgram_       = 0;
+        curProg_          = nullptr;
+        dstProgDirty_     = false;
+        activeTexUnit_    = 0;
+        boundArrayBuf_    = 0;
+        boundElemBuf_     = 0;
+        enabledAttrMask_  = 0;
+        std::memset(boundTex_, 0, sizeof(boundTex_));
+        for (auto& a : attribs_) a = {};
+        shadowCache_.Clear();
+    }
+
+    // Invalidates CPU-side binding tracking & pending staging without orphaning live GPU objects
+    // (used when a same-context eglMakeCurrent fails while the context remains alive).
+    void ResetBindingsOnly() {
         vertCount_        = 0;
         indexCount_       = 0;
         batchTexCount_    = 0;
@@ -573,11 +593,14 @@ public:
     }
 
     // Must be called before any non-absorbed uniform or vanilla GL draw on the current program!
-    void EnsureDstProgramBound() {
+    // Returns true if a deferred glUseProgram(dstProgram_) was actually emitted to the GL driver.
+    bool EnsureDstProgramBound() {
         if (dstProgDirty_ && ops_.glUseProgram) {
             ops_.glUseProgram(dstProgram_);
             dstProgDirty_ = false;
+            return true;
         }
+        return false;
     }
 
     void FlushDeferredStateForCurrentProg() {
@@ -810,30 +833,43 @@ public:
         // AZDO Linear Streaming Append Ring:
         //   - Disjoint tail append uses WRITE|INVALIDATE_RANGE|UNSYNCHRONIZED (0 GPU overlap, 0 stall!)
         //   - Wrap-to-0 orphan uses WRITE|INVALIDATE_BUFFER (NO UNSYNCHRONIZED -> 0% GPU/CPU race!)
+        //   - Fallback upload advances cursor past [0, bytes) (or marks shrunk for full re-orphan),
+        //     and glUnmapBuffer() return value is checked so corrupted unmaps safely fall back!
         size_t vBaseOffset = 0;
         ops_.glBindBuffer(kGlArrayBuffer, vbo);
         bool vUploaded = false;
         if (ops_.glMapBufferRange && ops_.glUnmapBuffer && vBytes <= kVboCap) {
-            const bool wrap = (streamVboCursor_ + vBytes > kVboCap);
-            const size_t off = wrap ? 0u : streamVboCursor_;
-            const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
-            if (void* mapped = ops_.glMapBufferRange(kGlArrayBuffer, static_cast<ptrdiff_t>(off),
-                                                     static_cast<ptrdiff_t>(vBytes), flags)) {
-                std::memcpy(mapped, verts_.data(), vBytes);
-                ops_.glUnmapBuffer(kGlArrayBuffer);
-                vBaseOffset      = off;
-                streamVboCursor_ = off + vBytes;
-                vUploaded        = true;
+            if (streamVboShrunk_ && ops_.glBufferData) {
+                ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
+                streamVboShrunk_ = false;
+                streamVboCursor_ = 0u;
+            }
+            if (!streamVboShrunk_) {
+                const bool wrap = (streamVboCursor_ + vBytes > kVboCap);
+                const size_t off = wrap ? 0u : streamVboCursor_;
+                const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
+                if (void* mapped = ops_.glMapBufferRange(kGlArrayBuffer, static_cast<ptrdiff_t>(off),
+                                                         static_cast<ptrdiff_t>(vBytes), flags)) {
+                    std::memcpy(mapped, verts_.data(), vBytes);
+                    if (ops_.glUnmapBuffer(kGlArrayBuffer) != 0) {
+                        vBaseOffset      = off;
+                        streamVboCursor_ = off + vBytes;
+                        vUploaded        = true;
+                    }
+                }
             }
         }
         if (!vUploaded && ops_.glBufferData) {
-            vBaseOffset      = 0u;
-            streamVboCursor_ = 0u;
-            ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
-            if (ops_.glBufferSubData) {
+            vBaseOffset = 0u;
+            if (ops_.glBufferSubData && vBytes <= kVboCap) {
+                ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
                 ops_.glBufferSubData(kGlArrayBuffer, 0, static_cast<ptrdiff_t>(vBytes), verts_.data());
+                streamVboShrunk_ = false;
+                streamVboCursor_ = vBytes;
             } else {
                 ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(vBytes), verts_.data(), kGlStreamDraw);
+                streamVboShrunk_ = true;
+                streamVboCursor_ = kVboCap;
             }
         }
 
@@ -842,26 +878,37 @@ public:
         ops_.glBindBuffer(kGlElementArrayBuffer, ibo);
         bool iUploaded = false;
         if (ops_.glMapBufferRange && ops_.glUnmapBuffer && iAligned <= kIboCap) {
-            const bool wrap = (streamIboCursor_ + iAligned > kIboCap);
-            const size_t off = wrap ? 0u : streamIboCursor_;
-            const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
-            if (void* mapped = ops_.glMapBufferRange(kGlElementArrayBuffer, static_cast<ptrdiff_t>(off),
-                                                     static_cast<ptrdiff_t>(iBytes), flags)) {
-                std::memcpy(mapped, indices_.data(), iBytes);
-                ops_.glUnmapBuffer(kGlElementArrayBuffer);
-                iBaseOffset      = off;
-                streamIboCursor_ = off + iAligned;
-                iUploaded        = true;
+            if (streamIboShrunk_ && ops_.glBufferData) {
+                ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
+                streamIboShrunk_ = false;
+                streamIboCursor_ = 0u;
+            }
+            if (!streamIboShrunk_) {
+                const bool wrap = (streamIboCursor_ + iAligned > kIboCap);
+                const size_t off = wrap ? 0u : streamIboCursor_;
+                const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
+                if (void* mapped = ops_.glMapBufferRange(kGlElementArrayBuffer, static_cast<ptrdiff_t>(off),
+                                                         static_cast<ptrdiff_t>(iBytes), flags)) {
+                    std::memcpy(mapped, indices_.data(), iBytes);
+                    if (ops_.glUnmapBuffer(kGlElementArrayBuffer) != 0) {
+                        iBaseOffset      = off;
+                        streamIboCursor_ = off + iAligned;
+                        iUploaded        = true;
+                    }
+                }
             }
         }
         if (!iUploaded && ops_.glBufferData) {
-            iBaseOffset      = 0u;
-            streamIboCursor_ = 0u;
-            ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
-            if (ops_.glBufferSubData) {
+            iBaseOffset = 0u;
+            if (ops_.glBufferSubData && iAligned <= kIboCap) {
+                ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
                 ops_.glBufferSubData(kGlElementArrayBuffer, 0, static_cast<ptrdiff_t>(iBytes), indices_.data());
+                streamIboShrunk_ = false;
+                streamIboCursor_ = iAligned;
             } else {
                 ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(iBytes), indices_.data(), kGlStreamDraw);
+                streamIboShrunk_ = true;
+                streamIboCursor_ = kIboCap;
             }
         }
 
@@ -951,7 +998,7 @@ private:
         }
     }
 
-    bool CanBatchBase(uint32_t mode) noexcept {
+    bool CanBatchBase(uint32_t mode) {
         if (!enabled_) { lastRejectCode_ = 1; return false; }
         if (gpuInitFailed_ || uberFailed_) { lastRejectCode_ = 2; return false; }
         if (!curProg_ || !curProg_->eligible) { lastRejectCode_ = 3; return false; }
@@ -965,6 +1012,20 @@ private:
             }
         } else {
             if (!curProg_->hasP || !curProg_->hasV || !curProg_->hasW) { lastRejectCode_ = 8; return false; }
+        }
+        if (!ops_.glUseProgram || !ops_.glBindBuffer || !ops_.glActiveTexture || !ops_.glBindTexture ||
+            !ops_.glVertexAttribPointer || !ops_.glEnableVertexAttribArray ||
+            !ops_.glDisableVertexAttribArray || !ops_.glDrawElements) {
+            gpuInitFailed_ = true;
+            lastRejectCode_ = 2;
+            return false;
+        }
+        // Fail-closed BEFORE accepting the very first UI/Font draw into verts_/indices_:
+        // if buffer creation or uber-shader compilation/linking fails, return false immediately
+        // so the caller executes the vanilla draw path with ZERO dropped UI or text!
+        if ((!gpuReady_ || uberProg_ == 0u) && !EnsureGpuAndUberReady()) {
+            lastRejectCode_ = 2;
+            return false;
         }
         return true;
     }
@@ -1192,28 +1253,68 @@ private:
             ops_.glGenBuffers(1, &streamVbo_);
             ops_.glGenBuffers(1, &streamIbo_);
             if (streamVbo_ == 0u || streamIbo_ == 0u) {
+                if (ops_.glDeleteBuffers) {
+                    if (streamVbo_ != 0u) ops_.glDeleteBuffers(1, &streamVbo_);
+                    if (streamIbo_ != 0u) ops_.glDeleteBuffers(1, &streamIbo_);
+                }
+                streamVbo_ = 0u;
+                streamIbo_ = 0u;
                 gpuInitFailed_ = true;
                 return false;
             }
+            constexpr ptrdiff_t kWantVboBytes = static_cast<ptrdiff_t>(kUiStreamBufVerts * sizeof(UiBatchedVertex));
+            constexpr ptrdiff_t kWantIboBytes = static_cast<ptrdiff_t>(kUiStreamBufIndices * sizeof(uint16_t));
             ops_.glBindBuffer(kGlArrayBuffer, streamVbo_);
-            ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kUiStreamBufVerts * sizeof(UiBatchedVertex)), nullptr, kGlStreamDraw);
+            ops_.glBufferData(kGlArrayBuffer, kWantVboBytes, nullptr, kGlStreamDraw);
+            int32_t vAlloc = static_cast<int32_t>(kWantVboBytes);
+            if (ops_.glGetBufferParameteriv) {
+                vAlloc = 0;
+                ops_.glGetBufferParameteriv(kGlArrayBuffer, hs_sprite_batch::kGlBufferSize, &vAlloc);
+            }
             ops_.glBindBuffer(kGlElementArrayBuffer, streamIbo_);
-            ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kUiStreamBufIndices * sizeof(uint16_t)), nullptr, kGlStreamDraw);
-            streamVboCursor_ = 0u;
-            streamIboCursor_ = 0u;
+            ops_.glBufferData(kGlElementArrayBuffer, kWantIboBytes, nullptr, kGlStreamDraw);
+            int32_t iAlloc = static_cast<int32_t>(kWantIboBytes);
+            if (ops_.glGetBufferParameteriv) {
+                iAlloc = 0;
+                ops_.glGetBufferParameteriv(kGlElementArrayBuffer, hs_sprite_batch::kGlBufferSize, &iAlloc);
+            }
             ops_.glBindBuffer(kGlArrayBuffer, boundArrayBuf_);
             ops_.glBindBuffer(kGlElementArrayBuffer, boundElemBuf_);
+            if (vAlloc < static_cast<int32_t>(kWantVboBytes) || iAlloc < static_cast<int32_t>(kWantIboBytes)) {
+                if (ops_.glDeleteBuffers) {
+                    ops_.glDeleteBuffers(1, &streamVbo_);
+                    ops_.glDeleteBuffers(1, &streamIbo_);
+                }
+                streamVbo_ = 0u;
+                streamIbo_ = 0u;
+                gpuInitFailed_ = true;
+                return false;
+            }
+            streamVboCursor_ = 0u;
+            streamIboCursor_ = 0u;
+            streamVboShrunk_ = false;
+            streamIboShrunk_ = false;
             gpuReady_ = true;
         }
 
         if (uberProg_ == 0u) {
+            auto failUber = [&]() -> bool {
+                uberFailed_ = true;
+                if (ops_.glDeleteBuffers) {
+                    if (streamVbo_ != 0u) ops_.glDeleteBuffers(1, &streamVbo_);
+                    if (streamIbo_ != 0u) ops_.glDeleteBuffers(1, &streamIbo_);
+                }
+                streamVbo_ = 0u;
+                streamIbo_ = 0u;
+                gpuReady_  = false;
+                return false;
+            };
             if (!ops_.glCreateShader || !ops_.glShaderSource || !ops_.glCompileShader ||
                 !ops_.glGetShaderiv || !ops_.glDeleteShader || !ops_.glCreateProgram ||
                 !ops_.glAttachShader || !ops_.glBindAttribLocation || !ops_.glLinkProgram ||
                 !ops_.glGetProgramiv || !ops_.glDeleteProgram || !ops_.glUseProgram ||
                 !ops_.glGetUniformLocation || !ops_.glUniform1i) {
-                uberFailed_ = true;
-                return false;
+                return failUber();
             }
 
             static constexpr const char* kUberVs =
@@ -1312,16 +1413,14 @@ private:
             if (!vs || !fs) {
                 if (vs) ops_.glDeleteShader(vs);
                 if (fs) ops_.glDeleteShader(fs);
-                uberFailed_ = true;
-                return false;
+                return failUber();
             }
 
             const uint32_t prog = ops_.glCreateProgram();
             if (prog == 0u) {
                 ops_.glDeleteShader(vs);
                 ops_.glDeleteShader(fs);
-                uberFailed_ = true;
-                return false;
+                return failUber();
             }
             ops_.glAttachShader(prog, vs);
             ops_.glAttachShader(prog, fs);
@@ -1337,8 +1436,7 @@ private:
             ops_.glGetProgramiv(prog, kGlLinkStatus, &linked);
             if (!linked) {
                 ops_.glDeleteProgram(prog);
-                uberFailed_ = true;
-                return false;
+                return failUber();
             }
 
             ops_.glUseProgram(prog);
@@ -1369,6 +1467,8 @@ private:
     uint32_t                     streamIbo_       = 0;
     size_t                       streamVboCursor_ = 0;
     size_t                       streamIboCursor_ = 0;
+    bool                         streamVboShrunk_ = false;
+    bool                         streamIboShrunk_ = false;
 
     std::vector<UiBatchedVertex> verts_;
     std::vector<uint16_t>        indices_;

@@ -275,8 +275,11 @@ struct OptionalGlProcs {
     void* glClientWaitSync       = nullptr;
     void* glDeleteSync           = nullptr;
     void* glFinish               = nullptr;
-    void* glGetBufferParameteriv = nullptr;
-    void* glGetBufferSubData     = nullptr;
+    void* glGetBufferParameteriv  = nullptr;
+    void* glGetBufferSubData      = nullptr;
+    void* glBlendFuncSeparate     = nullptr;
+    void* glBlendEquationSeparate = nullptr;
+    void* glBlitFramebuffer       = nullptr;
 };
 
 struct ProbeResult {
@@ -486,11 +489,11 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     }
 
     if (mode == BackendMode::Auto) {
+        // Auto mode strictly restricts Native OpenGL Compat to empirically verified NVIDIA drivers.
+        // AMD Radeon & Intel iGPUs default to battle-tested ANGLE D3D9 (users may still opt in via
+        // `RenderBackend = opengl` in dst_hypersmooth.ini).
         const bool isNvidia = ContainsAsciiInsensitive(out.vendor.c_str(), "NVIDIA");
-        const bool isAmd = ContainsAsciiInsensitive(out.vendor.c_str(), "ATI") ||
-                           ContainsAsciiInsensitive(out.vendor.c_str(), "AMD");
-        const bool isModernAmd = isAmd && (glMaj > 4 || (glMaj == 4 && glMin >= 5));
-        if (!isNvidia && !isModernAmd) {
+        if (!isNvidia) {
             out.reason = "auto_prefer_d3d9_for_gpu_vendor";
             cleanup();
             return out;
@@ -614,8 +617,11 @@ inline int ResolveLiveGlesTable(WglRuntime& rt, void* outProcs[76], OptionalGlPr
     outOpt.glClientWaitSync       = rt.ResolveGlProc("glClientWaitSync");
     outOpt.glDeleteSync           = rt.ResolveGlProc("glDeleteSync");
     outOpt.glFinish               = rt.ResolveGlProc("glFinish");
-    outOpt.glGetBufferParameteriv = rt.ResolveGlProc("glGetBufferParameteriv");
-    outOpt.glGetBufferSubData     = rt.ResolveGlProc("glGetBufferSubData");
+    outOpt.glGetBufferParameteriv  = rt.ResolveGlProc("glGetBufferParameteriv");
+    outOpt.glGetBufferSubData      = rt.ResolveGlProc("glGetBufferSubData");
+    outOpt.glBlendFuncSeparate     = rt.ResolveGlProc("glBlendFuncSeparate");
+    outOpt.glBlendEquationSeparate = rt.ResolveGlProc("glBlendEquationSeparate");
+    outOpt.glBlitFramebuffer       = rt.ResolveGlProc("glBlitFramebuffer");
     return count;
 }
 

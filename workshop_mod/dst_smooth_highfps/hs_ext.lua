@@ -95,6 +95,7 @@ local plugins_ordered = {}    -- sorted list of plugin records
 local rejected_records = {}   -- { { id, reason } } for diagnostics
 local unloaded_saved = {}     -- persisted plugin configs for currently uninstalled plugins
 local master_bypass = false
+local vanilla_suspend = false
 local shaders_built = false
 local shaders_sorted = false
 local ctx_uniform_ids = {}    -- "TIME" -> PostProcessor uniform id
@@ -415,12 +416,16 @@ local function ResortPluginList()
     end)
 end
 
+local function IsSuspended()
+    return master_bypass or vanilla_suspend
+end
+
 local function RecomputeActiveCtxSubs()
     active_ctx_subs.TIME = 0
     active_ctx_subs.SUN  = 0
     active_ctx_subs.ENV  = 0
     active_ctx_subs.CAM  = 0
-    if master_bypass then return end
+    if IsSuspended() then return end
     for i = 1, #plugins_ordered do
         local p = plugins_ordered[i]
         if p.compiled and not p.faulted and p.enabled then
@@ -474,11 +479,11 @@ end
 
 local function SyncPluginEffectState(p, fire_callbacks)
     local pp = rawget(G, "PostProcessor")
-    local want_on = (not master_bypass) and p.compiled and (not p.faulted) and (p.enabled == true)
+    local want_on = (not IsSuspended()) and p.compiled and (not p.faulted) and (p.enabled == true)
     if pp and p.pp_effect_id ~= nil and type(pp.EnablePostProcessEffect) == "function" then
         if want_on and p.dirty_uniforms then
             PushPluginUniforms(p)
-            want_on = (not master_bypass) and p.compiled and (not p.faulted) and (p.enabled == true)
+            want_on = (not IsSuspended()) and p.compiled and (not p.faulted) and (p.enabled == true)
         end
         local ok_e, err_e = pcall(pp.EnablePostProcessEffect, pp, p.pp_effect_id, want_on)
         if not ok_e then
@@ -596,7 +601,7 @@ local function SetPluginParam(id, key, val)
     local clamped = ClampParamValue(pd, val)
     p.values[key] = clamped
     p.dirty_uniforms = true
-    if p.compiled and not p.faulted and p.enabled and not master_bypass then
+    if p.compiled and not p.faulted and p.enabled and not IsSuspended() then
         PushPluginUniforms(p)
     end
     NotifyStateChanged()
@@ -611,7 +616,7 @@ local function ResetPlugin(id)
         p.values[pd.key] = pd.default
     end
     p.dirty_uniforms = true
-    if p.compiled and not p.faulted and p.enabled and not master_bypass then
+    if p.compiled and not p.faulted and p.enabled and not IsSuspended() then
         PushPluginUniforms(p)
     end
     NotifyStateChanged()
@@ -625,6 +630,16 @@ local function SetMasterBypass(bypass)
     SyncAllPluginStates(true)
     NotifyStateChanged()
     return master_bypass
+end
+
+-- Non-destructive Preset 0 (Vanilla Pure) suspension: disables active extension passes
+-- without modifying the player's saved master_bypass or per-plugin enable preferences.
+local function SetVanillaSuspend(suspend)
+    local s = (suspend == true)
+    if vanilla_suspend == s then return vanilla_suspend end
+    vanilla_suspend = s
+    SyncAllPluginStates(true)
+    return vanilla_suspend
 end
 
 -- Phase A: Called inside HyperSmooth's AddModShadersInit AFTER Core's own shaders are registered
@@ -887,7 +902,7 @@ end
 
 -- Per-frame / 10Hz dynamic context bus + optional plugin on_frame callback
 local function Tick(dt, light_state)
-    if #plugins_ordered == 0 or master_bypass then return end
+    if #plugins_ordered == 0 or IsSuspended() then return end
     local pp = rawget(G, "PostProcessor")
     if not (pp and type(pp.SetUniformVariable) == "function") then return end
 
@@ -1080,7 +1095,7 @@ local function GetSnapshot()
     for i = 1, #plugins_ordered do
         local p = plugins_ordered[i]
         local gpu = QueryNativeGpuStats(p.id)
-        if p.compiled and not p.faulted and p.enabled and not master_bypass then
+        if p.compiled and not p.faulted and p.enabled and not IsSuspended() then
             active_count = active_count + 1
             total_gpu_ms = total_gpu_ms + (gpu.ema_ms or 0.0)
         end
@@ -1111,9 +1126,10 @@ local function GetSnapshot()
         }
     end
     return {
-        abi_version   = ABI_VERSION,
-        master_bypass = master_bypass,
-        total_count   = #plugins_ordered,
+        abi_version     = ABI_VERSION,
+        master_bypass   = master_bypass,
+        vanilla_suspend = vanilla_suspend,
+        total_count     = #plugins_ordered,
         active_count  = active_count,
         fault_count   = fault_count,
         rejected      = rejected_records,
@@ -1218,6 +1234,8 @@ HS_ExtRuntime = {
     ResetPlugin        = ResetPlugin,
     SetMasterBypass    = SetMasterBypass,
     IsMasterBypass     = function() return master_bypass end,
+    SetVanillaSuspend  = SetVanillaSuspend,
+    IsVanillaSuspend   = function() return vanilla_suspend end,
     ExportPersistedMap = ExportPersistedMap,
     ApplyPersistedMap  = ApplyPersistedMap,
     PrintStatusReport  = PrintStatusReport,

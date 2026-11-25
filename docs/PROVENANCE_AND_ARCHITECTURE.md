@@ -5,7 +5,7 @@
 # 技术溯源、独立演进与开源合规白皮书
 # Technical Provenance, Independent Development Trail & Compliance
 
-本文档系统记录 **DST HyperSmooth 240FPS & Visual Studio** 的三项核心合规依据：
+本文档系统记录 **DST HyperShade — 240FPS & Visual Engine**（原 **DST HyperSmooth**）的三项核心合规依据：
 1. **技术来源**：每一项核心图形学、渲染管线、动画与系统优化模块所对应的公开学术论文、教材、行业演讲与规范；
 2. **独立开发记录**：基于 Git 公开提交历史、架构演进决策（ADR）与可复现自动化测试套件的完整演进链条；
 3. **授权记录**：第三方依赖库、MIT 适配代码、仓库自生成素材与游戏官方运行时资源的清晰权属边界（详见根目录 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) 与 [`LICENSE`](../LICENSE)）。
@@ -26,6 +26,7 @@
 | [`native_plugin/sprite_batcher.h`](../native_plugin/sprite_batcher.h)<br>[`native_plugin/ui_batcher.h`](../native_plugin/ui_batcher.h)<br>[`native_plugin/vb_pool.h`](../native_plugin/vb_pool.h)<br>[`native_plugin/gl_state_cache.h`](../native_plugin/gl_state_cache.h) | 8 槽位多纹理 2D 精灵与 UI/字体 Uber-Batcher、AZDO 线性流式追加环与驱动页重命名（`GL_MAP_WRITE_BIT \| GL_MAP_INVALIDATE_BUFFER_BIT`）、32MB 双轨动态 VBO 池、状态与 Uniform 影子去重缓存 | • Cass Everitt, Graham Sellers, John McDonald, Tim Foley, *"Approaching Zero Driver Overhead in OpenGL (AZDO)"*, **GDC 2014**<br>• Khronos Group, *OpenGL ES 3.0 Specification*, **§6.3.2 Mapping and Unmapping Buffer Data**（消除 `GL_MAP_UNSYNCHRONIZED_BIT` 显存数据竞争） |
 | [`native_plugin/native_gl_bridge.h`](../native_plugin/native_gl_bridge.h)<br>`native_plugin/dxgi_flip_present.h` *(v2.9.x 待发布)* | 原生 WGL OpenGL ES 2.0 硬件直通桥接、DXGI Flip Model 零拷呈现、ANGLE D3D9Ex `SetMaximumFrameLatency(1)` 与硬件 16× AF / MipLodBias | • Khronos Group, *OpenGL ES 2.0 / EGL 1.4 / WGL_EXT_create_context_es2_profile* 官方规范<br>• Microsoft Learn, *DXGI Flip Model* 与 *IDirect3DDevice9Ex::SetMaximumFrameLatency* 官方文档 |
 | [`native_plugin/dinput8.cpp`](../native_plugin/dinput8.cpp)（HD-2D 世界着色器段） | 世界地形/海洋/立绘 GLSL ES 1.00 屏幕空间导数微法线、三波链式法则水波反光、0-Tap 接地接触 AO 与边缘轮廓光 | • Khronos `GL_OES_standard_derivatives` (`dFdx`/`dFdy`) 屏幕空间法线重建<br>• 经典 Blinn-Phong 高光与链式法则（Chain Rule）解析波浪法线 |
+| `native_plugin/look_matcher.h` *(v2.9.x 待发布)* | HyperShade 视觉闭环引擎：Win32 `CF_DIBV5`/`CF_DIB`/`CF_HDROP` 规范化补头 + Windows WIC 后台解码缩放、Native OpenGL 3.2 `glBlitFramebuffer` + `GL_PIXEL_PACK_BUFFER` + `glFenceSync` 非阻塞异步帧采样、双模式 Oklab 特征分析与分项置信度、能力白名单（Capability Whitelist）正则化坐标模式优化器 | • Björn Ottosson, *"A perceptual color space for image processing (Oklab)"* (2020, Public Domain)<br>• E. Reinhard, M. Adhikhmin, B. Gooch, P. Shirley, *"Color Transfer between Images"*, **IEEE CG&A 2001**<br>• P. J. Huber, *"Robust Estimation of a Location Parameter"*, **Ann. Math. Stat. 1964**（抗微动截断损失）<br>• R. Hooke & T. A. Jeeves, *"Direct Search Solution of Numerical and Statistical Problems"*, **JACM 1961**<br>• Microsoft Learn *Windows Imaging Component (WIC)* & Khronos *OpenGL 3.2 `GL_PIXEL_PACK_BUFFER` / `glFenceSync`* 规范 |
 
 ### 1.2 后处理着色器管线（`tools/build_shaders.py`）
 
@@ -74,6 +75,9 @@
   - 重构为线性无重叠偏移追加 + 绕回时纯 `GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT` 驱动页重命名，并修复渲染线程小缓冲影子捕获跨线程门控，彻底消除闪烁与 `GL_MAP_READ_BIT` 管线停顿。
 - **ADR-3：为何推出 `HS_EXT_V1` 开放着色器标准与外部 Mod 礼让机制（[`docs/HS_EXT_V1_SPEC.md`](HS_EXT_V1_SPEC.md)）**
   - 确立“兼容标准，而非逐个硬编码兼容单个模组”的开放生态原则；并通过 `IsExternalBcasActive()` 检测机制，在玩家同时启用独立版 `DST-BCAS-Studio` 时主动让出后处理，尊重社区共存。
+- **ADR-4：HyperShade 视觉闭环与能力白名单解耦（`look_matcher.h`，v2.9.x 待发布）**
+  - 采用“通用输入层（Win32 剪贴板 + WIC + 异步 PBO，0 新增 DLL）→ 双模式视觉分析层（通用统计迁移 vs 同场景精确匹配 + 置信度）→ 核心能力白名单（仅映射 HyperShade 已接管且稳定可控的自有参数）→ 标准 `HS1-` 分享码”的四层解耦架构。
+  - 明确技术与合规边界：`HS1-` 保证**参数配置状态的精确复现**（不同显卡、分辨率、场景与渲染后端不保证最终像素完全一致）；全链路不读取、不复制第三方 Mod 的着色器、素材或代码，仅从用户提供的参考图片中提取统计视觉特征并映射为自有管线参数预设，可显著降低知识产权风险（但不代替正式法律结论）。
 
 ### 2.3 独立可复现自动化验证套件（工程原创铁证）
 
@@ -81,9 +85,9 @@
 
 | 测试套件 | 规模与覆盖内容 | 运行命令 |
 | :--- | :--- | :--- |
-| [`tools/test_redteam_client.cpp`](../tools/test_redteam_client.cpp) | **24 项（v2.8.0 已推送）/ 28 项（v2.9.x 待发布）** C++20 单元 + 真机 GPU 红队测试（W^X、RTSS 稳帧、GC、骨骼/粒子/世界坐标平滑、A\* 并发、Native WGL ES2、VBPool、SpriteBatcher、UiBatcher 等） | Zig C++20 编译后执行 `tools/test_redteam_client.exe` |
+| [`tools/test_redteam_client.cpp`](../tools/test_redteam_client.cpp) | **24 项（v2.8.0 已推送）/ 29 项（v2.9.x 待发布）** C++20 单元 + 真机 GPU & WIC 红队测试（含视觉闭环 DIB/V5/Bitfields→WIC、双模式拟合、错位降级与能力白名单校验） | Zig C++20 编译后执行 `tools/test_redteam_client.exe` |
 | `tools/test_world_shadow_gpu.cpp` *(v2.9.x 待发布)* | **双后端（Native OpenGL + ANGLE D3D9）真机 GPU FBO 验证**：World ShadowMask、多点光源、Planar Water Reflection、DXGI Flip、Mock-GL 状态机、双 Context 与并发存盘压测 | Zig C++20 编译后执行 `tools/test_world_shadow_gpu.exe` |
-| [`tools/test_client_lua_v24.py`](../tools/test_client_lua_v24.py) | **18 项（v2.8.0 已推送）/ 26 项（v2.9.x 待发布）** 真实 64 位 DST Lua 5.1 虚拟机全链路测试 | `python tools/test_client_lua_v24.py` |
+| [`tools/test_client_lua_v24.py`](../tools/test_client_lua_v24.py) | **18 项（v2.8.0 已推送）/ 29 项（v2.9.x 待发布）** 真实 64 位 DST Lua 5.1 虚拟机全链路测试（含 3,053 控件面板压测与视觉闭环 `HS1-` / 撤销验证） | `python tools/test_client_lua_v24.py` |
 | [`tools/test_redteam_client.py`](../tools/test_redteam_client.py) | PE 6/6 导出检查、纯 UCRT 依赖校验、`System32` 无锁透传验证、**58/58** 客户端与 ANGLE 唯一 AOB 签名验证 | `python tools/test_redteam_client.py` |
 | [`tools/test_spike_blackbox.py`](../tools/test_spike_blackbox.py) | 掉帧黑匣子（Spike Blackbox）环形缓冲与归因逻辑回归测试 | `python tools/test_spike_blackbox.py` |
 

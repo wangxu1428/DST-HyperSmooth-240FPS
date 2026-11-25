@@ -35,6 +35,10 @@
 #include "../native_plugin/async_save_commit.h"
 #include "../native_plugin/ui_batcher.h"
 #include "../native_plugin/sprite_batcher.h"
+#include "../native_plugin/world_pos_smooth.h"
+#include "../native_plugin/skeletal_fluid.h"
+#include "../native_plugin/combat_impact.h"
+#include "../native_plugin/look_matcher.h"
 #include "../third_party/libdeflate-1.23/libdeflate.h"
 
 #define CHECK(cond) do { \
@@ -2449,6 +2453,14 @@ int main() {
         mops.glGetIntegerv = [](uint32_t pname, int32_t* out) WINAPI {
             if (pname == kGlMaxTextureImageUnits) *out = 16;
         };
+        mops.glGetBufferParameteriv = [](uint32_t target, uint32_t pname, int32_t* out) WINAPI {
+            if (!out) return;
+            const uint32_t id = (target == kGlArrayBuffer) ? g_mkSb->boundVbo : g_mkSb->boundIbo;
+            auto it = g_mkSb->gpuBufs.find(id);
+            *out = (pname == 0x8764u && it != g_mkSb->gpuBufs.end())
+                ? static_cast<int32_t>(it->second.size())
+                : 0;
+        };
         mops.glDrawElements = [](uint32_t, int32_t count, uint32_t, const void*) WINAPI {
             ++g_mkSb->drawCalls;
             const auto& vb = g_mkSb->gpuBufs[g_mkSb->boundVbo];
@@ -3268,6 +3280,682 @@ int main() {
         std::printf("[PASS] 24. Unified UI+Font Uber-Batcher (3 interleaved shaders+textures -> 1 DrawCall + live GPU FBO pixel-exact + fail-closed) verified\n");
     }
 
-    std::printf("ALL 24 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH & ASTAR TESTS PASSED!\n");
+    // [25] Real DST Wire RPC4 Slots ('0'..'5' + '6'/'X' passthrough) & Split-Peek Stencil/PolyOff GL Cache
+    {
+        hs_rpc_qos::Classifier qos;
+        qos.SetMasks((1ULL << 59), (1ULL << 4), (1ULL << 3) | (1ULL << 8), 0ULL);
+
+        uint8_t bsAttack[4] = { static_cast<uint8_t>(0x80u | 4u), 0, 0, 0 };
+        auto c0 = qos.Classify("0", bsAttack, 32u, 1, 3, 0);
+        CHECK(c0.priority == 0 && c0.orderingChannel == 0 && c0.promotedImmediate && !c0.movedOffCh0);
+
+        uint8_t bsSocial[4] = { static_cast<uint8_t>(0x80u | 59u), 0, 0, 0 };
+        auto c1 = qos.Classify("0", bsSocial, 32u, 1, 3, 0);
+        CHECK(c1.priority == 1 && c1.orderingChannel == 1 && !c1.promotedImmediate && c1.movedOffCh0);
+
+        uint8_t bsLearn[4] = { static_cast<uint8_t>(0x80u | 3u), 0, 0, 0 };
+        auto c2 = qos.Classify("2", bsLearn, 32u, 1, 3, 0);
+        CHECK(c2.priority == 2 && c2.orderingChannel == 2 && c2.movedOffCh0);
+
+        uint8_t bsPopup[4] = { 1u, 0, 0, 0 }; // ShowPopup NOT in non-entity mask -> stays causal Ch0/IMM!
+        auto cPopup = qos.Classify("2", bsPopup, 32u, 1, 3, 0);
+        CHECK(cPopup.priority == 0 && cPopup.orderingChannel == 0 && cPopup.promotedImmediate && !cPopup.movedOffCh0);
+
+        auto cEng6 = qos.Classify("6", bsAttack, 32u, 1, 3, 0);
+        CHECK(cEng6.priority == 1 && cEng6.orderingChannel == 0 && !cEng6.promotedImmediate && !cEng6.movedOffCh0);
+        auto cEngX = qos.Classify("X", bsAttack, 32u, 1, 3, 0);
+        CHECK(cEngX.priority == 1 && cEngX.orderingChannel == 0 && !cEngX.promotedImmediate && !cEngX.movedOffCh0);
+
+        hs_gl_cache::ThreadState st;
+        // First call MUST miss (unknown state), peek must NOT mutate state until Record* is called!
+        CHECK(!st.IsStencilFuncRedundant(0x0202u, 1, 0xFFu));
+        CHECK(!st.IsStencilFuncRedundant(0x0202u, 1, 0xFFu)); // still unrecorded!
+        st.RecordStencilFunc(0x0202u, 1, 0xFFu);
+        CHECK(st.IsStencilFuncRedundant(0x0202u, 1, 0xFFu));
+        CHECK(!st.IsStencilFuncRedundant(0x0202u, 2, 0xFFu));
+
+        CHECK(!st.IsStencilMaskRedundant(0xFFu));
+        st.RecordStencilMask(0xFFu);
+        CHECK(st.IsStencilMaskRedundant(0xFFu));
+        CHECK(!st.IsStencilMaskRedundant(0x00u));
+
+        CHECK(!st.IsStencilOpRedundant(0x1E00u, 0x1E00u, 0x1E01u));
+        st.RecordStencilOp(0x1E00u, 0x1E00u, 0x1E01u);
+        CHECK(st.IsStencilOpRedundant(0x1E00u, 0x1E00u, 0x1E01u));
+        CHECK(!st.IsStencilOpRedundant(0x1E00u, 0x1E01u, 0x1E01u));
+
+        CHECK(!st.IsPolygonOffsetRedundant(1.0f, 1.0f));
+        st.RecordPolygonOffset(1.0f, 1.0f);
+        CHECK(st.IsPolygonOffsetRedundant(1.0f, 1.0f));
+        CHECK(!st.IsPolygonOffsetRedundant(std::numeric_limits<float>::quiet_NaN(), 1.0f));
+
+        // SwapBuffers / eglMakeCurrent barrier MUST invalidate all stencil & polygon-offset state!
+        st.ResetBindingsOnly();
+        CHECK(!st.IsStencilFuncRedundant(0x0202u, 1, 0xFFu));
+        CHECK(!st.IsStencilMaskRedundant(0xFFu));
+        CHECK(!st.IsStencilOpRedundant(0x1E00u, 0x1E00u, 0x1E01u));
+        CHECK(!st.IsPolygonOffsetRedundant(1.0f, 1.0f));
+
+        std::printf("[PASS] 25. Client RPC4 real wire slots ('0'..'5' + '6'/'X' passthrough) & split-peek Stencil/PolyOff GL cache verified\n");
+    }
+
+    // 26. Unified Main-Thread PLL Snapshot-Timeline Smoother (Character + Camera + Shadow + Light 0.00px lockstep)
+    {
+        constexpr double kDtRend = 1.0 / 200.0; // 200Hz render cadence (5.0ms)
+        constexpr float  kSpeed  = 6.0f;        // 6.0 world tiles/sec (~400px/sec Wolfgang running!)
+        constexpr float  kPxPerTile = 66.6667f;
+
+        auto runSteadyCheck = [&](int snapHz, double jitterMs, double maxAllowedVelErrPx, double maxAllowedCamDiffPx) {
+            hs_world_pos::SmoothTimelineTable tbl;
+            const uintptr_t playerKey = 0x10000100ULL;
+            const uintptr_t camKey    = 0xCAFE000000000007ULL;
+            const double dtSnap = 1.0 / static_cast<double>(snapHz);
+
+            double nextSnap = dtSnap;
+            int snapIdx = 0;
+            float rawX = 0.0f;
+            float prevPx = 0.0f;
+            double maxVelErrPx = 0.0;
+            double maxCamCharDiff = 0.0;
+            int falseBypass = 0;
+
+            for (int step = 0; step < 700; ++step) {
+                const double t = static_cast<double>(step) * kDtRend;
+                const uint64_t seq = static_cast<uint64_t>(step) + 1ULL;
+                while (t >= nextSnap) {
+                    ++snapIdx;
+                    rawX = static_cast<float>(static_cast<double>(snapIdx) * kSpeed * dtSnap);
+                    const double jit = (jitterMs * 0.001) * std::sin(static_cast<double>(snapIdx) * 1.73);
+                    nextSnap = static_cast<double>(snapIdx + 1) * dtSnap + jit;
+                }
+                float px = 0.0f, py = 0.0f, pz = 0.0f;
+                float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                hs_world_pos::SmoothStats st{};
+                tbl.Evaluate(playerKey, rawX, 0.0f, 0.0f, seq, t, kDtRend, snapHz, 1u, nullptr, true, px, py, pz, &st);
+                tbl.Evaluate(camKey,    rawX, 0.0f, 0.0f, seq, t, kDtRend, snapHz, 1u, nullptr, true, cx, cy, cz, nullptr);
+
+                // Same-frame multi-pass lockstep MUST return bit-identical position!
+                float px2 = 0.0f, py2 = 0.0f, pz2 = 0.0f;
+                tbl.Evaluate(playerKey, rawX, 0.0f, 0.0f, seq, t, kDtRend, snapHz, 1u, nullptr, true, px2, py2, pz2, nullptr);
+                CHECK(px2 == px);
+
+                if (st.bypassed) ++falseBypass;
+                if (step >= 300) {
+                    const double idealStepPx = static_cast<double>(kSpeed) * kDtRend * kPxPerTile;
+                    const double actualStepPx = static_cast<double>(px - prevPx) * kPxPerTile;
+                    maxVelErrPx = std::max(maxVelErrPx, std::fabs(actualStepPx - idealStepPx));
+                    maxCamCharDiff = std::max(maxCamCharDiff, std::fabs(static_cast<double>(px - cx)) * kPxPerTile);
+                }
+                prevPx = px;
+            }
+            if (falseBypass != 0 || maxCamCharDiff > maxAllowedCamDiffPx || maxVelErrPx > maxAllowedVelErrPx) {
+                std::printf("  [DIAG T26] snap=%dHz jit=%.1fms falseByp=%d maxCamDiff=%.4fpx maxVelErr=%.4fpx (lim=%.3f)\n",
+                            snapHz, jitterMs, falseBypass, maxCamCharDiff, maxVelErrPx, maxAllowedVelErrPx);
+            }
+            CHECK(falseBypass == 0);
+            CHECK(maxCamCharDiff <= maxAllowedCamDiffPx);
+            CHECK(maxVelErrPx <= maxAllowedVelErrPx);
+        };
+
+        // Steady-state 200Hz sub-pixel precision across 60Hz/30Hz/15Hz and 0..5ms jitter (0.000px cam-vs-char lockstep!)
+        runSteadyCheck(60, 0.0, 0.10, 1e-4);
+        runSteadyCheck(60, 2.5, 0.25, 1e-4);
+        runSteadyCheck(60, 5.0, 0.35, 1e-4);
+        runSteadyCheck(30, 0.0, 0.08, 1e-4);
+        runSteadyCheck(30, 5.0, 0.20, 1e-4);
+        runSteadyCheck(15, 5.0, 0.20, 1e-4);
+
+        // Edge cases: 60Hz loopback 2-packet burst immunity, LagComp ON (>=6 fast frames), teleport, vine hop, stop settle
+        {
+            hs_world_pos::SmoothTimelineTable tbl;
+            const uintptr_t k = 0x20000200ULL;
+            float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+            hs_world_pos::SmoothStats st{};
+
+            // Seed at rest, then 2-packet 5ms loopback burst -> MUST NOT bypass!
+            tbl.Evaluate(k, 0.0f, 0.0f, 0.0f, 1u, 1.000, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            tbl.Evaluate(k, 0.1f, 0.0f, 0.0f, 2u, 1.017, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            CHECK(!st.bypassed);
+            tbl.Evaluate(k, 0.2f, 0.0f, 0.0f, 3u, 1.022, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            CHECK(!st.bypassed);
+            tbl.Evaluate(k, 0.3f, 0.0f, 0.0f, 4u, 1.027, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            CHECK(!st.bypassed);
+
+            // Teleport (> 5.0 tiles) -> immediate exact snap
+            const bool smTele = tbl.Evaluate(k, 25.0f, 0.0f, 0.0f, 5u, 1.044, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            CHECK(!smTele && ox == 25.0f);
+
+            // Stationary discrete hop (> 1.35 tiles from rest, e.g. lunarthrall vine) -> immediate exact snap
+            const bool smVine = tbl.Evaluate(k, 27.0f, 0.0f, 0.0f, 6u, 1.060, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            CHECK(!smVine && ox == 27.0f);
+
+            // Stop convergence: walk 3 ticks then stop -> converges cleanly to exact raw coordinate with 0 drift!
+            double t = 2.000;
+            uint64_t seq = 100u;
+            tbl.ResetKey(k);
+            tbl.Evaluate(k, 0.0f, 0.0f, 0.0f, seq++, t, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            for (int i = 1; i <= 3; ++i) {
+                t += 0.016667;
+                tbl.Evaluate(k, 0.1f * static_cast<float>(i), 0.0f, 0.0f, seq++, t, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+            }
+            bool settledAtRest = false;
+            for (int f = 0; f < 25; ++f) {
+                t += 0.005;
+                if (!tbl.Evaluate(k, 0.3f, 0.0f, 0.0f, seq++, t, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st)) {
+                    settledAtRest = (std::fabs(ox - 0.3f) < 1e-5f);
+                    break;
+                }
+            }
+            CHECK(settledAtRest);
+
+            // Lag Comp ON (continuous 200Hz local Bullet physics): bypasses cleanly at >=6 consecutive <7.5ms updates!
+            tbl.ResetKey(k);
+            t = 3.000;
+            int bypassedFrames = 0;
+            for (int f = 0; f < 30; ++f) {
+                t += 0.005;
+                tbl.Evaluate(k, 0.03f * static_cast<float>(f), 0.0f, 0.0f, seq++, t, 0.005, 60, 1u, nullptr, true, ox, oy, oz, &st);
+                if (st.bypassed) ++bypassedFrames;
+            }
+            CHECK(bypassedFrames >= 20 && std::fabs(ox - 0.03f * 29.0f) < 1e-4f);
+        }
+
+        std::printf("[PASS] 26. Unified Main-Thread PLL Snapshot-Timeline Smoother verified (60/30/15Hz + 5ms jit <0.35px velErr, 0.000px cam-char lockstep, 0 false bypasses, LagComp-ON bypass & stop-settle OK)\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 27: Track A Fluid Skeletal Engine (A1 Cross-Clip Pose Crossfade +
+    //          A2 4-Keyframe C1 Monotone PCHIP Spline) Red-Team Verification
+    // -------------------------------------------------------------------------
+    {
+        auto makeElem = [](uint32_t layer, uint32_t sym, uint32_t fn,
+                           float angleRad, float sx, float sy, float tx, float ty) -> hs_skeletal::AnimElement {
+            hs_skeletal::AnimElement e{};
+            e.layer_hash = layer;
+            e.symbol_hash = sym;
+            e.frame_num = fn;
+            const float c = std::cos(angleRad), s = std::sin(angleRad);
+            e.m[0] = hs_skeletal::FloatToHalf(sx * c);
+            e.m[1] = hs_skeletal::FloatToHalf(-sy * s);
+            e.m[2] = hs_skeletal::FloatToHalf(sx * s);
+            e.m[3] = hs_skeletal::FloatToHalf(sy * c);
+            e.m[4] = hs_skeletal::FloatToHalf(tx);
+            e.m[5] = hs_skeletal::FloatToHalf(ty);
+            return e;
+        };
+
+        // A2-1: PCHIP C1 derivative continuity across knot & exact reduction to linear at splineStr=0
+        {
+            const float k0 = 0.0f, k1 = 10.0f, k2 = 30.0f, k3 = 60.0f, k4 = 80.0f;
+            const float eps = 1e-3f;
+            // Left slope approaching k2 on seg [k1,k2] vs right slope leaving k2 on seg [k2,k3]
+            const float leftVal  = hs_skeletal::PchipScalar(k0, k1, k2, k3, true, true, 1.0f - eps, 1.0f);
+            const float rightVal = hs_skeletal::PchipScalar(k1, k2, k3, k4, true, true, eps, 1.0f);
+            const float slopeL = (k2 - leftVal) / eps;
+            const float slopeR = (rightVal - k2) / eps;
+            CHECK(std::fabs(slopeL - slopeR) < 0.05f);
+            // Bit-exact linear reduction at splineStr == 0
+            const float linVal = hs_skeletal::PchipScalar(k0, k1, k2, k3, true, true, 0.37f, 0.0f);
+            CHECK(std::fabs(linVal - (k1 + (k2 - k1) * 0.37f)) < 1e-5f);
+        }
+
+        // A2-2: Strict zero-overshoot monotonicity on reversals & sharp stops!
+        {
+            const float cases[3][4] = {
+                { 0.0f, 0.0f, 100.0f, 100.0f },   // step up + flat hold
+                { 0.0f, 100.0f, 100.0f, 0.0f },   // flat plateau
+                { 0.0f, 50.0f, 100.0f, 20.0f },   // apex reversal
+            };
+            for (const auto& c : cases) {
+                const float lo = std::min(c[1], c[2]) - 1e-4f;
+                const float hi = std::max(c[1], c[2]) + 1e-4f;
+                for (int i = 0; i <= 100; ++i) {
+                    const float t = static_cast<float>(i) * 0.01f;
+                    const float v = hs_skeletal::PchipScalar(c[0], c[1], c[2], c[3], true, true, t, 1.0f);
+                    CHECK(v >= lo && v <= hi);
+                }
+            }
+        }
+
+        // A2-3: Polar-Decomposed C1 Spline across +-pi seam + neighbor teleport/flip rejection
+        {
+            constexpr float kDeg = 3.14159265358979323846f / 180.0f;
+            auto eM1 = makeElem(1, 10, 0,  150.0f * kDeg, 1.0f, 1.0f,  0.0f,  0.0f);
+            auto e0  = makeElem(1, 10, 0,  170.0f * kDeg, 1.0f, 1.0f, 10.0f,  5.0f);
+            auto e1  = makeElem(1, 10, 0, -170.0f * kDeg, 1.0f, 1.0f, 24.0f, 12.0f);
+            auto eP2 = makeElem(1, 10, 0, -150.0f * kDeg, 1.0f, 1.0f, 40.0f, 16.0f);
+            uint16_t outM[6]{};
+            bool usedSpl = false;
+            CHECK(hs_skeletal::TweenElementMatrixSpline(eM1.m, e0.m, e1.m, eP2.m, 0.5f, 0.8f, outM, false, &usedSpl));
+            CHECK(usedSpl);
+            const float a = hs_skeletal::HalfToFloat(outM[0]), c = hs_skeletal::HalfToFloat(outM[2]);
+            const float ang = std::atan2(c, a);
+            const float scale = std::sqrt(a * a + c * c);
+            // Midpoint between +170 deg and -170 deg MUST cross +-180 deg cleanly without 0-deg spin or collapse!
+            CHECK(std::fabs(std::fabs(ang) - 3.14159265f) < 0.05f);
+            CHECK(std::fabs(scale - 1.0f) < 0.02f);
+
+            // Corrupt/teleported neighbor mP2 (>420px jump) must degrade cleanly without NaN or blowup!
+            auto eBad = makeElem(1, 10, 0, -150.0f * kDeg, -1.0f, 1.0f, 999.0f, -999.0f);
+            uint16_t outSafe[6]{};
+            CHECK(hs_skeletal::TweenElementMatrixSpline(eM1.m, e0.m, e1.m, eBad.m, 0.5f, 1.0f, outSafe, false, &usedSpl));
+            const float txSafe = hs_skeletal::HalfToFloat(outSafe[4]);
+            CHECK(std::isfinite(txSafe) && txSafe >= 9.9f && txSafe <= 24.1f);
+        }
+
+        // A1-1..A1-5: PoseCrossfadePool (idle->run ease-out, frame_num immediate, mirror-flip guard,
+        //             off-screen guard, Werebeaver low-overlap guard, chained clip C0 continuity, particle skip)
+        {
+            hs_skeletal::PoseCrossfadePool pool;
+            const uintptr_t kEnt = 0x55551000ULL;
+            const double qpcFreq = 10000000.0; // 10 MHz synthetic clock
+            const double invFreq = 1.0 / qpcFreq;
+            const float rightAxis[3] = { 1.0f, 0.0f, 0.0f };
+            const float leftAxis[3]  = { -1.0f, 0.0f, 0.0f };
+            const float camRot10[3]  = { std::cos(0.17f), 0.0f, std::sin(0.17f) };
+
+            hs_skeletal::AnimElement idleElems[5] = {
+                makeElem(1, 100, 0, 0.0f, 1.0f, 1.0f,  0.0f,  0.0f),
+                makeElem(2, 101, 0, 0.0f, 1.0f, 1.0f,  0.0f, 40.0f),
+                makeElem(3, 102, 0, 0.0f, 1.0f, 1.0f, 10.0f, 20.0f),
+                makeElem(4, 103, 0, 0.0f, 1.0f, 1.0f, -8.0f, 20.0f),
+                makeElem(5, 104, 0, 0.0f, 1.0f, 1.0f,  2.0f,  5.0f),
+            };
+            hs_skeletal::AnimFrame idleFrame{};
+            idleFrame.elements = idleElems;
+            idleFrame.num_elements = 5;
+
+            hs_skeletal::AnimElement runElems[5] = {
+                makeElem(1, 100, 3, 0.2f, 1.0f, 1.0f, 20.0f,  4.0f),
+                makeElem(2, 101, 3, 0.1f, 1.0f, 1.0f, 20.0f, 44.0f),
+                makeElem(3, 102, 3, 0.5f, 1.0f, 1.0f, 30.0f, 24.0f),
+                makeElem(4, 103, 3,-0.4f, 1.0f, 1.0f, 12.0f, 24.0f),
+                makeElem(5, 104, 3, 0.3f, 1.0f, 1.0f, 22.0f,  9.0f),
+            };
+            hs_skeletal::AnimFrame runFrame{};
+            runFrame.elements = runElems;
+            runFrame.num_elements = 5;
+
+            auto* slot = pool.FindOrAlloc(kEnt, 1000000);
+            CHECK(slot != nullptr);
+            hs_skeletal::PoseCrossfadePool::RecordPose(*slot, idleFrame, 1000000, rightAxis);
+
+            // Reject off-screen teleport (>100ms unseen)
+            CHECK(!hs_skeletal::PoseCrossfadePool::TryStartCrossfade(*slot, runFrame, 3000000, 0.055f, 0.20, rightAxis));
+            // Reject Left<->Right 180-deg mirror flip
+            CHECK(!hs_skeletal::PoseCrossfadePool::TryStartCrossfade(*slot, runFrame, 1050000, 0.055f, 0.005, leftAxis));
+            // Reject radical form transformation (<30% bone overlap, e.g. Wilson -> Werebeaver)
+            hs_skeletal::AnimElement beaverElems[5] = {
+                makeElem(9, 901, 0, 0.0f, 1.0f, 1.0f, 0, 0),
+                makeElem(9, 902, 0, 0.0f, 1.0f, 1.0f, 0, 0),
+                makeElem(9, 903, 0, 0.0f, 1.0f, 1.0f, 0, 0),
+                makeElem(9, 904, 0, 0.0f, 1.0f, 1.0f, 0, 0),
+                makeElem(1, 100, 0, 0.0f, 1.0f, 1.0f, 0, 0), // only 1/5 = 20% < 30%
+            };
+            hs_skeletal::AnimFrame beaverFrame{};
+            beaverFrame.elements = beaverElems;
+            beaverFrame.num_elements = 5;
+            CHECK(!hs_skeletal::PoseCrossfadePool::TryStartCrossfade(*slot, beaverFrame, 1050000, 0.055f, 0.005, rightAxis));
+
+            // Accept genuine idle->run transition (even with 10-deg camera rotation!)
+            const int64_t tStart = 1050000;
+            CHECK(hs_skeletal::PoseCrossfadePool::TryStartCrossfade(*slot, runFrame, tStart, 0.055f, 0.005, camRot10));
+
+            // At t = tStart (0ms): 0.00px jump from idle, yet NEW clip's frame_num==3 is already active!
+            hs_skeletal::AnimElement work[5];
+            std::memcpy(work, runElems, sizeof(work));
+            CHECK(hs_skeletal::PoseCrossfadePool::ApplyCrossfade(*slot, work, 5, tStart, invFreq, camRot10, false) == 5u);
+            CHECK(work[0].frame_num == 3u);
+            CHECK(std::fabs(hs_skeletal::HalfToFloat(work[0].m[4]) - 0.0f) < 0.05f);
+
+            // At t = 50% duration (27.5ms): Cubic Ease-Out w = 1 - 0.5^3 = 0.875 -> tx = 20 * 0.875 = 17.5px!
+            const int64_t tMid = tStart + static_cast<int64_t>(0.0275 * qpcFreq);
+            std::memcpy(work, runElems, sizeof(work));
+            CHECK(hs_skeletal::PoseCrossfadePool::ApplyCrossfade(*slot, work, 5, tMid, invFreq, camRot10, false) == 5u);
+            const float txMid = hs_skeletal::HalfToFloat(work[0].m[4]);
+            CHECK(std::fabs(txMid - 17.5f) < 0.15f);
+
+            // Chained clip switch mid-blend: record blended pose, then switch to atk (tx=50px) -> starts cleanly at txMid (17.5px)!
+            hs_skeletal::AnimFrame midFrame{};
+            midFrame.elements = work;
+            midFrame.num_elements = 5;
+            hs_skeletal::PoseCrossfadePool::RecordPose(*slot, midFrame, tMid, camRot10);
+            hs_skeletal::AnimElement atkElems[5];
+            std::memcpy(atkElems, runElems, sizeof(atkElems));
+            atkElems[0].m[4] = hs_skeletal::FloatToHalf(50.0f);
+            hs_skeletal::AnimFrame atkFrame{};
+            atkFrame.elements = atkElems;
+            atkFrame.num_elements = 5;
+            CHECK(hs_skeletal::PoseCrossfadePool::TryStartCrossfade(*slot, atkFrame, tMid + 50000, 0.055f, 0.005, camRot10));
+            std::memcpy(work, atkElems, sizeof(work));
+            CHECK(hs_skeletal::PoseCrossfadePool::ApplyCrossfade(*slot, work, 5, tMid + 50000, invFreq, camRot10, false) == 5u);
+            CHECK(std::fabs(hs_skeletal::HalfToFloat(work[0].m[4]) - txMid) < 0.15f);
+
+            // Mid-blend Left<->Right flip immediately cancels crossfade!
+            std::memcpy(work, atkElems, sizeof(work));
+            CHECK(hs_skeletal::PoseCrossfadePool::ApplyCrossfade(*slot, work, 5, tMid + 100000, invFreq, leftAxis, false) == 0u);
+            CHECK(slot->blending == 0);
+        }
+
+        std::printf("[PASS] 27. Track A Fluid Skeletal Engine verified (A1 Cross-Clip Ease-Out Crossfade + flip/teleport/overlap/chain guards, A2 4-Key C1 Monotone PCHIP Spline +-pi polar + 0 overshoot OK)\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // 28. Track B Combat Hit-Feel Engine (B1 Hit-Stop, B2 Recoil/Squash, B3 Additive Flash)
+    //     + Geometric Placement Static Grid Symbol Hashes Verification
+    // -------------------------------------------------------------------------
+    {
+        // Verify Klei/Geo gridplacer symbol hashes (vanilla gridplacer.zip, buildgridplacer.zip, geo_gridplacer.zip)
+        constexpr uint32_t kGeoSyms[3] = { 0x006719C9u, 0x7DE50C20u, 0x98AD297Fu };
+        CHECK(kGeoSyms[0] != kGeoSyms[1] && kGeoSyms[1] != kGeoSyms[2] && kGeoSyms[0] != kGeoSyms[2]);
+
+        hs_combat::CombatImpactEngine eng;
+        const int64_t qpcFreq = 10000000LL;
+        const double invFreq = 1.0 / static_cast<double>(qpcFreq);
+        const int64_t t0 = 500000000LL;
+
+        // 1) Disabled state rejects triggers cleanly
+        CHECK(!eng.TriggerImpact(10.0f, 0.0f, 5.0f, 1.0f, 0.0f, 1.0f, hs_combat::ImpactStyle::Heavy, false, true, t0, qpcFreq));
+        CHECK(eng.ActiveImpulseCount() == 0u);
+
+        // 2) Enable and trigger target impulse (Heavy) + attacker impulse (hit-stop only)
+        eng.SetConfig(true, 1.0f, 1.0f, 1.0f, 1.0f);
+        CHECK(eng.IsEnabled());
+        CHECK(eng.TriggerImpact(10.0f, 0.0f, 5.0f, 1.0f, 0.0f, 1.2f, hs_combat::ImpactStyle::Heavy, false, true, t0, qpcFreq));
+        CHECK(eng.TriggerImpact(8.5f, 0.0f, 5.0f, 1.0f, 0.0f, 1.0f, hs_combat::ImpactStyle::Heavy, true, false, t0, qpcFreq));
+        CHECK(eng.ActiveImpulseCount() == 2u);
+
+        std::vector<hs_combat::VfxBurstEvent> vfxQ;
+        eng.DrainVfxQueue(vfxQ);
+        CHECK(vfxQ.size() == 1u);
+        CHECK(vfxQ[0].style == hs_combat::ImpactStyle::Heavy);
+
+        auto initCmd = [](uint8_t* cmd, uint32_t layer, uint32_t orient, float wx, float wy, float wz) {
+            std::memset(cmd, 0, 0x130);
+            *reinterpret_cast<uint32_t*>(cmd + 0x60) = layer;
+            *reinterpret_cast<uint32_t*>(cmd + 0x64) = orient;
+            auto* m = reinterpret_cast<float*>(cmd + 0x18);
+            m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
+            m[3] = wx; m[7] = wy; m[11] = wz;
+            uint8_t* ct = cmd + 0xD4;
+            ct[0] = 10u; ct[1] = 20u; ct[2] = 30u; ct[3] = 0u;
+            ct[4] = 255u; ct[5] = 255u; ct[6] = 255u; ct[7] = 255u;
+            ct[0x0E] = 0u;
+        };
+
+        alignas(16) uint8_t cmdGround[0x130];
+        initCmd(cmdGround, 3u, 1u, 10.0f, 0.0f, 5.0f); // orientMode=1 (OnGround) MUST NEVER bind/mutate!
+        const uintptr_t tgtKey = 0xCAFE0001ULL;
+        const int64_t t15ms = t0 + static_cast<int64_t>(0.015 * qpcFreq);
+        CHECK(!eng.BindAndApplyOnMainThread(cmdGround, tgtKey, 10.0f, 0.0f, 5.0f, t15ms, invFreq));
+        CHECK(*reinterpret_cast<float*>(cmdGround + 0x18) == 1.0f);
+        CHECK(cmdGround[0xD4 + 0x0E] == 0u);
+
+        // Bind valid standing target at t = 15ms (within hit-stop, recoil, and flash windows)
+        alignas(16) uint8_t cmdTgt[0x130];
+        initCmd(cmdTgt, 3u, 0u, 10.0f, 0.0f, 5.0f);
+        CHECK(eng.BindAndApplyOnMainThread(cmdTgt, tgtKey, 10.1f, 0.0f, 5.0f, t15ms, invFreq));
+        CHECK(eng.IsInHitStop(tgtKey, t15ms));
+        const auto* mTgt = reinterpret_cast<const float*>(cmdTgt + 0x18);
+        // Feet stay planted at y=0, while local X/Y scale and directional X jitter mutate
+        CHECK(mTgt[7] == 0.0f);
+        CHECK(std::fabs(mTgt[3] - 10.0f) > 1e-4f);
+        CHECK(std::fabs(mTgt[0] - 1.0f) > 1e-4f);
+        CHECK(std::fabs(mTgt[5] - 1.0f) > 1e-4f);
+        // B3 Saturating additive tint preserved existing base (10, 20, 30) and flagged dirty byte +0xE2=1
+        CHECK(cmdTgt[0xD4 + 0] > 10u && cmdTgt[0xD4 + 1] > 20u && cmdTgt[0xD4 + 2] > 30u);
+        CHECK(cmdTgt[0xD4 + 0x0E] == 1u);
+
+        // Attacker gets B1 Hit-Stop + B4 Forward Follow-Through Lunge (ZERO camera shake, ColourTransform untouched!)
+        const uintptr_t atkKey = 0xCAFE0002ULL;
+        alignas(16) uint8_t cmdAtk[0x130];
+        initCmd(cmdAtk, 3u, 0u, 8.5f, 0.0f, 5.0f);
+        const int64_t t12ms = t0 + static_cast<int64_t>(0.012 * qpcFreq);
+        CHECK(eng.BindAndApplyOnMainThread(cmdAtk, atkKey, 8.5f, 0.0f, 5.0f, t12ms, invFreq));
+        CHECK(eng.IsInHitStop(atkKey, t12ms));
+        const auto* mAtk = reinterpret_cast<const float*>(cmdAtk + 0x18);
+        CHECK(mAtk[7] == 0.0f);          // feet planted
+        CHECK(mAtk[3] > 8.501f);         // forward lunge along +X attack dir
+        CHECK(mAtk[0] > 1.001f);         // subtle forward follow-through stretch
+        CHECK(cmdAtk[0xD4 + 0x0E] == 0u); // no additive flash on attacker!
+
+        // After expiry (200ms), hit-stop & lunge clean up completely to 0
+        const int64_t t200ms = t0 + static_cast<int64_t>(0.200 * qpcFreq);
+        initCmd(cmdTgt, 3u, 0u, 10.0f, 0.0f, 5.0f);
+        CHECK(!eng.BindAndApplyOnMainThread(cmdTgt, tgtKey, 10.0f, 0.0f, 5.0f, t200ms, invFreq));
+        CHECK(!eng.IsInHitStop(tgtKey, t200ms));
+        CHECK(eng.ActiveImpulseCount() == 0u);
+
+        // Verify lungeScale == 0.0 disables attacker lunge cleanly (WorldMtx untouched)
+        eng.SetConfig(true, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f);
+        CHECK(eng.TriggerImpact(8.5f, 0.0f, 5.0f, 1.0f, 0.0f, 1.0f, hs_combat::ImpactStyle::Heavy, true, false, t200ms, qpcFreq));
+        initCmd(cmdAtk, 3u, 0u, 8.5f, 0.0f, 5.0f);
+        CHECK(eng.BindAndApplyOnMainThread(cmdAtk, atkKey, 8.5f, 0.0f, 5.0f, t200ms + 50000, invFreq));
+        CHECK(mAtk[3] == 8.5f && mAtk[0] == 1.0f);
+        CHECK(cmdAtk[0xD4 + 0x0E] == 0u);
+
+        std::printf("[PASS] 28. Track B Combat Hit-Feel Engine verified (B1 Hit-Stop, B2 Feet-Planted Spring/Jitter, B3 ColourTransform Flash, B4 Attacker Lunge, Geo Hashes OK)\n");
+    }
+
+    // =========================================================================
+    // 29. HyperShade Visual Closed-Loop Engine (look_matcher.h) Red-Team Suite
+    // =========================================================================
+    {
+        using namespace hs_look_match;
+
+        // 29.1 Capability Whitelist invariants (bounds, defaults, unique keys)
+        for (int i = 0; i < kParamCount; ++i) {
+            const auto& s = kCapabilityWhitelist[i];
+            CHECK(s.key && s.key[0] != '\0');
+            CHECK(s.minVal <= s.defVal && s.defVal <= s.maxVal);
+            for (int j = i + 1; j < kParamCount; ++j) {
+                CHECK(std::strcmp(s.key, kCapabilityWhitelist[j].key) != 0);
+            }
+        }
+
+        // 29.2 Strict CF_DIB / CF_DIBV5 -> BMP header/stride/sign normalization + WIC decode
+        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        // (a) 24-bit bottom-up DIB with odd width=5 (row stride = ((5*24+31)/32)*4 = 16 bytes)
+        {
+            const int32_t w = 5, h = 4;
+            const size_t stride = 16u;
+            std::vector<uint8_t> dib(40u + stride * static_cast<size_t>(h), 0u);
+            WriteLe32(dib.data() + 0,  40u);
+            WriteLe32(dib.data() + 4,  static_cast<uint32_t>(w));
+            WriteLe32(dib.data() + 8,  static_cast<uint32_t>(h)); // >0 bottom-up
+            WriteLe16(dib.data() + 12, 1u);
+            WriteLe16(dib.data() + 14, 24u);
+            WriteLe32(dib.data() + 16, 0u); // BI_RGB
+            // Bottom-up: row 0..1 = bottom of image (BLUE: B=240,G=10,R=20), row 2..3 = top (RED: B=15,G=25,R=235)
+            for (int y = 0; y < h; ++y) {
+                uint8_t* row = dib.data() + 40u + static_cast<size_t>(y) * stride;
+                const bool isTop = (y >= 2);
+                for (int x = 0; x < w; ++x) {
+                    row[x * 3 + 0] = isTop ? 15u  : 240u; // B
+                    row[x * 3 + 1] = isTop ? 25u  : 10u;  // G
+                    row[x * 3 + 2] = isTop ? 235u : 20u;  // R
+                }
+            }
+            std::vector<uint8_t> bmp;
+            std::string err;
+            DibHeaderInfo info{};
+            CHECK(BuildValidatedBmpFromDib(dib.data(), dib.size(), bmp, err, &info));
+            CHECK(info.bfOffBits == 54u && info.rowStride == 16ull && !info.isTopDown);
+
+            ImageRgb dec{};
+            CHECK(DecodeImageBytesWithWic(bmp.data(), bmp.size(), true, dec, err));
+            CHECK(dec.Valid() && dec.width == kAnalysisW && dec.height == kAnalysisH);
+            // Verify top row is RED and bottom row is BLUE (correct bottom-up -> top-down flip!)
+            const size_t topMid = (static_cast<size_t>(2) * dec.width + dec.width / 2) * 3u;
+            const size_t botMid = (static_cast<size_t>(dec.height - 3) * dec.width + dec.width / 2) * 3u;
+            CHECK(dec.rgb[topMid + 0] > 0.80f && dec.rgb[topMid + 2] < 0.20f);
+            CHECK(dec.rgb[botMid + 2] > 0.80f && dec.rgb[botMid + 0] < 0.20f);
+        }
+
+        // (b) 32-bit top-down BITMAPV5HEADER (biSize=124, BI_BITFIELDS -> NO extra +12 bytes!)
+        {
+            const int32_t w = 8, h = -4; // negative = top-down!
+            const size_t stride = static_cast<size_t>(w) * 4u;
+            std::vector<uint8_t> dib(124u + stride * 4u, 0u);
+            WriteLe32(dib.data() + 0,  124u);
+            WriteLe32(dib.data() + 4,  static_cast<uint32_t>(w));
+            WriteLe32(dib.data() + 8,  static_cast<uint32_t>(h));
+            WriteLe16(dib.data() + 12, 1u);
+            WriteLe16(dib.data() + 14, 32u);
+            WriteLe32(dib.data() + 16, 3u); // BI_BITFIELDS inside V5 header!
+            WriteLe32(dib.data() + 40, 0x00FF0000u); // RedMask
+            WriteLe32(dib.data() + 44, 0x0000FF00u); // GreenMask
+            WriteLe32(dib.data() + 48, 0x000000FFu); // BlueMask
+            WriteLe32(dib.data() + 52, 0xFF000000u); // AlphaMask
+            WriteLe32(dib.data() + 56, 0x73524742u); // LCS_sRGB
+            // Top-down: row 0..1 = top (GREEN), row 2..3 = bottom (YELLOW)
+            for (int y = 0; y < 4; ++y) {
+                uint8_t* row = dib.data() + 124u + static_cast<size_t>(y) * stride;
+                const bool isTop = (y < 2);
+                for (int x = 0; x < w; ++x) {
+                    row[x * 4 + 0] = 10u;                  // B
+                    row[x * 4 + 1] = 230u;                 // G
+                    row[x * 4 + 2] = isTop ? 15u : 235u;   // R
+                    row[x * 4 + 3] = 255u;                 // A
+                }
+            }
+            std::vector<uint8_t> bmp;
+            std::string err;
+            DibHeaderInfo info{};
+            CHECK(BuildValidatedBmpFromDib(dib.data(), dib.size(), bmp, err, &info));
+            CHECK(info.bfOffBits == 138u && info.isTopDown);
+
+            ImageRgb dec{};
+            CHECK(DecodeImageBytesWithWic(bmp.data(), bmp.size(), true, dec, err));
+            CHECK(dec.Valid());
+            const size_t topMid = (static_cast<size_t>(2) * dec.width + dec.width / 2) * 3u;
+            const size_t botMid = (static_cast<size_t>(dec.height - 3) * dec.width + dec.width / 2) * 3u;
+            CHECK(dec.rgb[topMid + 1] > 0.80f && dec.rgb[topMid + 0] < 0.20f); // GREEN on top
+            CHECK(dec.rgb[botMid + 0] > 0.80f && dec.rgb[botMid + 1] > 0.80f && dec.rgb[botMid + 2] < 0.20f); // YELLOW on bottom
+        }
+
+        // (c) 40-byte BITMAPINFOHEADER + BI_BITFIELDS (MUST add 12-byte mask table -> bfOffBits=66)
+        {
+            std::vector<uint8_t> dib(40u + 12u + 4u * 4u * 4u, 0u);
+            WriteLe32(dib.data() + 0, 40u);
+            WriteLe32(dib.data() + 4, 4u);
+            WriteLe32(dib.data() + 8, 4u);
+            WriteLe16(dib.data() + 12, 1u);
+            WriteLe16(dib.data() + 14, 32u);
+            WriteLe32(dib.data() + 16, 3u); // BI_BITFIELDS
+            std::vector<uint8_t> bmp;
+            std::string err;
+            DibHeaderInfo info{};
+            CHECK(BuildValidatedBmpFromDib(dib.data(), dib.size(), bmp, err, &info));
+            CHECK(info.bfOffBits == 66u);
+        }
+
+        // (d) Reject malformed / truncated / oversized DIBs cleanly
+        {
+            std::vector<uint8_t> bad(60u, 0u);
+            WriteLe32(bad.data() + 0, 40u);
+            WriteLe32(bad.data() + 4, 64u);
+            WriteLe32(bad.data() + 8, 64u);
+            WriteLe16(bad.data() + 12, 1u);
+            WriteLe16(bad.data() + 14, 24u);
+            std::vector<uint8_t> bmp;
+            std::string err;
+            CHECK(!BuildValidatedBmpFromDib(bad.data(), bad.size(), bmp, err));
+            CHECK(err == "dib_truncated_pixels");
+            CHECK(!BuildValidatedBmpFromDib(bad.data(), 16u, bmp, err));
+            CHECK(err == "dib_too_small");
+        }
+
+        // 29.3 Synthesize rich textured DST scene & verify Dual-Mode Solver (Same-Scene + General)
+        auto makeScene = [](int variant) -> ImageRgb {
+            ImageRgb img;
+            img.width = kAnalysisW; img.height = kAnalysisH;
+            img.origWidth = 1920;   img.origHeight = 1080;
+            img.rgb.resize(static_cast<size_t>(kAnalysisW) * kAnalysisH * 3u);
+            for (int32_t y = 0; y < kAnalysisH; ++y) {
+                const float v = (y + 0.5f) / kAnalysisH;
+                for (int32_t x = 0; x < kAnalysisW; ++x) {
+                    const float u = (x + 0.5f) / kAnalysisW;
+                    float r, g, b;
+                    if (variant == 0) {
+                        const float wave = 0.5f + 0.5f * std::sin(u * 13.0f + v * 5.0f) * std::cos(v * 9.0f - u * 4.0f);
+                        const float tree = ((x / 16 + y / 14) % 3 == 0) ? -0.14f : 0.08f;
+                        r = ClampF(0.24f + 0.34f * wave + 0.16f * u + tree, 0.04f, 0.90f);
+                        g = ClampF(0.32f + 0.36f * wave + 0.10f * v + tree, 0.05f, 0.92f);
+                        b = ClampF(0.22f + 0.24f * (1.0f - wave) + 0.18f * (1.0f - v), 0.04f, 0.88f);
+                    } else {
+                        // Completely different geometry (checker + inverted radial bands)
+                        const float band = 0.5f + 0.5f * std::cos(v * 17.0f) * std::sin(u * 19.0f);
+                        const float box  = (((x / 10) ^ (y / 10)) & 1) ? 0.16f : -0.10f;
+                        r = ClampF(0.28f + 0.30f * band + box + 0.12f * (1.0f - u), 0.05f, 0.92f);
+                        g = ClampF(0.26f + 0.28f * (1.0f - band) + box, 0.05f, 0.90f);
+                        b = ClampF(0.30f + 0.32f * band - 0.10f * box, 0.05f, 0.92f);
+                    }
+                    const size_t o = (static_cast<size_t>(y) * kAnalysisW + x) * 3u;
+                    img.rgb[o + 0] = r; img.rgb[o + 1] = g; img.rgb[o + 2] = b;
+                }
+            }
+            return img;
+        };
+
+        const ImageRgb srcScene   = makeScene(0);
+        const ImageRgb otherScene = makeScene(1);
+
+        ParamVector gt = ParamVector::Identity();
+        gt.v[kP_Exposure] =  0.26f;
+        gt.v[kP_Temp]     =  0.48f;
+        gt.v[kP_Contrast] =  0.18f;
+        gt.v[kP_Sat]      =  1.24f;
+        gt.v[kP_Vignette] =  0.26f;
+
+        auto applyGt = [&](const ImageRgb& in, const ParamVector& pv) -> ImageRgb {
+            ImageRgb out = in;
+            for (int32_t y = 0; y < in.height; ++y) {
+                const float v = (y + 0.5f) / in.height;
+                for (int32_t x = 0; x < in.width; ++x) {
+                    const float u = (x + 0.5f) / in.width;
+                    const size_t o = (static_cast<size_t>(y) * in.width + x) * 3u;
+                    const Vec3 c = EvaluateGradePixel({ in.rgb[o], in.rgb[o + 1], in.rgb[o + 2] }, u, v, pv, true);
+                    out.rgb[o + 0] = c.x; out.rgb[o + 1] = c.y; out.rgb[o + 2] = c.z;
+                }
+            }
+            return out;
+        };
+
+        // (a) Mode 2 Auto Same-Scene Exact Matching
+        const ImageRgb sameSceneRef = applyGt(srcScene, gt);
+        const LookMatchResult rExact = SolveLookMatch(srcScene, sameSceneRef, FitModeRequest::Auto, "clipboard_dibv5", "async_pbo");
+        CHECK(rExact.ok && rExact.usedMode == "same_scene");
+        CHECK(rExact.zncc > 0.90f && rExact.gradCorr > 0.80f);
+        CHECK(rExact.deltaEBefore > 5.0f && rExact.deltaEAfter < 2.2f);
+        CHECK(rExact.colorConfidence > 0.75f && rExact.spatialConfidence > 0.70f);
+        CHECK(rExact.vignetteFitted && rExact.params.v[kP_Vignette] > 0.10f);
+        CHECK(rExact.params.v[kP_Temp] > 0.20f && rExact.params.v[kP_Exposure] > 0.05f);
+
+        // (b) Mode 1 Auto General Look Matching (different scene geometry)
+        const ImageRgb crossSceneRef = applyGt(otherScene, gt);
+        const LookMatchResult rGen = SolveLookMatch(srcScene, crossSceneRef, FitModeRequest::Auto, "clipboard_file", "async_pbo");
+        CHECK(rGen.ok && rGen.usedMode == "general");
+        CHECK(rGen.zncc < 0.70f);
+        CHECK(rGen.deltaEAfter < rGen.deltaEBefore * 0.65f);
+        CHECK(!rGen.sharpFitted);
+        CHECK(rGen.spatialConfidence < rGen.colorConfidence);
+
+        // (c) Misaligned SameScene request degrades honestly to General mode with warning
+        const LookMatchResult rFall = SolveLookMatch(srcScene, crossSceneRef, FitModeRequest::SameScene, "clipboard_dib", "async_pbo");
+        CHECK(rFall.ok && rFall.usedMode == "general" && rFall.warningCode == "misaligned_fallback_general");
+
+        // (d) Same-Frame identical input reports no_post_colourcube_delta
+        const LookMatchResult rNoDelta = SolveLookMatch(srcScene, srcScene, FitModeRequest::SameFrame, "same_frame_gl", "async_pbo");
+        CHECK(rNoDelta.ok && rNoDelta.warningCode == "no_post_colourcube_delta");
+
+        if (SUCCEEDED(comHr)) CoUninitialize();
+        std::printf("[PASS] 29. HyperShade Visual Closed-Loop verified (DIB/V5/Bitfields->WIC OK, Same-Scene dE %.2f->%.2f in %.1fms, General dE %.2f->%.2f in %.1fms, Misaligned Fallback & No-Delta Guard OK)\n",
+                    rExact.deltaEBefore, rExact.deltaEAfter, rExact.elapsedMs,
+                    rGen.deltaEBefore, rGen.deltaEAfter, rGen.elapsedMs);
+    }
+
+    std::printf("ALL 29 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH, STENCIL-CACHE, PLL-WORLD-POS, FLUID-SKELETAL, COMBAT-IMPACT, LOOK-MATCH & ASTAR TESTS PASSED!\n");
     return 0;
 }

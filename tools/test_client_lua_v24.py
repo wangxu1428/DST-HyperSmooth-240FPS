@@ -56,7 +56,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.8.0", "Expected modinfo version 2.8.0, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.9.5", "Expected modinfo version 2.9.5, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do
@@ -90,7 +90,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env_en)
     fn_info()
-    assert(bare_env_en.version == "2.8.0", "Expected EN modinfo version 2.8.0, got " .. tostring(bare_env_en.version))
+    assert(bare_env_en.version == "2.9.5", "Expected EN modinfo version 2.9.5, got " .. tostring(bare_env_en.version))
     assert(type(bare_env_en.name) == "string" and bare_env_en.name ~= bare_env.name,
            "Expected localized EN modinfo name to differ from ZH")
     assert(type(bare_env_en.description) == "string" and bare_env_en.description ~= bare_env.description,
@@ -192,7 +192,7 @@ AddSimPostInit(function()
                 return true, 10, mStr, 1.5, 0.3, 2.2, 0.4, 445, 452, 7200
             end,
             HyperSmooth_GetFrameStats = function() return 239.8, 226.4, 4.21, 0.04, 15, native_sim_hz end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.8.0" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
             HyperSmooth_SetSimTickRate = function(hz)
                 if hz == 30 or hz == 60 then native_sim_hz = hz; return true end
                 return false
@@ -326,15 +326,13 @@ AddSimPostInit(function()
         setfenv(fn_main, env)
         fn_main()
 
-        -- Verify Player-First Default: 100% Vanilla Pure (0 forced post-process, 0 world shaders!)
-        -- Note: BloomSampler canvas pre-allocates at 1.0x HD during ModShadersInit (only phase Klei allows resize)
-        -- so live F7 switching to Preset 2 gets full-res shadows immediately; costs 0ms when Bloom & Shadows OFF!
-        assert(type(env.Assets) == "table" and #env.Assets == 4, "Expected 4 SHADER Assets")
+        -- Verify Player-First Default: 100% Vanilla Pure (0 forced post-process, 0 world shaders, exact 0.25x BloomSampler!)
+        assert(type(env.Assets) == "table" and #env.Assets == 16, "Expected 16 Assets (4 custom shaders + 2 VFX shaders + 6 FX images + lightrays + 2 shade tex + ds_fog1), got " .. tostring(env.Assets and #env.Assets))
         assert(#hooks.sh_init == 1 and #hooks.sh_sort == 1, "Expected ModShadersInit & Sort hooks")
         hooks.sh_init[1]()
         hooks.sh_sort[1]()
-        assert(pp_bloom_params ~= nil and pp_bloom_params[2] == 1.0 and pp_bloom_params[3] == 1.0,
-            "Fluid Shadow Engine v2 must pre-configure 1.0x HD BloomSampler during ModShadersInit!")
+        assert(pp_bloom_params == nil,
+            "Vanilla Pure (Preset 0) MUST keep Klei's exact stock 0.25x BloomSampler untouched (prevents Magiluminescence bloom distortion)!")
         assert(fakeG.PostProcessorEffects.HS_Bloom ~= nil and fakeG.PostProcessorEffects.HS_VisualFinal ~= nil, "Visual shaders missing")
         assert(pp_enabled[1] == true and pp_enabled[fakeG.PostProcessorEffects.HS_Bloom] == false, "Default Vanilla must keep stock Bloom untouched")
         assert(pp_enabled[fakeG.PostProcessorEffects.HS_VisualFinal] == false, "Default Vanilla must NOT enable HS_VisualFinal!")
@@ -418,10 +416,10 @@ AddSimPostInit(function()
         -- Verify DLL Version Handshake & Update Banner status detection ("ok" / "outdated" / "missing")
         do
             local st, ver, exp = fakeG.HyperSmooth_GetDllStatus()
-            assert(st == "ok" and ver == "2.8.0" and exp == "2.8.0",
-                   "Expected ok/2.8.0/2.8.0, got " .. tostring(st) .. "/" .. tostring(ver))
+            assert(st == "ok" and ver == "2.9.5" and exp == "2.9.5",
+                   "Expected ok/2.9.5/2.9.5, got " .. tostring(st) .. "/" .. tostring(ver))
             local snap_ok = env.HS_PanelApi.GetSnapshot()
-            assert(snap_ok.dll_status == "ok" and snap_ok.dll_ver == "2.8.0", "Panel snapshot dll_status ok mismatch")
+            assert(snap_ok.dll_status == "ok" and snap_ok.dll_ver == "2.9.5", "Panel snapshot dll_status ok mismatch")
 
             local saved_ver = fakeG.HyperSmooth_Version
             local saved_fps = fakeG.HyperSmooth_SetFps
@@ -1408,7 +1406,44 @@ AddSimPostInit(function()
             assert(opt_res[name] == exp, "O(slots) snapshot parity mismatch on " .. name .. ": got " .. tostring(opt_res[name]) .. " exp " .. tostring(exp))
         end
 
-        print(string.format("[CLIENT_V24_TEST] 10. CraftingMenu Zero-Stall PASS (600/600 vanilla O(slots) + early-exit mod memo exact parity, Has %d->%d, hidden UI deferred 3->0 & flushed on Open)",
+        -- Round 2 regression (P2 #6): CraftingMenuHUD:Open error-retry!
+        -- If ApplyFilters throws on 1st Open(), orig_Open MUST still run AND deferred flags MUST NOT be consumed!
+        local open_runs_r2, apply_attempts_r2, apply_ok_r2 = 0, 0, 0
+        local cm_r2 = {
+            crafting_hud = { IsCraftingOpen = function() return false end },
+            UpdateFilterButtons = function() return true end,
+            ApplyFilters = function()
+                apply_attempts_r2 = apply_attempts_r2 + 1
+                if apply_attempts_r2 == 1 then
+                    G.error("simulated third-party mod filter error")
+                end
+                apply_ok_r2 = apply_ok_r2 + 1
+            end,
+            details_root = { Refresh = function() end },
+            Refresh = function() end,
+        }
+        local hud_r2 = {
+            owner = real_owner,
+            craftingmenu = cm_r2,
+            RebuildRecipes = function() end,
+            Open = function(self) open_runs_r2 = open_runs_r2 + 1 return true end,
+        }
+        class_hooks["widgets/redux/craftingmenu_widget"](cm_r2)
+        class_hooks["widgets/redux/craftingmenu_hud"](hud_r2)
+        cm_r2:Refresh(true)
+        assert(cm_r2._hs_deferred_refresh == true and cm_r2._hs_deferred_rebuild == true, "Deferred flags not set")
+        hud_r2:Open() -- 1st Open: ApplyFilters throws, orig_Open still executes, flags MUST remain true!
+        assert(open_runs_r2 == 1 and apply_attempts_r2 == 1 and apply_ok_r2 == 0,
+            "1st Open failed to preserve orig_Open or attempt ApplyFilters")
+        assert(cm_r2._hs_deferred_refresh == true and cm_r2._hs_deferred_rebuild == true,
+            "Round 2 P2 #6 REGRESSION: failed ApplyFilters prematurely cleared deferred flags!")
+        hud_r2:Open() -- 2nd Open: retries ApplyFilters, succeeds, THEN clears flags!
+        assert(open_runs_r2 == 2 and apply_attempts_r2 == 2 and apply_ok_r2 == 1,
+            "2nd Open did not retry ApplyFilters after 1st failure!")
+        assert(cm_r2._hs_deferred_refresh == false and cm_r2._hs_deferred_rebuild == false,
+            "2nd Open did not clear deferred flags after success!")
+
+        print(string.format("[CLIENT_V24_TEST] 10. CraftingMenu Zero-Stall PASS (600/600 vanilla O(slots) + early-exit mod memo exact parity, Has %d->%d, hidden UI deferred 3->0 & Open error-retry verified)",
             vanilla_calls, mod_has_calls))
     end
 
@@ -1473,8 +1508,9 @@ AddSimPostInit(function()
                "TrueScrollArea 4x 240Hz should equal 30.0 (1x 60Hz), got " .. tostring(area.current_scroll_pos))
         assert(area.target_scroll_pos == 100, "TrueScrollArea target_scroll_pos drifted!")
 
-        -- 11b) FollowText 240Hz smooth interpolation + >5u teleport snap
+        -- 11b) FollowText 240Hz smooth interpolation + >5u teleport snap + LagComp/No-DLL zero-jitter bypass!
         assert(type(class_hooks["widgets/followtext"]) == "function", "followtext hook missing!")
+        fakeG11.HyperSmooth_SetFps = function() end
         local ent_x = 0.0
         local last_ft_x = 0
         local ft = {
@@ -1499,16 +1535,56 @@ AddSimPostInit(function()
         assert(last_ft_x == 0)
         for _ = 1, 7 do ft:OnUpdate(1/240) end -- advance ~33ms
         ent_x = 1.0 -- 30Hz sim step!
-        ft:OnUpdate(1/240) -- right on step edge -> C0 smooth near 0
+        ft:OnUpdate(1/240) -- right on step edge -> C0 smooth advance (no alpha=0 freeze!)
         local x_edge = last_ft_x
         ft:OnUpdate(1/240) -- mid-step -> MUST smoothly interpolate between 0 and 10!
         ft:OnUpdate(1/240)
         local x_mid = last_ft_x
-        assert(x_mid > x_edge and x_mid < 9.5, "FollowText did not smoothly interpolate at 240Hz: edge=" .. x_edge .. " mid=" .. x_mid)
+        assert(x_edge > 0.1 and x_mid > x_edge and x_mid < 9.5, "FollowText did not smoothly interpolate at 240Hz: edge=" .. x_edge .. " mid=" .. x_mid)
         -- Teleport >5u -> MUST hard-snap immediately!
         ent_x = 20.0
         ft:OnUpdate(1/240)
         assert(math.abs(last_ft_x - 200.0) < 0.01, "FollowText did not snap on >5u teleport: got " .. last_ft_x)
+        -- Round 2 regression (P2 #7): 115Hz & 120Hz continuous per-frame target motion MUST NOT lag!
+        for _, hz in ipairs({ 115.0, 120.0, 240.0 }) do
+            local dt_hz = 1.0 / hz
+            local ft_hz_x = 0.0
+            local target_hz_x = 0.0
+            local ft_hz = {
+                hashud = true,
+                target = {
+                    IsValid = function() return true end,
+                    AnimState = { GetSymbolPosition = function() return target_hz_x, 0.0, 0.0 end },
+                },
+                symbol = "head",
+                offset = { x = 0, y = 0, z = 0 },
+                screen_offset = { x = 0, y = 0 },
+                SetPosition = function(_, x, y) ft_hz_x = x end,
+                OnUpdate = function(self)
+                    local x, y = fakeG11.TheSim:GetScreenPos(target_hz_x, 0, 0)
+                    self:SetPosition(x, y)
+                end,
+            }
+            class_hooks["widgets/followtext"](ft_hz)
+            ft_hz:OnUpdate(dt_hz) -- init at 0.0
+            for step = 1, 30 do
+                target_hz_x = step * 0.1
+                ft_hz:OnUpdate(dt_hz)
+            end
+            assert(math.abs(ft_hz_x - 30.0) < 1e-4,
+                string.format("Round 2 P2 #7 REGRESSION: FollowText lagged at %.0fHz! got=%.4f expected=30.0", hz, ft_hz_x))
+        end
+        -- Lag Comp ON / Local Host (locomotor present) -> MUST bypass 30Hz lag-lerp with 0 jitter at 60/115Hz!
+        ft.target.components = { locomotor = {} }
+        ent_x = 20.15
+        ft:OnUpdate(1/60)
+        assert(math.abs(last_ft_x - 201.5) < 0.01, "FollowText with locomotor must stay locked to raw pos! got=" .. last_ft_x)
+        -- Pure Lua Workshop mod without dinput8.dll -> MUST bypass cleanly!
+        ft.target.components = nil
+        fakeG11.HyperSmooth_SetFps = nil
+        ent_x = 20.45
+        ft:OnUpdate(1/60)
+        assert(math.abs(last_ft_x - 204.5) < 0.01, "FollowText without native DLL must stay locked to raw pos! got=" .. last_ft_x)
 
         -- 11c) Solo / Non-Caves Local Host DataDumper -> HyperSmooth_FastDump bridge + R3.1 fail-reason safety (#06)
         local fastdump_mode = "ok"
@@ -1858,7 +1934,7 @@ AddSimPostInit(function()
         g13.debug = mock_debug
         g13.os = mock_os
         g13.table = G.table
-        g13.HyperSmooth_Version = function() return "DST-HyperSmooth/2.8.0" end
+        g13.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end
         g13.HyperSmooth_FastJsonEncode = function(val, compliant)
             fast_enc_calls = fast_enc_calls + 1
             if type(val) == "table" and val.__fallback then
@@ -2183,7 +2259,7 @@ AddSimPostInit(function()
         g14.CLIENT_MOD_RPC_HANDLERS = {}
         g14.RPC = { AttackButton = 4, LeftClick = 1, SetWriteableText = 59, ClosePopup = 62, SetSkillActivatedState = 68, PostActivateHandshake = 70 }
         g14.CLIENT_RPC = { ShowPopup = 1, RecieveChatHistory = 8, TryToTeachScrapbookData = 15, PostActivateHandshake = 14 }
-        g14.HyperSmooth_Version = function() return "DST-HyperSmooth/2.8.0" end
+        g14.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end
         g14.HyperSmooth_SetFps = function() return true end
         g14.HyperSmooth_SetSkeletal = function() return true end
         g14.HyperSmooth_SetWorldInterp = function() return true end
@@ -2274,7 +2350,9 @@ AddSimPostInit(function()
         local exp_s1 = (2 ^ 27) + (2 ^ 30)
         assert(captured_masks.s1 == exp_s1, "Expected srv1=" .. tostring(exp_s1) .. ", got " .. tostring(captured_masks.s1))
         assert(captured_masks.s2 == (2 ^ 4), "Expected srv2=16, got " .. tostring(captured_masks.s2))
-        local exp_c0 = (2 ^ 1) + (2 ^ 8)
+        -- ShowPopup (bit 1) intentionally stays causal on Ch0 (SGwilson passes live target entities);
+        -- only entity-free RecieveChatHistory (bit 8) moves off Ch0!
+        local exp_c0 = (2 ^ 8)
         assert(captured_masks.c0 == exp_c0, "Expected cli0=" .. tostring(exp_c0) .. ", got " .. tostring(captured_masks.c0))
 
         -- Non-Chinese fallback verify: Russian LanguageTranslator must default to English (ui_zh=false)
@@ -3311,7 +3389,7 @@ AddSimPostInit(function()
                 SetBloomEnabled = function() end,
             },
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "2.8.0" end,
+            HyperSmooth_Version = function() return "2.9.0" end,
             HyperSmooth_SetWorldStudio = function(...) ws_calls[#ws_calls + 1] = { ... }; return true end,
             HyperSmooth_SetShadowDyn   = function(...) sd_calls[#sd_calls + 1] = { ... }; return true end,
         }
@@ -3385,10 +3463,17 @@ AddSimPostInit(function()
         mock_lights = { fireA }
         for _ = 1, 40 do hud_onupdate({}, 0.05) end
         local before_flip = ws_calls[#ws_calls]
-        -- Instantly switch dominant light to opposite side (-5, 0) -> single 4ms frame MUST smoothly damp, NEVER snap 180 deg!
+        -- Instantly switch dominant light to opposite side (-5, 0) -> single rescan frame MUST smoothly damp, NEVER snap 180 deg!
         mock_lights = { fireB }
-        hud_onupdate({}, 0.06) -- trigger 20Hz light scan + 1 damped step
         local after_1step = ws_calls[#ws_calls]
+        for _ = 1, 6 do
+            hud_onupdate({}, 0.05)
+            local cur = ws_calls[#ws_calls]
+            if math.abs(cur[13] - before_flip[13]) > 0.01 then
+                after_1step = cur
+                break
+            end
+        end
         local delta_x = math.abs(after_1step[13] - before_flip[13])
         assert(delta_x > 0.02 and delta_x < 0.85,
             "Test 18: Night firelight switch must smoothly damp rather than teleport 180 deg! delta_x=" .. tostring(delta_x))
@@ -3439,6 +3524,2528 @@ AddSimPostInit(function()
         print("[CLIENT_V24_TEST] 18. Fluid Shadow Engine v2 (240Hz dt arc + zero dusk freeze + multi-light damping + shadow-creature exclusion) PASS")
     end
 
+    -- =========================================================================
+    -- TEST 19: v2.9.0 World-Space ShadowMask FBO Lua Bridge & Fail-Closed Fallback
+    -- =========================================================================
+    do
+        local sc_calls = {}
+        local bloom_rt_calls = {}
+        local bloom_params_19 = nil
+        local pp_unis_19 = {}
+        local ws_ready_flag = true
+        local ws_fail_flag = false
+        local sh_init_19, sh_sort_19, hud_upd_19 = nil, nil, nil
+        local prefab_hooks_19 = {}
+        local fire_x = 6.0
+        local fire_mob = {
+            IsValid = function() return true end,
+            Light = { IsEnabled = function() return true end, GetCalculatedRadius = function() return 6.0 end },
+            Transform = { GetWorldPosition = function() return fire_x, 0, 2.0 end },
+        }
+        local g19 = {
+            print = function() end,
+            pcall = G.pcall, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            type = G.type, tonumber = G.tonumber, tostring = G.tostring,
+            math = G.math, string = G.string, table = G.table,
+            rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, setmetatable = G.setmetatable,
+            json = G.json,
+            resolvefilepath = function(p) return "resolved/" .. tostring(p) end,
+            GetTick = function() return 0 end, GetTimeRealSeconds = function() return 0 end,
+            TheNet = { IsDedicated = function() return false end },
+            TheInput = { AddKeyDownHandler = function() end, OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end },
+            KnownModIndex = { GetModInfo = function() return {} end },
+            TheFrontEnd = {}, Settings = {}, TUNING = {}, scheduler = {},
+            ANCHOR_RIGHT = 2, ANCHOR_TOP = 1, NUMBERFONT = "stint-ucr", CLIENT_MOD_RPC = {},
+            LanguageTranslator = { defaultlang = "zh" },
+            STRINGS = { UI = { OPTIONS = { ENABLED = "Enabled", DISABLED = "Disabled" } } },
+            TheWorld = { HasTag = function() return false end, state = { phase = "day", timeinphase = 0.35, time = 0.25, isfullmoon = false } },
+            ThePlayer = { Transform = { GetWorldPosition = function() return 0, 0, 0 end } },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+                FindEntities = function() return { fire_mob } end,
+            },
+            TheCamera = {
+                currentpos = { x = 12.5, y = 0, z = -8.25 },
+                GetRightVec = function() return { x = 0.7071, y = 0, z = -0.7071 } end,
+                GetDownVec  = function() return { x = 0.7071, y = 0, z =  0.7071 } end,
+            },
+            require = function(mod)
+                if mod == "widgets/text" then
+                    return function()
+                        return {
+                            inst = { IsValid = function() return true end },
+                            SetHAnchor = function() end, SetVAnchor = function() end,
+                            SetRegionSize = function() end, SetHAlign = function() end,
+                            SetPosition = function() end, SetColour = function() end,
+                            SetClickable = function() end, Hide = function() end,
+                            Show = function() end, SetString = function() end,
+                        }
+                    end
+                end
+                return {}
+            end,
+            IsPaused = function() return false end,
+            SamplerSizes = { Relative = 1 },
+            SamplerColourMode = { RGB = 1 },
+            SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 }, MIP_FILTER_MODE = { NONE = 0 }, WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            PostProcessorEffects = { Bloom = 1, ColourCube = 2 },
+            SamplerEffects = {},
+            UniformVariables = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function(_, sm, w, h, cm) bloom_params_19 = { sm, w, h, cm } end,
+                    AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end,
+                    AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end, EnablePostProcessEffect = function() end,
+                    SetUniformVariable = function(_, uid, a, b, c, d) pp_unis_19[uid] = { a, b, c, d } end,
+                    IsBloomEnabled = function() return false end,
+                    SetBloomEnabled = function(_, en) bloom_rt_calls[#bloom_rt_calls + 1] = en end,
+                },
+            }),
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn   = function() return true end,
+            HyperSmooth_SetShadowConfig = function(...)
+                sc_calls[#sc_calls + 1] = { ... }
+                return ws_ready_flag, ws_fail_flag
+            end,
+        }
+        local env19 = {
+            GLOBAL = g19, MODROOT = "../mods/client_v24_lua_test/", Asset = function(t, p) return { t, p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 2 end return nil end,
+            AddModShadersInit = function(fn) sh_init_19 = fn end,
+            AddModShadersSortAndEnable = function(fn) sh_sort_19 = fn end,
+            AddPrefabPostInit = function(name, fn)
+                prefab_hooks_19[name] = prefab_hooks_19[name] or {}
+                prefab_hooks_19[name][#prefab_hooks_19[name] + 1] = fn
+            end,
+            AddPrefabPostInitAny = function() end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "screens/playerhud" then
+                    local mock_hud = { AddChild = function(_, w) return w end }
+                    fn(mock_hud)
+                    hud_upd_19 = mock_hud.OnUpdate
+                end
+            end,
+            AddComponentPostInit = function() end, AddSimPostInit = function() end,
+            AddGamePostInit = function() end, AddClientModRPCHandler = function() end,
+            modimport = function() end,
+        }
+        local fn19 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setmetatable(env19, { __index = g19 })
+        G.setfenv(fn19, env19); fn19()
+        assert(sh_init_19 and sh_sort_19 and hud_upd_19, "Test 19 hooks missing")
+        sh_init_19(); sh_sort_19()
+
+        -- 1) v2.9.0 WorldShadowEngine active: NEVER forces BloomSampler ON when user Bloom is OFF!
+        for i = 1, #bloom_rt_calls do
+            assert(bloom_rt_calls[i] == false, "Test 19: v2.9.0 must NEVER force BloomSampler ON when Game Bloom is OFF!")
+        end
+        assert(bloom_params_19 == nil,
+            "Test 19: v2.9.0+ WorldShadowEngine MUST keep Klei's exact stock 0.25x BloomSampler untouched!")
+        assert(pp_unis_19["U_HS_SHADOW_CFG"] and pp_unis_19["U_HS_SHADOW_CFG"][4] == 0.0,
+            "Test 19: PS_VISUAL_FINAL HS_SHADOW_CFG.w must be 0.0 when v2.9.0 WorldShadowEngine is active!")
+
+        -- 2) Verify HyperSmooth_SetShadowConfig receives exact density/soft/tint/hd/skip/cam!
+        hud_upd_19({}, 1.0 / 240.0)
+        assert(#sc_calls >= 1, "Test 19: HyperSmooth_SetShadowConfig was not called!")
+        local lc = sc_calls[#sc_calls]
+        assert(lc[1] > 0.1 and lc[2] >= 0.4 and lc[6] == 1 and lc[7] == 1,
+            "Test 19: SetShadowConfig args invalid: " .. tostring(lc[1]) .. "/" .. tostring(lc[2]) .. "/" .. tostring(lc[6]) .. "/" .. tostring(lc[7]))
+        assert(math.abs(lc[8] - 12.5) < 1e-3 and math.abs(lc[9] - (-8.25)) < 1e-3,
+            "Test 19: Camera target center did not propagate to SetShadowConfig!")
+        assert(math.abs((lc[12] or -1) - 0.68) < 1e-3 and math.abs((lc[13] or -1) - 0.24) < 1e-3,
+            "Test 19: Phase 1 default entityRecv/ovalKeep did not propagate: " .. tostring(lc[12]) .. "/" .. tostring(lc[13]))
+        g19.c_hstune("shadow_entity_recv", 0.0)
+        g19.c_hstune("shadow_oval_keep", 0.80)
+        hud_upd_19({}, 1.0 / 240.0)
+        local lc2 = sc_calls[#sc_calls]
+        assert(math.abs((lc2[12] or -1) - 0.0) < 1e-3 and math.abs((lc2[13] or -1) - 0.80) < 1e-3,
+            "Test 19: Live tuned entityRecv/ovalKeep did not propagate: " .. tostring(lc2[12]) .. "/" .. tostring(lc2[13]))
+
+        -- 3) Verify shadow creatures are NOT mutated with SetBloomEffectHandle under v2.9.0!
+        local ch19 = {
+            bloom_handle = nil,
+            IsValid = function() return true end,
+            AnimState = {
+                SetBloomEffectHandle = function(_, h) ch19.bloom_handle = h end,
+                ClearBloomEffectHandle = function() ch19.bloom_handle = nil end,
+            },
+        }
+        prefab_hooks_19["crawlinghorror"][1](ch19)
+        assert(ch19.bloom_handle == nil, "Test 19: v2.9.0 handles shadow-creature exclusion natively; must NOT mutate SetBloomEffectHandle!")
+
+        -- 4) Verify 240Hz live moving light tracking WITHOUT needing FindEntities rescan!
+        g19.TheWorld.state.phase = "night"
+        g19.TheWorld.state.timeinphase = 0.4
+        hud_upd_19({}, 0.30) -- populates cached light list
+        fire_x = -6.0        -- move cached lantern on next single 240Hz frame (dt=1/240 << 0.25s!)
+        local calls_before = #sc_calls
+        hud_upd_19({}, 1.0 / 240.0)
+        assert(#sc_calls == calls_before + 1, "Test 19: Expected 240Hz shadow update on moving cached light!")
+
+        -- 5) Round 2 regression (P2 #4): (ready=false, failed=false) MUST NOT suppress legacy shadows!
+        g19.TheWorld.state.phase = "day"
+        g19.TheWorld.state.timeinphase = 0.4
+        ws_ready_flag = false
+        ws_fail_flag = false
+        hud_upd_19({}, 0.05)
+        assert(pp_unis_19["U_HS_SHADOW_CFG"][4] > 0.1,
+            "Test 19 (Round 2 P2 #4): (ready=false, failed=false) MUST fall back to legacy PS_VISUAL_FINAL shadows!")
+        assert(bloom_rt_calls[#bloom_rt_calls] == true,
+            "Test 19 (Round 2 P2 #4): (ready=false, failed=false) fallback must arm BloomSampler RT!")
+        -- 5b) Once native shadow FBO becomes ready=(true, false), cleanly return to 0-Bloom v2 mode!
+        ws_ready_flag = true
+        ws_fail_flag = false
+        hud_upd_19({}, 0.05)
+        assert(pp_unis_19["U_HS_SHADOW_CFG"][4] == 0.0,
+            "Test 19 (Round 2): Returning to (ready=true, failed=false) must disable legacy HS_SHADOW_CFG!")
+        assert(bloom_rt_calls[#bloom_rt_calls] == false,
+            "Test 19 (Round 2): Returning to (ready=true, failed=false) must release BloomSampler RT!")
+
+        -- 6) Verify fail-closed fallback when ws_failed == true!
+        ws_ready_flag = false
+        ws_fail_flag = true
+        hud_upd_19({}, 0.05)
+        assert(pp_unis_19["U_HS_SHADOW_CFG"][4] > 0.1,
+            "Test 19: Fail-closed fallback must re-enable PS_VISUAL_FINAL HS_SHADOW_CFG when ws_failed=true!")
+
+        print("[CLIENT_V24_TEST] 19. v2.9.0 World-Space ShadowMask FBO Lua Bridge + 0-Bloom + (false,false)/(false,true) Fallback PASS")
+    end
+
+    -- =========================================================================
+    -- TEST 20: v2.9.5 Multi-Light Dynamic Point Shadows Lua Bridge + Temporal Fade +
+    --          Zero Double-Shadow Handoff + 100% Legacy v2.9.0 HS1 ShareCode Parity
+    -- =========================================================================
+    do
+        local sh_init_20, sh_sort_20, hud_upd_20 = nil, nil, nil
+        local pl_calls = {}
+        local ws_calls_20 = {}
+        local sc_calls_20 = {}
+        local fire1_on = true
+        local fire1_x, fire1_z = 5.0, 2.0
+        local fire2_x, fire2_z = -6.0, -3.0
+        local weak_bug = {
+            IsValid = function() return true end,
+            Light = { IsEnabled = function() return true end, GetCalculatedRadius = function() return 1.2 end, GetIntensity = function() return 0.9 end },
+            Transform = { GetWorldPosition = function() return 1.0, 0, 1.0 end },
+        }
+        local fire1 = {
+            IsValid = function() return true end,
+            Light = { IsEnabled = function() return fire1_on end, GetCalculatedRadius = function() return 6.0 end, GetIntensity = function() return 0.90 end },
+            Transform = { GetWorldPosition = function() return fire1_x, 0, fire1_z end },
+        }
+        local fire2 = {
+            IsValid = function() return true end,
+            Light = { IsEnabled = function() return true end, GetCalculatedRadius = function() return 4.5 end, GetIntensity = function() return 0.70 end },
+            Transform = { GetWorldPosition = function() return fire2_x, 0, fire2_z end },
+        }
+        local g20 = {
+            pcall = G.pcall, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            type = G.type, tonumber = G.tonumber, tostring = G.tostring, print = G.print,
+            math = G.math, string = G.string, table = G.table,
+            rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, setmetatable = G.setmetatable,
+            json = G.json,
+            resolvefilepath = function(p) return "resolved/" .. tostring(p) end,
+            GetTick = function() return 0 end, GetTimeRealSeconds = function() return 0 end,
+            TheNet = { IsDedicated = function() return false end },
+            TheInput = { AddKeyDownHandler = function() end, OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end },
+            KnownModIndex = { GetModInfo = function() return {} end },
+            TheFrontEnd = {}, Settings = {}, TUNING = {}, scheduler = {},
+            ANCHOR_RIGHT = 2, ANCHOR_TOP = 1, NUMBERFONT = "stint-ucr", CLIENT_MOD_RPC = {},
+            LanguageTranslator = { defaultlang = "zh" },
+            STRINGS = { UI = { OPTIONS = { ENABLED = "Enabled", DISABLED = "Disabled" } } },
+            TheWorld = { HasTag = function() return false end, state = { phase = "night", timeinphase = 0.50, time = 0.85, isfullmoon = false } },
+            ThePlayer = { Transform = { GetWorldPosition = function() return 0, 0, 0 end } },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+                FindEntities = function() return { weak_bug, fire1, fire2 } end,
+            },
+            TheCamera = {
+                currentpos = { x = 0.0, y = 0.0, z = 0.0 },
+                GetRightVec = function() return { x = 1.0, y = 0, z = 0.0 } end,
+                GetDownVec  = function() return { x = 0.0, y = 0, z = 1.0 } end,
+            },
+            require = function(mod)
+                if mod == "widgets/text" then
+                    return function()
+                        return {
+                            inst = { IsValid = function() return true end },
+                            SetHAnchor = function() end, SetVAnchor = function() end,
+                            SetRegionSize = function() end, SetHAlign = function() end,
+                            SetPosition = function() end, SetColour = function() end,
+                            SetClickable = function() end, Hide = function() end,
+                            Show = function() end, SetString = function() end,
+                        }
+                    end
+                end
+                return {}
+            end,
+            IsPaused = function() return false end,
+            SamplerSizes = { Relative = 1 },
+            SamplerColourMode = { RGB = 1 },
+            SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 }, MIP_FILTER_MODE = { NONE = 0 }, WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            PostProcessorEffects = { Bloom = 1, ColourCube = 2 },
+            SamplerEffects = {},
+            UniformVariables = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function() end,
+                    AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end,
+                    AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end, EnablePostProcessEffect = function() end,
+                    SetUniformVariable = function() end,
+                    IsBloomEnabled = function() return false end,
+                    SetBloomEnabled = function() end,
+                },
+            }),
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_SetWorldStudio = function(...) ws_calls_20[#ws_calls_20 + 1] = { ... }; return true end,
+            HyperSmooth_SetShadowDyn   = function() return true end,
+            HyperSmooth_SetShadowConfig = function(...) sc_calls_20[#sc_calls_20 + 1] = { ... }; return true, false end,
+            HyperSmooth_SetPointLights = function(...) pl_calls[#pl_calls + 1] = { ... }; return select(3, ...) or 0 end,
+        }
+        local env20 = {
+            GLOBAL = g20, MODROOT = "../mods/client_v24_lua_test/", Asset = function(t, p) return { t, p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 2 end return nil end,
+            AddModShadersInit = function(fn) sh_init_20 = fn end,
+            AddModShadersSortAndEnable = function(fn) sh_sort_20 = fn end,
+            AddPrefabPostInit = function() end,
+            AddPrefabPostInitAny = function() end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "screens/playerhud" then
+                    local mock_hud = { AddChild = function(_, w) return w end }
+                    fn(mock_hud)
+                    hud_upd_20 = mock_hud.OnUpdate
+                end
+            end,
+            AddComponentPostInit = function() end, AddSimPostInit = function() end,
+            AddGamePostInit = function() end, AddClientModRPCHandler = function() end,
+            modimport = function() end,
+        }
+        local fn20 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setmetatable(env20, { __index = g20 })
+        G.setfenv(fn20, env20); fn20()
+        sh_init_20(); sh_sort_20()
+
+        -- 1) Night with 2 campfires + 1 weak firefly (rad=1.2 <= 1.8 filtered out!):
+        --    dirStrength MUST be 0 (NO parallel double shadow!), count MUST be 2, density > 0!
+        hud_upd_20({}, 0.30)
+        local p_night = pl_calls[#pl_calls]
+        local ws_night = ws_calls_20[#ws_calls_20]
+        local sc_night = sc_calls_20[#sc_calls_20]
+        assert(p_night and p_night[1] <= 0.001 and p_night[3] == 2,
+            "Test 20: Night must send dirStrength=0 & 2 campfires (filtering firefly), got dir=" .. tostring(p_night and p_night[1]) .. " cnt=" .. tostring(p_night and p_night[3]))
+        assert(ws_night and ws_night[16] == 0.0,
+            "Test 20: Night radial mode must set directional proj_on=0 to prevent double shadows!")
+        assert(sc_night and sc_night[1] > 0.15,
+            "Test 20: Shadow density must remain active during radial point-light night!")
+
+        -- 2) Temporal smooth fade-out when fire1 extinguishes (NO instant hard pop!)
+        fire1_on = false
+        hud_upd_20({}, 0.05) -- 50ms after extinguish: fire1 should still be fading smoothly (> 0), not popped to 0!
+        local p_fade1 = pl_calls[#pl_calls]
+        assert(p_fade1 and p_fade1[3] == 2,
+            "Test 20: Extinguished campfire must fade out smoothly over ~0.25s instead of instant pop!")
+        for _ = 1, 20 do hud_upd_20({}, 0.05) end -- 1.0s later: fire1 cleanly pruned, only fire2 remains!
+        local p_fade2 = pl_calls[#pl_calls]
+        assert(p_fade2 and p_fade2[3] == 1,
+            "Test 20: After 1.0s fade-out, extinguished fire1 must be pruned leaving count=1, got " .. tostring(p_fade2 and p_fade2[3]))
+
+        -- 3) Dusk cross-fade: BOTH dirStrength (0..1) AND point lights active simultaneously!
+        g20.TheWorld.state.phase = "dusk"
+        g20.TheWorld.state.timeinphase = 0.50
+        for _ = 1, 15 do hud_upd_20({}, 0.08) end
+        local p_dusk = pl_calls[#pl_calls]
+        assert(p_dusk and p_dusk[1] > 0.15 and p_dusk[1] < 0.85 and p_dusk[3] >= 1,
+            "Test 20: Dusk must cross-fade directional (0<dir<1) + point light, got dir=" .. tostring(p_dusk and p_dusk[1]) .. " cnt=" .. tostring(p_dusk and p_dusk[3]))
+
+        -- 4) Toggling shadow_point_lights=0 cleanly falls back to v2.9.0 directional night mode!
+        g20.TheWorld.state.phase = "night"
+        g20.TheWorld.state.timeinphase = 0.50
+        g20.c_hstune("shadow_point_lights", 0)
+        for _ = 1, 10 do hud_upd_20({}, 0.08) end
+        local p_off = pl_calls[#pl_calls]
+        local ws_off = ws_calls_20[#ws_calls_20]
+        assert(p_off and p_off[1] == 1.0 and p_off[3] == 0 and ws_off and ws_off[16] == 1.0,
+            "Test 20: shadow_point_lights=0 must restore v2.9.0 directional night shadow cleanly!")
+
+        -- 5) Preset 0 (100% Vanilla Pure) MUST clear point lights & dirStrength to 0!
+        env20.HS_PanelApi.SetPreset(0)
+        local p_van = pl_calls[#pl_calls]
+        assert(p_van and p_van[1] == 0.0 and p_van[3] == 0,
+            "Test 20: Preset 0 Vanilla Pure must clear point lights to (0, 1.0, 0)!")
+
+        -- 6) 100% Legacy v2.9.0 HS1 ShareCode ID Parity (keys #49 glint_str, #53 exposure, #81 shadow_entity_recv, #82 shadow_oval_keep MUST NOT shift!)
+        --    Construct exact v2.9.0 HS1 binary packet: ver=1, base=0, has_name=0, mask=0, count=4,
+        --    (id=49 glint_str=1.20 -> q16=52428), (id=53 exposure=0.40 -> q16=49151), (id=81 shadow_entity_recv=0.25 -> q16=16384), (id=82 shadow_oval_keep=0.75 -> q16=49151)
+        local function b64u(bytes)
+            local enc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            local out, n, i = {}, #bytes, 1
+            while i <= n do
+                local b1, b2, b3 = bytes[i], bytes[i+1], bytes[i+2]
+                local v1 = math.floor(b1 / 4)
+                local v2 = (b1 % 4) * 16 + (b2 and math.floor(b2 / 16) or 0)
+                out[#out + 1] = enc:sub(v1 + 1, v1 + 1)
+                out[#out + 1] = enc:sub(v2 + 1, v2 + 1)
+                if b2 then
+                    local v3 = (b2 % 16) * 4 + (b3 and math.floor(b3 / 64) or 0)
+                    out[#out + 1] = enc:sub(v3 + 1, v3 + 1)
+                    if b3 then out[#out + 1] = enc:sub((b3 % 64) + 1, (b3 % 64) + 1) end
+                end
+                i = i + 3
+            end
+            return table.concat(out)
+        end
+        local function xor16(a, b)
+            local r, p = 0, 1
+            for _ = 1, 16 do
+                if (a % 2) ~= (b % 2) then r = r + p end
+                a = math.floor(a / 2); b = math.floor(b / 2); p = p * 2
+            end
+            return r
+        end
+        local raw_v290 = { 1, 0, 0, 4,
+            49, math.floor(52428 / 256), 52428 % 256,
+            53, math.floor(49151 / 256), 49151 % 256,
+            81, math.floor(16384 / 256), 16384 % 256,
+            82, math.floor(49151 / 256), 49151 % 256,
+        }
+        local crc = 0xFFFF
+        for i = 1, #raw_v290 do
+            crc = xor16(crc, raw_v290[i] * 256)
+            for _ = 1, 8 do
+                if crc >= 0x8000 then crc = xor16((crc * 2) % 65536, 0x1021) else crc = (crc * 2) % 65536 end
+            end
+        end
+        raw_v290[#raw_v290 + 1] = math.floor(crc / 256) % 256
+        raw_v290[#raw_v290 + 1] = crc % 256
+        local legacy_code = "HS1-" .. b64u(raw_v290)
+        local ok_v, err_v, st_v = env20.HS_PanelApi.ValidateShareCode(legacy_code)
+        assert(ok_v and st_v, "Test 20: Legacy v2.9.0 HS1 code rejected: " .. tostring(err_v))
+        assert(math.abs(st_v.tune.glint_str - 1.20) < 0.02 and
+               math.abs(st_v.tune.exposure - 0.40) < 0.02 and
+               math.abs(st_v.tune.shadow_entity_recv - 0.25) < 0.02 and
+               math.abs(st_v.tune.shadow_oval_keep - 0.75) < 0.02,
+            "Test 20: Legacy v2.9.0 HS1 IDs shifted! glint=" .. tostring(st_v.tune.glint_str) .. " exp=" .. tostring(st_v.tune.exposure))
+
+        print("[CLIENT_V24_TEST] 20. v2.9.5 Multi-Light Point Shadows Bridge + Temporal Fade + Zero Double-Shadow + Legacy HS1 Parity PASS")
+    end
+
+    -- =========================================================================
+    -- TEST 21: v2.9.5 M2 (Crash Detective + Safe ClipCursor) + M3 (Water Refl)
+    --          + M4 (Strict Tag-Whitelist Foliage Sway/Wake, 0 Wall Wobble,
+    --            Decoupled from Shadows, Instant Preset-0 Zero, HS1 #85..#89)
+    -- =========================================================================
+    do
+        local wr_calls, wf_calls, fa_calls, clip_calls, crash_calls = {}, {}, {}, {}, {}
+        local is_paused = false
+        local is_console = false
+        local screen_name = "HUD"
+        local sh_init_21, sh_sort_21, hud_upd_21 = nil, nil, nil
+        local function mk_ent(x, z, tag_list)
+            local tset = {}
+            for i = 1, #tag_list do tset[tag_list[i]] = true end
+            return {
+                IsValid = function() return true end,
+                HasTag = function(_, tag) return tset[tag] == true end,
+                Transform = { GetWorldPosition = function() return x, 0, z end },
+            }
+        end
+        local mixed_ents = {
+            mk_ent(2.0,  3.0,  { "plant", "grass" }),                       -- MUST ACCEPT cls=1
+            mk_ent(-5.0, 4.0,  { "tree", "plant" }),                        -- MUST ACCEPT cls=2
+            mk_ent(1.0,  1.0,  { "structure", "wall", "plant" }),           -- MUST REJECT (wall/structure!)
+            mk_ent(3.0,  2.0,  { "structure", "chest" }),                   -- MUST REJECT (chest/structure!)
+            mk_ent(4.0, -2.0,  { "player", "character" }),                  -- MUST REJECT (player!)
+            mk_ent(-3.0, 1.0,  { "character", "locomotor", "pig" }),        -- MUST REJECT (mob!)
+            mk_ent(-6.0, 5.0,  { "tree", "stump" }),                        -- MUST REJECT (stump!)
+            mk_ent(6.0,  0.0,  { "flower", "NOCLICK" }),                    -- MUST REJECT (NOCLICK!)
+            mk_ent(7.0,  1.0,  { "bush", "plant" }),                        -- MUST ACCEPT cls=1
+        }
+        local orig_tb_called = 0
+        local mock_debug = {
+            traceback = function(msg)
+                orig_tb_called = orig_tb_called + 1
+                return "ORIG_TB:" .. tostring(msg) .. "\\n../mods/workshop-123456789/scripts/boom.lua:42"
+            end,
+        }
+        local g21 = {
+            pairs = G.pairs, ipairs = G.ipairs, next = G.next, type = G.type,
+            tostring = G.tostring, tonumber = G.tonumber, pcall = G.pcall,
+            rawget = G.rawget, rawset = G.rawset, select = G.select, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            print = function() end, debug = mock_debug,
+            ANCHOR_RIGHT = 2, ANCHOR_TOP = 1, NUMBERFONT = "stint-ucr", CLIENT_MOD_RPC = {},
+            LanguageTranslator = { defaultlang = "zh" },
+            STRINGS = { UI = { OPTIONS = { ENABLED = "Enabled", DISABLED = "Disabled" } } },
+            require = function(mod)
+                if mod == "widgets/text" then
+                    return function()
+                        return {
+                            inst = { IsValid = function() return true end },
+                            SetHAnchor = function() end, SetVAnchor = function() end,
+                            SetRegionSize = function() end, SetHAlign = function() end,
+                            SetPosition = function() end, SetColour = function() end,
+                            SetClickable = function() end, Hide = function() end,
+                            Show = function() end, SetString = function() end,
+                        }
+                    end
+                end
+                return {}
+            end,
+            IsPaused = function() return is_paused end,
+            KnownModIndex = {
+                GetModFancyName = function(_, id)
+                    if id == "workshop-123456789" then return "Exploding Beefalo Mod" end
+                    return id
+                end,
+            },
+            TheWorld = {
+                HasTag = function() return false end,
+                state = { phase = "day", timeinphase = 0.50, isfullmoon = false, israining = false, wetness = 0 },
+            },
+            ThePlayer = {
+                HUD = { IsChatInputScreenOpen = function() return false end },
+                Transform = { GetWorldPosition = function() return 0.0, 0.0, 0.0 end },
+            },
+            TheFrontEnd = {
+                IsConsoleOpen = function() return is_console end,
+                GetActiveScreen = function() return { name = screen_name } end,
+            },
+            TheCamera = {
+                heading = 45, currentpos = { x = 0, y = 0, z = 0 },
+                GetRightVec = function() return { x = 0.707, y = 0, z = -0.707 } end,
+            },
+            TheSim = {
+                FindEntities = function() return mixed_ents end,
+                GetPersistentString = function(_, _, cb) if cb then cb(false, "") end end,
+                SetPersistentString = function() end,
+                GetTick = function() return 100 end, GetTickTime = function() return 1/30 end,
+            },
+            TheInput = { AddKeyUpHandler = function() end, IsKeyDown = function() return false end },
+            UniformVariables = {}, PostProcessorEffects = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function() end,
+                    AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end,
+                    AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end, EnablePostProcessEffect = function() end,
+                    SetUniformVariable = function() end,
+                    IsBloomEnabled = function() return false end, SetBloomEnabled = function() end,
+                },
+            }),
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn = function() return true end,
+            HyperSmooth_SetShadowConfig = function() return true, false end,
+            HyperSmooth_SetPointLights = function() return 0 end,
+            HyperSmooth_SetWaterRefl = function(...) wr_calls[#wr_calls + 1] = { ... }; return true, 2 end,
+            HyperSmooth_SetWindField = function(...) wf_calls[#wf_calls + 1] = { ... }; return true end,
+            HyperSmooth_SetFoliageAnchors = function(...) fa_calls[#fa_calls + 1] = { ... }; return select(1, ...) or 0 end,
+            HyperSmooth_SetClipCursor = function(...) clip_calls[#clip_calls + 1] = { ... }; return select(1, ...) and select(2, ...) end,
+            HyperSmooth_ReportLuaCrash = function(...) crash_calls[#crash_calls + 1] = { ... } end,
+            HyperSmooth_GetCrashReportPath = function() return "D:\\dst\\bin64\\hypersmooth_crash_report.txt" end,
+        }
+        local env21 = {
+            -- Strict real DST mods.lua CreateEnvironment whitelist (NO unpack, NO os, NO select, NO __index = GLOBAL!)
+            pairs = G.pairs, ipairs = G.ipairs, print = function() end,
+            math = G.math, table = G.table, type = G.type, string = G.string, tostring = G.tostring,
+            require = g21.require,
+            GLOBAL = g21, MODROOT = "../mods/client_v24_lua_test/", Asset = function(t, p) return { t, p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 2 end return nil end,
+            AddModShadersInit = function(fn) sh_init_21 = fn end,
+            AddModShadersSortAndEnable = function(fn) sh_sort_21 = fn end,
+            AddPrefabPostInit = function() end, AddPrefabPostInitAny = function() end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "screens/playerhud" then
+                    local mock_hud = { AddChild = function(_, w) return w end }
+                    fn(mock_hud)
+                    hud_upd_21 = mock_hud.OnUpdate
+                end
+            end,
+            AddComponentPostInit = function() end, AddSimPostInit = function() end,
+            AddGamePostInit = function() end, AddClientModRPCHandler = function() end,
+            modimport = function() end,
+        }
+        local fn21 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setfenv(fn21, env21); fn21()
+        sh_init_21(); sh_sort_21()
+
+        -- 1) M3 Water Reflections + M4 Strict Tag-Whitelist Foliage (0 walls/chests/players/mobs/stumps!)
+        hud_upd_21({}, 0.30)
+        local wr_p2 = wr_calls[#wr_calls]
+        assert(wr_p2 and math.abs(wr_p2[1] - 0.48) < 0.01 and math.abs(wr_p2[2] - 0.55) < 0.01,
+            "Test 21 M3: Preset 2 must send water_refl=(0.48, 0.55), got " .. tostring(wr_p2 and wr_p2[1]))
+        local wf_p2 = wf_calls[#wf_calls]
+        assert(wf_p2 and wf_p2[2] > 0.50 and wf_p2[3] > 0.60 and wf_p2[6] == true,
+            "Test 21 M4: Preset 2 must send active wind field + player pos!")
+        local fa_p2 = fa_calls[#fa_calls]
+        assert(fa_p2 and fa_p2[1] == 3,
+            "Test 21 M4: Strict whitelist MUST accept ONLY 3 plants/trees (rejecting wall/chest/player/mob/stump/NOCLICK), got " .. tostring(fa_p2 and fa_p2[1]))
+        -- Verify classes: grass=1, evergreen=2, bush=1
+        assert(fa_p2[4] == 1 and fa_p2[7] == 2 and fa_p2[10] == 1,
+            "Test 21 M4: Wrong foliage classes! got " .. tostring(fa_p2[4]) .. "," .. tostring(fa_p2[7]) .. "," .. tostring(fa_p2[10]))
+
+        -- 2) M4 MUST remain active when shadows are OFF (decoupled from shadow sync!)
+        g21.c_hstune("shadow_density", 0)
+        hud_upd_21({}, 0.05)
+        local wf_noshad = wf_calls[#wf_calls]
+        assert(wf_noshad and wf_noshad[2] > 0.50,
+            "Test 21 M4: Foliage wind sway must stay active even when shadow_density=0!")
+
+        -- 3) M2 ClipCursor: default OFF -> enable -> active in HUD -> auto-unlocks on Pause, Console, PauseScreen!
+        local cl_def = clip_calls[#clip_calls]
+        assert(cl_def and cl_def[1] == false and cl_def[2] == false, "Test 21 M2: ClipCursor must default OFF!")
+        g21.c_hsclip(true)
+        hud_upd_21({}, 0.05)
+        local cl_on = clip_calls[#clip_calls]
+        assert(cl_on and cl_on[1] == true and cl_on[2] == true, "Test 21 M2: ClipCursor must lock in unpaused HUD!")
+        is_paused = true
+        hud_upd_21({}, 0.05)
+        assert(clip_calls[#clip_calls][2] == false, "Test 21 M2: ClipCursor MUST unlock when paused!")
+        is_paused = false; is_console = true
+        hud_upd_21({}, 0.05)
+        assert(clip_calls[#clip_calls][2] == false, "Test 21 M2: ClipCursor MUST unlock when console open!")
+        is_console = false; screen_name = "PauseScreen"
+        hud_upd_21({}, 0.05)
+        assert(clip_calls[#clip_calls][2] == false, "Test 21 M2: ClipCursor MUST unlock on modal PauseScreen!")
+        screen_name = "HUD"; g21.c_hsclip(false)
+
+        -- 4) M2 Crash Detective: debug.traceback hook preserves return verbatim & attributes Mod!
+        g21.c_hscrashreport()
+        local tb_ret = g21.debug.traceback("nil deref in boom")
+        assert(orig_tb_called == 1 and tb_ret:find("ORIG_TB:nil deref in boom", 1, true) ~= nil,
+            "Test 21 M2: debug.traceback wrapper must preserve original return value verbatim!")
+        local cr = crash_calls[#crash_calls]
+        assert(cr and cr[1] == "workshop-123456789" and cr[2] == "Exploding Beefalo Mod" and cr[3]:find("nil deref", 1, true) ~= nil,
+            "Test 21 M2: Crash Detective failed to attribute Mod fancy name! got " .. tostring(cr and cr[1]) .. "/" .. tostring(cr and cr[2]))
+
+        -- 5) Preset 0 (Vanilla Pure) MUST instantly zero WaterRefl + WindField + FoliageAnchors!
+        env21.HS_PanelApi.SetPreset(0)
+        assert(wr_calls[#wr_calls][1] == 0.0, "Test 21 Preset 0: water_refl_str must zero immediately!")
+        assert(wf_calls[#wf_calls][2] == 0.0 and wf_calls[#wf_calls][3] == 0.0, "Test 21 Preset 0: wind/wake must zero immediately!")
+        assert(fa_calls[#fa_calls][1] == 0, "Test 21 Preset 0: foliage anchors must clear to 0!")
+
+        -- 6) v2.9.5 HS1 ShareCode roundtrip with new #85..#89 knobs!
+        env21.HS_PanelApi.SetPreset(2)
+        g21.c_hstune("water_refl", 0.92)
+        g21.c_hstune("wind_wake", 1.15)
+        local code21 = env21.HS_PanelApi.PreviewShareCode("M1234")
+        local ok21, err21, st21 = env21.HS_PanelApi.ValidateShareCode(code21)
+        assert(ok21 and st21 and math.abs(st21.tune.water_refl_str - 0.92) < 0.02 and math.abs(st21.tune.wind_wake_strength - 1.15) < 0.02,
+            "Test 21 HS1: v2.9.5 #85..#89 share code roundtrip failed: " .. tostring(err21))
+
+        print("[CLIENT_V24_TEST] 21. v2.9.5 M2 (CrashDetective+ClipCursor) + M3 (WaterRefl) + M4 (Whitelist Foliage) + Preset0 + HS1 #85..#89 PASS")
+    end
+
+    -- =========================================================================
+    -- 22. Track A (v2.9.5-A) Fluid Skeletal Animation (A1 Crossfade + A2 Spline)
+    --     & Real-Time High-DPI Detail (A3-1) + Tab2 Sub2 UI + HS1 #90..#93
+    -- =========================================================================
+    do
+        local af_calls, det_calls = {}, {}
+        local g22 = {
+            print = G.print, pcall = G.pcall, xpcall = G.xpcall, error = G.error, assert = G.assert,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, tostring = G.tostring,
+            tonumber = G.tonumber, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            setmetatable = G.setmetatable, select = G.select, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            TheNet = { GetIsServer = function() return false end, GetIsClient = function() return true end,
+                       GetServerGameMode = function() return "survival" end },
+            TheWorld = { ismastersim = false, HasTag = function() return false end,
+                         state = { isday = true, phase = "day", time = 0.25, timeinphase = 0.5, israining = false, wetness = 0 } },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) if type(cb) == "function" then cb(false, "") end end,
+                SetPersistentString = function(_, _, _, _, cb) if type(cb) == "function" then cb(true) end end,
+                GetTick = function() return 100 end,
+                GetTickTime = function() return 1/30 end,
+            },
+            TheInput = {
+                AddKeyDownHandler = function() end,
+                IsKeyDown = function() return false end,
+            },
+            HyperSmooth_Version = function() return "2.9.5" end,
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_SetSkeletal = function() return true end,
+            HyperSmooth_SetWorldInterp = function() return true end,
+            HyperSmooth_SetVfxSmooth = function() return true end,
+            HyperSmooth_SetLowLatency = function() return true end,
+            HyperSmooth_SetVisual = function() return true end,
+            HyperSmooth_SetHd2d = function() return true end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn = function() return true end,
+            HyperSmooth_SetShadowConfig = function() return true, false end,
+            HyperSmooth_SetPointLights = function() return true end,
+            HyperSmooth_SetWaterRefl = function() return true end,
+            HyperSmooth_SetWindField = function() return true end,
+            HyperSmooth_SetFoliageAnchors = function() return true end,
+            HyperSmooth_SetAnimFluid = function(sp, xf)
+                af_calls[#af_calls + 1] = { sp, xf }
+                return true
+            end,
+            HyperSmooth_SetDetailParams = function(gd, se, si, ex)
+                det_calls[#det_calls + 1] = { gd, se, si, ex }
+                return true
+            end,
+            PostProcessorEffects = {}, UniformVariables = {}, SamplerSizes = { Relative = 1 }, SamplerColourMode = { RGB = 1 },
+            require = function(mod)
+                if mod == "widgets/widget" or mod == "widgets/image" or mod == "widgets/imagebutton" or mod == "widgets/text" then
+                    return function()
+                        local w = { inst = { IsValid = function() return true end } }
+                        setmetatable(w, { __index = function(self, k)
+                            return function(_, child) return child or self end
+                        end })
+                        return w
+                    end
+                end
+                return nil
+            end,
+            ANCHOR_RIGHT = 2, ANCHOR_MIDDLE = 0, ANCHOR_LEFT = 1, SCALEMODE_PROPORTIONAL = 1,
+            BODYTEXTFONT = "body", NUMBERFONT = "num",
+        }
+        local env22
+        env22 = {
+            GLOBAL = g22,
+            modname = "dst_smooth_highfps",
+            MODROOT = "../mods/client_v24_lua_test/",
+            GetModConfigData = function(k)
+                if k == "visual_preset" then return 0 end
+                if k == "skeletal_tween" then return true end
+                return nil
+            end,
+            AddSimPostInit = function(fn) fn() end,
+            AddClassPostConstruct = function() end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end,
+            AddModShadersInit = function() end,
+            AddModShadersSortAndEnable = function() end,
+            AddPlayerPostInit = function() end,
+            modimport = function(p)
+                local fp = "../mods/client_v24_lua_test/target_" .. p:gsub("^%./", "")
+                if not fp:match("%.lua$") then fp = fp .. ".lua" end
+                local fn = assert(G.kleiloadlua(fp))
+                setfenv(fn, env22)
+                return fn()
+            end,
+        }
+        setmetatable(env22, { __index = g22 })
+        local fn22 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fn22, env22)
+        fn22()
+
+        -- 1) Preset 0 (Vanilla Pure): detail shaders MUST be 0, while smooth skeletal defaults (0.75, 55ms) stay active!
+        env22.HS_PanelApi.SetPreset(0)
+        assert(#af_calls > 0 and math.abs(af_calls[#af_calls][1] - 0.75) < 0.01 and math.abs(af_calls[#af_calls][2] - 55.0) < 0.5,
+            "Test 22 Preset 0: anim_spline/anim_crossfade defaults mismatch!")
+        assert(#det_calls > 0 and det_calls[#det_calls][1] == 0.0 and det_calls[#det_calls][2] == 0.0 and det_calls[#det_calls][3] == 0.0,
+            "Test 22 Preset 0: detail shaders MUST be 0.0 in Vanilla Pure!")
+
+        -- 2) Preset 1 (EyeHD) & Preset 2 (Cinema): activate High-DPI ground & sprite detail cleanly!
+        env22.HS_PanelApi.SetPreset(1)
+        local d1 = det_calls[#det_calls]
+        assert(d1[1] > 0.50 and d1[2] > 0.50 and d1[3] > 0.60, "Test 22 Preset 1: EyeHD detail params expected >0.5!")
+        env22.HS_PanelApi.SetPreset(2)
+        local d2 = det_calls[#det_calls]
+        assert(d2[1] > 0.70 and d2[3] > 0.80, "Test 22 Preset 2: Cinema detail params expected >0.7!")
+
+        -- 3) StepTune from Preset 0 on sprite_detail MUST switch to Custom Preset 3 and push non-zero shader!
+        env22.HS_PanelApi.SetPreset(0)
+        env22.HS_PanelApi.StepTune("sprite_detail", 0.50)
+        local snap22 = env22.HS_PanelApi.GetSnapshot()
+        assert(snap22.preset == 3 and math.abs(det_calls[#det_calls][3] - 0.50) < 0.01,
+            "Test 22 StepTune from Preset 0 must promote to Custom Preset 3 and apply sprite_detail!")
+
+        -- 4) StepTune anim_crossfade & anim_spline pushes immediately to C++!
+        env22.HS_PanelApi.StepTune("anim_crossfade", 15.0) -- 55 + 15 = 70ms
+        env22.HS_PanelApi.StepTune("anim_spline", -0.25)   -- 0.75 - 0.25 = 0.50
+        assert(math.abs(af_calls[#af_calls][1] - 0.50) < 0.01 and math.abs(af_calls[#af_calls][2] - 70.0) < 0.5,
+            "Test 22 StepTune anim_fluid live sync failed!")
+
+        -- 5) HS1 ShareCode roundtrip with #90..#93 tail keys!
+        local code22 = env22.HS_PanelApi.PreviewShareCode("TrackA")
+        local ok22, err22, st22 = env22.HS_PanelApi.ValidateShareCode(code22)
+        assert(ok22 and st22 and
+               math.abs(st22.tune.anim_spline - 0.50) < 0.02 and
+               math.abs(st22.tune.anim_crossfade - 70.0) < 0.5 and
+               math.abs(st22.tune.sprite_detail - 0.50) < 0.02,
+            "Test 22 HS1 ShareCode #90..#93 roundtrip failed: " .. tostring(err22))
+
+        -- 6) hs_panel.lua instantiates Tab 2 Sub-2 cleanly with zero Lua errors!
+        g22.ThePlayer = { HUD = g22.require("widgets/widget")() }
+        assert(env22.HS_TogglePanel(true) == true, "Test 22 Panel open failed!")
+
+        print("[CLIENT_V24_TEST] 22. v2.9.5-A Track A (AnimFluid + High-DPI Detail + Tab2 Sub2 + HS1 #90..#93) PASS")
+    end
+
+    -- 23. Geometric Placement High-FPS Optimizer (Test 23A) + v2.9.5-B Combat Hit-Feel Engine (Test 23B)
+    do
+        local combat_cfg_calls = {}
+        local impact_calls = {}
+        local geo_testfn_calls = 0
+        local geo_refresh_pt_calls = 0
+        local mock_time_23 = 100.0
+        local mock_tick_23 = 500
+        local cam_applies = {}
+
+        local mock_placer_mod = {
+            TestPoint = function(self, inst, pt)
+                if inst == self.inst then
+                    geo_testfn_calls = geo_testfn_calls + 1
+                end
+                return true
+            end,
+            BuildGridPoint = function(self, bgx, bgz, bgpt)
+                self.build_grid[bgx] = self.build_grid[bgx] or {}
+                self.build_grid[bgx][bgz] = { x = bgx, z = bgz }
+                table.insert(self.refresh_queue, { bgx, bgz })
+            end,
+            RemoveBuildGrid = function(self)
+                self.build_grid = nil
+                self.refresh_queue = nil
+            end,
+            RefreshGridPoint = function(self, bgx, bgz)
+                geo_refresh_pt_calls = geo_refresh_pt_calls + 1
+            end,
+            RefreshBuildGrid = function(self, time_remaining)
+                while #self.refresh_queue > 0 do
+                    local it = table.remove(self.refresh_queue)
+                    self:RefreshGridPoint(it[1], it[2])
+                end
+            end,
+            OnUpdate = function(self, dt)
+                if self.build_grid ~= nil and #self.refresh_queue == 0 then
+                    for bgx, row in pairs(self.build_grid) do
+                        for bgz, _ in pairs(row) do
+                            table.insert(self.refresh_queue, { bgx, bgz })
+                        end
+                    end
+                end
+                self:RefreshBuildGrid(false)
+            end,
+        }
+
+        local sim_inits_23 = {}
+        local class_hooks_23 = {}
+        local player_hooks_23 = {}
+        local prefab_hooks_23 = {}
+        local loaded_23 = {
+            ["components/placer"] = mock_placer_mod,
+        }
+        local g23
+        g23 = {
+            TheSim = {
+                GetPersistentString = function(self, k, cb) if type(cb) == "function" then cb(false, "") end end,
+                SetPersistentString = function(self, k, v, e, cb) if type(cb) == "function" then cb(true) end end,
+                GetGameID = function() return "DST" end,
+                GetTick = function() return mock_tick_23 end,
+                FindEntities = function() return {} end,
+            },
+            TheNet = { IsDedicated = function() return false end },
+            TheInput = { AddKeyUpHandler = function() end },
+            TheFrontEnd = nil,
+            GetTimeRealSeconds = function() return mock_time_23 end,
+            Vector3 = function(x, y, z) return { x = x or 0, y = y or 0, z = z or 0, Get = function(s) return s.x, s.y, s.z end } end,
+            EQUIPSLOTS = { HANDS = "hands" },
+            HyperSmooth_SetFps = function() end,
+            HyperSmooth_SetVisual = function() end,
+            HyperSmooth_SetHd2d = function() end,
+            HyperSmooth_SetAnimFluid = function() end,
+            HyperSmooth_SetDetailParams = function() end,
+            HyperSmooth_SetCombatConfig = function(en, hs, rc, fl, vf, lg)
+                combat_cfg_calls[#combat_cfg_calls + 1] = { en, hs, rc, fl, vf, lg }
+            end,
+            HyperSmooth_TriggerImpact = function(wx, wy, wz, dx, dz, inten, sty, is_atk, spawn_vfx)
+                impact_calls[#impact_calls + 1] = { wx, wy, wz, dx, dz, inten, sty, is_atk, spawn_vfx }
+                return true
+            end,
+            require = function(mod)
+                if loaded_23[mod] ~= nil then return loaded_23[mod] end
+                if mod == "widgets/widget" or mod == "widgets/image" or mod == "widgets/imagebutton" or mod == "widgets/text" then
+                    return function()
+                        local w = { inst = { IsValid = function() return true end } }
+                        setmetatable(w, { __index = function(self, k)
+                            return function(_, child) return child or self end
+                        end })
+                        return w
+                    end
+                end
+                return nil
+            end,
+            package = { loaded = loaded_23 },
+            ANCHOR_RIGHT = 2, ANCHOR_MIDDLE = 0, ANCHOR_LEFT = 1, SCALEMODE_PROPORTIONAL = 1,
+            BODYTEXTFONT = "body", NUMBERFONT = "num",
+            os = G.os, string = G.string, math = G.math, table = G.table, pairs = G.pairs, ipairs = G.ipairs,
+            type = G.type, pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, tostring = G.tostring,
+            tonumber = G.tonumber, setmetatable = G.setmetatable, print = G.print, error = G.error, unpack = G.unpack,
+        }
+        local env23
+        env23 = {
+            GLOBAL = g23,
+            modname = "dst_smooth_highfps",
+            MODROOT = "../mods/client_v24_lua_test/",
+            GetModConfigData = function(k)
+                if k == "visual_preset" then return 0 end
+                if k == "target_fps" then return 240 end
+                if k == "skeletal_tween" then return true end
+                if k == "reduce_240hz_churn" then return true end
+                if k == "smooth_camera" then return true end
+                return nil
+            end,
+            AddSimPostInit = function(fn) sim_inits_23[#sim_inits_23 + 1] = fn end,
+            AddClassPostConstruct = function(name, fn) class_hooks_23[name] = fn end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function(p, fn) prefab_hooks_23[p] = fn end,
+            AddPrefabPostInitAny = function() end,
+            AddModShadersInit = function() end,
+            AddModShadersSortAndEnable = function() end,
+            AddPlayerPostInit = function(fn) player_hooks_23[#player_hooks_23 + 1] = fn end,
+            modimport = function(p)
+                local fp = "../mods/client_v24_lua_test/target_" .. p:gsub("^%./", "")
+                if not fp:match("%.lua$") then fp = fp .. ".lua" end
+                local fn = assert(G.kleiloadlua(fp))
+                setfenv(fn, env23)
+                return fn()
+            end,
+        }
+        setmetatable(env23, { __index = g23 })
+        local fn23 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fn23, env23)
+        fn23()
+        for _, sfn in ipairs(sim_inits_23) do sfn() end
+
+        -- Test 23A: Geometric Placement 240Hz Adaptive Optimizer
+        assert(mock_placer_mod._hs_geo_opt == true, "Test 23A: Placer._hs_geo_opt must be installed!")
+        local placer_obj = {
+            inst = { Transform = { GetWorldPosition = function() return 0, 0, 0 end, GetRotation = function() return 0 end } },
+            _rot = 0,
+            build_grid = {},
+            refresh_queue = {},
+        }
+        setmetatable(placer_obj, { __index = mock_placer_mod })
+        for gx = -10, 10 do
+            placer_obj.build_grid[gx] = {}
+            for gz = -10, 10 do
+                placer_obj:BuildGridPoint(gx, gz, { x = gx * 0.5, z = gz * 0.5 })
+            end
+        end
+        local pt_same = { x = 1.0, z = 2.0 }
+        for k = 1, 8 do
+            assert(placer_obj:TestPoint(placer_obj.inst, pt_same) == true)
+        end
+        assert(geo_testfn_calls == 1, "Test 23A: same-tick stationary TestPoint must cache! got=" .. tostring(geo_testfn_calls))
+        assert((g23.HS_PLACER_SKIP_COUNT or 0) >= 7, "Test 23A: expected HS_PLACER_SKIP_COUNT >= 7")
+
+        -- Drain initial queue across 240Hz frames, then verify stationary cooldown avoids thrash
+        for frame = 1, 40 do
+            mock_time_23 = mock_time_23 + (1.0 / 240.0)
+            placer_obj:OnUpdate(1.0 / 240.0)
+        end
+        assert(#placer_obj.refresh_queue == 0, "Test 23A: refresh_queue must never leak sentinel or stay stuck!")
+        local rp_before_idle = geo_refresh_pt_calls
+        for frame = 1, 10 do -- 10 * 4.17ms = 41.7ms < 120ms cooldown -> 0 redundant grid sweeps!
+            mock_time_23 = mock_time_23 + (1.0 / 240.0)
+            placer_obj:OnUpdate(1.0 / 240.0)
+        end
+        assert(geo_refresh_pt_calls == rp_before_idle,
+            "Test 23A: stationary 240Hz frames inside cooldown must do 0 grid thrash! delta=" .. tostring(geo_refresh_pt_calls - rp_before_idle))
+        -- Cursor move (BuildGridPoint) immediately cancels cooldown & refreshes moved point!
+        placer_obj:BuildGridPoint(11, 0, { x = 5.5, z = 0 })
+        mock_time_23 = mock_time_23 + (1.0 / 240.0)
+        placer_obj:OnUpdate(1.0 / 240.0)
+        assert(geo_refresh_pt_calls > rp_before_idle, "Test 23A: cursor move must immediately cancel idle cooldown!")
+
+        -- Test 23B: Track B Combat Hit-Feel + B4 Zero-Drift Camera Punch + HS1 #94..#99 + Tab 2 Sub-3 UI
+        env23.HS_PanelApi.SetPreset(0)
+        assert(#combat_cfg_calls > 0 and combat_cfg_calls[#combat_cfg_calls][1] == false,
+            "Test 23B Preset 0 must disable CombatConfig!")
+        env23.HS_PanelApi.SetPreset(1)
+        assert(combat_cfg_calls[#combat_cfg_calls][1] == true, "Test 23B Preset 1 must enable CombatConfig!")
+        env23.HS_PanelApi.SetPreset(2)
+        assert(combat_cfg_calls[#combat_cfg_calls][1] == true, "Test 23B Preset 2 must enable CombatConfig!")
+
+        local mock_player = {
+            Transform = {
+                GetWorldPosition = function() return 4.0, 0.0, 8.0 end,
+                GetRotation = function() return 0.0 end,
+            },
+            HUD = g23.require("widgets/widget")(),
+        }
+        g23.ThePlayer = mock_player
+
+        local mock_cam = {
+            pangain = 10, headinggain = 10, distancegain = 10, continuousdistancegain = 10,
+            paused = false, cutscene = false,
+            target = mock_player,
+            currentpos = { x = 10.0, y = 0.0, z = 20.0 },
+            targetpos = { x = 10.0, y = 0.0, z = 20.0 },
+            Update = function(c, dt) c:Apply() end,
+            Snap = function(c) c:Apply() end,
+            Apply = function(c)
+                cam_applies[#cam_applies + 1] = { c.currentpos.x, c.currentpos.y, c.currentpos.z }
+            end,
+        }
+        assert(type(class_hooks_23["cameras/followcamera"]) == "function", "Test 23B: FollowCamera hook missing!")
+        class_hooks_23["cameras/followcamera"](mock_cam)
+
+        local n_imp_before = #impact_calls
+        assert(env23.HS_PanelApi.PreviewHitFeel() == true, "Test 23B PreviewHitFeel failed!")
+        assert(#impact_calls > n_imp_before, "Test 23B PreviewHitFeel did not call HyperSmooth_TriggerImpact!")
+
+        -- Step FollowCamera across impact -> ZERO camera shake (0.00px deflection & 0.00px drift)!
+        mock_cam:Update(0.022, false)
+        local peak_apply = cam_applies[#cam_applies]
+        local peak_dx = math.abs(peak_apply[1] - 10.0)
+        assert(peak_dx < 1e-6, "Test 23B: screen shake MUST be 0.00px (replaced by attacker lunge)! dx=" .. tostring(peak_dx))
+        assert(combat_cfg_calls[#combat_cfg_calls][6] ~= nil and combat_cfg_calls[#combat_cfg_calls][6] > 0.7,
+            "Test 23B: CombatConfig arg 6 (attacker lunge) missing!")
+        for step = 1, 40 do
+            mock_cam:Update(0.005, false)
+        end
+        local final_apply = cam_applies[#cam_applies]
+        assert(math.abs(final_apply[1] - 10.0) < 1e-6 and math.abs(final_apply[3] - 20.0) < 1e-6,
+            "Test 23B B4 camera residual drift detected!")
+        assert(math.abs(mock_cam.currentpos.x - 10.0) < 1e-6 and math.abs(mock_cam.currentpos.z - 20.0) < 1e-6,
+            "Test 23B B4 mutated cam.currentpos permanently!")
+
+        -- HS1 ShareCode roundtrip with #94..#105 (Hit-Feel Lunge + Native VFX + Volumetric Light/Cloud/Canopy)
+        env23.HS_PanelApi.StepTune("hitfeel_campunch", 0.25) -- 0.95 -> 1.20
+        env23.HS_PanelApi.StepTune("hitfeel_vfx", 0.15)      -- 1.05 -> 1.20
+        env23.HS_PanelApi.StepTune("vfx_fire_embers", 0.20)  -- 1.05 -> 1.25
+        env23.HS_PanelApi.StepTune("vfx_footsteps", 0.15)    -- 1.00 -> 1.15
+        env23.HS_PanelApi.StepTune("vol_lightrays", 0.20)    -- 1.00 -> 1.20
+        env23.HS_PanelApi.StepTune("vol_cloud_shade", 0.25)  -- 1.00 -> 1.25
+        env23.HS_PanelApi.StepTune("vol_canopy_shade", 0.20) -- 0.90 -> 1.10
+        local code23 = env23.HS_PanelApi.PreviewShareCode("TrackB")
+        local ok23, err23, st23 = env23.HS_PanelApi.ValidateShareCode(code23)
+        assert(ok23 and st23 and
+               math.abs(st23.tune.hitfeel_enabled - 1.0) < 0.01 and
+               math.abs(st23.tune.hitfeel_campunch - 1.20) < 0.02 and
+               math.abs(st23.tune.hitfeel_vfx - 1.20) < 0.02 and
+               math.abs(st23.tune.vfx_fire_embers - 1.25) < 0.02 and
+               math.abs(st23.tune.vfx_footsteps - 1.15) < 0.02 and
+               math.abs(st23.tune.vol_lightrays - 1.20) < 0.02 and
+               math.abs(st23.tune.vol_cloud_shade - 1.25) < 0.02 and
+               math.abs(st23.tune.vol_canopy_shade - 1.10) < 0.02,
+            "Test 23B HS1 #94..#105 ShareCode roundtrip failed: " .. tostring(err23))
+
+        -- Tab 2 3-pill UI + Sub-3 Hit-Feel renders cleanly with zero Lua errors
+        assert(env23.HS_TogglePanel(true) == true, "Test 23B Panel open failed!")
+
+        print("[CLIENT_V24_TEST] 23. Geo High-FPS Fix + v2.9.5-B/C Zero-Shake Hit-Feel (Attacker Lunge + 0.00px Cam + HS1 #94..#102) PASS")
+    end
+
+    -- 24. Panel redesign: Simple/Pro modes, plain-language bundles, QQ group button, persisted UI mode, monkey-click
+    do
+        local perr = {}
+        local saved_ui = nil
+        local clip = nil
+        local mouse_x, mouse_down, fake_t = 0, false, 100
+        local function MW()
+            local w = { visible = true, children = {}, inst = { IsValid = function() return true end } }
+            setmetatable(w, { __index = function(self, k)
+                if k == "AddChild" then return function(s, c) s.children[#s.children + 1] = c; c._parent = s; return c end end
+                if k == "SetOnDown" then return function(s, fn) s._ondown = fn end end
+                if k == "GetWorldPosition" then
+                    return function(s)
+                        local x, y, n = 0, 0, s
+                        while n do
+                            local np = G.rawget(n, "_pos")
+                            if np then x = x + np[1]; y = y + np[2] end
+                            n = G.rawget(n, "_parent")
+                        end
+                        return { x = x, y = y, z = 0 }
+                    end
+                end
+                if k == "SetText" then return function(s, t) s._txt = t end end
+                if k == "SetString" then return function(s, t) s._str = t end end
+                if k == "SetOnClick" then return function(s, fn) s._onclick = fn end end
+                if k == "Show" then return function(s) s.visible = true end end
+                if k == "Hide" then return function(s) s.visible = false end end
+                if k == "SetPosition" then return function(s, x, y, z) s._pos = { x, y, z } end end
+                return function() end
+            end })
+            return w
+        end
+        local hud24 = MW()
+        local g24 = {
+            pcall = function(f, ...)
+                local r = { G.pcall(f, ...) }
+                if not r[1] then perr[#perr + 1] = tostring(r[2]) end
+                return G.unpack(r)
+            end,
+            rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, type = G.type,
+            pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            BODYTEXTFONT = "bodyfont", NUMBERFONT = "numfont",
+            ANCHOR_RIGHT = 2, ANCHOR_MIDDLE = 0, ANCHOR_LEFT = 1, ANCHOR_TOP = 1, SCALEMODE_PROPORTIONAL = 2,
+            STRINGS = { UI = { OPTIONS = { ENABLED = "Enabled", DISABLED = "Disabled" } } },
+            ThePlayer = { HUD = hud24 },
+            TheSim = {
+                GetPersistentString = function(_, name, cb)
+                    if name == "hypersmooth_ui.cfg" then cb(true, "pro") else cb(false, "") end
+                end,
+                SetPersistentString = function(_, name, val)
+                    if name == "hypersmooth_ui.cfg" then saved_ui = val end
+                end,
+            },
+            TheInput = {
+                OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end,
+                GetScreenPosition = function() return { x = mouse_x, y = 0, z = 0 } end,
+                IsMouseDown = function() return mouse_down end,
+            },
+            MOUSEBUTTON_LEFT = 1000,
+            GetTimeRealSeconds = function() return fake_t end,
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_SetSkeletal = function() return true end,
+            HyperSmooth_SetVfxSmooth = function() return true end,
+            HyperSmooth_SetLowLatency = function() return true end,
+            HyperSmooth_SetVisual = function() return true end,
+            HyperSmooth_SetHd2d = function() return true end,
+            HyperSmooth_SetClipboard = function(s) clip = s; return true end,
+            HyperSmooth_GetFrameStats = function() return 240.0, 228.0, 4.18, 0.03, 0, 30 end,
+            require = function(p)
+                if p == "widgets/widget" or p == "widgets/image" or p == "widgets/imagebutton" or p == "widgets/text" then
+                    return function() return MW() end
+                end
+                return {}
+            end,
+        }
+        setmetatable(g24, {
+            __newindex = function(_, k, _)
+                G.error("assign to undeclared variable '" .. tostring(k) .. "'", 2)
+            end,
+        })
+        local env24
+        env24 = {
+            GLOBAL = g24,
+            GetModConfigData = function(k)
+                if k == "target_fps" then return 240 end
+                if k == "skeletal_tween" or k == "low_latency_input" then return true end
+                return false
+            end,
+            AddClassPostConstruct = function() end, AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end, AddSimPostInit = function() end,
+            AddClientModRPCHandler = function() end,
+            modimport = function(name)
+                if name == "hs_panel" then
+                    local fp, ep = G.kleiloadlua("../mods/client_v24_lua_test/target_hs_panel.lua")
+                    assert(fp ~= nil, "hs_panel.lua load error: " .. tostring(ep))
+                    setfenv(fp, env24)
+                    fp()
+                end
+            end,
+        }
+        local f24 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(f24, env24)
+        f24()
+        local api24 = env24.HS_PanelApi
+        assert(api24.GetUiMode() == "pro", "Test 24: persisted UI mode 'pro' not loaded!")
+
+        -- Bundles (plain-language master switches)
+        local function snapOf() return api24.GetSnapshot() end
+        assert(type(snapOf().bounds) == "table" and snapOf().bounds.sharp.max > 1.0, "Test 24: snapshot.bounds missing")
+        assert(type(snapOf().bundles) == "table" and snapOf().ui_mode == "pro", "Test 24: snapshot.bundles/ui_mode missing")
+        assert(snapOf().bundles.clarity == false)
+        api24.ToggleBundle("clarity")
+        local f1 = snapOf().flags
+        assert(f1.cas and f1.af16 and f1.mip_sharp and snapOf().bundles.clarity == true, "Test 24: clarity bundle ON failed")
+        api24.ToggleBundle("clarity")
+        local f2 = snapOf().flags
+        assert(not f2.cas and not f2.af16 and not f2.mip_sharp and snapOf().bundles.clarity == false, "Test 24: clarity bundle OFF failed")
+        api24.ToggleBundle("glow")
+        assert(snapOf().flags.soft_bloom and snapOf().flags.ao and snapOf().bundles.glow == true, "Test 24: glow bundle failed")
+        api24.ToggleBundle("world3d")
+        assert(snapOf().tune.shadow_density > 0.3 and snapOf().tune.water_refl_str > 0.3 and snapOf().bundles.world3d == true, "Test 24: world3d ON failed")
+        api24.ToggleBundle("world3d")
+        assert(snapOf().tune.shadow_density < 0.001 and snapOf().bundles.world3d == false, "Test 24: world3d OFF failed")
+        api24.ToggleBundle("hitfeel")
+        assert(snapOf().bundles.hitfeel == true, "Test 24: hitfeel bundle failed")
+        assert(api24.ToggleBundle("nonsense") == false)
+
+        -- Build panel in Pro mode and collect widget tree
+        g24.c_hsmenu(true)
+        assert(#hud24.children == 1 and hud24.children[1].visible == true, "Test 24: panel failed to build in Pro mode")
+        local all = {}
+        local function walk(w)
+            all[#all + 1] = w
+            for _, c in ipairs(w.children or {}) do walk(c) end
+        end
+        walk(hud24.children[1])
+        local qq_btn = nil
+        local nclick = 0
+        for _, w in ipairs(all) do
+            if w._onclick then nclick = nclick + 1 end
+            if type(w._txt) == "string" and w._txt:find("978808336", 1, true) and w._onclick then qq_btn = w end
+        end
+        assert(nclick > 120, "Test 24: expected >120 clickable widgets, got " .. tostring(nclick))
+        assert(qq_btn ~= nil, "Test 24: QQ group 978808336 button missing from header!")
+        qq_btn._onclick()
+        assert(clip == "978808336", "Test 24: QQ click must copy group number, clip=" .. tostring(clip))
+        assert(type(qq_btn._txt) == "string" and (qq_btn._txt:find("已复制", 1, true) or qq_btn._txt:find("Copied", 1, true)),
+            "Test 24: QQ button must flash copied state")
+
+        -- Persist UI mode through API
+        assert(api24.SetUiMode("simple") == true and saved_ui == "simple", "Test 24: SetUiMode must persist")
+        assert(api24.SetUiMode("bogus") == false)
+        api24.SetUiMode("pro")
+
+        -- Monkey-click every clickable widget (all tabs, accordion headers, steppers, toggles, slots, mood, share, reset)
+        local clickables = {}
+        for _, w in ipairs(all) do
+            if w._onclick and w ~= qq_btn then clickables[#clickables + 1] = w end
+        end
+        local mark = #perr
+        for _, w in ipairs(clickables) do
+            local okc, errc = G.pcall(w._onclick)
+            if not okc and tostring(errc):find("target_hs_panel", 1, true) then
+                perr[#perr + 1] = "CLICK: " .. tostring(errc)
+            end
+        end
+        env24.HS_PanelNotifySync()
+        env24.HS_PanelTickTelemetry()
+        local bad = {}
+        for i = mark + 1, #perr do
+            if perr[i]:find("target_hs_panel", 1, true) then bad[#bad + 1] = perr[i] end
+        end
+        assert(#bad == 0, "Test 24: hs_panel runtime errors: " .. table.concat(bad, " | "))
+
+        -- Slider / button interaction: hold-repeat, drag, magnet-to-default, FX animation
+        do
+            g24.c_hsmenu(true)
+            local UI = g24.HS_PanelDebug
+            assert(type(UI) == "table" and type(UI.steppers) == "table" and #UI.steppers > 20, "Test 24: UI.steppers hook missing")
+            local root = hud24.children[1]
+            assert(type(G.rawget(root, "OnUpdate")) == "function", "Test 24: root.OnUpdate missing")
+            local sw = nil
+            for _, e in ipairs(UI.steppers) do
+                if e.key == "sharp" and G.rawget(e.hit, "_ondown") and G.rawget(e.minus, "_ondown") then sw = e; break end
+            end
+            assert(sw ~= nil, "Test 24: sharp slider with _ondown handlers not found")
+            local bd = snapOf().bounds.sharp
+            local span = bd.max - bd.min
+            local function cur() return snapOf().tune.sharp end
+            local function tick(n, dt) for _ = 1, n do fake_t = fake_t + dt; root.OnUpdate(root, dt) end end
+
+            -- single press of [-]
+            api24.SetTune("sharp", bd.min + span * 0.6)
+            local v0 = cur()
+            sw.minus._ondown()
+            local v1 = cur()
+            assert(v1 < v0, "Test 24: [-] press must step down: " .. v0 .. " -> " .. v1)
+            assert(UI.hold ~= nil, "Test 24: [-] press must arm hold-repeat")
+            -- held: repeats after the initial delay
+            mouse_down = true
+            tick(3, 0.05)
+            assert(cur() == v1, "Test 24: hold-repeat fired before the 0.4s delay")
+            tick(20, 0.05)
+            local v2 = cur()
+            assert(v2 < v1, "Test 24: hold-repeat must keep stepping down: " .. v1 .. " -> " .. v2)
+            -- release: stops
+            mouse_down = false
+            tick(1, 0.05)
+            assert(UI.hold == nil, "Test 24: hold must clear on mouse release")
+            tick(10, 0.05)
+            assert(cur() == v2, "Test 24: value must not move after release")
+            -- [+] press
+            sw.plus._ondown(); mouse_down = false; tick(1, 0.02)
+            assert(cur() > v2, "Test 24: [+] press must step up")
+
+            -- drag the knob: mouse at 75% of the track
+            local hp = sw.hit:GetWorldPosition()
+            local rp = sw.ref:GetWorldPosition()
+            local half = rp.x - hp.x
+            assert(half > 40 and half < 60, "Test 24: track half-width calibration off: " .. tostring(half))
+            mouse_x = hp.x + (0.75 - 0.5) * 2 * half
+            mouse_down = true
+            sw.hit._ondown()
+            assert(UI.drag == sw and not UI.slider_bad, "Test 24: drag must begin")
+            local want = bd.min + 0.75 * span
+            assert(math.abs(cur() - want) <= span * 0.01 + 1e-6, "Test 24: drag start value " .. tostring(cur()) .. " vs " .. want)
+            -- keep dragging beyond the right end -> clamps to max
+            mouse_x = hp.x + 3 * half
+            tick(4, 0.06)
+            assert(math.abs(cur() - bd.max) <= span * 0.006 + 1e-6, "Test 24: drag beyond end must clamp to max, got " .. tostring(cur()))
+            -- magnet to default
+            local fdef = (bd.default - bd.min) / span
+            mouse_x = hp.x + (fdef + 0.008 - 0.5) * 2 * half
+            tick(4, 0.06)
+            assert(math.abs(cur() - bd.default) <= 1e-6, "Test 24: drag near default must magnet to default, got " .. tostring(cur()) .. " vs " .. bd.default)
+            -- release finalizes and clears drag state
+            mouse_x = hp.x + (0.25 - 0.5) * 2 * half
+            mouse_down = false
+            tick(1, 0.06)
+            assert(UI.drag == nil, "Test 24: drag must clear on release")
+            assert(math.abs(cur() - (bd.min + 0.25 * span)) <= span * 0.01 + 1e-6, "Test 24: release must apply final position, got " .. tostring(cur()))
+
+            -- coordinate sanity guard: absurd mouse position disables drag instead of corrupting values
+            local vkeep = cur()
+            mouse_x = hp.x + 50 * half
+            mouse_down = true
+            sw.hit._ondown()
+            assert(UI.slider_bad == true and UI.drag == nil and cur() == vkeep, "Test 24: coordinate mismatch guard failed")
+            UI.slider_bad = nil
+            mouse_down = false
+
+            -- FX animation drains to idle without errors
+            for _, w in ipairs(clickables) do
+                local fx = G.rawget(w, "_hs_fx")
+                if fx then fx.press = 1.0; fx.hover_t = 1.0; UI.fx_active[fx] = true end
+            end
+            tick(60, 0.016)
+            local pending = 0
+            for _ in pairs(UI.fx_active) do pending = pending + 1 end
+            assert(pending == 0, "Test 24: FX animation did not settle, pending=" .. pending)
+            local mk2 = #perr
+            tick(5, 0.016)
+            assert(#perr == mk2, "Test 24: OnUpdate raised errors")
+        end
+        g24.c_hsmenu(false)
+        assert(hud24.children[1].visible == false)
+        print("[CLIENT_V24_TEST] 24. Panel redesign (Simple/Pro + bundles + persisted mode + QQ 978808336 copy + " .. tostring(#clickables) .. "-widget monkey click, 0 errors + slider drag/hold-repeat/magnet/FX) PASS")
+    end
+
+    -- 25. v2.9.5-C Native DST VFX Engine (hs_vfx.lua): strict.lua + Fire Embers + Ambient Motes/Spores + Footsteps + Ground-Physics Hit Debris & Weapon-Tip Glint
+    do
+        local env_cols, env_scales = {}, {}
+        local emitted_by_host = {} -- host_idx -> { [em_idx] = count }
+        local follow_calls = {}
+        local prefab_hooks = {}
+        local px25, pz25 = 10.0, 20.0
+        local is_cave25 = false
+        local wstate25 = { israining = false, isnight = false, isautumn = true, isspring = false, snowlevel = 0.0 }
+        local host_seq = 0
+        local created_hosts = {}
+
+        local function MakeMockVfxEnt()
+            host_seq = host_seq + 1
+            local hid = host_seq
+            local counts = {}
+            emitted_by_host[hid] = counts
+            local function bump(idx) counts[idx] = (counts[idx] or 0) + 1 end
+            local valid = true
+            local ent = { _hid = hid, _pos = { 0, 0, 0 } }
+            ent.IsValid = function() return valid end
+            ent.Remove = function() valid = false end
+            ent.AddTag = function() end
+            ent.Transform = {
+                SetPosition = function(_, x, y, z) ent._pos = { x, y, z } end,
+                GetWorldPosition = function() return ent._pos[1], ent._pos[2], ent._pos[3] end,
+            }
+            local vfx = {
+                InitEmitters = function(_, n) ent._n_emit = n end,
+                AddParticle = function(_, idx) bump(idx) end,
+                AddParticleUV = function(_, idx) bump(idx) end,
+                AddRotatingParticle = function(_, idx) bump(idx) end,
+                AddRotatingParticleUV = function(_, idx) bump(idx) end,
+            }
+            setmetatable(vfx, { __index = function() return function() end end })
+            ent.entity = {
+                SetCanSleep = function() end,
+                AddTransform = function() return ent.Transform end,
+                AddVFXEffect = function() ent.VFXEffect = vfx; return vfx end,
+                CallPrefabConstructionComplete = function()
+                    assert(ent._n_emit ~= nil and ent._n_emit > 0, "Test 25: CallPrefabConstructionComplete called before InitEmitters!")
+                    ent._constructed = true
+                end,
+                AddFollower = function()
+                    ent.Follower = {
+                        FollowSymbol = function(_, guid, sym, x, y, z)
+                            follow_calls[#follow_calls + 1] = { guid = guid, sym = sym, y = y }
+                        end,
+                    }
+                    return ent.Follower
+                end,
+                SetParent = function() end,
+            }
+            created_hosts[hid] = ent
+            return ent
+        end
+
+        local player25 = {
+            GUID = 7777,
+            IsValid = function() return true end,
+            entity = { IsVisible = function() return true end },
+            Transform = { GetWorldPosition = function() return px25, 0.0, pz25 end },
+            DoTaskInTime = function(_, _, fn) end,
+        }
+        local g25 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            TheNet = { IsDedicated = function() return false end },
+            TheSim = { GetTickTime = function() return 1.0 / 30.0 end },
+            ThePlayer = player25,
+            TheWorld = {
+                state = wstate25,
+                HasTag = function(_, tag) return tag == "cave" and is_cave25 end,
+                Map = {
+                    IsVisualGroundAtPoint = function() return true end,
+                    GetTileAtPoint = function() return 6 end, -- GRASS
+                },
+            },
+            WORLD_TILES = { GRASS = 6, FOREST = 7, DECIDUOUS = 30 },
+            BLENDMODE = { Additive = 1, Premultiplied = 2 },
+            CreateEntity = MakeMockVfxEnt,
+            resolvefilepath = function(p) return p end,
+            EnvelopeManager = {
+                AddColourEnvelope = function(_, name) env_cols[name] = true end,
+                AddVector2Envelope = function(_, name) env_scales[name] = true end,
+            },
+            EmitterManager = { AddEmitter = function() end },
+        }
+        setmetatable(g25, {
+            __newindex = function(_, k, _)
+                G.error("strict.lua violation in hs_vfx: assign to undeclared '" .. tostring(k) .. "'", 2)
+            end,
+        })
+        local env25 = {
+            GLOBAL = g25,
+            AddPrefabPostInit = function(pref, fn) prefab_hooks[pref] = fn end,
+            AddPlayerPostInit = function() end,
+        }
+        local fv, ev = G.kleiloadlua("../mods/client_v24_lua_test/target_hs_vfx.lua")
+        assert(fv ~= nil, "Test 25: hs_vfx.lua load error: " .. tostring(ev))
+        setfenv(fv, env25)
+        fv()
+        local V = env25.HS_VFX
+        assert(type(V) == "table", "Test 25: HS_VFX not exported")
+        assert(prefab_hooks["campfirefire"] ~= nil and prefab_hooks["coldfirefire"] ~= nil, "Test 25: fire prefab hooks missing")
+
+        -- 1) Vanilla Pure (all 0.0): zero emissions
+        V.ApplyConfig(0.0, 0.0, 0.0, false, 0.0)
+        for _ = 1, 15 do V.StepTick(0.033) end
+        assert(V.GetStats().atmo_emitted == 0 and V.GetStats().foot_emitted == 0 and V.GetStats().combat_emitted == 0,
+            "Test 25: Vanilla Pure must emit 0 particles!")
+
+        -- 2) Register warm campfire + cold firepit -> emit warm (em 0) & cold (em 1) embers
+        local function MockFire(x, z)
+            local f = {
+                IsValid = function() return true end,
+                Transform = { GetWorldPosition = function() return x, 0.0, z end },
+                ListenForEvent = function() end,
+            }
+            return f
+        end
+        prefab_hooks["campfirefire"](MockFire(13.0, 20.0))
+        prefab_hooks["coldfirefire"](MockFire(8.0, 22.0))
+        V.ApplyConfig(1.0, 1.0, 1.0, true, 1.0)
+        assert(env_cols["hs_vfx_ember_warm_c"] and env_cols["hs_vfx_hit_wood_c"] and env_cols["hs_vfx_wpn_arcane_c"],
+            "Test 25: VFX envelopes not registered!")
+
+        -- 3) Surface Autumn Day standing still -> embers + sun motes + leaves, 0 footsteps!
+        for _ = 1, 30 do V.StepTick(0.033) end
+        local atmo_c = emitted_by_host[1]
+        assert((atmo_c[0] or 0) > 0 and (atmo_c[1] or 0) > 0, "Test 25: warm & cold fire embers missing!")
+        assert((atmo_c[2] or 0) > 0 and (atmo_c[4] or 0) > 0, "Test 25: surface sun motes or autumn leaves missing!")
+        assert(V.GetStats().foot_emitted == 0, "Test 25: standing still must emit 0 footsteps!")
+
+        -- 4) Switch to Cave -> bioluminescent cave spores (em 3)
+        is_cave25 = true
+        for _ = 1, 20 do V.StepTick(0.033) end
+        assert((atmo_c[3] or 0) > 0, "Test 25: cave spores missing!")
+        is_cave25 = false
+
+        -- 5) Turf-aware footsteps: grass dust + leaf, then winter snow, then rain splash
+        local foot_c = emitted_by_host[2]
+        for step = 1, 20 do px25 = px25 + 0.25; V.StepTick(0.033) end
+        assert((foot_c[0] or 0) > 0 and (foot_c[3] or 0) > 0, "Test 25: grass footstep dust/leaf missing!")
+        wstate25.snowlevel = 0.6
+        for step = 1, 15 do px25 = px25 + 0.25; V.StepTick(0.033) end
+        assert((foot_c[1] or 0) > 0, "Test 25: winter snow footstep kick-up missing!")
+        wstate25.snowlevel = 0.0; wstate25.israining = true
+        for step = 1, 15 do px25 = px25 + 0.25; V.StepTick(0.033) end
+        assert((foot_c[2] or 0) > 0, "Test 25: rain splash footsteps missing!")
+
+        -- 6) Ground-physics combat/work impacts + FollowSymbol("swap_object") weapon-tip glint!
+        local cbt_c = emitted_by_host[3]
+        assert(V.OnImpact(px25 + 1.5, 0, pz25, px25, 0, pz25, 1.0, 5, true) == true)  -- Chop -> wood chips (0)
+        assert(V.OnImpact(px25 + 1.5, 0, pz25, px25, 0, pz25, 1.0, 6, true) == true)  -- Mine -> rocks (1) + sparks (2)
+        assert(V.OnImpact(px25 + 1.5, 0, pz25, px25, 0, pz25, 1.2, 2, false) == true) -- Shadow combat -> arcane sparks (3) + glints (4) + weapon tip!
+        assert((cbt_c[0] or 0) > 0 and (cbt_c[1] or 0) > 0 and (cbt_c[2] or 0) > 0
+            and (cbt_c[3] or 0) > 0 and (cbt_c[4] or 0) > 0,
+            "Test 25: missing ground-physics wood/rock/spark/glint combat emitters!")
+        assert(#follow_calls >= 1 and follow_calls[1].sym == "swap_object",
+            "Test 25: weapon-tip FollowSymbol('swap_object') not attached!")
+        for _ = 1, 4 do V.StepTick(0.033) end
+        assert(V.GetStats().weapon_emitted > 0, "Test 25: weapon-tip swing glints not emitted!")
+        for hid = 1, host_seq do
+            assert(created_hosts[hid]._constructed == true,
+                "Test 25: VFX host #" .. tostring(hid) .. " missed CallPrefabConstructionComplete() (would crash CollectNodes +0x388a2!)")
+        end
+
+        -- 7) Clean shutdown
+        V.Shutdown()
+        assert(created_hosts[1]:IsValid() == false, "Test 25: Shutdown did not clean up local VFX hosts!")
+        print("[CLIENT_V24_TEST] 25. v2.9.5-C Native DST VFX Engine (Embers + Motes/Spores + Turf Footsteps + Ground-Physics Debris + swap_object Glint + strict.lua) PASS")
+    end
+
+    -- 26. v2.9.5-D Phase 1 World-Space Volumetric Lighting (hs_vollight.lua): 3D Forest Light Rays + ShadeRenderer Cloud/Canopy Shades
+    do
+        local px26, pz26 = 0.0, 0.0
+        local is_cave26 = false
+        local cur_tile26 = 7 -- FOREST
+        local wstate26 = { isdusk = false, isnight = false, isfullmoon = false, israining = false }
+        local shade_types = {}
+        local shade_next_id = 0
+        local shade_next_h = 0
+        local shade_live = {} -- [type] -> { [handle] = true }
+        local shade_str = {}
+        local shade_en = {}
+        local shade_tex = {}
+        local shade_global_en = nil
+        local ray_ents = {}
+
+        local function MakeEnt26()
+            local valid = true
+            local e = { _pos = { 0, 0, 0 }, _vis = true, _lo = 0, _rgba = { 1, 1, 1, 1 } }
+            e.IsValid = function() return valid end
+            e.Remove = function() valid = false end
+            e.AddTag = function() end
+            e.Show = function() e._vis = true end
+            e.Hide = function() e._vis = false end
+            e.DoPeriodicTask = function() end
+            e.Transform = {
+                SetPosition = function(_, x, y, z) e._pos = { x, y, z } end,
+                GetWorldPosition = function() return e._pos[1], e._pos[2], e._pos[3] end,
+                SetEightFaced = function() end,
+                SetRotation = function() end,
+            }
+            e.AnimState = {
+                SetBank = function(_, b) e._bank = b end,
+                SetBuild = function(_, b) e._build = b end,
+                PlayAnimation = function() end,
+                SetLightOverride = function(_, v) e._lo = v end,
+                SetFinalOffset = function() end,
+                SetScale = function() end,
+                Hide = function() end,
+                Show = function() end,
+                OverrideMultColour = function(_, r, g, b, a) e._rgba = { r, g, b, a } end,
+            }
+            e.entity = {
+                SetCanSleep = function() end,
+                AddTransform = function() return e.Transform end,
+                AddAnimState = function() ray_ents[#ray_ents + 1] = e; return e.AnimState end,
+                CallPrefabConstructionComplete = function() e._constructed = true end,
+            }
+            return e
+        end
+
+        local sr26 = {
+            Enable = function(_, on) shade_global_en = on end,
+            CreateShadeType = function()
+                shade_next_id = shade_next_id + 1
+                shade_types[shade_next_id] = true
+                shade_live[shade_next_id] = {}
+                return shade_next_id
+            end,
+            SetShadeTexture = function(_, id, tex) shade_tex[id] = tex end,
+            SetShadeStrength = function(_, id, s) shade_str[id] = s end,
+            SetShadeEnabled = function(_, id, en) shade_en[id] = en end,
+            SetShadeMaxRotation = function() end, SetShadeRotationSpeed = function() end,
+            SetShadeMaxTranslation = function() end, SetShadeTranslationSpeed = function() end,
+            SetShadeMaxScale = function() end, SetShadeScaleSpeed = function() end,
+            SpawnShade = function(_, id, x, z, rot, sc)
+                shade_next_h = shade_next_h + 1
+                shade_live[id][shade_next_h] = { x = x, z = z, sc = sc }
+                return shade_next_h
+            end,
+            RemoveShade = function(_, id, h)
+                if shade_live[id] then shade_live[id][h] = nil end
+            end,
+        }
+        local function CountKeys(t) local n = 0; for _ in pairs(t) do n = n + 1 end; return n end
+
+        local player26 = {
+            IsValid = function() return true end,
+            Transform = { GetWorldPosition = function() return px26, 0.0, pz26 end },
+            DoTaskInTime = function() end,
+        }
+        local g26 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            FRAMES = 1.0 / 30.0,
+            TheNet = { IsDedicated = function() return false end },
+            ThePlayer = player26,
+            TheCamera = { currentpos = { x = 0, y = 0, z = 0 }, GetDownVec = function() return { x = 0, y = -1, z = 0 } end },
+            TheWorld = {
+                state = wstate26,
+                HasTag = function(_, tag) return tag == "cave" and is_cave26 end,
+                Map = { GetTileAtPoint = function() return cur_tile26 end },
+            },
+            WORLD_TILES = { FOREST = 7, DECIDUOUS = 30, SINKHOLE = 43, FUNGUS = 14, GRASS = 6 },
+            ShadeRenderer = sr26,
+            CreateEntity = MakeEnt26,
+            resolvefilepath = function(p) return p end,
+        }
+        setmetatable(g26, {
+            __newindex = function(_, k, _)
+                G.error("strict.lua violation in hs_vollight: assign to undeclared '" .. tostring(k) .. "'", 2)
+            end,
+        })
+        local env26 = { GLOBAL = g26, AddPlayerPostInit = function() end }
+        local fl, el = G.kleiloadlua("../mods/client_v24_lua_test/target_hs_vollight.lua")
+        assert(fl ~= nil, "Test 26: hs_vollight.lua load error: " .. tostring(el))
+        setfenv(fl, env26)
+        fl()
+        local VL = env26.HS_VOLLIGHT
+        assert(type(VL) == "table", "Test 26: HS_VOLLIGHT missing")
+
+        -- 1) Vanilla Pure (0,0,0): 0 rays, 0 shades, ShadeRenderer untouched
+        VL.ApplyConfig(0.0, 0.0, 0.0)
+        for _ = 1, 5 do VL.StepUpdate(0.1) end
+        assert(VL.GetStats().active_rays == 0 and VL.GetStats().active_clouds == 0 and VL.GetStats().active_canopy == 0,
+            "Test 26: Vanilla Pure must spawn 0 volumetric light/shades!")
+        assert(shade_global_en == nil, "Test 26: Vanilla Pure must not touch ShadeRenderer:Enable!")
+
+        -- 2) Daytime Forest -> spawns 3D lightrays (SetLightOverride=1!) + cloud shades + forest canopy shades
+        VL.ApplyConfig(1.0, 1.0, 1.0)
+        for _ = 1, 15 do VL.StepUpdate(0.1) end
+        local st = VL.GetStats()
+        assert(st.active_rays > 0 and st.active_clouds > 0 and st.active_canopy > 0,
+            string.format("Test 26: expected rays/clouds/canopy > 0, got %d/%d/%d", st.active_rays, st.active_clouds, st.active_canopy))
+        assert(shade_tex[1] == "images/hs_cloud_shade.tex" and shade_tex[2] == "images/tree.tex",
+            "Test 26: ShadeRenderer textures mismatch!")
+        assert(shade_en[1] == true and shade_en[2] == true and st.cloud_str > 0.15 and st.canopy_str > 0.15,
+            "Test 26: Daytime ShadeRenderer strengths did not ramp up!")
+        assert(ray_ents[1]._bank == "lightrays" and ray_ents[1]._lo == 1 and ray_ents[1]._rgba[4] > 0.10 and ray_ents[1]._constructed == true,
+            "Test 26: Light ray must set bank=lightrays, LightOverride=1, visible alpha, and CallPrefabConstructionComplete()!")
+
+        -- 3) Night (not full moon) -> rays fade to 0 & hide, clouds & canopy disable
+        wstate26.isnight = true; wstate26.isfullmoon = false
+        for _ = 1, 30 do VL.StepUpdate(0.15) end
+        assert(VL.GetStats().ray_alpha < 0.01 and shade_en[1] == false and shade_en[2] == false,
+            "Test 26: Night must fade rays to 0 and disable cloud/canopy shades!")
+
+        -- 4) Full Moon -> silver-blue moonbeam rays & gentle cloud drift return!
+        wstate26.isfullmoon = true
+        for _ = 1, 25 do VL.StepUpdate(0.15) end
+        assert(VL.GetStats().ray_alpha > 0.25 and ray_ents[1]._rgba[3] > ray_ents[1]._rgba[1],
+            "Test 26: Full moon must activate cool blue-silver moonbeams!")
+
+        -- 5) Cave Sinkhole -> cave shafts stay active, surface clouds & canopy clean up to 0!
+        wstate26.isnight = false; wstate26.isfullmoon = false
+        is_cave26 = true; cur_tile26 = 43 -- SINKHOLE
+        px26 = 200.0; pz26 = 200.0
+        for _ = 1, 10 do VL.StepUpdate(0.2) end
+        assert(VL.GetStats().active_clouds == 0 and VL.GetStats().active_canopy == 0
+            and CountKeys(shade_live[1]) == 0 and CountKeys(shade_live[2]) == 0,
+            "Test 26: Cave must evict all surface cloud & canopy shade handles!")
+        assert(VL.GetStats().active_rays > 0, "Test 26: Cave sinkhole/fungus must spawn cave light shafts!")
+
+        -- 6) Clean Shutdown -> 0 leaked handles & entities
+        VL.Shutdown()
+        assert(VL.GetStats().active_rays == 0 and CountKeys(shade_live[1]) == 0 and CountKeys(shade_live[2]) == 0,
+            "Test 26: Shutdown leaked ray entities or ShadeRenderer handles!")
+        print("[CLIENT_V24_TEST] 26. v2.9.5-D Phase 1 Volumetric Lighting (3D Forest/Cave LightRays + ShadeRenderer Cloud/Canopy + strict.lua) PASS")
+    end
+
+    -- 27. v2.9.5-E Shadow Pipeline Parity (#106..#110 + soft=0.00 + Weather/Season + Moon Blue + Dusk Fire Gate + MinHeight + Flash Lights + HS1 Roundtrip)
+    do
+        local sc27, pl27 = {}, {}
+        local sh_init_27, sh_sort_27, hud_upd_27 = nil, nil, nil
+        local prefab_hooks_27 = {}
+        local wstate27 = { phase = "day", timeinphase = 0.5, isfullmoon = false, precipitation = "none", season = "autumn" }
+        local fire_ent27 = {
+            IsValid = function() return true end,
+            Transform = { GetWorldPosition = function() return 4.0, 0.0, 0.0 end },
+            Light = {
+                IsEnabled = function() return true end,
+                GetCalculatedRadius = function() return 6.0 end,
+                GetRadius = function() return 6.0 end,
+                GetIntensity = function() return 0.90 end,
+            },
+        }
+        local g27 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            setmetatable = G.setmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error, select = G.select,
+            TheNet = { IsDedicated = function() return false end, GetClientTable = function() return {} end },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) if cb then cb(false, "") end end,
+                SetPersistentString = function() end,
+                GetRenderState = function() return 0 end,
+                FindEntities = function() return { fire_ent27 } end,
+            },
+            TheWorld = { state = wstate27, HasTag = function() return false end },
+            ThePlayer = {
+                Transform = { GetWorldPosition = function() return 0.0, 0.0, 0.0 end },
+                HUD = {},
+            },
+            TheCamera = {
+                currentpos = { x = 0.0, y = 0.0, z = 0.0 },
+                GetRightVec = function() return { x = 0.707, y = 0.0, z = -0.707 } end,
+                GetDownVec  = function() return { x = 0.707, y = 0.0, z = 0.707 } end,
+            },
+            require = function(mod)
+                if mod == "widgets/text" then
+                    return function()
+                        return {
+                            inst = { IsValid = function() return true end },
+                            SetHAnchor = function() end, SetVAnchor = function() end,
+                            SetRegionSize = function() end, SetHAlign = function() end,
+                            SetPosition = function() end, SetColour = function() end,
+                            SetClickable = function() end, Hide = function() end,
+                            Show = function() end, SetString = function() end,
+                        }
+                    end
+                end
+                return {}
+            end,
+            IsPaused = function() return false end,
+            SamplerSizes = { Relative = 1 },
+            SamplerColourMode = { RGB = 1 },
+            SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 }, MIP_FILTER_MODE = { NONE = 0 }, WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            PostProcessorEffects = { Bloom = 1, ColourCube = 2 },
+            SamplerEffects = {}, UniformVariables = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function() end, AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end, AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end, EnablePostProcessEffect = function() end,
+                    SetUniformVariable = function() end, IsBloomEnabled = function() return false end,
+                    SetBloomEnabled = function() end,
+                },
+            }),
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn   = function() return true end,
+            HyperSmooth_SetShadowConfig = function(...) sc27[#sc27 + 1] = { ... }; return true, false end,
+            HyperSmooth_SetPointLights  = function(...) pl27[#pl27 + 1] = { ... }; return select(3, ...) or 0 end,
+        }
+        local env27 = {
+            GLOBAL = g27, MODROOT = "../mods/client_v24_lua_test/", Asset = function(t, p) return { t, p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 2 end return nil end,
+            AddModShadersInit = function(fn) sh_init_27 = fn end,
+            AddModShadersSortAndEnable = function(fn) sh_sort_27 = fn end,
+            AddPrefabPostInit = function(name, fn)
+                prefab_hooks_27[name] = prefab_hooks_27[name] or {}
+                prefab_hooks_27[name][#prefab_hooks_27[name] + 1] = fn
+            end,
+            AddPrefabPostInitAny = function() end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "screens/playerhud" then
+                    local mock_hud = { AddChild = function(_, w) return w end }
+                    fn(mock_hud)
+                    hud_upd_27 = mock_hud.OnUpdate
+                end
+            end,
+            AddComponentPostInit = function() end, AddSimPostInit = function() end,
+            AddGamePostInit = function() end, AddClientModRPCHandler = function() end,
+            modimport = function() end,
+        }
+        local fn27 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setmetatable(env27, { __index = g27 })
+        G.setfenv(fn27, env27); fn27()
+        sh_init_27(); sh_sort_27()
+
+        -- Configure full MingYuHui-style crisp parity profile:
+        g27.c_hstune("shadow_density", 0.50)
+        g27.c_hstune("shadow_soft", 0.00)
+        g27.c_hstune("shadow_tint_r", 0.00)
+        g27.c_hstune("shadow_tint_g", 0.00)
+        g27.c_hstune("shadow_tint_b", 0.00)
+        g27.c_hstune("shadow_oval_keep", 0.00)
+        g27.c_hstune("shadow_weather", 1.00)
+        g27.c_hstune("shadow_moon_blue", 1.00)
+        g27.c_hstune("shadow_dusk_point", 0.00)
+        g27.c_hstune("shadow_min_height", 0.85)
+        g27.c_hstune("shadow_flash_lights", 1)
+
+        -- 1) Clear Autumn Day: soft=0.00, pure black tint (0,0,0), minHeight=0.85, density=0.50
+        for _ = 1, 20 do hud_upd_27({}, 0.25) end
+        local d_aut = sc27[#sc27]
+        assert(math.abs(d_aut[1] - 0.50) < 0.02 and d_aut[2] == 0.00 and d_aut[3] == 0.00 and d_aut[4] == 0.00 and d_aut[5] == 0.00
+            and math.abs((d_aut[14] or -1) - 0.85) < 1e-3,
+            "Test 27.1: Autumn day crisp black + minHeight mismatch: " .. tostring(d_aut[1]) .. "/" .. tostring(d_aut[2]) .. "/" .. tostring(d_aut[14]))
+
+        -- 2) Rainy Autumn Day: smoothly decays directional density to 0.50 * 0.60 = 0.30!
+        wstate27.precipitation = "rain"
+        for _ = 1, 25 do hud_upd_27({}, 0.25) end
+        local d_rain = sc27[#sc27]
+        assert(math.abs(d_rain[1] - 0.30) < 0.03, "Test 27.2: Rain decay expected ~0.30, got " .. tostring(d_rain[1]))
+
+        -- 3) Clear Summer vs Clear Winter: Summer -> 0.50 * 1.20 = 0.60, Winter -> 0.50 * 0.80 = 0.40!
+        wstate27.precipitation = "none"; wstate27.season = "summer"
+        for _ = 1, 25 do hud_upd_27({}, 0.25) end
+        local d_sum = sc27[#sc27]
+        assert(math.abs(d_sum[1] - 0.60) < 0.03, "Test 27.3a: Summer boost expected ~0.60, got " .. tostring(d_sum[1]))
+        wstate27.season = "winter"
+        for _ = 1, 25 do hud_upd_27({}, 0.25) end
+        local d_win = sc27[#sc27]
+        assert(math.abs(d_win[1] - 0.40) < 0.03, "Test 27.3b: Winter decay expected ~0.40, got " .. tostring(d_win[1]))
+
+        -- 4) Full Moon Night: tint automatically shifts from (0,0,0) -> (0.10, 0.15, 0.30)!
+        wstate27.season = "autumn"; wstate27.phase = "night"; wstate27.timeinphase = 0.5; wstate27.isfullmoon = true
+        for _ = 1, 30 do hud_upd_27({}, 0.25) end
+        local d_moon = sc27[#sc27]
+        assert(math.abs(d_moon[3] - 0.10) < 0.02 and math.abs(d_moon[4] - 0.15) < 0.02 and math.abs(d_moon[5] - 0.30) < 0.02,
+            string.format("Test 27.4: Full-moon blue tint expected (0.10,0.15,0.30), got (%.3f,%.3f,%.3f)", d_moon[3], d_moon[4], d_moon[5]))
+
+        -- 5) Dusk Firelight Gate: shadow_dusk_point=0 -> 0 fire point lights at dusk; night -> fire point light activates!
+        wstate27.phase = "dusk"; wstate27.timeinphase = 0.5; wstate27.isfullmoon = false
+        for _ = 1, 30 do hud_upd_27({}, 0.25) end
+        local pl_dusk0 = pl27[#pl27]
+        assert((pl_dusk0[3] or 0) == 0, "Test 27.5a: shadow_dusk_point=0 must suppress campfire point shadow at dusk! got " .. tostring(pl_dusk0[3]))
+        g27.c_hstune("shadow_dusk_point", 1.00)
+        for _ = 1, 10 do hud_upd_27({}, 0.25) end
+        local pl_dusk1 = pl27[#pl27]
+        assert((pl_dusk1[3] or 0) >= 1, "Test 27.5b: shadow_dusk_point=1 must allow campfire point shadow at dusk!")
+        g27.c_hstune("shadow_dusk_point", 0.00)
+        wstate27.phase = "night"; wstate27.isfullmoon = false
+        for _ = 1, 30 do hud_upd_27({}, 0.25) end
+        local pl_night = pl27[#pl27]
+        assert((pl_night[3] or 0) >= 1, "Test 27.5c: Night must still cast campfire point shadow even when shadow_dusk_point=0!")
+
+        -- 6) Transient Lightning Flash Shadow: spawn mock lightning prefab -> immediate point shadow, decays to 0 after 1.1s!
+        wstate27.phase = "day"; wstate27.timeinphase = 0.5
+        for _ = 1, 25 do hud_upd_27({}, 0.25) end
+        assert((pl27[#pl27][3] or 0) == 0, "Test 27.6a: Clear day should have 0 point lights before lightning")
+        local bolt = {
+            IsValid = function() return true end,
+            Transform = { GetWorldPosition = function() return 8.0, 0.0, -5.0 end },
+            DoTaskInTime = function(self, _, cb) cb(self) end,
+        }
+        assert(prefab_hooks_27["lightning"] and #prefab_hooks_27["lightning"] >= 1, "Test 27.6b: lightning hook missing")
+        for i = 1, #prefab_hooks_27["lightning"] do prefab_hooks_27["lightning"][i](bolt) end
+        hud_upd_27({}, 0.05)
+        local pl_bolt = pl27[#pl27]
+        assert((pl_bolt[3] or 0) >= 1 and math.abs((pl_bolt[4] or 0) - 8.0) < 0.1 and (pl_bolt[7] or 0) > 0.50,
+            "Test 27.6c: Lightning strike did not emit immediate transient flash shadow!")
+        for _ = 1, 10 do hud_upd_27({}, 0.15) end
+        assert((pl27[#pl27][3] or 0) == 0, "Test 27.6d: Lightning flash shadow failed to decay cleanly after 1s!")
+
+        -- 7) HS1 ShareCode roundtrip for #106..#110 + soft=0.00!
+        local code27 = env27.HS_PanelApi.ExportShareCode("MingYuHui-Parity")
+        local ok27, err27, st27 = env27.HS_PanelApi.ValidateShareCode(code27)
+        assert(ok27 and st27 and st27.tune
+            and st27.tune.shadow_soft == 0.00
+            and math.abs(st27.tune.shadow_weather - 1.00) < 0.02
+            and math.abs(st27.tune.shadow_moon_blue - 1.00) < 0.02
+            and math.abs(st27.tune.shadow_dusk_point - 0.00) < 0.02
+            and math.abs(st27.tune.shadow_min_height - 0.85) < 0.02
+            and st27.tune.shadow_flash_lights == 1,
+            "Test 27.7: HS1 #106..#110 ShareCode roundtrip failed: " .. tostring(err27))
+        print("[CLIENT_V24_TEST] 27. v2.9.5-E Shadow Pipeline Parity (soft=0 + Rain/Summer/Winter + FullMoonBlue + DuskFireGate + MinHeight + LightningFlash + HS1 #106..#110) PASS")
+    end
+
+    -- Test 28: v2.9.5-F PBR Ocean Optics + Horizontal Volumetric Fog (World-Edge Void Mist & Lit Ground Fog) + HS1 #111..#116!
+    do
+        -- Part A: hs_vollight.lua Horizontal Volumetric Fog under strict.lua
+        local env_c28, env_s28 = {}, {}
+        local fog_hosts28 = {}
+        local fog_emitted28 = { [0] = 0, [1] = 0 }
+        local fog_cleared28 = { [0] = 0, [1] = 0 }
+        local fog_spawn_vec28 = {}
+        local fog_res28 = {}
+        local cur_tile28 = 1 -- WORLD_TILES.IMPASSABLE
+        local is_cave28 = false
+        local wstate28 = { isdusk = false, isnight = false, isfullmoon = false, israining = false }
+
+        local function MakeEnt28()
+            local e = { _valid = true, _constructed = false }
+            e.IsValid = function(self) return self._valid end
+            e.Remove = function(self) self._valid = false end
+            e.AddTag = function() end
+            e.DoPeriodicTask = function() end
+            e.entity = {
+                SetCanSleep = function() end,
+                AddTransform = function()
+                    e.Transform = {
+                        _x = 0, _y = 0, _z = 0,
+                        SetPosition = function(self, x, y, z) self._x, self._y, self._z = x, y, z end,
+                        SetEightFaced = function() end,
+                        SetRotation = function() end,
+                    }
+                    return e.Transform
+                end,
+                AddAnimState = function()
+                    e.AnimState = {
+                        SetBank = function() end, SetBuild = function() end, PlayAnimation = function() end,
+                        SetLightOverride = function() end, SetFinalOffset = function() end, SetScale = function() end,
+                        Hide = function() end, Show = function() end, OverrideMultColour = function() end,
+                    }
+                    return e.AnimState
+                end,
+                AddVFXEffect = function()
+                    local vfx = {
+                        _emitters = 0,
+                        InitEmitters = function(self, n) self._emitters = n end,
+                        SetRenderResources = function(_, idx, tex, sh) fog_res28[idx] = { tex = tex, sh = sh } end,
+                        SetMaxNumParticles = function() end,
+                        SetMaxLifetime = function() end,
+                        SetColourEnvelope = function() end,
+                        SetScaleEnvelope = function() end,
+                        SetBlendMode = function() end,
+                        SetUVFrameSize = function() end,
+                        SetRotationStatus = function() end,
+                        SetDragCoefficient = function() end,
+                        SetSpawnVectors = function(_, idx, x1, y1, z1, x2, y2, z2)
+                            fog_spawn_vec28[idx] = { x1, y1, z1, x2, y2, z2 }
+                        end,
+                        SetSortOrder = function() end,
+                        SetSortOffset = function() end,
+                        SetRadius = function() end,
+                        ClearAllParticles = function(_, idx) fog_cleared28[idx] = (fog_cleared28[idx] or 0) + 1 end,
+                        AddRotatingParticle = function(_, idx) fog_emitted28[idx] = (fog_emitted28[idx] or 0) + 1 end,
+                        AddParticle = function(_, idx) fog_emitted28[idx] = (fog_emitted28[idx] or 0) + 1 end,
+                    }
+                    e.VFXEffect = vfx
+                    fog_hosts28[#fog_hosts28 + 1] = e
+                    return vfx
+                end,
+                CallPrefabConstructionComplete = function() e._constructed = true end,
+            }
+            return e
+        end
+
+        local g28 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            FRAMES = 1.0 / 30.0,
+            BLENDMODE = { Premultiplied = 2, Additive = 1 },
+            TheNet = { IsDedicated = function() return false end },
+            ThePlayer = {
+                IsValid = function() return true end,
+                Transform = { GetWorldPosition = function() return 120.0, 0.0, -80.0 end },
+            },
+            TheWorld = {
+                state = wstate28,
+                HasTag = function(_, tag) return tag == "cave" and is_cave28 end,
+                Map = {
+                    GetTileAtPoint = function() return cur_tile28 end,
+                    IsVisualGroundAtPoint = function() return cur_tile28 ~= 1 and cur_tile28 ~= 255 end,
+                },
+            },
+            TheSim = { FindEntities = function() return {} end },
+            WORLD_TILES = { IMPASSABLE = 1, INVALID = 255, FOREST = 7, MARSH = 8, DECIDUOUS = 30, FUNGUS = 14, GRASS = 6 },
+            EnvelopeManager = {
+                AddColourEnvelope = function(_, k, v) env_c28[k] = v end,
+                AddVector2Envelope = function(_, k, v) env_s28[k] = v end,
+            },
+            CreateEntity = MakeEnt28,
+            resolvefilepath = function(p) return p end,
+        }
+        setmetatable(g28, {
+            __newindex = function(_, k, _)
+                G.error("strict.lua violation in hs_vollight fog: assign to undeclared '" .. tostring(k) .. "'", 2)
+            end,
+        })
+        local env28v = { GLOBAL = g28, AddPlayerPostInit = function() end }
+        local fl28 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_hs_vollight.lua"))
+        setfenv(fl28, env28v); fl28()
+        local VL28 = env28v.HS_VOLLIGHT
+
+        -- 1) Vanilla Pure (0,0,0,0,0): 0 fog hosts, 0 particles
+        VL28.ApplyConfig(0, 0, 0, 0, 0)
+        for _ = 1, 5 do VL28.StepUpdate(0.15) end
+        assert(#fog_hosts28 == 0 and fog_emitted28[0] == 0 and fog_emitted28[1] == 0,
+            "Test 28.1: Vanilla Pure must spawn 0 fog host/particles!")
+
+        -- 2) World-Edge Void Ocean Mist (vol_edge_fog=1.0, vol_ground_fog=0.0) near IMPASSABLE void
+        VL28.ApplyConfig(0, 0, 0, 1.0, 0.0)
+        for _ = 1, 15 do VL28.StepUpdate(0.20) end
+        assert(#fog_hosts28 == 1 and fog_hosts28[1]._constructed == true,
+            "Test 28.2a: Fog VFX host MUST call CallPrefabConstructionComplete() after InitEmitters(2)!")
+        assert(fog_hosts28[1].Transform._x == 0 and fog_hosts28[1].Transform._z == 0,
+            "Test 28.2a2: Fog host MUST stay world-anchored at (0,0,0) so moving player NEVER drags existing mist!")
+        assert(fog_res28[0].tex == "levels/textures/ds_fog1.tex" and fog_res28[0].sh == "shaders/vfx_particle.ksh",
+            "Test 28.2b: Edge fog must use ds_fog1.tex + lightmap-lit vfx_particle.ksh!")
+        assert(fog_spawn_vec28[0][1] == -1 and fog_spawn_vec28[0][2] == 0 and fog_spawn_vec28[0][3] == 1
+            and fog_spawn_vec28[0][4] == 1 and fog_spawn_vec28[0][5] == 0 and fog_spawn_vec28[0][6] == 1,
+            "Test 28.2c: Edge fog must use horizontal XZ SetSpawnVectors(-1,0,1, 1,0,1)!")
+        assert(fog_emitted28[0] > 0 and fog_emitted28[1] == 0 and VL28.GetStats().edge_fog_emitted == fog_emitted28[0],
+            "Test 28.2d: Edge fog emitted mismatch: " .. tostring(fog_emitted28[0]) .. "/" .. tostring(fog_emitted28[1]))
+
+        -- 3) Lightmap-Lit Forest / Marsh / Cave Ground Fog (vol_edge_fog=0.0, vol_ground_fog=1.0)
+        cur_tile28 = 8 -- MARSH
+        VL28.ApplyConfig(0, 0, 0, 0.0, 1.0)
+        for _ = 1, 20 do VL28.StepUpdate(0.20) end
+        assert(fog_cleared28[0] > 0 and fog_emitted28[1] > 0 and VL28.GetStats().ground_fog_emitted == fog_emitted28[1],
+            "Test 28.3: Ground fog must clear emitter 0 and emit on MARSH/FOREST/CAVE tiles!")
+
+        -- 4) Sunbeams Everywhere (vol_lightrays_everywhere): GRASS base turf spawns 0 rays when OFF, >0 rays when ON, evicts cleanly on OFF!
+        cur_tile28 = 6 -- GRASS (non-forest base turf)
+        VL28.ApplyConfig(1.0, 0, 0, 0.0, 0.0, 0)
+        for _ = 1, 6 do VL28.StepUpdate(0.15) end
+        assert(VL28.GetStats().active_rays == 0 and VL28.GetStats().non_forest_rays == 0,
+            "Test 28.4a: GRASS turf must spawn 0 rays when vol_lightrays_everywhere=0!")
+        VL28.ApplyConfig(1.0, 0, 0, 0.0, 0.0, 1)
+        for _ = 1, 6 do VL28.StepUpdate(0.15) end
+        assert(VL28.GetStats().active_rays > 0 and VL28.GetStats().non_forest_rays == VL28.GetStats().active_rays,
+            "Test 28.4b: GRASS turf must spawn Waterlogged-style sunbeams when vol_lightrays_everywhere=1!")
+        VL28.ApplyConfig(1.0, 0, 0, 0.0, 0.0, 0)
+        assert(VL28.GetStats().non_forest_rays == 0 and VL28.GetStats().active_rays == 0,
+            "Test 28.4c: Disabling vol_lightrays_everywhere must immediately clear non-forest base sunbeams!")
+
+        -- 4d) Clean Shutdown: clears both emitters & removes fog host cleanly!
+        VL28.Shutdown()
+        assert(fog_hosts28[1]._valid == false and VL28.GetStats().fog_host_ready == false,
+            "Test 28.4d: Shutdown must destroy fog VFX host cleanly!")
+
+        -- Part B: modmain.lua PBR Ocean native bus + Preset 0 purity + HS1 #111..#116 roundtrip!
+        local oc_pbr_calls = {}
+        local vl_apply_calls = {}
+        local sh_init_28, sh_sort_28, hud_upd_28
+        local g28m = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, setmetatable = G.setmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os, tonumber = G.tonumber, tostring = G.tostring,
+            print = G.print, error = G.error, select = G.select, assert = G.assert,
+            TheSim = {
+                GetPersistentString = function(_, _, cb) if cb then cb(false, "") end end,
+                SetPersistentString = function() end,
+                FindEntities = function() return {} end,
+            },
+            TheInput = { AddKeyUpHandler = function() end, AddKeyDownHandler = function() end, IsKeyDown = function() return false end },
+            TheNet = { IsDedicated = function() return false end, GetIsServer = function() return false end, GetIsClient = function() return true end, GetServerGameMode = function() return "survival" end },
+            KnownModIndex = { IsModEnabled = function() return false end, GetModsToLoad = function() return {} end },
+            Profile = { GetBloomEnabled = function() return true end, SetBloomEnabled = function() end },
+            SamplerSizes = { Relative = 1 }, SamplerColourMode = { RGB = 1 }, SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 }, MIP_FILTER_MODE = { NONE = 0 }, WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            PostProcessorEffects = { Bloom = 1, ColourCube = 2 }, SamplerEffects = {}, UniformVariables = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function() end, AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end, AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end, EnablePostProcessEffect = function() end,
+                    SetUniformVariable = function() end, IsBloomEnabled = function() return false end,
+                    SetBloomEnabled = function() end,
+                    SetColourCubeData = function() end, SetColourCubeLerp = function() end, SetDistortionFactor = function() end,
+                },
+            }),
+            TheWorld = {
+                state = { phase = "day", timeinphase = 0.5, season = "autumn", isfullmoon = false, israining = false, precipitation = "none" },
+                HasTag = function() return false end,
+            },
+            ThePlayer = { IsValid = function() return true end, Transform = { GetWorldPosition = function() return 0, 0, 0 end } },
+            TheCamera = { currentpos = { x = 0, y = 0, z = 0 }, GetRightVec = function() return { x = 0.707, y = 0, z = -0.707 } end },
+            HyperSmooth_SetOceanPbr = function(a, b, c, d) oc_pbr_calls[#oc_pbr_calls + 1] = { a, b, c, d }; return true end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn = function() return true end,
+            HyperSmooth_SetShadowConfig = function() return true, false end,
+            HyperSmooth_SetPointLights = function() return 0 end,
+            HyperSmooth_SetWaterRefl = function() return true, 0 end,
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            require = function(p)
+                if p == "widgets/text" then
+                    return function()
+                        return G.setmetatable({ inst = { IsValid = function() return true end, entity = { IsValid = function() return true end } } }, { __index = function() return function() end end })
+                    end
+                end
+                return {}
+            end,
+        }
+        local env28m = {
+            GLOBAL = g28m,
+            MODROOT = "../mods/client_v24_lua_test/",
+            HS_VOLLIGHT = {
+                ApplyConfig = function(a, b, c, d, e, f) vl_apply_calls[#vl_apply_calls + 1] = { a, b, c, d, e, f } end,
+            },
+            Asset = function(t, p) return { type = t, file = p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 0 end return nil end,
+            AddModShadersInit = function(cb) sh_init_28 = cb end,
+            AddModShadersSortAndEnable = function(cb) sh_sort_28 = cb end,
+            AddClassPostConstruct = function(cls, cb)
+                if cls == "screens/playerhud" then
+                    local mock = { AddChild = function(_, w) return w end, OnUpdate = function() end }
+                    cb(mock); hud_upd_28 = mock.OnUpdate
+                end
+            end,
+            AddPrefabPostInit = function() end, AddPrefabPostInitAny = function() end, AddPlayerPostInit = function() end,
+            AddComponentPostInit = function() end, AddSimPostInit = function() end,
+            AddGamePostInit = function() end, AddClientModRPCHandler = function() end,
+            modimport = function() end,
+        }
+        local fn28m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setmetatable(env28m, { __index = g28m })
+        G.setfenv(fn28m, env28m); fn28m()
+        sh_init_28(); sh_sort_28()
+
+        -- 5) Preset 0 purity: HyperSmooth_SetOceanPbr receives (0,0,0,0), HS_VOLLIGHT receives (0,0,0,0,0)
+        hud_upd_28({}, 0.05)
+        local p0 = oc_pbr_calls[#oc_pbr_calls]
+        local v0 = vl_apply_calls[#vl_apply_calls]
+        assert(p0 and p0[1] == 0 and p0[2] == 0 and p0[3] == 0 and p0[4] == 0,
+            "Test 28.5a: Preset 0 must push HyperSmooth_SetOceanPbr(0,0,0,0)!")
+        assert(v0 and v0[4] == 0 and v0[5] == 0,
+            "Test 28.5b: Preset 0 must push vol_edge_fog=0 & vol_ground_fog=0!")
+
+        -- 6) Tune ocean_pbr + sky_refl + sun_glow + hide_waves + edge/ground fog from Preset 0 -> switches to Preset 3 & pushes live!
+        g28m.c_hstune("ocean_pbr", 1.00)
+        g28m.c_hstune("ocean_sky_refl", 0.90)
+        g28m.c_hstune("ocean_sun_glow", 0.95)
+        g28m.c_hstune("ocean_hide_waves", 1)
+        g28m.c_hstune("vol_edge_fog", 1.10)
+        g28m.c_hstune("vol_ground_fog", 0.75)
+        env28m.HS_PanelApi.ToggleTuneBool("vol_lightrays_everywhere")
+        hud_upd_28({}, 0.05)
+        local p1 = oc_pbr_calls[#oc_pbr_calls]
+        local v1 = vl_apply_calls[#vl_apply_calls]
+        assert(math.abs(p1[1] - 1.00) < 0.01 and math.abs(p1[2] - 0.90) < 0.01 and math.abs(p1[3] - 0.95) < 0.01 and p1[4] == 1,
+            "Test 28.6a: HyperSmooth_SetOceanPbr propagation mismatch!")
+        assert(math.abs(v1[1] - 0.85) < 0.02 and math.abs(v1[4] - 1.10) < 0.01 and math.abs(v1[5] - 0.75) < 0.01 and v1[6] == 1,
+            "Test 28.6b: HS_VOLLIGHT edge/ground fog & lightrays_everywhere propagation mismatch!")
+
+        -- 7) HS1 ShareCode #111..#117 export -> validate -> clean import from Preset 0!
+        local code28 = env28m.HS_PanelApi.ExportShareCode("ShadowShade-Ocean")
+        local ok28, err28, st28 = env28m.HS_PanelApi.ValidateShareCode(code28)
+        assert(ok28 and st28 and st28.tune
+            and math.abs(st28.tune.ocean_pbr - 1.00) < 0.02
+            and math.abs(st28.tune.ocean_sky_refl - 0.90) < 0.02
+            and math.abs(st28.tune.ocean_sun_glow - 0.95) < 0.02
+            and st28.tune.ocean_hide_waves == 1
+            and math.abs(st28.tune.vol_edge_fog - 1.10) < 0.02
+            and math.abs(st28.tune.vol_ground_fog - 0.75) < 0.02
+            and st28.tune.vol_lightrays_everywhere == 1,
+            "Test 28.7a: HS1 #111..#117 validate failed: " .. tostring(err28))
+        env28m.HS_PanelApi.SetPreset(0)
+        local impOk, impErr = env28m.HS_PanelApi.ImportShareCode(code28)
+        assert(impOk, "Test 28.7b: HS1 #111..#117 import failed: " .. tostring(impErr))
+        hud_upd_28({}, 0.05)
+        local p2 = oc_pbr_calls[#oc_pbr_calls]
+        local v2 = vl_apply_calls[#vl_apply_calls]
+        assert(math.abs(p2[1] - 1.00) < 0.02 and p2[4] == 1 and v2[6] == 1,
+            "Test 28.7c: Imported HS1 did not restore PBR Ocean + Sunbeams Everywhere!")
+        print("[CLIENT_V24_TEST] 28. v2.9.5-F/G PBR Ocean Optics + Volumetric Fog + Base Sunbeams + HS1 #111..#117 PASS")
+    end
+
+    -- 29. HyperShade Visual Closed-Loop Lua Bridge (HS_SHARE.Look + c_hslook + ShareCard UI + Whitelist Preservation + Undo)
+    do
+        local hud_upd_29 = nil
+        local started_modes = {}
+        local poll_queue = {}
+        local mock_caps = {
+            { key = "exposure", min = -0.8, max = 0.8, default = 0.0, general = true, same_scene = true, stage = 1 },
+            { key = "temp",     min = -1.0, max = 1.0, default = 0.0, general = true, same_scene = true, stage = 1 },
+            { key = "vignette", min =  0.0, max = 0.5, default = 0.0, general = false, same_scene = true, stage = 3 },
+        }
+        local function MW29()
+            local w = { visible = true, children = {}, inst = { IsValid = function() return true end } }
+            setmetatable(w, { __index = function(self, k)
+                if k == "AddChild" then return function(s, c) s.children[#s.children + 1] = c; c._parent = s; return c end end
+                if k == "SetText" then return function(s, t) s._txt = t end end
+                if k == "SetString" then return function(s, t) s._str = t end end
+                if k == "SetOnClick" then return function(s, fn) s._onclick = fn end end
+                if k == "Show" then return function(s) s.visible = true end end
+                if k == "Hide" then return function(s) s.visible = false end end
+                if k == "SetPosition" then return function(s, x, y, z) s._pos = { x, y, z } end end
+                return function() end
+            end })
+            return w
+        end
+        local hud29 = MW29()
+        local g29 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, type = G.type,
+            pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = function() end, error = G.error,
+            BODYTEXTFONT = "bodyfont", NUMBERFONT = "numfont",
+            ANCHOR_RIGHT = 2, ANCHOR_MIDDLE = 0, ANCHOR_LEFT = 1, ANCHOR_TOP = 1, SCALEMODE_PROPORTIONAL = 2,
+            STRINGS = { UI = { OPTIONS = { ENABLED = "Enabled", DISABLED = "Disabled" } } },
+            ThePlayer = { HUD = hud29 },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+                GetClipboardData = function() return "" end,
+            },
+            TheInput = {
+                OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end,
+                GetScreenPosition = function() return { x = 0, y = 0, z = 0 } end,
+                IsMouseDown = function() return false end,
+            },
+            MOUSEBUTTON_LEFT = 1000,
+            GetTimeRealSeconds = function() return 100 end,
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_SetSkeletal = function() return true end,
+            HyperSmooth_SetVfxSmooth = function() return true end,
+            HyperSmooth_SetLowLatency = function() return true end,
+            HyperSmooth_SetVisual = function() return true end,
+            HyperSmooth_SetHd2d = function() return true end,
+            HyperSmooth_SetClipboard = function() return true end,
+            HyperSmooth_GetFrameStats = function() return 240.0, 232.0, 4.18, 0.02, 0, 30 end,
+            HyperSmooth_StartLookMatch = function(mode, fpath)
+                started_modes[#started_modes + 1] = { mode = mode, path = fpath }
+                if mode == "fail_text" then
+                    return false, "clipboard_has_text_not_image"
+                end
+                return true, #started_modes
+            end,
+            HyperSmooth_PollLookMatch = function()
+                if #poll_queue > 0 then
+                    local nxt = table.remove(poll_queue, 1)
+                    return nxt[1], nxt[2]
+                end
+                return "idle"
+            end,
+            HyperSmooth_GetLookCapabilities = function() return mock_caps end,
+            require = function(p)
+                if p == "widgets/widget" or p == "widgets/image" or p == "widgets/imagebutton" or p == "widgets/text" then
+                    return function() return MW29() end
+                end
+                return {}
+            end,
+        }
+        local env29
+        env29 = {
+            GLOBAL = g29,
+            GetModConfigData = function(k)
+                if k == "target_fps" then return 240 end
+                return false
+            end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "screens/playerhud" then
+                    local fake_hud = MW29()
+                    fake_hud.controls = { bottomright_root = MW29() }
+                    fake_hud.inst.DoTaskInTime = function() end
+                    fake_hud.OnUpdate = function() end
+                    fn(fake_hud)
+                    hud_upd_29 = fake_hud.OnUpdate
+                end
+            end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end,
+            AddSimPostInit = function() end,
+            AddClientModRPCHandler = function() end,
+            modimport = function(name)
+                if name == "hs_panel" then
+                    local fp, ep = G.kleiloadlua("../mods/client_v24_lua_test/target_hs_panel.lua")
+                    assert(fp ~= nil, "Test 29 hs_panel.lua load error: " .. tostring(ep))
+                    setfenv(fp, env29)
+                    fp()
+                end
+            end,
+        }
+        local f29 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(f29, env29)
+        f29()
+
+        local api29 = env29.HS_PanelApi
+        assert(type(api29.StartLookMatch) == "function" and type(api29.GetLookCapabilities) == "function",
+            "Test 29.1: panel_api Look Match exports missing!")
+        assert(type(g29.c_hslook) == "function" and type(g29.c_hsmatch) == "function",
+            "Test 29.1b: c_hslook / c_hsmatch console commands missing!")
+        assert(#api29.GetLookCapabilities() == 3, "Test 29.1c: GetLookCapabilities mismatch!")
+
+        -- Set non-grading settings first (must be 100% preserved after Look Match applies!)
+        g29.c_hstune("shadow_density", 0.72)
+        g29.c_hstune("water_refl_str", 0.65)
+        g29.c_hstune("wind_sway_enabled", 1)
+        g29.c_hstune("exposure", -0.35) -- previous grading MUST be replaced cleanly, not stacked!
+
+        -- 29.2 Async lifecycle: capturing -> solving -> done -> transactional HS1 apply -> Undo
+        poll_queue = {
+            { "capturing" },
+            { "solving" },
+            { "done", {
+                mode = "same_scene",
+                input_source = "clipboard_dibv5",
+                readback_path = "async_pbo",
+                warning = "",
+                ref_width = 1920, ref_height = 1080, elapsed_ms = 14.2,
+                zncc = 0.96, grad_corr = 0.91,
+                delta_e_before = 9.4, delta_e_after = 1.3,
+                confidence = 0.91, color_confidence = 0.92, spatial_confidence = 0.89,
+                vignette_fitted = true, sharp_fitted = false,
+                params = { exposure = 0.25, temp = 0.45, contrast = 0.16, sat = 1.22, vignette = 0.20, unowned_hack = 99.0 },
+            } },
+        }
+        local cb_ok, cb_msg, cb_code = nil, nil, nil
+        local s_ok = api29.StartLookMatch("clipboard", function(ok_r, msg_r, code_r)
+            cb_ok, cb_msg, cb_code = ok_r, msg_r, code_r
+        end)
+        assert(s_ok == true and started_modes[#started_modes].mode == "clipboard", "Test 29.2a: StartLookMatch failed!")
+        hud_upd_29({}, 0.016)
+        assert(cb_ok == nil, "Test 29.2b: must stay pending while capturing!")
+        hud_upd_29({}, 0.016)
+        assert(cb_ok == nil, "Test 29.2c: must stay pending while solving!")
+        hud_upd_29({}, 0.016)
+        assert(cb_ok == true and type(cb_code) == "string" and cb_code:sub(1, 4) == "HS1-",
+            "Test 29.2d: expected HS1- share code on completion! msg=" .. tostring(cb_msg))
+
+        local sn = api29.GetSnapshot()
+        assert(math.abs(sn.tune.exposure - 0.25) < 0.01 and math.abs(sn.tune.temp - 0.45) < 0.01
+            and math.abs(sn.tune.vignette - 0.20) < 0.01,
+            "Test 29.2e: fitted whitelist params not applied accurately!")
+        assert(math.abs(sn.tune.shadow_density - 0.72) < 0.01
+            and math.abs(sn.tune.water_refl_str - 0.65) < 0.01
+            and sn.tune.wind_sway_enabled == 1,
+            "Test 29.2f: non-grading settings (shadow/water/wind) were clobbered!")
+        assert(sn.tune.unowned_hack == nil, "Test 29.2g: unknown param leaked past whitelist!")
+
+        -- 29.3 One-click Undo restores exact previous exposure (-0.35)!
+        assert(g29.c_hslook("undo") == true, "Test 29.3a: c_hslook('undo') failed!")
+        local sn_undo = api29.GetSnapshot()
+        assert(math.abs(sn_undo.tune.exposure - (-0.35)) < 0.01,
+            "Test 29.3b: Undo did not restore prior exposure! got=" .. tostring(sn_undo.tune.exposure))
+
+        -- 29.4 Error & no-delta guards + ShareCard UI Look Match buttons clickable
+        local ok_err, msg_err = api29.StartLookMatch("fail_text")
+        assert(ok_err == false and type(msg_err) == "string" and #msg_err > 5, "Test 29.4a: error propagation failed!")
+
+        poll_queue = {
+            { "done", { mode = "same_frame", warning = "no_post_colourcube_delta", params = {} } }
+        }
+        local nd_ok, nd_msg = nil, nil
+        assert(api29.StartLookMatch("same_frame", function(o, m) nd_ok, nd_msg = o, m end) == true)
+        hud_upd_29({}, 0.016)
+        assert(nd_ok == false and type(nd_msg) == "string" and #nd_msg > 5, "Test 29.4b: no_post_colourcube_delta not handled!")
+
+        assert(env29.HS_TogglePanel(true) == true, "Test 29.4c0: HS_TogglePanel failed!")
+        local found_cb_btn, found_fr_btn = false, false
+        local function walk29(w)
+            if type(w._txt) == "string" and w._onclick then
+                if w._txt:find("剪贴板", 1, true) or w._txt:find("Clipboard", 1, true) then found_cb_btn = true end
+                if w._txt:find("同帧", 1, true) or w._txt:find("Capture Frame", 1, true) then found_fr_btn = true end
+            end
+            for _, c in ipairs(w.children or {}) do walk29(c) end
+        end
+        walk29(hud29.children[1])
+        assert(found_cb_btn and found_fr_btn, "Test 29.4c: ShareCard Look Match buttons missing in hs_panel.lua!")
+
+        print("[CLIENT_V24_TEST] 29. HyperShade Visual Closed-Loop (HS_SHARE.Look + c_hslook + Whitelist Preservation + Undo + ShareCard UI) PASS")
+    end
+
+    -- 30. Preset 0 Zero-Leak (Exact 0.25x Vanilla BloomSampler / Magiluminescence Parity + Instant VFX Clear)
+    --     + Built-In Curated 6-Preset Gallery Panel (hs_panel.lua + HS_PanelApi + c_hspreset + HS1 Roundtrip + Undo)
+    do
+        local bloom_resize_calls = 0
+        local pp_en30 = {}
+        local vfx_clears30 = {}
+        local sh_init30, sh_sort30
+        local function MW30()
+            local w = { visible = true, children = {}, inst = { IsValid = function() return true end } }
+            setmetatable(w, { __index = function(self, k)
+                if k == "AddChild" then return function(s, c) s.children[#s.children + 1] = c; c._parent = s; return c end end
+                if k == "SetText" then return function(s, t) s._txt = t end end
+                if k == "SetString" then return function(s, t) s._str = t end end
+                if k == "SetOnClick" then return function(s, fn) s._onclick = fn end end
+                if k == "Show" then return function(s) s.visible = true end end
+                if k == "Hide" then return function(s) s.visible = false end end
+                if k == "SetPosition" then return function(s, x, y, z) s._pos = { x, y, z } end end
+                return function() end
+            end })
+            return w
+        end
+        local hud30 = MW30()
+        local g30 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable, setmetatable = G.setmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = function() end, error = G.error, select = G.select, assert = G.assert,
+            FRAMES = 1.0 / 30.0,
+            BLENDMODE = { Premultiplied = 2, Additive = 1 },
+            BODYTEXTFONT = "bodyfont", NUMBERFONT = "numfont",
+            ANCHOR_RIGHT = 2, ANCHOR_MIDDLE = 0, ANCHOR_LEFT = 1, ANCHOR_TOP = 1, SCALEMODE_PROPORTIONAL = 2,
+            STRINGS = { UI = { OPTIONS = { ENABLED = "启用", DISABLED = "禁用" } } },
+            LanguageTranslator = { defaultlang = "zh" },
+            TheNet = { IsDedicated = function() return false end, GetIsServer = function() return false end, GetIsClient = function() return true end, GetServerGameMode = function() return "survival" end },
+            KnownModIndex = { IsModEnabled = function() return false end, GetModsToLoad = function() return {} end },
+            TheSim = {
+                GetPersistentString = function(_, _, cb) if cb then cb(false, "") end end,
+                SetPersistentString = function() end,
+                GetClipboardData = function() return "" end,
+                FindEntities = function() return {} end,
+            },
+            TheInput = {
+                OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end,
+                GetScreenPosition = function() return { x = 0, y = 0, z = 0 } end,
+                IsMouseDown = function() return false end,
+            },
+            MOUSEBUTTON_LEFT = 1000,
+            GetTimeRealSeconds = function() return 200 end,
+            SamplerSizes = { Relative = 1 }, SamplerColourMode = { RGB = 1 }, SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 }, MIP_FILTER_MODE = { NONE = 0 }, WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            PostProcessorEffects = { Bloom = "VANILLA_BLOOM", ColourCube = "CC" }, SamplerEffects = {}, UniformVariables = {},
+            PostProcessor = G.setmetatable({}, {
+                __index = {
+                    SetBloomSamplerParams = function(_, _, w, h)
+                        bloom_resize_calls = bloom_resize_calls + 1
+                        assert(math.abs(w - 0.25) < 1e-4 and math.abs(h - 0.25) < 1e-4,
+                            "Test 30.1: BloomSampler MUST stay at Klei vanilla 0.25x (got " .. tostring(w) .. ")!")
+                    end,
+                    AddUniformVariable = function(_, n) return "U_" .. n end,
+                    AddSamplerEffect = function(_, p) return "SE_" .. p end,
+                    AddPostProcessEffect = function(_, p) return "PPE_" .. p end,
+                    AddSampler = function() end, SetEffectUniformVariables = function() end,
+                    SetSamplerEffectState = function() end, SetSamplerEffectFilter = function() end,
+                    SetPostProcessEffectAfter = function() end,
+                    EnablePostProcessEffect = function(_, id, en) pp_en30[id] = en end,
+                    SetUniformVariable = function() end,
+                    IsBloomEnabled = function() return true end,
+                    SetBloomEnabled = function(_, en) pp_en30["VANILLA_BLOOM"] = en end,
+                    SetColourCubeData = function() end, SetColourCubeLerp = function() end, SetDistortionFactor = function() end,
+                },
+            }),
+            EnvelopeManager = { AddColourEnvelope = function() end, AddVector2Envelope = function() end },
+            CreateEntity = function()
+                local e = { _valid = true, IsValid = function(s) return s._valid end, Remove = function(s) s._valid = false end }
+                e.entity = {
+                    SetCanSleep = function() end, AddTag = function() end, AddFollower = function() end, SetParent = function() end,
+                    AddTransform = function() e.Transform = { SetPosition = function() end, GetWorldPosition = function() return 0, 0, 0 end }; return e.Transform end,
+                    AddVFXEffect = function()
+                        local vfx = {
+                            InitEmitters = function(s, n) s._n = n end,
+                            ClearAllParticles = function(_, idx) vfx_clears30[#vfx_clears30 + 1] = idx end,
+                        }
+                        G.setmetatable(vfx, { __index = function() return function() end end })
+                        e.VFXEffect = vfx
+                        return vfx
+                    end,
+                    CallPrefabConstructionComplete = function() end,
+                }
+                return e
+            end,
+            resolvefilepath = function(p) return p end,
+            ThePlayer = { HUD = hud30, IsValid = function() return true end, Transform = { GetWorldPosition = function() return 0, 0, 0 end } },
+            TheWorld = { state = { phase = "day", timeinphase = 0.5, season = "autumn", isfullmoon = false, israining = false }, HasTag = function() return false end },
+            TheCamera = { currentpos = { x = 0, y = 0, z = 0 }, GetRightVec = function() return { x = 0.707, y = 0, z = -0.707 } end },
+            HyperSmooth_SetFps = function() return true end,
+            HyperSmooth_SetSkeletal = function() return true end,
+            HyperSmooth_SetVfxSmooth = function() return true end,
+            HyperSmooth_SetLowLatency = function() return true end,
+            HyperSmooth_SetVisual = function() return true end,
+            HyperSmooth_SetHd2d = function() return true end,
+            HyperSmooth_SetWorldStudio = function() return true end,
+            HyperSmooth_SetShadowDyn = function() return true end,
+            HyperSmooth_SetShadowConfig = function() return true, false end,
+            HyperSmooth_SetPointLights = function() return 0 end,
+            HyperSmooth_SetWaterRefl = function() return true, 0 end,
+            HyperSmooth_SetOceanPbr = function() return true end,
+            HyperSmooth_SetDetailParams = function() return true end,
+            HyperSmooth_SetCombatConfig = function() return true end,
+            HyperSmooth_SetClipboard = function() return true end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            require = function(modname)
+                if modname == "widgets/widget" or modname == "widgets/image" or modname == "widgets/imagebutton"
+                    or modname == "widgets/text" or modname == "widgets/textedit" then
+                    return function() return MW30() end
+                end
+                return {}
+            end,
+        }
+        local env30 = {
+            GLOBAL = g30, MODROOT = "../mods/client_v24_lua_test/",
+            Asset = function(t, p) return { type = t, file = p } end,
+            GetModConfigData = function(k) if k == "visual_preset" then return 0 end return nil end,
+            AddModShadersInit = function(cb) sh_init30 = cb end,
+            AddModShadersSortAndEnable = function(cb) sh_sort30 = cb end,
+            AddClassPostConstruct = function() end,
+            AddPrefabPostInit = function() end, AddPrefabPostInitAny = function() end,
+            AddPlayerPostInit = function() end, AddComponentPostInit = function() end,
+            AddSimPostInit = function() end, AddGamePostInit = function() end,
+            AddClientModRPCHandler = function() end,
+        }
+        env30.modimport = function(nm)
+            local map = {
+                hs_vfx = "../mods/client_v24_lua_test/target_hs_vfx.lua",
+                hs_vollight = "../mods/client_v24_lua_test/target_hs_vollight.lua",
+                hs_panel = "../mods/client_v24_lua_test/target_hs_panel.lua",
+            }
+            if map[nm] then
+                local fn = assert(G.kleiloadlua(map[nm]))
+                G.setfenv(fn, env30)
+                fn()
+            end
+        end
+        G.setmetatable(env30, { __index = g30 })
+        local fn30 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        G.setfenv(fn30, env30); fn30()
+        sh_init30(); sh_sort30()
+
+        -- 1) Preset 0 starts with 0 BloomSampler resizes, vanilla Bloom ON, HS_Bloom OFF, HS_VisualFinal OFF!
+        assert(bloom_resize_calls == 0, "Test 30.1a: Preset 0 must NEVER call SetBloomSamplerParams!")
+        assert(pp_en30["VANILLA_BLOOM"] == true and pp_en30[g30.PostProcessorEffects.HS_Bloom] == false and pp_en30[g30.PostProcessorEffects.HS_VisualFinal] == false,
+            "Test 30.1b: Preset 0 must keep exact vanilla Bloom ON and HS_Bloom/HS_VisualFinal OFF!")
+
+        -- 2) Switch Preset 2 -> Preset 0: BloomSampler STILL untouched at 0.25x + HS_VFX immediately calls ClearAllParticles!
+        env30.HS_PanelApi.SetPreset(2)
+        assert(pp_en30[g30.PostProcessorEffects.HS_Bloom] == true and pp_en30["VANILLA_BLOOM"] == false,
+            "Test 30.2a: Preset 2 with game Bloom ON must use HS_Bloom!")
+        vfx_clears30 = {}
+        env30.HS_PanelApi.SetPreset(0)
+        assert(bloom_resize_calls == 0, "Test 30.2b: Switching Preset 2 -> 0 must NEVER disturb vanilla 0.25x BloomSampler!")
+        assert(pp_en30["VANILLA_BLOOM"] == true and pp_en30[g30.PostProcessorEffects.HS_Bloom] == false and pp_en30[g30.PostProcessorEffects.HS_VisualFinal] == false,
+            "Test 30.2c: Switching Preset 2 -> 0 must restore exact vanilla Bloom & disable HS_VisualFinal!")
+        assert(#vfx_clears30 >= 14, "Test 30.2d: Switching to Preset 0 must immediately ClearAllParticles on all VFX hosts (got " .. tostring(#vfx_clears30) .. ")!")
+
+        -- 3) Built-In Curated 6-Preset Gallery: verify API, live hs_panel UI, mutual exclusion, HS1 roundtrip & Undo!
+        local gallery = env30.HS_PanelApi.GetBuiltinPresets()
+        assert(type(gallery) == "table" and #gallery == 6, "Test 30.3a: Expected 6 built-in curated presets, got " .. tostring(gallery and #gallery))
+        assert(env30.HS_TogglePanel(true) == true, "Test 30.3b: Failed opening live panel!")
+        local ui30 = g30.HS_PanelDebug
+        assert(ui30 and ui30.preset_card and #ui30.preset_card.cards == 6 and type(ui30.TogglePresetCard) == "function",
+            "Test 30.3c: Preset Gallery card or 6 cards missing in hs_panel.lua!")
+
+        -- Open ShareCard then open PresetCard -> strict mutual exclusion!
+        ui30.ToggleShareCard()
+        ui30.TogglePresetCard(true)
+        assert(ui30.preset_card.visible == true and ui30.preset_card.root.visible == true,
+            "Test 30.3d: Preset Gallery card failed to show!")
+
+        -- Click every single one of the 6 preset cards in the live UI + validate HS1 share code round-trip!
+        local expected_ids = { "vanilla", "eyecare_hd", "storybook", "crisp_daylight", "cozy_firelight", "misty_canopy" }
+        for i = 1, 6 do
+            local card = ui30.preset_card.cards[i]
+            assert(card.item.id == expected_ids[i], "Test 30.3e: Gallery order mismatch at #" .. tostring(i))
+            card.btn._onclick()
+            local sn = env30.HS_PanelApi.GetSnapshot()
+            assert(sn.active_builtin_id == expected_ids[i],
+                "Test 30.3f: Active builtin preset mismatch after clicking card #" .. tostring(i) .. ": got " .. tostring(sn.active_builtin_id))
+            local code = env30.HS_PanelApi.ExportShareCode(card.item.zh)
+            local vok, verr = env30.HS_PanelApi.ValidateShareCode(code)
+            assert(vok == true, "Test 30.3g: HS1 code invalid for preset " .. card.item.id .. ": " .. tostring(verr))
+        end
+
+        -- Click Undo button in Preset Gallery -> reverts from misty_canopy back to cozy_firelight!
+        ui30.preset_card.undo_btn._onclick()
+        assert(env30.HS_PanelApi.GetSnapshot().active_builtin_id == "cozy_firelight",
+            "Test 30.4a: Preset Gallery Undo did not revert to previous preset!")
+
+        -- Manual slider tweak clears active_builtin_id (honest Custom state!)
+        env30.HS_PanelApi.SetTune("exposure", 0.20)
+        assert(env30.HS_PanelApi.GetSnapshot().active_builtin_id == nil,
+            "Test 30.4b: Manual slider tweak must clear active_builtin_id!")
+
+        -- Console c_hspreset() switches cleanly to crisp_daylight & vanilla!
+        assert(g30.c_hspreset("crisp_daylight") == true and env30.HS_PanelApi.GetSnapshot().active_builtin_id == "crisp_daylight",
+            "Test 30.4c: c_hspreset('crisp_daylight') failed!")
+        assert(g30.c_hspreset(1) == true and env30.HS_PanelApi.GetSnapshot().preset == 0 and env30.HS_PanelApi.GetSnapshot().active_builtin_id == "vanilla",
+            "Test 30.4d: c_hspreset(1) failed to restore Vanilla Pure!")
+
+        print("[CLIENT_V24_TEST] 30. Preset 0 Zero-Leak (0.25x Magiluminescence Parity + Instant VFX Clear) & 6-Preset Gallery Panel PASS")
+    end
+
     print("[CLIENT_V24_TEST] ALL_PASS")
     G.c_shutdown(false)
 end)
@@ -3459,6 +6066,8 @@ def main():
     shutil.copy2(os.path.join(CLIENT_MOD, "modmain.lua"), os.path.join(HARNESS_DIR, "target_modmain.lua"))
     shutil.copy2(os.path.join(CLIENT_MOD, "keybind.lua"), os.path.join(HARNESS_DIR, "target_keybind.lua"))
     shutil.copy2(os.path.join(CLIENT_MOD, "hs_ext.lua"), os.path.join(HARNESS_DIR, "target_hs_ext.lua"))
+    shutil.copy2(os.path.join(CLIENT_MOD, "hs_vfx.lua"), os.path.join(HARNESS_DIR, "target_hs_vfx.lua"))
+    shutil.copy2(os.path.join(CLIENT_MOD, "hs_vollight.lua"), os.path.join(HARNESS_DIR, "target_hs_vollight.lua"))
     shutil.copy2(os.path.join(CLIENT_MOD, "hs_panel.lua"), os.path.join(HARNESS_DIR, "target_hs_panel.lua"))
     shutil.copy2(
         os.path.join(os.path.dirname(os.path.dirname(CLIENT_MOD)), "sdk", "example_hs_crt_vintage", "modmain.lua"),

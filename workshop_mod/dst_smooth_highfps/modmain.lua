@@ -25,82 +25,142 @@ if type(Asset) == "function" then
         Asset("SHADER", "shaders/hs_kawase_up.ksh"),
         Asset("SHADER", "shaders/hs_postprocess_bloom.ksh"),
         Asset("SHADER", "shaders/hs_visual_final.ksh"),
+        Asset("SHADER", "shaders/vfx_particle.ksh"),
+        Asset("SHADER", "shaders/vfx_particle_add.ksh"),
+        Asset("IMAGE", "fx/snow.tex"),
+        Asset("IMAGE", "fx/smoke.tex"),
+        Asset("IMAGE", "fx/spark.tex"),
+        Asset("IMAGE", "fx/sparkle.tex"),
+        Asset("IMAGE", "fx/petal.tex"),
+        Asset("IMAGE", "fx/debris_rock.tex"),
+        Asset("ANIM",  "anim/lightrays.zip"),
+        Asset("IMAGE", "images/tree.tex"),
+        Asset("IMAGE", "images/hs_cloud_shade.tex"),
+        Asset("IMAGE", "levels/textures/ds_fog1.tex"),
     }
 end
 
-local TARGET_FPS = GetModConfigData("target_fps")
-if type(TARGET_FPS) ~= "number" then TARGET_FPS = 240 end
-local VISUAL_PRESET = GetModConfigData("visual_preset")
-if type(VISUAL_PRESET) ~= "number" then VISUAL_PRESET = 0 end
-if VISUAL_PRESET < 0 or VISUAL_PRESET > 3 then VISUAL_PRESET = 0 end
+local HS_CFG = {}
+HS_CFG.TARGET_FPS = GetModConfigData("target_fps")
+if type(HS_CFG.TARGET_FPS) ~= "number" then HS_CFG.TARGET_FPS = 240 end
+HS_CFG.VISUAL_PRESET = GetModConfigData("visual_preset")
+if type(HS_CFG.VISUAL_PRESET) ~= "number" then HS_CFG.VISUAL_PRESET = 0 end
+if HS_CFG.VISUAL_PRESET < 0 or HS_CFG.VISUAL_PRESET > 3 then HS_CFG.VISUAL_PRESET = 0 end
 
 -- Player-First: 10 independent per-effect toggles (ALL default OFF -> 100% Vanilla Pure out of the box!)
-local CFG_VIS_AF16         = GetModConfigData("visual_af16") == true
-local CFG_VIS_LIGHTMAP     = GetModConfigData("visual_full_lightmap") == true
-local CFG_VIS_CAS          = GetModConfigData("visual_cas") == true
-local CFG_VIS_AO           = GetModConfigData("visual_contact_ao") == true
-local CFG_VIS_ENV          = GetModConfigData("visual_calm_env") == true
-local CFG_VIS_SOFT_BLOOM   = GetModConfigData("visual_soft_bloom") == true
-local CFG_VIS_TONE         = GetModConfigData("visual_storybook_tone") == true
-local CFG_VIS_MIP_SHARP    = GetModConfigData("visual_mip_sharp") == true
-local CFG_VIS_DARK         = GetModConfigData("visual_dark_clarity") == true
-local CFG_VIS_CLEAN_FILTER = GetModConfigData("visual_clean_filter") == true
-local CFG_VIS_MASK = (CFG_VIS_AF16 and 1 or 0)
-    + (CFG_VIS_LIGHTMAP and 2 or 0)
-    + (CFG_VIS_CAS and 4 or 0)
-    + (CFG_VIS_AO and 8 or 0)
-    + (CFG_VIS_ENV and 16 or 0)
-    + (CFG_VIS_SOFT_BLOOM and 32 or 0)
-    + (CFG_VIS_TONE and 64 or 0)
-    + (CFG_VIS_MIP_SHARP and 128 or 0)
-    + (CFG_VIS_DARK and 256 or 0)
-    + (CFG_VIS_CLEAN_FILTER and 512 or 0)
-if VISUAL_PRESET == 0 and CFG_VIS_MASK > 0 then
-    VISUAL_PRESET = 3 -- User enabled individual switches in Mod Config -> honor Custom mode directly!
+HS_CFG.CFG_VIS_AF16         = GetModConfigData("visual_af16") == true
+HS_CFG.CFG_VIS_LIGHTMAP     = GetModConfigData("visual_full_lightmap") == true
+HS_CFG.CFG_VIS_CAS          = GetModConfigData("visual_cas") == true
+HS_CFG.CFG_VIS_AO           = GetModConfigData("visual_contact_ao") == true
+HS_CFG.CFG_VIS_ENV          = GetModConfigData("visual_calm_env") == true
+HS_CFG.CFG_VIS_SOFT_BLOOM   = GetModConfigData("visual_soft_bloom") == true
+HS_CFG.CFG_VIS_TONE         = GetModConfigData("visual_storybook_tone") == true
+HS_CFG.CFG_VIS_MIP_SHARP    = GetModConfigData("visual_mip_sharp") == true
+HS_CFG.CFG_VIS_DARK         = GetModConfigData("visual_dark_clarity") == true
+HS_CFG.CFG_VIS_CLEAN_FILTER = GetModConfigData("visual_clean_filter") == true
+HS_CFG.CFG_VIS_MASK = (HS_CFG.CFG_VIS_AF16 and 1 or 0)
+    + (HS_CFG.CFG_VIS_LIGHTMAP and 2 or 0)
+    + (HS_CFG.CFG_VIS_CAS and 4 or 0)
+    + (HS_CFG.CFG_VIS_AO and 8 or 0)
+    + (HS_CFG.CFG_VIS_ENV and 16 or 0)
+    + (HS_CFG.CFG_VIS_SOFT_BLOOM and 32 or 0)
+    + (HS_CFG.CFG_VIS_TONE and 64 or 0)
+    + (HS_CFG.CFG_VIS_MIP_SHARP and 128 or 0)
+    + (HS_CFG.CFG_VIS_DARK and 256 or 0)
+    + (HS_CFG.CFG_VIS_CLEAN_FILTER and 512 or 0)
+if HS_CFG.VISUAL_PRESET == 0 and HS_CFG.CFG_VIS_MASK > 0 then
+    HS_CFG.VISUAL_PRESET = 3 -- User enabled individual switches in Mod Config -> honor Custom mode directly!
 end
 
-local SKELETAL_TWEEN = GetModConfigData("skeletal_tween")
-if SKELETAL_TWEEN == nil then SKELETAL_TWEEN = true end
-local LOW_LATENCY_INPUT = GetModConfigData("low_latency_input")
-if LOW_LATENCY_INPUT == nil then LOW_LATENCY_INPUT = true end
-local SMOOTH_CAMERA = GetModConfigData("smooth_camera")
-if SMOOTH_CAMERA == nil then SMOOTH_CAMERA = true end
-local SMOOTH_UI_240HZ = GetModConfigData("smooth_ui_240hz")
-if SMOOTH_UI_240HZ == nil then SMOOTH_UI_240HZ = true end
-local REDUCE_240HZ_CHURN = GetModConfigData("reduce_240hz_churn")
-if REDUCE_240HZ_CHURN == nil then REDUCE_240HZ_CHURN = true end
-local KEEP_SHARD_ASSETS = GetModConfigData("keep_shard_assets")
-if KEEP_SHARD_ASSETS == nil then KEEP_SHARD_ASSETS = true end
-local FAST_MOD_SCAN = GetModConfigData("fast_mod_scan")
-if FAST_MOD_SCAN == nil then FAST_MOD_SCAN = true end
-local SKIP_TOP_MODS_QUERY = GetModConfigData("skip_top_mods_query")
-if SKIP_TOP_MODS_QUERY == nil then SKIP_TOP_MODS_QUERY = true end
-local SKIP_MOTD_DELAY = GetModConfigData("skip_motd_delay")
-if SKIP_MOTD_DELAY == nil then SKIP_MOTD_DELAY = true end
-local SHOW_FPS_HUD = GetModConfigData("show_fps_hud")
-if SHOW_FPS_HUD == nil then SHOW_FPS_HUD = true end
-local HUD_MODE = GetModConfigData("hud_mode")
-if HUD_MODE ~= "detail" then HUD_MODE = "simple" end
-local SHOW_1PCT_LOW = GetModConfigData("show_1pct_low")
-if SHOW_1PCT_LOW == nil then SHOW_1PCT_LOW = true end
-local AUTO_60HZ_SIM = GetModConfigData("auto_60hz_sim")
-if AUTO_60HZ_SIM == nil then AUTO_60HZ_SIM = true end
+HS_CFG.SKELETAL_TWEEN = GetModConfigData("skeletal_tween")
+if HS_CFG.SKELETAL_TWEEN == nil then HS_CFG.SKELETAL_TWEEN = true end
+HS_CFG.LOW_LATENCY_INPUT = GetModConfigData("low_latency_input")
+if HS_CFG.LOW_LATENCY_INPUT == nil then HS_CFG.LOW_LATENCY_INPUT = true end
+HS_CFG.SMOOTH_CAMERA = GetModConfigData("smooth_camera")
+if HS_CFG.SMOOTH_CAMERA == nil then HS_CFG.SMOOTH_CAMERA = true end
+HS_CFG.SMOOTH_UI_240HZ = GetModConfigData("smooth_ui_240hz")
+if HS_CFG.SMOOTH_UI_240HZ == nil then HS_CFG.SMOOTH_UI_240HZ = true end
+HS_CFG.REDUCE_240HZ_CHURN = GetModConfigData("reduce_240hz_churn")
+if HS_CFG.REDUCE_240HZ_CHURN == nil then HS_CFG.REDUCE_240HZ_CHURN = true end
+HS_CFG.KEEP_SHARD_ASSETS = GetModConfigData("keep_shard_assets")
+if HS_CFG.KEEP_SHARD_ASSETS == nil then HS_CFG.KEEP_SHARD_ASSETS = true end
+HS_CFG.FAST_MOD_SCAN = GetModConfigData("fast_mod_scan")
+if HS_CFG.FAST_MOD_SCAN == nil then HS_CFG.FAST_MOD_SCAN = true end
+HS_CFG.SKIP_TOP_MODS_QUERY = GetModConfigData("skip_top_mods_query")
+if HS_CFG.SKIP_TOP_MODS_QUERY == nil then HS_CFG.SKIP_TOP_MODS_QUERY = true end
+HS_CFG.SKIP_MOTD_DELAY = GetModConfigData("skip_motd_delay")
+if HS_CFG.SKIP_MOTD_DELAY == nil then HS_CFG.SKIP_MOTD_DELAY = true end
+HS_CFG.SHOW_FPS_HUD = GetModConfigData("show_fps_hud")
+if HS_CFG.SHOW_FPS_HUD == nil then HS_CFG.SHOW_FPS_HUD = true end
+HS_CFG.HUD_MODE = GetModConfigData("hud_mode")
+if HS_CFG.HUD_MODE ~= "detail" then HS_CFG.HUD_MODE = "simple" end
+HS_CFG.SHOW_1PCT_LOW = GetModConfigData("show_1pct_low")
+if HS_CFG.SHOW_1PCT_LOW == nil then HS_CFG.SHOW_1PCT_LOW = true end
+HS_CFG.AUTO_60HZ_SIM = GetModConfigData("auto_60hz_sim")
+if HS_CFG.AUTO_60HZ_SIM == nil then HS_CFG.AUTO_60HZ_SIM = true end
+HS_CFG.clip_cursor = false
+HS_CFG.foliage_cache = { accum = 999.0, last_cnt = 0 }
+HS_CFG.FOLIAGE_CANT_TAGS = {
+    "FX", "DECOR", "INLIMBO", "NOCLICK", "structure", "wall",
+    "player", "character", "chest", "heavy", "locomotor",
+    "monster", "animal", "bird", "insect", "epic", "boat",
+}
+HS_CFG.FOLIAGE_ONEOF_TAGS = {
+    "plant", "tree", "flower", "bush", "sapling", "reeds", "grass", "farm_plant", "lichen",
+}
+
+-- M2 Crash Detective: transparent zero-interference Lua error -> Mod attribution bridge
+if not HS_CFG._crash_tb_hooked and type(GLOBAL.debug) == "table" and type(GLOBAL.debug.traceback) == "function" then
+    HS_CFG._crash_tb_hooked = true
+    local orig_tb = GLOBAL.debug.traceback
+    local last_rep_t = -999
+    GLOBAL.debug.traceback = function(thread_or_msg, msg_or_lvl, lvl)
+        local res = orig_tb(thread_or_msg, msg_or_lvl, lvl)
+        local fnRep = rawget(GLOBAL, "HyperSmooth_ReportLuaCrash")
+        if type(fnRep) == "function" then
+            local raw_msg = (type(thread_or_msg) == "string") and thread_or_msg or ((type(msg_or_lvl) == "string") and msg_or_lvl or "")
+            local hay = (type(res) == "string" and #res > 0) and res or raw_msg
+            if #hay > 0 then
+                local os_mod = rawget(GLOBAL, "os")
+                local now_t = (type(os_mod) == "table" and type(os_mod.clock) == "function") and os_mod.clock() or 0
+                if (now_t - last_rep_t) >= 0.25 or raw_msg ~= "" then
+                    last_rep_t = now_t
+                    local moddir = hay:match("mods[/\\](workshop%-%d+)[/\\]") or hay:match("mods[/\\]([^/\\\r\n]+)[/\\]") or ""
+                    local modname = ""
+                    if #moddir > 0 then
+                        local kmi = rawget(GLOBAL, "KnownModIndex")
+                        if type(kmi) == "table" and type(kmi.GetModFancyName) == "function" then
+                            local ok_n, fn = pcall(kmi.GetModFancyName, kmi, moddir)
+                            if ok_n and type(fn) == "string" and #fn > 0 then
+                                modname = fn
+                            end
+                        end
+                    end
+                    local summary = (#raw_msg > 0) and raw_msg or hay
+                    if #summary > 300 then summary = summary:sub(1, 300) end
+                    pcall(fnRep, moddir, modname, summary)
+                end
+            end
+        end
+        return res
+    end
+end
 
 local CFG_FILENAME = "dst_smooth_highfps_cfg"
 local FPS_PRESETS = { 60, 120, 144, 165, 240, 360, 0 }
-local current_target_fps = TARGET_FPS
-local current_visual_preset = VISUAL_PRESET
+local current_target_fps = HS_CFG.TARGET_FPS
+local current_visual_preset = HS_CFG.VISUAL_PRESET
 local custom_vis_flags = {
-    af16         = CFG_VIS_AF16,
-    full_lm      = CFG_VIS_LIGHTMAP,
-    cas          = CFG_VIS_CAS,
-    ao           = CFG_VIS_AO,
-    env          = CFG_VIS_ENV,
-    soft_bloom   = CFG_VIS_SOFT_BLOOM,
-    tone         = CFG_VIS_TONE,
-    mip_sharp    = CFG_VIS_MIP_SHARP,
-    dark_clarity = CFG_VIS_DARK,
-    clean_filter = CFG_VIS_CLEAN_FILTER,
+    af16         = HS_CFG.CFG_VIS_AF16,
+    full_lm      = HS_CFG.CFG_VIS_LIGHTMAP,
+    cas          = HS_CFG.CFG_VIS_CAS,
+    ao           = HS_CFG.CFG_VIS_AO,
+    env          = HS_CFG.CFG_VIS_ENV,
+    soft_bloom   = HS_CFG.CFG_VIS_SOFT_BLOOM,
+    tone         = HS_CFG.CFG_VIS_TONE,
+    mip_sharp    = HS_CFG.CFG_VIS_MIP_SHARP,
+    dark_clarity = HS_CFG.CFG_VIS_DARK,
+    clean_filter = HS_CFG.CFG_VIS_CLEAN_FILTER,
 }
 
 -- Full 80-knob parameter-driven visual studio registry (ZERO hardcoded runtime overrides!)
@@ -128,6 +188,27 @@ local TUNE_KEYS = {
     "power_r", "power_g", "power_b", "vignette", "grain",
     -- Independent Reversible Vanilla Filters (5)
     "vanilla_cc", "snow_cap", "sanity_color", "distort_free", "sand_filter",
+    -- v2.9.0 Phase 1 World Shadow Controls (appended at tail to preserve HS1 ShareCode IDs 1..80!)
+    "shadow_entity_recv", "shadow_oval_keep",
+    -- v2.9.5 Multi-Light Near-Field Point Shadows (appended at tail to preserve HS1 ShareCode IDs 1..82!)
+    "shadow_point_lights", "shadow_point_strength",
+    -- v2.9.5 M3 Planar Water Reflections + M4 Whitelist Foliage Wind-Sway & Wake (tail #85..#89!)
+    "water_refl_str", "water_refl_ripple",
+    "wind_sway_enabled", "wind_sway_strength", "wind_wake_strength",
+    -- v2.9.5-A Fluid Skeletal Animation (A1 Crossfade + A2 PCHIP Spline) & High-DPI Detail (A3-1) (tail #90..#93!)
+    "anim_spline", "anim_crossfade", "sprite_detail", "ground_detail",
+    -- v2.9.5-B Pure Client-Side Combat Hit-Feel & Impact Presentation (tail #94..#99!)
+    "hitfeel_enabled", "hitfeel_hitstop", "hitfeel_recoil", "hitfeel_flash", "hitfeel_campunch", "hitfeel_vfx",
+    -- v2.9.5-C Native DST VFX Atmosphere & Turf Motion Particles (tail #100..#102!)
+    "vfx_fire_embers", "vfx_ambient_motes", "vfx_footsteps",
+    -- v2.9.5-D World-Space Volumetric Lighting: 3D Light Rays + ShadeRenderer Cloud/Canopy Shades (tail #103..#105!)
+    "vol_lightrays", "vol_cloud_shade", "vol_canopy_shade",
+    -- v2.9.5-E Shadow Pipeline Parity: Weather/Season, Moon Blue, Dusk Fire Gate, Low-Height Filter, Flash Lights (#106..#110!)
+    "shadow_weather", "shadow_moon_blue", "shadow_dusk_point", "shadow_min_height", "shadow_flash_lights",
+    -- v2.9.5-F PBR Ocean Optics + Horizontal Volumetric Fog (World-Edge Void Mist & Lit Ground Fog) (#111..#116!)
+    "ocean_pbr", "ocean_sky_refl", "ocean_sun_glow", "ocean_hide_waves", "vol_edge_fog", "vol_ground_fog",
+    -- v2.9.5-G All-Turf / Base Waterlogged-Style Sunbeams (#117!)
+    "vol_lightrays_everywhere",
 }
 local TUNE_BOUNDS = {
     -- Sharpen / Ink / Bilateral / AURA / Texture
@@ -171,7 +252,7 @@ local TUNE_BOUNDS = {
     shade_dark     = { min = 0.00,  max = 1.00,  default = 0.50 },
     shadow_density = { min = 0.00,  max = 1.00,  default = 0.00 },
     shadow_length  = { min = 0.50,  max = 1.80,  default = 1.00 },
-    shadow_soft    = { min = 0.40,  max = 2.00,  default = 1.20 },
+    shadow_soft    = { min = 0.00,  max = 2.00,  default = 1.20 },
     shadow_fade    = { min = 0.00,  max = 1.00,  default = 0.55 },
     shadow_sway    = { min = 0.00,  max = 1.20,  default = 0.45 },
     shadow_smooth  = { min = 0.00,  max = 1.00,  default = 0.65 },
@@ -181,6 +262,49 @@ local TUNE_BOUNDS = {
     shadow_night   = { min = 0,     max = 1,     default = 1, is_bool = true },
     shadow_hd      = { min = 0,     max = 1,     default = 1, is_bool = true },
     shadow_skip_nightmare = { min = 0, max = 1,  default = 1, is_bool = true },
+    shadow_entity_recv    = { min = 0.00, max = 1.00, default = 0.68 },
+    shadow_oval_keep      = { min = 0.00, max = 1.00, default = 0.24 },
+    shadow_point_lights   = { min = 0, max = 1,  default = 1, is_bool = true },
+    shadow_point_strength = { min = 0.00, max = 1.00, default = 0.85 },
+    water_refl_str        = { min = 0.00, max = 1.20, default = 0.00 },
+    water_refl_ripple     = { min = 0.00, max = 1.50, default = 0.55 },
+    wind_sway_enabled     = { min = 0, max = 1, default = 0, is_bool = true },
+    wind_sway_strength    = { min = 0.00, max = 1.50, default = 0.50 },
+    wind_wake_strength    = { min = 0.00, max = 1.50, default = 0.65 },
+    -- v2.9.5-A Fluid Skeletal Animation & High-DPI Visual Detail
+    anim_spline           = { min = 0.00, max = 1.00,   default = 0.75 },
+    anim_crossfade        = { min = 0.00, max = 100.00, default = 55.00 },
+    sprite_detail         = { min = 0.00, max = 1.50,   default = 0.00 },
+    ground_detail         = { min = 0.00, max = 1.50,   default = 0.00 },
+    -- v2.9.5-B Pure Client-Side Combat Hit-Feel & Impact Presentation (slot hitfeel_campunch = Attacker Lunge, 0 camera shake!)
+    hitfeel_enabled       = { min = 0,    max = 1,      default = 0,    is_bool = true },
+    hitfeel_hitstop       = { min = 0.00, max = 1.50,   default = 1.00 },
+    hitfeel_recoil        = { min = 0.00, max = 1.50,   default = 1.00 },
+    hitfeel_flash         = { min = 0.00, max = 1.50,   default = 1.00 },
+    hitfeel_campunch      = { min = 0.00, max = 1.50,   default = 0.85 },
+    hitfeel_vfx           = { min = 0.00, max = 1.50,   default = 1.00 },
+    -- v2.9.5-C Native DST VFX Atmosphere & Turf Motion Particles
+    vfx_fire_embers       = { min = 0.00, max = 1.50,   default = 0.00 },
+    vfx_ambient_motes     = { min = 0.00, max = 1.50,   default = 0.00 },
+    vfx_footsteps         = { min = 0.00, max = 1.50,   default = 0.00 },
+    -- v2.9.5-D World-Space Volumetric Lighting (Phase 1: 3D Light Rays + Cloud/Canopy Shades)
+    vol_lightrays         = { min = 0.00, max = 1.50,   default = 0.00 },
+    vol_cloud_shade       = { min = 0.00, max = 1.50,   default = 0.00 },
+    vol_canopy_shade      = { min = 0.00, max = 1.50,   default = 0.00 },
+    -- v2.9.5-E Shadow Pipeline Parity (Weather/Season Fade, Full-Moon Blue Tint, Dusk Fire Gate, Low-Height Filter, Flash Shadows)
+    shadow_weather        = { min = 0.00, max = 1.50,   default = 0.00 },
+    shadow_moon_blue      = { min = 0.00, max = 1.00,   default = 0.00 },
+    shadow_dusk_point     = { min = 0.00, max = 1.50,   default = 1.00 },
+    shadow_min_height     = { min = 0.00, max = 1.50,   default = 0.00 },
+    shadow_flash_lights   = { min = 0,    max = 1,      default = 0,    is_bool = true },
+    -- v2.9.5-F PBR Ocean Optics + Horizontal Volumetric Fog (World-Edge Mist & Lightmap-Lit Ground Fog)
+    ocean_pbr             = { min = 0.00, max = 1.50,   default = 0.00 },
+    ocean_sky_refl        = { min = 0.00, max = 1.50,   default = 0.00 },
+    ocean_sun_glow        = { min = 0.00, max = 1.50,   default = 0.00 },
+    ocean_hide_waves      = { min = 0,    max = 1,      default = 0,    is_bool = true },
+    vol_edge_fog          = { min = 0.00, max = 1.50,   default = 0.00 },
+    vol_ground_fog        = { min = 0.00, max = 1.50,   default = 0.00 },
+    vol_lightrays_everywhere = { min = 0, max = 1,      default = 0,    is_bool = true },
     glint_str      = { min = 0.00,  max = 1.50,  default = 0.00 },
     glint_density  = { min = 0.50,  max = 0.99,  default = 0.92 },
     glint_grain    = { min = 0.40,  max = 2.20,  default = 0.85 },
@@ -221,7 +345,7 @@ for i = 1, #TUNE_KEYS do
     local k = TUNE_KEYS[i]
     vis_tune[k] = TUNE_BOUNDS[k].default
 end
-if CFG_VIS_CLEAN_FILTER then
+if HS_CFG.CFG_VIS_CLEAN_FILTER then
     vis_tune.sanity_color = 1
     vis_tune.distort_free = 1
     vis_tune.snow_cap     = 0.65
@@ -247,19 +371,31 @@ local PRESET_TUNE = {
     [0] = MakePresetTune({
         sharp = 0.00, ink = 0.00, dither = 0.00, mip_bias = 0.00,
         ao_str = 0.00, env_str = 0.00, dark_str = 0.00,
-        surface_light = 0.00, shadow_density = 0.00, glint_str = 0.00,
+        surface_light = 0.00, shadow_density = 0.00, shadow_point_lights = 0, glint_str = 0.00,
+        water_refl_str = 0.00, wind_sway_enabled = 0, wind_sway_strength = 0.00, wind_wake_strength = 0.00,
+        anim_spline = 0.75, anim_crossfade = 55.00, sprite_detail = 0.00, ground_detail = 0.00,
+        hitfeel_enabled = 0, hitfeel_hitstop = 1.00, hitfeel_recoil = 1.00, hitfeel_flash = 1.00, hitfeel_campunch = 0.85, hitfeel_vfx = 1.00,
+        vfx_fire_embers = 0.00, vfx_ambient_motes = 0.00, vfx_footsteps = 0.00,
+        vol_lightrays = 0.00, vol_cloud_shade = 0.00, vol_canopy_shade = 0.00,
+        shadow_weather = 0.00, shadow_moon_blue = 0.00, shadow_dusk_point = 1.00, shadow_min_height = 0.00, shadow_flash_lights = 0,
+        ocean_pbr = 0.00, ocean_sky_refl = 0.00, ocean_sun_glow = 0.00, ocean_hide_waves = 0, vol_edge_fog = 0.00, vol_ground_fog = 0.00, vol_lightrays_everywhere = 0,
         exposure = 0.00, temp = 0.00, tint = 0.00, contrast = 0.00, lightness = 0.00, gamma = 1.00,
         sat = 1.00, vibrance = 0.00, filmic = 0.00, hl_desat = 0.00, sun_fill = 0.00, original_mix = 0.00,
         vignette = 0.00, grain = 0.00,
         vanilla_cc = 1.00, snow_cap = 1.00, sanity_color = 0, distort_free = 0, sand_filter = 0,
     }),
-    -- Preset 1: Eye-Care HD (crisp BCAS + 1.0x LM + gentle bloom + subtle ocean shimmer, vanilla colors)
+    -- Preset 1: Eye-Care HD (crisp BCAS + 1.0x LM + gentle bloom + High-DPI Detail, vanilla colors)
     [1] = MakePresetTune({
         sharp = 0.85, ink = 0.85, anti_ring = 0.90, dither = 1.00, mip_bias = -0.45,
         bloom_str = 0.68, bloom_thresh = 0.04, bloom_knee = 0.55, bloom_chr = 0.10, bloom_prot = 0.85,
         bloom_warmth = 0.15, bloom_spread = 0.50, bloom_compress = 0.10, glow_tail = 0.25,
         ao_str = 1.00, env_str = 0.00, dark_str = 0.00,
-        surface_light = 0.00, shadow_density = 0.00, glint_str = 0.00,
+        surface_light = 0.00, shadow_density = 0.00, shadow_point_lights = 0, glint_str = 0.00,
+        water_refl_str = 0.00, wind_sway_enabled = 0,
+        anim_spline = 0.75, anim_crossfade = 55.00, sprite_detail = 0.65, ground_detail = 0.55,
+        hitfeel_enabled = 1, hitfeel_hitstop = 0.85, hitfeel_recoil = 0.90, hitfeel_flash = 0.85, hitfeel_campunch = 0.75, hitfeel_vfx = 0.85,
+        vfx_fire_embers = 0.85, vfx_ambient_motes = 0.70, vfx_footsteps = 0.80,
+        vol_lightrays = 0.70, vol_cloud_shade = 0.65, vol_canopy_shade = 0.55,
         vanilla_cc = 1.00, snow_cap = 1.00, sanity_color = 0, distort_free = 0, sand_filter = 0,
     }),
     -- Preset 2: Cinematic Storybook Studio (BCAS + Warm ACES + 3D Relief Lighting + Velvety Ground Shadows + Ocean Caustics!)
@@ -271,6 +407,15 @@ local PRESET_TUNE = {
         surface_light = 0.75, shade_warm = 0.62, shade_contrast = 0.52, shade_cool = 0.72, shade_dark = 0.45,
         shadow_density = 0.45, shadow_length = 1.05, shadow_soft = 1.30, shadow_fade = 0.60, shadow_sway = 0.50, shadow_smooth = 0.65,
         shadow_tint_r = 0.10, shadow_tint_g = 0.14, shadow_tint_b = 0.38, shadow_night = 1, shadow_hd = 1, shadow_skip_nightmare = 1,
+        shadow_point_lights = 1, shadow_point_strength = 0.85,
+        shadow_weather = 0.75, shadow_moon_blue = 0.45, shadow_dusk_point = 1.00, shadow_min_height = 0.00, shadow_flash_lights = 1,
+        water_refl_str = 0.48, water_refl_ripple = 0.55,
+        wind_sway_enabled = 1, wind_sway_strength = 0.55, wind_wake_strength = 0.70,
+        anim_spline = 0.80, anim_crossfade = 55.00, sprite_detail = 0.85, ground_detail = 0.75,
+        hitfeel_enabled = 1, hitfeel_hitstop = 1.00, hitfeel_recoil = 1.00, hitfeel_flash = 1.00, hitfeel_campunch = 0.95, hitfeel_vfx = 1.05,
+        vfx_fire_embers = 1.05, vfx_ambient_motes = 1.00, vfx_footsteps = 1.00,
+        vol_lightrays = 1.00, vol_cloud_shade = 1.00, vol_canopy_shade = 0.90,
+        ocean_pbr = 0.80, ocean_sky_refl = 0.70, ocean_sun_glow = 0.75, ocean_hide_waves = 0, vol_edge_fog = 0.85, vol_ground_fog = 0.70,
         glint_str = 0.45, glint_density = 0.92, glint_grain = 0.85, glint_soft = 0.88,
         exposure = 0.05, temp = 0.22, tint = -0.02, contrast = 0.03, lightness = 0.00, gamma = 1.00,
         sat = 1.04, vibrance = 0.22, filmic = 0.28, hl_desat = 0.35, sun_fill = 0.25, original_mix = 0.00,
@@ -304,11 +449,11 @@ local function GetActiveVisTune()
     end
     return PRESET_TUNE[current_visual_preset] or PRESET_TUNE[0]
 end
-local current_skeletal_tween = SKELETAL_TWEEN and true or false
-local current_low_latency = LOW_LATENCY_INPUT and true or false
-local current_show_fps_hud = SHOW_FPS_HUD and true or false
+local current_skeletal_tween = HS_CFG.SKELETAL_TWEEN and true or false
+local current_low_latency = HS_CFG.LOW_LATENCY_INPUT and true or false
+local current_show_fps_hud = HS_CFG.SHOW_FPS_HUD and true or false
 local current_mod_lang = "auto"
-local current_hud_mode = HUD_MODE
+local current_hud_mode = HS_CFG.HUD_MODE
 local fps_hud_text = nil
 local hud_dirty_now = false
 local visual_bench_timer = 0
@@ -377,20 +522,21 @@ local orig_SetBloomEnabled = nil
 local hd2d_smooth_wetness = 0.0
 
 -- Reversible vanilla filter hook state (ColourCube strength via identity LUT swap, Sanity/Distortion, Snow Cap)
-local vanilla_filter_hooked = false
-local orig_SetColourCubeData = nil
-local orig_SetColourCubeLerp = nil
-local orig_SetDistortionFactor = nil
-local orig_MapSetOverlayLerp = nil
-local vf_cc_src0 = nil
-local vf_cc_dst0 = nil
-local vf_cc_lerp0 = nil
-local vf_cc_lerp1 = nil
-local vf_distort_last = nil
-local vf_snow_map = nil
-local vf_snow_last = nil
-local vf_sandover_widgets = (type(setmetatable) == "function") and setmetatable({}, { __mode = "k" }) or {}
-local IDENTITY_CC_TEX = "images/colour_cubes/identity_colourcube.tex"
+local HS_VF = {}
+HS_VF.vanilla_filter_hooked = false
+HS_VF.orig_SetColourCubeData = nil
+HS_VF.orig_SetColourCubeLerp = nil
+HS_VF.orig_SetDistortionFactor = nil
+HS_VF.orig_MapSetOverlayLerp = nil
+HS_VF.vf_cc_src0 = nil
+HS_VF.vf_cc_dst0 = nil
+HS_VF.vf_cc_lerp0 = nil
+HS_VF.vf_cc_lerp1 = nil
+HS_VF.vf_distort_last = nil
+HS_VF.vf_snow_map = nil
+HS_VF.vf_snow_last = nil
+HS_VF.vf_sandover_widgets = (type(setmetatable) == "function") and setmetatable({}, { __mode = "k" }) or {}
+HS_VF.IDENTITY_CC_TEX = "images/colour_cubes/identity_colourcube.tex"
 
 -- Detect standalone DST-BCAS-Studio Workshop mod so HyperSmooth yields post-process/ColourCube cleanly
 local function IsExternalBcasActive()
@@ -447,59 +593,59 @@ local function DecodeCustomVisMask(m)
     custom_vis_flags.clean_filter = has_bit(m, 512)
 end
 
-local function GetEffectiveVanillaCc()
+function HS_VF.GetEffectiveVanillaCc()
     if IsExternalBcasActive() or current_visual_preset == 0 then return 1.0 end
     local tn = GetActiveVisTune()
     return ClampTuneValue("vanilla_cc", tn.vanilla_cc)
 end
 
-local function GetEffectiveSnowCap()
+function HS_VF.GetEffectiveSnowCap()
     if IsExternalBcasActive() or current_visual_preset == 0 then return 1.0 end
     local tn = GetActiveVisTune()
     return ClampTuneValue("snow_cap", tn.snow_cap)
 end
 
-local function IsSanityColorClean()
+function HS_VF.IsSanityColorClean()
     if IsExternalBcasActive() or current_visual_preset == 0 then return false end
     local tn = GetActiveVisTune()
     return (tn.sanity_color or 0) > 0.5
 end
 
-local function IsDistortFreeActive()
+function HS_VF.IsDistortFreeActive()
     if IsExternalBcasActive() or current_visual_preset == 0 then return false end
     local tn = GetActiveVisTune()
     return (tn.distort_free or 0) > 0.5
 end
 
-local function IsSandFilterActive()
+function HS_VF.IsSandFilterActive()
     if IsExternalBcasActive() or current_visual_preset == 0 then return false end
     local tn = GetActiveVisTune()
     return (tn.sand_filter or 0) > 0.5
 end
 
-local function HookWorldSnowMap(world_inst)
+function HS_VF.HookWorldSnowMap(world_inst)
     local mp = world_inst and world_inst.Map
     if not mp then return end
-    vf_snow_map = mp
+    HS_VF.vf_snow_map = mp
     local mt = getmetatable(mp)
     local idx = mt and mt.__index
     if type(idx) == "table" and type(idx.SetOverlayLerp) == "function" and not idx._hs_snow_hooked then
         idx._hs_snow_hooked = true
-        orig_MapSetOverlayLerp = idx.SetOverlayLerp
+        HS_VF.orig_MapSetOverlayLerp = idx.SetOverlayLerp
         idx.SetOverlayLerp = function(self, level, ...)
-            vf_snow_map = self
-            vf_snow_last = level
-            local cap = GetEffectiveSnowCap()
+            HS_VF.vf_snow_map = self
+            HS_VF.vf_snow_last = level
+            local cap = HS_VF.GetEffectiveSnowCap()
             if type(level) == "number" and cap < 0.999 and level > cap then
                 level = cap
             end
-            return orig_MapSetOverlayLerp(self, level, ...)
+            return HS_VF.orig_MapSetOverlayLerp(self, level, ...)
         end
     end
 end
 
-local function InstallVanillaFilterHooks()
-    if vanilla_filter_hooked then return true end
+function HS_VF.InstallVanillaFilterHooks()
+    if HS_VF.vanilla_filter_hooked then return true end
     local pp = rawget(GLOBAL, "PostProcessor")
     if not pp then return false end
     local mt = getmetatable(pp)
@@ -508,91 +654,91 @@ local function InstallVanillaFilterHooks()
 
     if type(idx.SetColourCubeData) == "function" and not idx._hs_ccdata_hooked then
         idx._hs_ccdata_hooked = true
-        orig_SetColourCubeData = idx.SetColourCubeData
+        HS_VF.orig_SetColourCubeData = idx.SetColourCubeData
         idx.SetColourCubeData = function(self, index, src, dest, ...)
             if index == 0 then
-                vf_cc_src0 = src
-                vf_cc_dst0 = dest
-                if GetEffectiveVanillaCc() < 0.999 then
+                HS_VF.vf_cc_src0 = src
+                HS_VF.vf_cc_dst0 = dest
+                if HS_VF.GetEffectiveVanillaCc() < 0.999 then
                     -- Swap src to identity LUT so scaling lerp blends Neutral <-> Current LUT
                     -- instead of resurrecting last season's stale LUT! (BCAS-Studio MIT insight)
-                    src = IDENTITY_CC_TEX
+                    src = HS_VF.IDENTITY_CC_TEX
                 end
             end
-            return orig_SetColourCubeData(self, index, src, dest, ...)
+            return HS_VF.orig_SetColourCubeData(self, index, src, dest, ...)
         end
     end
 
     if type(idx.SetColourCubeLerp) == "function" and not idx._hs_cclerp_hooked then
         idx._hs_cclerp_hooked = true
-        orig_SetColourCubeLerp = idx.SetColourCubeLerp
+        HS_VF.orig_SetColourCubeLerp = idx.SetColourCubeLerp
         idx.SetColourCubeLerp = function(self, index, lerp, ...)
             if index == 0 then
-                vf_cc_lerp0 = lerp
-                local vcc = GetEffectiveVanillaCc()
+                HS_VF.vf_cc_lerp0 = lerp
+                local vcc = HS_VF.GetEffectiveVanillaCc()
                 if vcc < 0.999 and type(lerp) == "number" then
                     lerp = lerp * vcc
                 end
             elseif index == 1 then
-                vf_cc_lerp1 = lerp
-                if IsSanityColorClean() then
+                HS_VF.vf_cc_lerp1 = lerp
+                if HS_VF.IsSanityColorClean() then
                     lerp = 0
                 end
             end
-            return orig_SetColourCubeLerp(self, index, lerp, ...)
+            return HS_VF.orig_SetColourCubeLerp(self, index, lerp, ...)
         end
     end
 
     if type(idx.SetDistortionFactor) == "function" and not idx._hs_distort_hooked then
         idx._hs_distort_hooked = true
-        orig_SetDistortionFactor = idx.SetDistortionFactor
+        HS_VF.orig_SetDistortionFactor = idx.SetDistortionFactor
         idx.SetDistortionFactor = function(self, factor, ...)
-            vf_distort_last = factor
-            if IsDistortFreeActive() then
+            HS_VF.vf_distort_last = factor
+            if HS_VF.IsDistortFreeActive() then
                 factor = 1.0
             end
-            return orig_SetDistortionFactor(self, factor, ...)
+            return HS_VF.orig_SetDistortionFactor(self, factor, ...)
         end
     end
 
     local tw = rawget(GLOBAL, "TheWorld")
-    if tw then HookWorldSnowMap(tw) end
-    vanilla_filter_hooked = true
+    if tw then HS_VF.HookWorldSnowMap(tw) end
+    HS_VF.vanilla_filter_hooked = true
     return true
 end
 
-local function ApplyVanillaFilters()
+function HS_VF.ApplyVanillaFilters()
     if IsExternalBcasActive() then return end
     local pp = rawget(GLOBAL, "PostProcessor")
-    if pp and vanilla_filter_hooked then
-        if orig_SetColourCubeData and vf_cc_src0 ~= nil and vf_cc_dst0 ~= nil then
-            local src0 = (GetEffectiveVanillaCc() < 0.999) and IDENTITY_CC_TEX or vf_cc_src0
-            pcall(orig_SetColourCubeData, pp, 0, src0, vf_cc_dst0)
+    if pp and HS_VF.vanilla_filter_hooked then
+        if HS_VF.orig_SetColourCubeData and HS_VF.vf_cc_src0 ~= nil and HS_VF.vf_cc_dst0 ~= nil then
+            local src0 = (HS_VF.GetEffectiveVanillaCc() < 0.999) and HS_VF.IDENTITY_CC_TEX or HS_VF.vf_cc_src0
+            pcall(HS_VF.orig_SetColourCubeData, pp, 0, src0, HS_VF.vf_cc_dst0)
         end
-        if orig_SetColourCubeLerp then
-            if vf_cc_lerp0 ~= nil then
-                local vcc = GetEffectiveVanillaCc()
-                pcall(orig_SetColourCubeLerp, pp, 0, (vcc < 0.999) and (vf_cc_lerp0 * vcc) or vf_cc_lerp0)
+        if HS_VF.orig_SetColourCubeLerp then
+            if HS_VF.vf_cc_lerp0 ~= nil then
+                local vcc = HS_VF.GetEffectiveVanillaCc()
+                pcall(HS_VF.orig_SetColourCubeLerp, pp, 0, (vcc < 0.999) and (HS_VF.vf_cc_lerp0 * vcc) or HS_VF.vf_cc_lerp0)
             end
-            if vf_cc_lerp1 ~= nil then
-                pcall(orig_SetColourCubeLerp, pp, 1, IsSanityColorClean() and 0 or vf_cc_lerp1)
+            if HS_VF.vf_cc_lerp1 ~= nil then
+                pcall(HS_VF.orig_SetColourCubeLerp, pp, 1, HS_VF.IsSanityColorClean() and 0 or HS_VF.vf_cc_lerp1)
             end
         end
-        if orig_SetDistortionFactor and vf_distort_last ~= nil then
-            pcall(orig_SetDistortionFactor, pp, IsDistortFreeActive() and 1.0 or vf_distort_last)
+        if HS_VF.orig_SetDistortionFactor and HS_VF.vf_distort_last ~= nil then
+            pcall(HS_VF.orig_SetDistortionFactor, pp, HS_VF.IsDistortFreeActive() and 1.0 or HS_VF.vf_distort_last)
         end
     end
     local tw = rawget(GLOBAL, "TheWorld")
-    if tw and tw.Map and vf_snow_map ~= tw.Map then
-        HookWorldSnowMap(tw)
+    if tw and tw.Map and HS_VF.vf_snow_map ~= tw.Map then
+        HS_VF.HookWorldSnowMap(tw)
     end
-    if orig_MapSetOverlayLerp and vf_snow_map ~= nil and vf_snow_last ~= nil then
-        local cap = GetEffectiveSnowCap()
-        local lvl = (type(vf_snow_last) == "number" and cap < 0.999 and vf_snow_last > cap) and cap or vf_snow_last
-        pcall(orig_MapSetOverlayLerp, vf_snow_map, lvl)
+    if HS_VF.orig_MapSetOverlayLerp and HS_VF.vf_snow_map ~= nil and HS_VF.vf_snow_last ~= nil then
+        local cap = HS_VF.GetEffectiveSnowCap()
+        local lvl = (type(HS_VF.vf_snow_last) == "number" and cap < 0.999 and HS_VF.vf_snow_last > cap) and cap or HS_VF.vf_snow_last
+        pcall(HS_VF.orig_MapSetOverlayLerp, HS_VF.vf_snow_map, lvl)
     end
-    local hide_sand = IsSandFilterActive()
-    for w in pairs(vf_sandover_widgets) do
+    local hide_sand = HS_VF.IsSandFilterActive()
+    for w in pairs(HS_VF.vf_sandover_widgets) do
         if w and w.inst and w.inst.entity then
             if hide_sand then
                 if w.shown then pcall(w.inst.entity.Hide, w.inst.entity, false) end
@@ -615,7 +761,7 @@ end
 local studio_grain_clock = 0.0
 local studio_wind_clock = 0.0
 local studio_engine_bloom_rt = nil
-local studio_bloom_sampler_scale = nil
+local studio_bloom_sampler_scale = 0.25
 local shadow_excluded_ents = (type(setmetatable) == "function") and setmetatable({}, { __mode = "k" }) or {}
 local shadow_exclusion_last_state = nil
 
@@ -628,10 +774,105 @@ local studio_clock_interp = {
 }
 local studio_nl_cache = {
     accum = 999.0,
+    ents = nil,
     wx = 0.707, wz = 0.707,
     presence = 0.0,
     stretch = 1.75,
+    flash_slots = {},
+    flash_enabled = false,
 }
+do
+    local function IsFiniteNum(v)
+        return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+    end
+    function studio_nl_cache.PushFlashLight(wx, wz, radius, peak_str, duration)
+        if not studio_nl_cache.flash_enabled then return false end
+        if not (IsFiniteNum(wx) and IsFiniteNum(wz) and IsFiniteNum(radius) and IsFiniteNum(peak_str)) then
+            return false
+        end
+        if radius <= 0.5 or peak_str <= 0.05 then return false end
+        local player = rawget(GLOBAL, "ThePlayer")
+        if player and player.Transform then
+            local ok_p, px, _, pz = pcall(player.Transform.GetWorldPosition, player.Transform)
+            if ok_p and IsFiniteNum(px) and IsFiniteNum(pz) then
+                local dx, dz = wx - px, wz - pz
+                if (dx * dx + dz * dz) > 1600.0 then return false end
+            end
+        end
+        local dur = (IsFiniteNum(duration) and duration >= 0.15 and duration <= 3.0) and duration or 1.0
+        local rad = math.max(3.0, math.min(32.0, radius))
+        local pk  = math.max(0.10, math.min(1.0, peak_str))
+        local slots = studio_nl_cache.flash_slots
+        if type(slots) ~= "table" then slots = {}; studio_nl_cache.flash_slots = slots end
+        for i = 1, #slots do
+            local s = slots[i]
+            local dx, dz = s.wx - wx, s.wz - wz
+            if (dx * dx + dz * dz) < 2.25 and (s.elapsed or 0) < 0.12 then
+                s.wx = wx; s.wz = wz; s.radius = math.max(s.radius, rad)
+                s.peak_str = math.max(s.peak_str, pk); s.elapsed = 0.0; s.duration = dur
+                return true
+            end
+        end
+        if #slots >= 4 then table.remove(slots, 1) end
+        slots[#slots + 1] = { wx = wx, wz = wz, radius = rad, peak_str = pk, elapsed = 0.0, duration = dur }
+        return true
+    end
+    if type(AddPrefabPostInit) == "function" then
+        AddPrefabPostInit("lightning", function(inst)
+            if not studio_nl_cache.flash_enabled or not inst or not inst.Transform then return end
+            local function emit_bolt(e)
+                if not studio_nl_cache.flash_enabled or not e or not e.Transform then return end
+                if e.IsValid and not e:IsValid() then return end
+                local ok_p, wx, _, wz = pcall(e.Transform.GetWorldPosition, e.Transform)
+                if ok_p and IsFiniteNum(wx) and IsFiniteNum(wz) then
+                    studio_nl_cache.PushFlashLight(wx, wz, 28.0, 0.95, 1.0)
+                end
+            end
+            if type(inst.DoTaskInTime) == "function" then
+                inst:DoTaskInTime(0, emit_bolt)
+            else
+                emit_bolt(inst)
+            end
+        end)
+    end
+    if type(AddPrefabPostInitAny) == "function" then
+        AddPrefabPostInitAny(function(inst)
+            if not studio_nl_cache.flash_enabled then return end
+            if not inst or not inst.Light or not inst.Transform then return end
+            local is_fx = false
+            if type(inst.HasTag) == "function" then
+                is_fx = inst:HasTag("FX") or inst:HasTag("projectile") or inst:HasTag("NOCLICK")
+            end
+            if not is_fx then return end
+            local function emit_fx_light(e)
+                if not studio_nl_cache.flash_enabled or not e or not e.Light or not e.Transform then return end
+                if e.IsValid and not e:IsValid() then return end
+                local ok_e, en = pcall(e.Light.IsEnabled, e.Light)
+                if not (ok_e and en) then return end
+                local ok_r, rad = pcall(e.Light.GetCalculatedRadius, e.Light)
+                if not (ok_r and IsFiniteNum(rad)) then
+                    ok_r, rad = pcall(e.Light.GetRadius, e.Light)
+                end
+                if not (ok_r and IsFiniteNum(rad) and rad >= 1.8) then return end
+                local inten = 0.85
+                if type(e.Light.GetIntensity) == "function" then
+                    local ok_i, iv = pcall(e.Light.GetIntensity, e.Light)
+                    if ok_i and IsFiniteNum(iv) then inten = math.max(0.0, math.min(1.0, iv)) end
+                end
+                if inten < 0.20 then return end
+                local ok_p, wx, _, wz = pcall(e.Transform.GetWorldPosition, e.Transform)
+                if ok_p and IsFiniteNum(wx) and IsFiniteNum(wz) then
+                    studio_nl_cache.PushFlashLight(wx, wz, math.min(math.max(rad * 1.5, 4.0), 28.0), math.min(1.0, math.max(0.35, inten * 1.1)), 1.0)
+                end
+            end
+            if type(inst.DoTaskInTime) == "function" then
+                inst:DoTaskInTime(0, emit_fx_light)
+            else
+                emit_fx_light(inst)
+            end
+        end)
+    end
+end
 local studio_light_init = false
 local studio_light_state = {
     sun_wx = 0.707, sun_wz = 0.707,
@@ -641,8 +882,15 @@ local studio_light_state = {
     day_factor = 1.0,
     eff_presence = 1.0,
     soft_mult = 1.0,
+    weather_mult = 1.0,
+    season_mult = 1.0,
+    env_shadow_mult = 1.0,
+    moon_blend = 0.0,
+    dusk_blend = 0.0,
     sun_u = 0.22, sun_v = 0.14,
     sun_sx = 0.22, sun_sy = 0.14, sun_elev = 0.64,
+    world_shadow_v2_active = nil,
+    world_shadow_v2_changed = false,
 }
 
 local function Smoothstep01(x)
@@ -661,7 +909,9 @@ local function IsGamePausedSafe()
 end
 
 local function IsShadowExclusionActive()
-    if current_visual_preset == 0 or IsExternalBcasActive() then
+    local v2_on = (studio_light_state.world_shadow_v2_active == true)
+        or (studio_light_state.world_shadow_v2_active == nil and type(rawget(GLOBAL, "HyperSmooth_SetShadowConfig")) == "function")
+    if current_visual_preset == 0 or IsExternalBcasActive() or v2_on then
         return false
     end
     local tn = GetActiveVisTune()
@@ -814,44 +1064,86 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
         tgt_soft_mult = 1.32
     end
 
-    -- Multi-Light Energy-Weighted Night/Cave Solver (20Hz entity scan + 240Hz dt damping -> ZERO 180-deg flips!)
+    -- Multi-Light Energy-Weighted Night/Cave Solver (4Hz FindEntities cache + 240Hz live world-pos evaluation!)
+    -- v2.9.5: Also tracks entity-keyed Top-3 near-field point lights with dt-smooth fade-in/fade-out (zero hard pop!)
     local nlc = studio_nl_cache
+    if type(nlc.pt_slots) ~= "table" then nlc.pt_slots = {} end
+    local pt_cand = {}
     if allow_night_light and tgt_day < 0.90 then
+        local player = rawget(GLOBAL, "ThePlayer")
+        local sim = rawget(GLOBAL, "TheSim")
+        local px, pz = nil, nil
+        if player and player.Transform then
+            local ok_p, x, _, z = pcall(player.Transform.GetWorldPosition, player.Transform)
+            if ok_p and type(x) == "number" and type(z) == "number" then
+                px, pz = x, z
+            end
+        end
         nlc.accum = has_dt and (nlc.accum + dt_step) or 999.0
-        if nlc.accum >= 0.05 then
+        if px and pz and sim and sim.FindEntities and (nlc.accum >= 0.25 or type(nlc.ents) ~= "table") then
             nlc.accum = 0.0
-            local sum_wx, sum_wz, sum_w, sum_dist_w = 0.0, 0.0, 0.0, 0.0
-            local player = rawget(GLOBAL, "ThePlayer")
-            local sim = rawget(GLOBAL, "TheSim")
-            if player and player.Transform and sim and sim.FindEntities then
-                local ok_p, px, _, pz = pcall(player.Transform.GetWorldPosition, player.Transform)
-                if ok_p and type(px) == "number" and type(pz) == "number" then
-                    local ok_f, ents = pcall(sim.FindEntities, sim, px, 0, pz, 18)
-                    if ok_f and type(ents) == "table" then
-                        for i = 1, #ents do
-                            local e = ents[i]
-                            if e and e ~= player and e.Light and e.Transform then
-                                local ok_e, en = pcall(e.Light.IsEnabled, e.Light)
-                                if ok_e and en then
-                                    local ok_r, rad = pcall(e.Light.GetCalculatedRadius, e.Light)
-                                    if not (ok_r and type(rad) == "number") then
-                                        ok_r, rad = pcall(e.Light.GetRadius, e.Light)
+            local cached = {}
+            local ok_f, ents = pcall(sim.FindEntities, sim, px, 0, pz, 26)
+            if ok_f and type(ents) == "table" then
+                for i = 1, #ents do
+                    local e = ents[i]
+                    if e and e ~= player and e.Light and e.Transform then
+                        cached[#cached + 1] = e
+                    end
+                end
+            end
+            nlc.ents = cached
+        end
+        local sum_wx, sum_wz, sum_w, sum_dist_w = 0.0, 0.0, 0.0, 0.0
+        if px and pz and type(nlc.ents) == "table" then
+            for i = 1, #nlc.ents do
+                local e = nlc.ents[i]
+                if e and e.Light and e.Transform and (not e.IsValid or e:IsValid()) then
+                    local ok_e, en = pcall(e.Light.IsEnabled, e.Light)
+                    if ok_e and en then
+                        local ok_r, rad = pcall(e.Light.GetCalculatedRadius, e.Light)
+                        if not (ok_r and type(rad) == "number") then
+                            ok_r, rad = pcall(e.Light.GetRadius, e.Light)
+                        end
+                        rad = (ok_r and type(rad) == "number" and rad > 0.5) and rad or 0.0
+                        if rad > 0.5 then
+                            local inten = 0.80
+                            if type(e.Light.GetIntensity) == "function" then
+                                local ok_in, iv = pcall(e.Light.GetIntensity, e.Light)
+                                if ok_in and type(iv) == "number" then
+                                    inten = math.max(0.0, math.min(1.0, iv))
+                                end
+                            end
+                            local ok_ep, ex, _, ez = pcall(e.Transform.GetWorldPosition, e.Transform)
+                            if ok_ep and type(ex) == "number" and type(ez) == "number" then
+                                local dx, dz = ex - px, ez - pz
+                                local d2 = dx * dx + dz * dz
+                                if d2 > 0.04 and d2 <= 324.0 then
+                                    local dl = math.sqrt(d2)
+                                    local w = (rad * rad) / (d2 + 4.0)
+                                    sum_wx = sum_wx + (dx / dl) * w
+                                    sum_wz = sum_wz + (dz / dl) * w
+                                    sum_w  = sum_w + w
+                                    sum_dist_w = sum_dist_w + math.min(dl / math.max(rad, 1.0), 2.2) * w
+                                end
+                                if rad > 1.8 and inten > 0.15 and d2 <= 676.0 then
+                                    local score = (rad * rad * inten) / (d2 + 4.0)
+                                    local ins = #pt_cand + 1
+                                    for k = 1, #pt_cand do
+                                        if score > pt_cand[k].score then ins = k; break end
                                     end
-                                    rad = (ok_r and type(rad) == "number" and rad > 0.5) and rad or 0.0
-                                    if rad > 0.5 then
-                                        local ok_ep, ex, _, ez = pcall(e.Transform.GetWorldPosition, e.Transform)
-                                        if ok_ep and type(ex) == "number" then
-                                            local dx, dz = ex - px, ez - pz
-                                            local d2 = dx * dx + dz * dz
-                                            if d2 > 0.04 then
-                                                local dl = math.sqrt(d2)
-                                                local w = (rad * rad) / (d2 + 4.0)
-                                                sum_wx = sum_wx + (dx / dl) * w
-                                                sum_wz = sum_wz + (dz / dl) * w
-                                                sum_w  = sum_w + w
-                                                sum_dist_w = sum_dist_w + math.min(dl / math.max(rad, 1.0), 2.2) * w
-                                            end
-                                        end
+                                    if ins <= 3 then
+                                        local r_norm = Smoothstep01((rad - 1.8) / 2.2)
+                                        local raw_str = math.min(1.0, math.max(0.25, inten * (0.45 + 0.55 * r_norm)))
+                                        table.insert(pt_cand, ins, {
+                                            ent     = e,
+                                            wx      = ex,
+                                            wz      = ez,
+                                            radius  = math.min(math.max(rad * 1.45, 3.0), 32.0),
+                                            raw_str = raw_str,
+                                            score   = score,
+                                        })
+                                        if #pt_cand > 3 then pt_cand[4] = nil end
                                     end
                                 end
                             end
@@ -859,21 +1151,163 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
                     end
                 end
             end
-            local vlen = math.sqrt(sum_wx * sum_wx + sum_wz * sum_wz)
-            if sum_w > 0.06 and vlen > 0.02 then
-                local coh = math.min(1.0, vlen / math.max(sum_w, 1e-4))
-                nlc.wx = sum_wx / vlen
-                nlc.wz = sum_wz / vlen
-                nlc.presence = math.min(1.0, sum_w * 0.45) * (0.25 + 0.75 * coh)
-                local avg_d = sum_dist_w / math.max(sum_w, 1e-4)
-                nlc.stretch = 1.35 + math.min(avg_d, 1.8) * 0.48
-            else
-                nlc.presence = 0.0
-            end
+        end
+        local vlen = math.sqrt(sum_wx * sum_wx + sum_wz * sum_wz)
+        if sum_w > 0.06 and vlen > 0.02 then
+            local coh = math.min(1.0, vlen / math.max(sum_w, 1e-4))
+            nlc.wx = sum_wx / vlen
+            nlc.wz = sum_wz / vlen
+            nlc.presence = math.min(1.0, sum_w * 0.45) * (0.25 + 0.75 * coh)
+            local avg_d = sum_dist_w / math.max(sum_w, 1e-4)
+            nlc.stretch = 1.35 + math.min(avg_d, 1.8) * 0.48
+        else
+            nlc.presence = 0.0
         end
     else
         nlc.presence = 0.0
+        nlc.ents = nil
         nlc.accum = 999.0
+    end
+
+    -- Temporal fade-in / fade-out slot tracking for Top-3 near-field point lights (zero pop on rank swap or extinguish!)
+    local pt_slots = nlc.pt_slots
+    local pt_damp = studio_light_init and has_dt and (not paused)
+    local pt_alpha = pt_damp and (1.0 - math.exp(-dt_step * 6.5)) or 1.0
+    for i = 1, #pt_slots do
+        pt_slots[i].target = 0.0
+    end
+    for i = 1, #pt_cand do
+        local c = pt_cand[i]
+        local matched = nil
+        for j = 1, #pt_slots do
+            if pt_slots[j].ent == c.ent then
+                matched = pt_slots[j]
+                break
+            end
+        end
+        if matched then
+            matched.wx     = c.wx
+            matched.wz     = c.wz
+            matched.radius = matched.radius + (c.radius - matched.radius) * pt_alpha
+            matched.target = c.raw_str
+            matched.score  = c.score
+        elseif #pt_slots < 6 then
+            pt_slots[#pt_slots + 1] = {
+                ent    = c.ent,
+                wx     = c.wx,
+                wz     = c.wz,
+                radius = c.radius,
+                weight = pt_damp and 0.0 or c.raw_str,
+                target = c.raw_str,
+                score  = c.score,
+            }
+        end
+    end
+    local kept_slots = {}
+    for i = 1, #pt_slots do
+        local sl = pt_slots[i]
+        if pt_damp then
+            sl.weight = sl.weight + (sl.target - sl.weight) * pt_alpha
+        else
+            sl.weight = sl.target
+        end
+        if sl.target > 0.001 or sl.weight > 0.01 then
+            kept_slots[#kept_slots + 1] = sl
+        end
+    end
+    nlc.pt_slots = kept_slots
+    table.sort(kept_slots, function(a, b)
+        if a.weight ~= b.weight then return a.weight > b.weight end
+        return (a.score or 0) > (b.score or 0)
+    end)
+    local pt_out = {}
+    for i = 1, math.min(#kept_slots, 3) do
+        local sl = kept_slots[i]
+        if sl.weight > 0.008 then
+            pt_out[#pt_out + 1] = {
+                wx       = sl.wx,
+                wz       = sl.wz,
+                radius   = sl.radius,
+                strength = sl.weight,
+            }
+        end
+    end
+    -- v2.9.5-E Transient Flash-Light Shadows (lightning / explosions / spell bursts: instant attack, smooth 1s decay!)
+    do
+        local tn_fl = GetActiveVisTune()
+        local fl_on = (current_visual_preset ~= 0) and (not IsExternalBcasActive())
+            and (ClampTuneValue("shadow_flash_lights", tn_fl.shadow_flash_lights) > 0.5)
+        nlc.flash_enabled = fl_on
+        local fslots = nlc.flash_slots
+        if type(fslots) == "table" and #fslots > 0 then
+            if not fl_on then
+                nlc.flash_slots = {}
+            else
+                local kept_f = {}
+                for i = 1, #fslots do
+                    local fs = fslots[i]
+                    if has_dt and not paused then
+                        fs.elapsed = (fs.elapsed or 0.0) + dt_step
+                    end
+                    local dur = (fs.duration and fs.duration > 0.05) and fs.duration or 1.0
+                    local t = (fs.elapsed or 0.0) / dur
+                    if t < 1.0 then
+                        kept_f[#kept_f + 1] = fs
+                        local inv = 1.0 - t
+                        local fstr = (fs.peak_str or 0.85) * inv * inv
+                        if fstr > 0.015 then
+                            pt_out[#pt_out + 1] = {
+                                wx       = fs.wx,
+                                wz       = fs.wz,
+                                radius   = fs.radius,
+                                strength = fstr,
+                                is_flash = true,
+                            }
+                        end
+                    end
+                end
+                nlc.flash_slots = kept_f
+                if #pt_out > 3 then
+                    table.sort(pt_out, function(a, b)
+                        if (a.is_flash == true) ~= (b.is_flash == true) then return a.is_flash == true end
+                        return (a.strength or 0) > (b.strength or 0)
+                    end)
+                    while #pt_out > 3 do pt_out[#pt_out] = nil end
+                end
+            end
+        end
+    end
+    nlc.point_lights = pt_out
+
+    -- v2.9.5-E Weather/Season Dynamic Attenuation + Full-Moon Blue / Dusk Fire Blends
+    local tgt_weather_mult = 1.0
+    local tgt_season_mult  = 1.0
+    local tgt_moon_blend   = 0.0
+    local tgt_dusk_blend   = 0.0
+    do
+        local tn_env = GetActiveVisTune()
+        local sw_lvl = (current_visual_preset ~= 0 and not IsExternalBcasActive())
+            and ClampTuneValue("shadow_weather", tn_env.shadow_weather) or 0.0
+        if not is_cave and wstate then
+            local ph = wstate.phase or "day"
+            if ph == "night" and wstate.isfullmoon then
+                tgt_moon_blend = 1.0
+            elseif ph == "dusk" then
+                tgt_dusk_blend = 1.0
+            end
+            if sw_lvl > 0.001 then
+                local precip = wstate.precipitation
+                if precip == "rain" or precip == "snow" then
+                    tgt_weather_mult = math.max(0.0, 1.0 - 0.40 * sw_lvl)
+                end
+                local seas = wstate.season
+                if seas == "winter" then
+                    tgt_season_mult = math.max(0.40, 1.0 - 0.20 * sw_lvl)
+                elseif seas == "summer" then
+                    tgt_season_mult = math.min(1.40, 1.0 + 0.20 * sw_lvl)
+                end
+            end
+        end
     end
 
     local mix_w = Smoothstep01(tgt_day)
@@ -896,7 +1330,8 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
     if sm < 0.0 then sm = 0.0 elseif sm > 1.0 then sm = 1.0 end
     local use_damp = studio_light_init and has_dt and (not paused)
     if use_damp then
-        local rate = 2.2 + (1.0 - sm) * (1.0 - sm) * 20.0
+        local night_boost = (mix_w < 0.5 and nl_w > 0.01) and 2.2 or 0.0
+        local rate = 2.2 + night_boost + (1.0 - sm) * (1.0 - sm) * 20.0
         local a = 1.0 - math.exp(-dt_step * rate)
         -- True circular angular damping (2D SLERP): constant smooth rotation with zero 180-deg chord stall!
         local cur_ang = math.atan2(st.sun_wz, st.sun_wx)
@@ -909,6 +1344,11 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
         st.day_factor   = st.day_factor + (tgt_day - st.day_factor) * a
         st.eff_presence = st.eff_presence + (tgt_eff_presence - st.eff_presence) * a
         st.soft_mult    = st.soft_mult + (tgt_eff_soft - st.soft_mult) * a
+        local wa = 1.0 - math.exp(-dt_step * 3.0)
+        st.weather_mult = (st.weather_mult or 1.0) + (tgt_weather_mult - (st.weather_mult or 1.0)) * wa
+        st.season_mult  = (st.season_mult or 1.0) + (tgt_season_mult - (st.season_mult or 1.0)) * wa
+        st.moon_blend   = (st.moon_blend or 0.0) + (tgt_moon_blend - (st.moon_blend or 0.0)) * wa
+        st.dusk_blend   = (st.dusk_blend or 0.0) + (tgt_dusk_blend - (st.dusk_blend or 0.0)) * wa
     else
         st.sun_wx       = lx
         st.sun_wz       = lz
@@ -916,8 +1356,13 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
         st.day_factor   = tgt_day
         st.eff_presence = tgt_eff_presence
         st.soft_mult    = tgt_eff_soft
+        st.weather_mult = tgt_weather_mult
+        st.season_mult  = tgt_season_mult
+        st.moon_blend   = tgt_moon_blend
+        st.dusk_blend   = tgt_dusk_blend
         studio_light_init = true
     end
+    st.env_shadow_mult = (st.weather_mult or 1.0) * (st.season_mult or 1.0)
 
     -- Project damped light vector into camera-space azimuth theta_cam (shortest-arc damped for silky Q/E rotation!)
     local tgt_theta = 0.785
@@ -966,8 +1411,22 @@ local function SyncBloomSamplerResolution(pp)
     local SS = rawget(GLOBAL, "SamplerSizes")
     local SCM = rawget(GLOBAL, "SamplerColourMode")
     if not (SS and SCM) then return end
-    local tn = GetActiveVisTune()
-    local want_scale = (ClampTuneValue("shadow_hd", tn.shadow_hd) > 0.5) and 1.0 or 0.5
+    -- Klei's BuildBloomShader allocates BloomSampler at 0.25x to match BlurH/BlurV (0.25x),
+    -- and PostProcessor::SetBloomSamplerParams only takes effect during AddModShadersInit.
+    -- Keep exact 0.25x for Preset 0 (Vanilla Pure), pure-Lua mode, and v2.9.0+ WorldShadowEngine FBO
+    -- so vanilla Magiluminescence/torches/fireflies stay 100% bit-for-bit stock even after live preset switches!
+    -- Only legacy v1 non-FBO DLL shadows (pre-v2.9.0) ever resize BloomSampler above 0.25x.
+    local want_scale = 0.25
+    if current_visual_preset ~= 0 and (not IsExternalBcasActive()) and HasNativeWorldStudio() then
+        local v2_on = (studio_light_state.world_shadow_v2_active == true)
+            or (studio_light_state.world_shadow_v2_active == nil and type(rawget(GLOBAL, "HyperSmooth_SetShadowConfig")) == "function")
+        if not v2_on then
+            local tn = GetActiveVisTune()
+            if ClampTuneValue("shadow_density", tn.shadow_density) > 0.001 then
+                want_scale = (ClampTuneValue("shadow_hd", tn.shadow_hd) > 0.5) and 1.0 or 0.5
+            end
+        end
+    end
     if studio_bloom_sampler_scale ~= want_scale then
         studio_bloom_sampler_scale = want_scale
         pcall(pp.SetBloomSamplerParams, pp, SS.Relative, want_scale, want_scale, SCM.RGB)
@@ -1010,14 +1469,93 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
         end
     end
 
-    -- Native C++ World Studio Bus: 3D Entity Surface Lighting + Procedural Ocean Caustics + Fluid Ground Shadows v2
+    -- v2.9.5-A Fluid Skeletal Animation (A1 Crossfade + A2 PCHIP Spline) & High-DPI Visual Detail (A3-1)
+    do
+        local fnAnimFluid = rawget(GLOBAL, "HyperSmooth_SetAnimFluid")
+        if type(fnAnimFluid) == "function" then
+            local sp_val = ClampTuneValue("anim_spline", tn.anim_spline)
+            local xf_val = ClampTuneValue("anim_crossfade", tn.anim_crossfade)
+            pcall(fnAnimFluid, sp_val, xf_val)
+        end
+        local fnDet = rawget(GLOBAL, "HyperSmooth_SetDetailParams")
+        if type(fnDet) == "function" then
+            if is_van or IsExternalBcasActive() then
+                pcall(fnDet, 0.0, 0.0, 0.0, 0.0)
+            else
+                local gd = ClampTuneValue("ground_detail", tn.ground_detail)
+                local sd = ClampTuneValue("sprite_detail", tn.sprite_detail)
+                pcall(fnDet, gd, sd * 0.85, sd, 0.0)
+            end
+        end
+        local hf_on = (not is_van) and (ClampTuneValue("hitfeel_enabled", tn.hitfeel_enabled) > 0.5)
+        local fnCombat = rawget(GLOBAL, "HyperSmooth_SetCombatConfig")
+        if type(fnCombat) == "function" then
+            pcall(fnCombat,
+                hf_on,
+                ClampTuneValue("hitfeel_hitstop", tn.hitfeel_hitstop),
+                ClampTuneValue("hitfeel_recoil", tn.hitfeel_recoil),
+                ClampTuneValue("hitfeel_flash", tn.hitfeel_flash),
+                ClampTuneValue("hitfeel_vfx", tn.hitfeel_vfx),
+                ClampTuneValue("hitfeel_campunch", tn.hitfeel_campunch))
+        end
+        if type(HS_VFX) == "table" and type(HS_VFX.ApplyConfig) == "function" then
+            pcall(HS_VFX.ApplyConfig,
+                is_van and 0.0 or ClampTuneValue("vfx_fire_embers", tn.vfx_fire_embers),
+                is_van and 0.0 or ClampTuneValue("vfx_ambient_motes", tn.vfx_ambient_motes),
+                is_van and 0.0 or ClampTuneValue("vfx_footsteps", tn.vfx_footsteps),
+                hf_on,
+                ClampTuneValue("hitfeel_vfx", tn.hitfeel_vfx))
+        end
+        if type(HS_VOLLIGHT) == "table" and type(HS_VOLLIGHT.ApplyConfig) == "function" then
+            pcall(HS_VOLLIGHT.ApplyConfig,
+                is_van and 0.0 or ClampTuneValue("vol_lightrays", tn.vol_lightrays),
+                is_van and 0.0 or ClampTuneValue("vol_cloud_shade", tn.vol_cloud_shade),
+                is_van and 0.0 or ClampTuneValue("vol_canopy_shade", tn.vol_canopy_shade),
+                is_van and 0.0 or ClampTuneValue("vol_edge_fog", tn.vol_edge_fog),
+                is_van and 0.0 or ClampTuneValue("vol_ground_fog", tn.vol_ground_fog),
+                is_van and 0 or ClampTuneValue("vol_lightrays_everywhere", tn.vol_lightrays_everywhere))
+        end
+        local fnOcPbr = rawget(GLOBAL, "HyperSmooth_SetOceanPbr")
+        if type(fnOcPbr) == "function" then
+            if is_van or IsExternalBcasActive() then
+                pcall(fnOcPbr, 0.0, 0.0, 0.0, 0.0)
+            else
+                pcall(fnOcPbr,
+                    ClampTuneValue("ocean_pbr", tn.ocean_pbr),
+                    ClampTuneValue("ocean_sky_refl", tn.ocean_sky_refl),
+                    ClampTuneValue("ocean_sun_glow", tn.ocean_sun_glow),
+                    ClampTuneValue("ocean_hide_waves", tn.ocean_hide_waves))
+            end
+        end
+    end
+
+    -- Native C++ World Studio Bus: 3D Entity Surface Lighting + Procedural Ocean Caustics + World-Space ShadowMask FBO v2.9.5
     local fnWs = rawget(GLOBAL, "HyperSmooth_SetWorldStudio")
     local fnSd = rawget(GLOBAL, "HyperSmooth_SetShadowDyn")
+    local fnSc = rawget(GLOBAL, "HyperSmooth_SetShadowConfig")
+    local fnPl = rawget(GLOBAL, "HyperSmooth_SetPointLights")
+    local fnWr = rawget(GLOBAL, "HyperSmooth_SetWaterRefl")
     if type(fnWs) == "function" then
         if is_van or IsExternalBcasActive() then
             pcall(fnWs, 0.0, 0.5, 0.5, 0.5, 0.5, 0.785, 0.75, 0.0, 0.0, 0.92, 0.85, 0.85, -0.707, -0.707, 1.35, 0.0)
             if type(fnSd) == "function" then
                 pcall(fnSd, studio_wind_clock, 0.0, 0.0, 1.0)
+            end
+            if type(fnPl) == "function" then
+                pcall(fnPl, 0.0, 1.0, 0)
+            end
+            if type(fnWr) == "function" then
+                pcall(fnWr, 0.0, 0.55, 1.00)
+            end
+            local prev_v2 = studio_light_state.world_shadow_v2_active
+            if type(fnSc) == "function" then
+                local ok_sc, ws_ready, ws_failed = pcall(fnSc, 0.0, 1.15, 0.10, 0.14, 0.38, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.68, 1.0, 0.0)
+                studio_light_state.world_shadow_v2_active = ok_sc and (ws_ready == true) and (ws_failed ~= true)
+            else
+                studio_light_state.world_shadow_v2_active = false
+            end
+            if prev_v2 ~= nil and prev_v2 ~= studio_light_state.world_shadow_v2_active then
+                studio_light_state.world_shadow_v2_changed = true
             end
         else
             local sl_str = ClampTuneValue("surface_light", tn.surface_light)
@@ -1026,8 +1564,53 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
             local gl_str = ClampTuneValue("glint_str", tn.glint_str)
             local allow_nl = (tn.shadow_night or 0) > 0.5
             local lst = precomputed_lst or ComputeWorldLightingState(allow_nl, dt_step, ClampTuneValue("shadow_smooth", tn.shadow_smooth))
-            local proj_on = (sh_den > 0.001 and lst.eff_presence > 0.005) and 1.0 or 0.0
+            local has_fn_pl = (type(fnPl) == "function")
+            local pt_on = has_fn_pl and allow_nl and (ClampTuneValue("shadow_point_lights", tn.shadow_point_lights) > 0.5)
+            local pt_user_str = ClampTuneValue("shadow_point_strength", tn.shadow_point_strength)
+            local sun_w = Smoothstep01(lst.day_factor or 0.0)
+            local night_w = 1.0 - sun_w
+            local dusk_pt = ClampTuneValue("shadow_dusk_point", tn.shadow_dusk_point)
+            local dusk_scale = math.max(0.0, 1.0 + (dusk_pt - 1.0) * (lst.dusk_blend or 0.0))
+            local eff_pt_scale = pt_on and math.min(1.5, pt_user_str * night_w * dusk_scale) or 0.0
+
+            local pts = studio_nl_cache.point_lights
+            local send_pts = {}
+            local max_pt_str = 0.0
+            if has_fn_pl and sh_den > 0.001 and type(pts) == "table" then
+                for i = 1, math.min(#pts, 3) do
+                    local p = pts[i]
+                    local s
+                    if p.is_flash then
+                        s = (p.strength or 0.0) * math.max(pt_user_str, 0.75)
+                    elseif pt_on and eff_pt_scale > 0.008 then
+                        s = (p.strength or 0.0) * eff_pt_scale
+                    else
+                        s = 0.0
+                    end
+                    if s > 0.008 and (p.radius or 0.0) > 0.5 then
+                        local clamped_s = math.min(1.0, s)
+                        send_pts[#send_pts + 1] = { wx = p.wx, wz = p.wz, radius = p.radius, strength = clamped_s }
+                        if clamped_s > max_pt_str then max_pt_str = clamped_s end
+                    end
+                end
+            end
+
+            -- Clean Parallel <-> Radial Handoff + Weather/Season directional modulation:
+            -- Rain/Snow/Winter/Summer scale directional sun/moon shadow cleanly without weakening campfire shadows!
+            local env_mult = lst.env_shadow_mult or 1.0
+            local sun_eff = sun_w * env_mult
+            local dir_str = pt_on and math.min(1.0, sun_eff) or math.min(1.0, env_mult)
+            local shad_presence = pt_on and math.max(sun_eff, max_pt_str) or ((lst.eff_presence or 0.0) * env_mult)
+            local dir_active
+            if pt_on then
+                dir_active = (dir_str > 0.005)
+            else
+                dir_active = (((lst.eff_presence or 0.0) * env_mult) > 0.005)
+            end
+            local proj_on = (sh_den > 0.001 and dir_active) and 1.0 or 0.0
             local eff_stretch = math.max(0.35, math.min(4.20, lst.stretch * sh_len))
+            local eff_den = (sh_den > 0.001) and math.min(1.0, sh_den * shad_presence) or 0.0
+            local eff_soft = math.max(0.00, math.min(2.00, ClampTuneValue("shadow_soft", tn.shadow_soft)))
             pcall(fnWs,
                 sl_str,
                 ClampTuneValue("shade_warm", tn.shade_warm),
@@ -1052,7 +1635,187 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
                     ClampTuneValue("shadow_fade", tn.shadow_fade),
                     lst.soft_mult or 1.0)
             end
+            local prev_v2 = studio_light_state.world_shadow_v2_active
+            if type(fnSc) == "function" then
+                local cam_x, cam_z, cam_rx, cam_rz = 0.0, 0.0, 0.0, 0.0
+                local cam = rawget(GLOBAL, "TheCamera")
+                if cam then
+                    local cp = cam.currentpos
+                    if cp and type(cp.x) == "number" and type(cp.z) == "number" then
+                        cam_x, cam_z = cp.x, cp.z
+                    end
+                    if cam.GetRightVec then
+                        local ok_r, rv = pcall(cam.GetRightVec, cam)
+                        if ok_r and rv and type(rv.x) == "number" and type(rv.z) == "number" then
+                            cam_rx, cam_rz = rv.x, rv.z
+                        end
+                    end
+                end
+                local sh_tr = ClampTuneValue("shadow_tint_r", tn.shadow_tint_r)
+                local sh_tg = ClampTuneValue("shadow_tint_g", tn.shadow_tint_g)
+                local sh_tb = ClampTuneValue("shadow_tint_b", tn.shadow_tint_b)
+                local moon_b = ClampTuneValue("shadow_moon_blue", tn.shadow_moon_blue) * (lst.moon_blend or 0.0)
+                if moon_b > 0.001 then
+                    sh_tr = sh_tr + (0.10 - sh_tr) * moon_b
+                    sh_tg = sh_tg + (0.15 - sh_tg) * moon_b
+                    sh_tb = sh_tb + (0.30 - sh_tb) * moon_b
+                end
+                local ok_sc, ws_ready, ws_failed = pcall(fnSc,
+                    eff_den,
+                    eff_soft,
+                    sh_tr,
+                    sh_tg,
+                    sh_tb,
+                    ClampTuneValue("shadow_hd", tn.shadow_hd),
+                    ClampTuneValue("shadow_skip_nightmare", tn.shadow_skip_nightmare),
+                    cam_x, cam_z, cam_rx, cam_rz,
+                    ClampTuneValue("shadow_entity_recv", tn.shadow_entity_recv),
+                    ClampTuneValue("shadow_oval_keep", tn.shadow_oval_keep),
+                    ClampTuneValue("shadow_min_height", tn.shadow_min_height))
+                studio_light_state.world_shadow_v2_active = ok_sc and (ws_ready == true) and (ws_failed ~= true)
+            else
+                studio_light_state.world_shadow_v2_active = false
+            end
+            if has_fn_pl then
+                local c = #send_pts
+                if c == 1 then
+                    local p1 = send_pts[1]
+                    pcall(fnPl, dir_str, sh_len, 1, p1.wx, p1.wz, p1.radius, p1.strength)
+                elseif c == 2 then
+                    local p1, p2 = send_pts[1], send_pts[2]
+                    pcall(fnPl, dir_str, sh_len, 2, p1.wx, p1.wz, p1.radius, p1.strength, p2.wx, p2.wz, p2.radius, p2.strength)
+                elseif c >= 3 then
+                    local p1, p2, p3 = send_pts[1], send_pts[2], send_pts[3]
+                    pcall(fnPl, dir_str, sh_len, 3, p1.wx, p1.wz, p1.radius, p1.strength, p2.wx, p2.wz, p2.radius, p2.strength, p3.wx, p3.wz, p3.radius, p3.strength)
+                else
+                    pcall(fnPl, dir_str, sh_len, 0)
+                end
+            end
+            if type(fnWr) == "function" then
+                pcall(fnWr,
+                    ClampTuneValue("water_refl_str", tn.water_refl_str),
+                    ClampTuneValue("water_refl_ripple", tn.water_refl_ripple),
+                    1.00)
+            end
+            if prev_v2 ~= nil and prev_v2 ~= studio_light_state.world_shadow_v2_active then
+                studio_light_state.world_shadow_v2_changed = true
+            end
         end
+    end
+
+    -- M4 True Tag-Whitelisted Foliage Wind-Sway & Player-Walk Wake (100% decoupled from shadows!)
+    local fnWf = rawget(GLOBAL, "HyperSmooth_SetWindField")
+    local fnFa = rawget(GLOBAL, "HyperSmooth_SetFoliageAnchors")
+    if type(fnWf) == "function" then
+        local wind_on = (not is_van) and (not IsExternalBcasActive()) and (ClampTuneValue("wind_sway_enabled", tn.wind_sway_enabled) > 0.5)
+        local sway_amp = wind_on and ClampTuneValue("wind_sway_strength", tn.wind_sway_strength) or 0.0
+        local wake_amp = wind_on and ClampTuneValue("wind_wake_strength", tn.wind_wake_strength) or 0.0
+        if sway_amp <= 0.001 and wake_amp <= 0.001 then
+            pcall(fnWf, studio_wind_clock, 0.0, 0.0, 0.0, 0.0, false)
+            if type(fnFa) == "function" and HS_CFG.foliage_cache.last_cnt > 0 then
+                HS_CFG.foliage_cache.last_cnt = 0
+                HS_CFG.foliage_cache.accum = 999.0
+                pcall(fnFa, 0)
+            end
+        else
+            local player = rawget(GLOBAL, "ThePlayer")
+            local px, pz, has_p = 0.0, 0.0, false
+            if player and player.Transform then
+                local ok_p, x, _, z = pcall(player.Transform.GetWorldPosition, player.Transform)
+                if ok_p and type(x) == "number" and type(z) == "number" then
+                    px, pz, has_p = x, z, true
+                end
+            end
+            pcall(fnWf, studio_wind_clock, sway_amp, wake_amp, px, pz, has_p)
+            if type(fnFa) == "function" and has_p then
+                local fc = HS_CFG.foliage_cache
+                local dt_num = (type(dt_step) == "number" and dt_step > 0 and dt_step < 0.5) and dt_step or 999.0
+                fc.accum = (fc.accum or 999.0) + dt_num
+                if fc.accum >= 0.25 then
+                    fc.accum = 0.0
+                    local sim = rawget(GLOBAL, "TheSim")
+                    local args = {}
+                    local cnt = 0
+                    if sim and sim.FindEntities then
+                        local ok_f, ents = pcall(sim.FindEntities, sim, px, 0, pz, 24, nil, HS_CFG.FOLIAGE_CANT_TAGS, HS_CFG.FOLIAGE_ONEOF_TAGS)
+                        if ok_f and type(ents) == "table" then
+                            for i = 1, #ents do
+                                local e = ents[i]
+                                if e and e ~= player and e.Transform and e.HasTag and (not e.IsValid or e:IsValid()) then
+                                    -- Belt-and-suspenders rigid exclusion: structures/walls/players/chests/mobs NEVER sway!
+                                    local rigid = e:HasTag("structure") or e:HasTag("wall") or e:HasTag("player")
+                                        or e:HasTag("character") or e:HasTag("chest") or e:HasTag("heavy")
+                                        or e:HasTag("locomotor") or e:HasTag("boat") or e:HasTag("INLIMBO") or e:HasTag("NOCLICK")
+                                    if not rigid then
+                                        local cls = 0
+                                        if e:HasTag("tree") and not e:HasTag("stump") and not e:HasTag("burnt") then
+                                            cls = 2
+                                        elseif e:HasTag("plant") or e:HasTag("flower") or e:HasTag("bush")
+                                            or e:HasTag("sapling") or e:HasTag("reeds") or e:HasTag("grass")
+                                            or e:HasTag("farm_plant") or e:HasTag("lichen") then
+                                            cls = 1
+                                        end
+                                        if cls > 0 then
+                                            local ok_ep, ex, _, ez = pcall(e.Transform.GetWorldPosition, e.Transform)
+                                            if ok_ep and type(ex) == "number" and type(ez) == "number" then
+                                                cnt = cnt + 1
+                                                local base = (cnt - 1) * 3
+                                                args[base + 1] = ex
+                                                args[base + 2] = ez
+                                                args[base + 3] = cls
+                                                if cnt >= 128 then break end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    fc.last_cnt = cnt
+                    local unpack_fn = rawget(GLOBAL, "unpack")
+                    if cnt > 0 and type(unpack_fn) == "function" then
+                        pcall(fnFa, cnt, unpack_fn(args, 1, cnt * 3))
+                    else
+                        pcall(fnFa, 0)
+                    end
+                end
+            end
+        end
+    end
+
+    -- M2 Safe Dual-Monitor Cursor Lock sync (auto-unlocks on Pause / Console / Chat / Modal Menus!)
+    local fnClip = rawget(GLOBAL, "HyperSmooth_SetClipCursor")
+    if type(fnClip) == "function" then
+        local safe_clip = false
+        if HS_CFG.clip_cursor == true then
+            local player = rawget(GLOBAL, "ThePlayer")
+            local hud = player and player.HUD or nil
+            local fe = rawget(GLOBAL, "TheFrontEnd")
+            local paused_now = IsGamePausedSafe()
+            local console_open = false
+            local modal_open = false
+            if fe then
+                if type(fe.IsConsoleOpen) == "function" then
+                    local ok_c, co = pcall(fe.IsConsoleOpen, fe)
+                    if ok_c and co then console_open = true end
+                end
+                if type(fe.GetActiveScreen) == "function" then
+                    local ok_s, scr = pcall(fe.GetActiveScreen, fe)
+                    if ok_s and scr then
+                        local sn = type(scr.name) == "string" and scr.name or ""
+                        if sn ~= "HUD" and sn ~= "PlayerHud" and sn ~= "" then
+                            modal_open = true
+                        end
+                    end
+                end
+            end
+            if hud and type(hud.IsChatInputScreenOpen) == "function" then
+                local ok_ch, ch = pcall(hud.IsChatInputScreenOpen, hud)
+                if ok_ch and ch then modal_open = true end
+            end
+            safe_clip = (player ~= nil) and (hud ~= nil) and (not paused_now) and (not console_open) and (not modal_open)
+        end
+        pcall(fnClip, HS_CFG.clip_cursor == true, safe_clip)
     end
 end
 
@@ -1060,7 +1823,7 @@ local function ApplyVisualPostProcess()
     local pp = rawget(GLOBAL, "PostProcessor")
     local ppe = rawget(GLOBAL, "PostProcessorEffects")
     local uv = rawget(GLOBAL, "UniformVariables")
-    ApplyVanillaFilters()
+    HS_VF.ApplyVanillaFilters()
     if not (visual_shaders_ready and pp and ppe and uv) then
         return
     end
@@ -1141,14 +1904,24 @@ local function ApplyVisualPostProcess()
     local vig_val    = fl.tone and ClampTuneValue("vignette", tn.vignette) or 0.0
     local grain_val  = fl.tone and ClampTuneValue("grain", tn.grain) or 0.0
 
-    -- 4. Native Ground Shadow Composite (Contract v17 blue marker in BloomSampler)
+    -- 4. Ground Shadow Composite: v2.9.0 World-Space ShadowMask FBO runs directly in PrimaryRT
+    --    BEFORE standing entities (zero BloomSampler pass, zero face clipping, native ColourCube LUT!).
+    --    Only falls back to legacy PS_VISUAL_FINAL BloomSampler composite if v2.9.0 FBO is unavailable.
     local has_native_ws = HasNativeWorldStudio()
+    local shadow_v2 = (studio_light_state.world_shadow_v2_active == true)
+        or (studio_light_state.world_shadow_v2_active == nil and type(rawget(GLOBAL, "HyperSmooth_SetShadowConfig")) == "function")
     local shadow_raw = (not is_van) and ClampTuneValue("shadow_density", tn.shadow_density) or 0.0
-    local shadow_eff = (has_native_ws and shadow_raw > 0.001) and (shadow_raw * lst.eff_presence) or 0.0
-    local shadow_soft = math.max(0.40, math.min(2.00, ClampTuneValue("shadow_soft", tn.shadow_soft) * (lst.soft_mult or 1.0)))
+    local shadow_eff = (has_native_ws and (not shadow_v2) and shadow_raw > 0.001) and (shadow_raw * lst.eff_presence) or 0.0
+    local shadow_soft = math.max(0.00, math.min(2.00, ClampTuneValue("shadow_soft", tn.shadow_soft) * (lst.soft_mult or 1.0)))
     local shad_r = ClampTuneValue("shadow_tint_r", tn.shadow_tint_r)
     local shad_g = ClampTuneValue("shadow_tint_g", tn.shadow_tint_g)
     local shad_b = ClampTuneValue("shadow_tint_b", tn.shadow_tint_b)
+    local shad_mb = ClampTuneValue("shadow_moon_blue", tn.shadow_moon_blue) * (lst.moon_blend or 0.0)
+    if shad_mb > 0.001 then
+        shad_r = shad_r + (0.10 - shad_r) * shad_mb
+        shad_g = shad_g + (0.15 - shad_g) * shad_mb
+        shad_b = shad_b + (0.30 - shad_b) * shad_mb
+    end
 
     local cdl_act = math.abs(slope_r - 1.0) + math.abs(slope_g - 1.0) + math.abs(slope_b - 1.0)
         + math.abs(offset_r) + math.abs(offset_g) + math.abs(offset_b)
@@ -1210,12 +1983,20 @@ local function PushDynamicPostUniforms(lst)
     local tn = GetActiveVisTune()
     local is_van = (current_visual_preset == 0)
     local has_native_ws = HasNativeWorldStudio()
+    local shadow_v2 = (studio_light_state.world_shadow_v2_active == true)
+        or (studio_light_state.world_shadow_v2_active == nil and type(rawget(GLOBAL, "HyperSmooth_SetShadowConfig")) == "function")
     local shadow_raw = (not is_van) and ClampTuneValue("shadow_density", tn.shadow_density) or 0.0
-    local shadow_eff = (has_native_ws and shadow_raw > 0.001) and (shadow_raw * (lst.eff_presence or 0.0)) or 0.0
-    local shadow_soft = math.max(0.40, math.min(2.00, ClampTuneValue("shadow_soft", tn.shadow_soft) * (lst.soft_mult or 1.0)))
+    local shadow_eff = (has_native_ws and (not shadow_v2) and shadow_raw > 0.001) and (shadow_raw * (lst.eff_presence or 0.0)) or 0.0
+    local shadow_soft = math.max(0.00, math.min(2.00, ClampTuneValue("shadow_soft", tn.shadow_soft) * (lst.soft_mult or 1.0)))
     local shad_r = ClampTuneValue("shadow_tint_r", tn.shadow_tint_r)
     local shad_g = ClampTuneValue("shadow_tint_g", tn.shadow_tint_g)
     local shad_b = ClampTuneValue("shadow_tint_b", tn.shadow_tint_b)
+    local shad_mb = ClampTuneValue("shadow_moon_blue", tn.shadow_moon_blue) * (lst.moon_blend or 0.0)
+    if shad_mb > 0.001 then
+        shad_r = shad_r + (0.10 - shad_r) * shad_mb
+        shad_g = shad_g + (0.15 - shad_g) * shad_mb
+        shad_b = shad_b + (0.30 - shad_b) * shad_mb
+    end
     local offset_r = fl.tone and ClampTuneValue("offset_r", tn.offset_r) or 0.0
     local offset_g = fl.tone and ClampTuneValue("offset_g", tn.offset_g) or 0.0
     local offset_b = fl.tone and ClampTuneValue("offset_b", tn.offset_b) or 0.0
@@ -1232,11 +2013,18 @@ local function PushDynamicPostUniforms(lst)
     end
 
     -- Silently toggle BloomSampler RT only when shadow visibility actually crosses 0 <-> active
+    -- (also re-apply full PostProcess state whenever v2 shadow transitions ready <-> fallback!)
+    local v2_flipped = (studio_light_state.world_shadow_v2_changed == true)
+    if v2_flipped then
+        studio_light_state.world_shadow_v2_changed = false
+    end
     local want_shadow_rt = (shadow_eff > 0.001)
     local need_engine_rt = user_bloom_enabled or want_shadow_rt
     if orig_SetBloomEnabled and studio_engine_bloom_rt ~= need_engine_rt then
         studio_engine_bloom_rt = need_engine_rt
         pcall(orig_SetBloomEnabled, pp, need_engine_rt)
+        ApplyVisualPostProcess()
+    elseif v2_flipped then
         ApplyVisualPostProcess()
     end
 end
@@ -1276,8 +2064,8 @@ local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
--- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.8.0.1)
-local EXPECTED_DLL_VERSION = "2.8.0"
+-- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.9.5.1)
+local EXPECTED_DLL_VERSION = "2.9.5"
 
 local function ParseSemVer(str)
     if type(str) ~= "string" then return nil, nil end
@@ -1298,7 +2086,7 @@ local function GetDllVersionStatus()
     end
     local ok, raw_ver = pcall(fnVer)
     local dll_num, dll_clean = ParseSemVer(ok and raw_ver or nil)
-    local exp_num = ParseSemVer(EXPECTED_DLL_VERSION) or 20800
+    local exp_num = ParseSemVer(EXPECTED_DLL_VERSION) or 20900
     if not dll_num then
         return "outdated", "unknown", EXPECTED_DLL_VERSION
     end
@@ -1320,8 +2108,10 @@ local function RegisterDynamicRpcQosMasks()
         "RecievePopupMessage", "GetChatHistory", "SetSkillActivatedState",
         "AddSkillXP", "OnScrapbookDataTaught", "SetClientAuthoritativeSetting",
     }
+    -- Strictly entity-free ClientRPC whitelist (ShowPopup / RecievePopupMessage
+    -- intentionally stay on Ch0 because SGwilson passes live target entities to ShowPopUp!)
     local cli_non_entity_names = {
-        "ShowPopup", "RecievePopupMessage", "LearnRecipe", "LearnFoodStats",
+        "LearnRecipe", "LearnFoodStats",
         "LearnPlantStage", "LearnFertilizerStage", "TakeOversizedPicture",
         "RecieveChatHistory", "LearnBuilderRecipe", "UpdateAccomplishment",
         "UpdateCountAccomplishment", "SetSkillActivatedState", "AddSkillXP",
@@ -1329,7 +2119,7 @@ local function RegisterDynamicRpcQosMasks()
 
     local srv_tbl = rawget(GLOBAL, "RPC")
     local cli_tbl = rawget(GLOBAL, "CLIENT_RPC")
-    local srv0, srv1, srv2, cli0 = 0, 0, 0, 0
+    local srv0, srv1, srv2, cli0, cli1 = 0, 0, 0, 0, 0
 
     if type(srv_tbl) == "table" then
         local seen = {}
@@ -1351,13 +2141,17 @@ local function RegisterDynamicRpcQosMasks()
         local seen = {}
         for _, name in ipairs(cli_non_entity_names) do
             local id = cli_tbl[name]
-            if type(id) == "number" and id >= 1 and id < 32 and math.floor(id) == id and not seen[id] then
+            if type(id) == "number" and id >= 1 and id < 64 and math.floor(id) == id and not seen[id] then
                 seen[id] = true
-                cli0 = cli0 + (2 ^ id)
+                if id < 32 then
+                    cli0 = cli0 + (2 ^ id)
+                else
+                    cli1 = cli1 + (2 ^ (id - 32))
+                end
             end
         end
     end
-    pcall(fnSetMasks, srv0, srv1, srv2, cli0)
+    pcall(fnSetMasks, srv0, srv1, srv2, cli0, cli1)
 end
 
 rawset(GLOBAL, "HyperSmooth_RegisterDynamicRpcQosMasks", RegisterDynamicRpcQosMasks)
@@ -1433,6 +2227,7 @@ local function LoadUserCustomSlot(slot_idx)
         vis_tune[tk] = ClampTuneValue(tk, sl.tune[tk])
     end
     current_visual_preset = 3
+    HS_CFG.active_builtin_id = nil
     visual_bench_timer = 12.0
     SyncToNativePlugin(true)
     hud_dirty_now = true
@@ -1474,7 +2269,7 @@ SyncToNativePlugin = function(save_persist)
     if save_persist ~= false and TheSim and TheSim.SetPersistentString then
         local parts = {
             string.format(
-                "fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;ll=%d;hm=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d;mll=%d;mhm=%d",
+                "fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;ll=%d;hm=%d;cc=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d;mll=%d;mhm=%d",
                 current_target_fps,
                 current_skeletal_tween and 1 or 0,
                 current_show_fps_hud and 1 or 0,
@@ -1482,13 +2277,14 @@ SyncToNativePlugin = function(save_persist)
                 EncodeCustomVisMask(custom_vis_flags),
                 current_low_latency and 1 or 0,
                 EncodeHudMode(current_hud_mode),
-                TARGET_FPS,
-                SKELETAL_TWEEN and 1 or 0,
-                SHOW_FPS_HUD and 1 or 0,
-                VISUAL_PRESET,
-                CFG_VIS_MASK,
-                LOW_LATENCY_INPUT and 1 or 0,
-                EncodeHudMode(HUD_MODE))
+                HS_CFG.clip_cursor and 1 or 0,
+                HS_CFG.TARGET_FPS,
+                HS_CFG.SKELETAL_TWEEN and 1 or 0,
+                HS_CFG.SHOW_FPS_HUD and 1 or 0,
+                HS_CFG.VISUAL_PRESET,
+                HS_CFG.CFG_VIS_MASK,
+                HS_CFG.LOW_LATENCY_INPUT and 1 or 0,
+                EncodeHudMode(HS_CFG.HUD_MODE))
         }
         SerializeTuneEntries(parts, vis_tune)
         TheSim:SetPersistentString(CFG_FILENAME, table.concat(parts, ";"), false)
@@ -1519,6 +2315,7 @@ if TheSim and TheSim.GetPersistentString then
             local svm = tonumber(str:match("vm=(%d+)"))
             local sll = tonumber(str:match("ll=(%d+)"))
             local shm = tonumber(str:match("hm=(%d+)"))
+            local scc = tonumber(str:match(";cc=(%d+)"))
             local mf = tonumber(str:match("mf=(%d+)"))
             local ms = tonumber(str:match("ms=(%d+)"))
             local mh = tonumber(str:match("mh=(%d+)"))
@@ -1526,22 +2323,25 @@ if TheSim and TheSim.GetPersistentString then
             local mvm = tonumber(str:match("mvm=(%d+)"))
             local mll = tonumber(str:match("mll=(%d+)"))
             local mhm = tonumber(str:match("mhm=(%d+)"))
-            if sf ~= nil and mf == TARGET_FPS then
+            if sf ~= nil and mf == HS_CFG.TARGET_FPS then
                 current_target_fps = sf
             end
-            if ss ~= nil and ms == (SKELETAL_TWEEN and 1 or 0) then
+            if ss ~= nil and ms == (HS_CFG.SKELETAL_TWEEN and 1 or 0) then
                 current_skeletal_tween = (ss ~= 0)
             end
-            if sh ~= nil and mh == (SHOW_FPS_HUD and 1 or 0) then
+            if sh ~= nil and mh == (HS_CFG.SHOW_FPS_HUD and 1 or 0) then
                 current_show_fps_hud = (sh ~= 0)
             end
-            if sll ~= nil and mll == (LOW_LATENCY_INPUT and 1 or 0) then
+            if sll ~= nil and mll == (HS_CFG.LOW_LATENCY_INPUT and 1 or 0) then
                 current_low_latency = (sll ~= 0)
             end
-            if shm ~= nil and mhm == EncodeHudMode(HUD_MODE) then
+            if shm ~= nil and mhm == EncodeHudMode(HS_CFG.HUD_MODE) then
                 current_hud_mode = DecodeHudMode(shm)
             end
-            if svp ~= nil and svp >= 0 and svp <= 3 and mvp == VISUAL_PRESET and mvm == CFG_VIS_MASK then
+            if scc ~= nil then
+                HS_CFG.clip_cursor = (scc ~= 0)
+            end
+            if svp ~= nil and svp >= 0 and svp <= 3 and mvp == HS_CFG.VISUAL_PRESET and mvm == HS_CFG.CFG_VIS_MASK then
                 current_visual_preset = svp
                 if svm ~= nil then
                     DecodeCustomVisMask(svm)
@@ -1575,6 +2375,8 @@ end
 --------------------------------------------------------------------------------
 if type(modimport) == "function" then
     pcall(modimport, "hs_ext")
+    pcall(modimport, "hs_vfx")
+    pcall(modimport, "hs_vollight")
 end
 
 local function ResolveModShaderPath(rel)
@@ -1694,7 +2496,7 @@ if type(AddModShadersInit) == "function" and type(AddModShadersSortAndEnable) ==
                 pp:SetPostProcessEffectAfter(ppe.HS_VisualFinal, tail_anchor)
             end
 
-            InstallVanillaFilterHooks()
+            HS_VF.InstallVanillaFilterHooks()
 
             -- Sync with vanilla Graphics -> Bloom toggle so both stay strictly mutually exclusive
             local mt = getmetatable(pp)
@@ -1712,6 +2514,10 @@ if type(AddModShadersInit) == "function" and type(AddModShadersSortAndEnable) ==
                 idx.SetBloomEnabled = function(self, enabled)
                     user_bloom_enabled = enabled and true or false
                     studio_engine_bloom_rt = nil
+                    if IsExternalBcasActive() and orig_SetBloomEnabled then
+                        studio_engine_bloom_rt = user_bloom_enabled
+                        pcall(orig_SetBloomEnabled, self, user_bloom_enabled)
+                    end
                     ApplyVisualPostProcess()
                 end
             end
@@ -1726,7 +2532,7 @@ end
 
 if type(AddPrefabPostInit) == "function" then
     AddPrefabPostInit("world", function(inst)
-        HookWorldSnowMap(inst)
+        HS_VF.HookWorldSnowMap(inst)
     end)
 
     -- Pure Ethereal Exclusion: shadow creatures / nightmare beings ARE shadows in DST lore
@@ -1765,15 +2571,199 @@ if type(AddPrefabPostInitAny) == "function" then
     end)
 end
 
+-- v2.9.5-B Dual-Mode Client Hit-Feel Detectors (Host exact events + Public-Server FX & anim observer)
+do
+    local function SafePos(ent)
+        if ent ~= nil and ent.Transform ~= nil and type(ent.Transform.GetWorldPosition) == "function" then
+            local ok, x, y, z = pcall(ent.Transform.GetWorldPosition, ent.Transform)
+            if ok and type(x) == "number" and type(z) == "number" then
+                return x, (type(y) == "number" and y or 0.0), z
+            end
+        end
+        return nil, nil, nil
+    end
+
+    if type(AddPlayerPostInit) == "function" then
+        AddPlayerPostInit(function(inst)
+            if inst == nil or type(inst.DoTaskInTime) ~= "function" then
+                return
+            end
+            inst:DoTaskInTime(0, function()
+                if inst ~= GLOBAL.ThePlayer or (inst.IsValid and not inst:IsValid()) then
+                    return
+                end
+                if inst._hs_hitfeel_hooked then
+                    return
+                end
+                inst._hs_hitfeel_hooked = true
+
+                -- 1) Host / Solo Exact Combat & Work Events
+                if type(inst.ListenForEvent) == "function" then
+                    inst:ListenForEvent("onhitother", function(player, data)
+                        if not HS_HITFEEL or not HS_HITFEEL.IsActive() then return end
+                        if type(data) ~= "table" or data.target == nil then return end
+                        local tx, ty, tz = SafePos(data.target)
+                        if tx == nil then return end
+                        local px, py, pz = SafePos(player)
+                        local dmg = (type(data.damage) == "number") and data.damage or 34.0
+                        local is_epic = (type(data.target.HasTag) == "function") and data.target:HasTag("epic")
+                        local heavy = (dmg >= 60.0) or is_epic
+                        local inten = math.max(0.65, math.min(1.55, 0.70 + dmg / 85.0))
+                        if is_epic then inten = math.min(1.60, inten + 0.15) end
+                        local style = HS_HITFEEL.ClassifyStyle(player, data.stimuli, heavy)
+                        HS_HITFEEL.EmitImpact(tx, ty, tz, px, py, pz, inten, style, false, false, data.target)
+                    end)
+
+                    local function OnWorkHit(player, data)
+                        if not HS_HITFEEL or not HS_HITFEEL.IsActive() then return end
+                        if type(data) ~= "table" or data.target == nil then return end
+                        local tx, ty, tz = SafePos(data.target)
+                        if tx == nil then return end
+                        local px, py, pz = SafePos(player)
+                        local work_hint = "CHOP"
+                        if type(data.target.HasTag) == "function" then
+                            if data.target:HasTag("MINE_workable") or data.target:HasTag("boulder") then
+                                work_hint = "MINE"
+                            elseif data.target:HasTag("HAMMER_workable") then
+                                work_hint = "MINE"
+                            end
+                        end
+                        local style = HS_HITFEEL.ClassifyStyle(player, work_hint, false)
+                        HS_HITFEEL.EmitImpact(tx, ty, tz, px, py, pz, 0.90, style, false, true, data.target)
+                    end
+                    inst:ListenForEvent("working", OnWorkHit)
+                    inst:ListenForEvent("finishedwork", OnWorkHit)
+
+                    inst:ListenForEvent("attacked", function(player, data)
+                        if not HS_HITFEEL or not HS_HITFEEL.IsActive() then return end
+                        local px, py, pz = SafePos(player)
+                        if px == nil then return end
+                        local ax, ay, az = px + 1.0, py, pz
+                        local dmg = 25.0
+                        if type(data) == "table" then
+                            if data.attacker ~= nil then
+                                local x, y, z = SafePos(data.attacker)
+                                if x ~= nil then ax, ay, az = x, y, z end
+                            end
+                            if type(data.damage) == "number" then
+                                dmg = data.damage
+                            end
+                        end
+                        local inten = math.max(0.75, math.min(1.50, 0.72 + dmg / 80.0))
+                        local style = (dmg >= 55.0) and 1 or 0
+                        HS_HITFEEL.EmitImpact(px, py, pz, ax, ay, az, inten, style, true, false, player)
+                    end)
+                end
+
+                -- 2) Public-Server Remote Client Melee / Work Fallback Observer
+                if type(inst.DoPeriodicTask) == "function" then
+                    inst:DoPeriodicTask(0.05, function()
+                        if not HS_HITFEEL or not HS_HITFEEL.IsActive() then return end
+                        if inst ~= GLOBAL.ThePlayer or (inst.IsValid and not inst:IsValid()) then return end
+                        if inst.components ~= nil and inst.components.combat ~= nil then return end
+                        local as = inst.AnimState
+                        if as == nil or type(as.IsCurrentAnimation) ~= "function" then return end
+                        local is_atk = as:IsCurrentAnimation("atk") or as:IsCurrentAnimation("atk_pre")
+                            or as:IsCurrentAnimation("spearjab") or as:IsCurrentAnimation("whip")
+                            or as:IsCurrentAnimation("slingshot_shoot")
+                        if not is_atk then return end
+                        local px, py, pz = SafePos(inst)
+                        local sim = rawget(GLOBAL, "TheSim")
+                        if px == nil or sim == nil or type(sim.FindEntities) ~= "function" then return end
+                        local ok, ents = pcall(sim.FindEntities, sim, px, 0, pz, 4.5, { "_combat" }, { "INLIMBO", "FX", "DECOR", "player" })
+                        if not ok or type(ents) ~= "table" then return end
+                        for j = 1, #ents do
+                            local e = ents[j]
+                            if e ~= nil and e.AnimState ~= nil and type(e.AnimState.IsCurrentAnimation) == "function" and e.AnimState:IsCurrentAnimation("hit") then
+                                local tx, ty, tz = SafePos(e)
+                                if tx ~= nil then
+                                    local is_epic = (type(e.HasTag) == "function") and e:HasTag("epic")
+                                    local style = HS_HITFEEL.ClassifyStyle(inst, nil, is_epic)
+                                    HS_HITFEEL.EmitImpact(tx, ty, tz, px, py, pz, is_epic and 1.15 or 0.95, style, false, false, e)
+                                end
+                            end
+                        end
+                    end)
+                end
+            end)
+        end)
+    end
+
+    -- 3) Public-Server & Client-Only FX Prefab Impact Hooks (0-desync, deduplicated against Host events)
+    if type(AddPrefabPostInit) == "function" then
+        local FX_WORK_HINT = {
+            impact               = false,
+            hitsparks_fx         = false,
+            hitsparks_piercing_fx = false,
+            hitsparks_reflect_fx = false,
+            planar_hit_fx        = false,
+            pine_needles_chop    = "CHOP",
+            mining_fx            = "MINE",
+            mining_ice_fx        = "MINE",
+            mining_moonglass_fx  = "MINE",
+        }
+        for fx_prefab, work_hint in pairs(FX_WORK_HINT) do
+            AddPrefabPostInit(fx_prefab, function(inst)
+                if inst == nil or type(inst.DoTaskInTime) ~= "function" then return end
+                inst:DoTaskInTime(0, function()
+                    if not HS_HITFEEL or not HS_HITFEEL.IsActive() then return end
+                    if inst.IsValid and not inst:IsValid() then return end
+                    local player = rawget(GLOBAL, "ThePlayer")
+                    local px, py, pz = SafePos(player)
+                    local fx, fy, fz = SafePos(inst)
+                    if fx == nil then return end
+                    if px ~= nil then
+                        local ddx = fx - px
+                        local ddz = fz - pz
+                        if (ddx * ddx + ddz * ddz) > 42.25 then return end -- ignore far-away background FX (>6.5 tiles)
+                    end
+                    local is_work = (work_hint == "CHOP" or work_hint == "MINE")
+                    local tx, ty, tz = fx, fy, fz
+                    local dedup_key = nil
+                    local sim = rawget(GLOBAL, "TheSim")
+                    if sim ~= nil and type(sim.FindEntities) == "function" then
+                        local must = is_work and { "CHOP_workable" } or { "_combat" }
+                        if work_hint == "MINE" then must = { "MINE_workable" } end
+                        local ok, ents = pcall(sim.FindEntities, sim, fx, 0, fz, 1.8, must, { "INLIMBO", "FX", "DECOR" })
+                        if ok and type(ents) == "table" then
+                            local best_d2 = 9.0
+                            for j = 1, #ents do
+                                local e = ents[j]
+                                if e ~= nil and e ~= player then
+                                    local ex, ey, ez = SafePos(e)
+                                    if ex ~= nil then
+                                        local d2 = (ex - fx) * (ex - fx) + (ez - fz) * (ez - fz)
+                                        if d2 < best_d2 then
+                                            best_d2 = d2
+                                            tx, ty, tz = ex, ey, ez
+                                            dedup_key = e
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if dedup_key == nil then
+                        dedup_key = fx_prefab .. ":" .. tostring(math.floor(fx * 2.0 + 0.5)) .. ":" .. tostring(math.floor(fz * 2.0 + 0.5))
+                    end
+                    local style = HS_HITFEEL.ClassifyStyle(player, is_work and work_hint or nil, fx_prefab == "planar_hit_fx")
+                    local inten = is_work and 0.88 or ((fx_prefab == "planar_hit_fx" or fx_prefab == "hitsparks_piercing_fx") and 1.12 or 0.95)
+                    HS_HITFEEL.EmitImpact(tx, ty, tz, px, py, pz, inten, style, false, is_work, dedup_key)
+                end)
+            end)
+        end
+    end
+end
+
 if type(AddClassPostConstruct) == "function" then
     AddClassPostConstruct("widgets/sandover", function(w)
-        vf_sandover_widgets[w] = true
+        HS_VF.vf_sandover_widgets[w] = true
         if type(w.OnUpdate) == "function" and not w._hs_sand_hooked then
             w._hs_sand_hooked = true
             local orig_onupdate = w.OnUpdate
             w.OnUpdate = function(self, ...)
                 local r = orig_onupdate(self, ...)
-                if IsSandFilterActive() then
+                if HS_VF.IsSandFilterActive() then
                     if self.inst and self.inst.entity then
                         pcall(self.inst.entity.Hide, self.inst.entity, false)
                     end
@@ -1784,7 +2774,7 @@ if type(AddClassPostConstruct) == "function" then
                 return r
             end
         end
-        if IsSandFilterActive() then
+        if HS_VF.IsSandFilterActive() then
             if w.inst and w.inst.entity then
                 pcall(w.inst.entity.Hide, w.inst.entity, false)
             end
@@ -2094,6 +3084,24 @@ local function HasAnyCustomActive()
         or ClampTuneValue("vanilla_cc", vis_tune.vanilla_cc) < 0.999
         or HasAnyCleanFilterTune(vis_tune)
         or HasAnyWorldStudioTune(vis_tune)
+        or ClampTuneValue("sprite_detail", vis_tune.sprite_detail) > 0.001
+        or ClampTuneValue("ground_detail", vis_tune.ground_detail) > 0.001
+        or math.abs(ClampTuneValue("anim_spline", vis_tune.anim_spline) - TUNE_BOUNDS.anim_spline.default) > 0.001
+        or math.abs(ClampTuneValue("anim_crossfade", vis_tune.anim_crossfade) - TUNE_BOUNDS.anim_crossfade.default) > 0.1
+        or ClampTuneValue("hitfeel_enabled", vis_tune.hitfeel_enabled) > 0.5
+        or ClampTuneValue("vfx_fire_embers", vis_tune.vfx_fire_embers) > 0.001
+        or ClampTuneValue("vfx_ambient_motes", vis_tune.vfx_ambient_motes) > 0.001
+        or ClampTuneValue("vfx_footsteps", vis_tune.vfx_footsteps) > 0.001
+        or ClampTuneValue("vol_lightrays", vis_tune.vol_lightrays) > 0.001
+        or ClampTuneValue("vol_cloud_shade", vis_tune.vol_cloud_shade) > 0.001
+        or ClampTuneValue("vol_canopy_shade", vis_tune.vol_canopy_shade) > 0.001
+        or ClampTuneValue("ocean_pbr", vis_tune.ocean_pbr) > 0.001
+        or ClampTuneValue("ocean_sky_refl", vis_tune.ocean_sky_refl) > 0.001
+        or ClampTuneValue("ocean_sun_glow", vis_tune.ocean_sun_glow) > 0.001
+        or ClampTuneValue("ocean_hide_waves", vis_tune.ocean_hide_waves) > 0.5
+        or ClampTuneValue("vol_edge_fog", vis_tune.vol_edge_fog) > 0.001
+        or ClampTuneValue("vol_ground_fog", vis_tune.vol_ground_fog) > 0.001
+        or ClampTuneValue("vol_lightrays_everywhere", vis_tune.vol_lightrays_everywhere) > 0.5
 end
 
 local function SnapshotFlagsToCustom()
@@ -2217,6 +3225,7 @@ local function ApplyTuneValue(field, val)
         custom_vis_flags.clean_filter = HasAnyCleanFilterTune(vis_tune)
     end
     current_visual_preset = HasAnyCustomActive() and 3 or 0
+    HS_CFG.active_builtin_id = nil
     visual_bench_timer = 12.0
     SyncToNativePlugin(true)
     hud_dirty_now = true
@@ -2314,6 +3323,15 @@ local TUNE_ALIASES = {
     shadow_night = "shadow_night", sh_night = "shadow_night",
     shadow_hd = "shadow_hd", shd = "shadow_hd",
     shadow_skip_nightmare = "shadow_skip_nightmare", snightmare = "shadow_skip_nightmare",
+    shadow_entity_recv = "shadow_entity_recv", srecv = "shadow_entity_recv", entity_recv = "shadow_entity_recv",
+    shadow_oval_keep = "shadow_oval_keep", soval = "shadow_oval_keep", oval_keep = "shadow_oval_keep",
+    shadow_point_lights = "shadow_point_lights", spoint = "shadow_point_lights", sh_pt = "shadow_point_lights",
+    shadow_point_strength = "shadow_point_strength", spstr = "shadow_point_strength", sh_pt_str = "shadow_point_strength",
+    water_refl_str = "water_refl_str", water_refl = "water_refl_str", refl = "water_refl_str",
+    water_refl_ripple = "water_refl_ripple", refl_ripple = "water_refl_ripple",
+    wind_sway_enabled = "wind_sway_enabled", wind_sway = "wind_sway_enabled", foliage_sway = "wind_sway_enabled",
+    wind_sway_strength = "wind_sway_strength", wind_amp = "wind_sway_strength",
+    wind_wake_strength = "wind_wake_strength", wind_wake = "wind_wake_strength",
     glint_str = "glint_str", glint = "glint_str",
     glint_density = "glint_density",
     glint_grain = "glint_grain",
@@ -2342,6 +3360,20 @@ local TUNE_ALIASES = {
     sanity = "sanity_color", sanity_color = "sanity_color",
     distort = "distort_free", distort_free = "distort_free",
     sand = "sand_filter", sand_filter = "sand_filter",
+    -- v2.9.5-B Pure Client-Side Combat Hit-Feel & Impact Presentation (Zero Screen Shake!)
+    hitfeel = "hitfeel_enabled", hitfeel_enabled = "hitfeel_enabled",
+    hitstop = "hitfeel_hitstop", hitfeel_hitstop = "hitfeel_hitstop",
+    recoil = "hitfeel_recoil", hitfeel_recoil = "hitfeel_recoil",
+    hitflash = "hitfeel_flash", hitfeel_flash = "hitfeel_flash",
+    lunge = "hitfeel_campunch", hitfeel_lunge = "hitfeel_campunch",
+    campunch = "hitfeel_campunch", hitfeel_campunch = "hitfeel_campunch",
+    hitvfx = "hitfeel_vfx", hitfeel_vfx = "hitfeel_vfx",
+    embers = "vfx_fire_embers", vfx_fire_embers = "vfx_fire_embers",
+    motes = "vfx_ambient_motes", vfx_ambient_motes = "vfx_ambient_motes",
+    footsteps = "vfx_footsteps", vfx_footsteps = "vfx_footsteps",
+    lightrays = "vol_lightrays", vol_lightrays = "vol_lightrays",
+    clouds = "vol_cloud_shade", vol_cloud_shade = "vol_cloud_shade",
+    canopy = "vol_canopy_shade", vol_canopy_shade = "vol_canopy_shade",
 }
 
 rawset(GLOBAL, "c_hstune", function(key, val)
@@ -2363,7 +3395,7 @@ rawset(GLOBAL, "c_hstune", function(key, val)
         GLOBAL.print(ui_zh and "[HyperSmooth] 全部 80 项画质/光影/调色参数已重置为默认" or "[HyperSmooth] All 80 studio parameters reset to defaults")
         return
     end
-    local field = TUNE_ALIASES[k]
+    local field = TUNE_ALIASES[k] or (TUNE_BOUNDS[k] and k or nil)
     if not field then
         GLOBAL.print(ui_zh
             and "[HyperSmooth] 未知参数。支持全部 80 项，例如: sharp/ink/exposure/temp/tint/gamma/sun_fill/slope_r/bloom_warmth/god_rays/surface_light/shade_cool/shadow_density/shadow_length/shadow_sway/shadow_fade/shadow_smooth/glint_str/vanilla_cc/snow_cap/reset"
@@ -2413,27 +3445,28 @@ end)
 -- Strict 3-Phase Import: (1) Pure Validate -> (2) Atomic Apply -> (3) Persist
 -- A corrupted/truncated/out-of-range code NEVER modifies live config or disk!
 --------------------------------------------------------------------------------
-local JSON_LIB_FILENAME = "hypersmooth_presets.json"
-local FLAG_KEYS_ORDER = {
+local HS_SHARE = {}
+HS_SHARE.JSON_LIB_FILENAME = "hypersmooth_presets.json"
+HS_SHARE.FLAG_KEYS_ORDER = {
     "af16", "full_lm", "cas", "ao", "env",
     "soft_bloom", "tone", "mip_sharp", "dark_clarity", "clean_filter",
 }
-local SHARE_KEY_TO_ID = {}
+HS_SHARE.SHARE_KEY_TO_ID = {}
 for i = 1, #TUNE_KEYS do
-    SHARE_KEY_TO_ID[TUNE_KEYS[i]] = i
+    HS_SHARE.SHARE_KEY_TO_ID[TUNE_KEYS[i]] = i
 end
 
-local current_scheme_name = ""
-local last_import_undo = nil
-local json_named_library = {} -- ordered array of { name, mask, tune }
+HS_SHARE.current_scheme_name = ""
+HS_SHARE.last_import_undo = nil
+HS_SHARE.json_named_library = {} -- ordered array of { name, mask, tune }
 
-local B64_ENC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-local B64_DEC = {}
+HS_SHARE.B64_ENC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+HS_SHARE.B64_DEC = {}
 for i = 1, 64 do
-    B64_DEC[B64_ENC:byte(i)] = i - 1
+    HS_SHARE.B64_DEC[HS_SHARE.B64_ENC:byte(i)] = i - 1
 end
 
-local function Base64UrlEncode(bytes)
+function HS_SHARE.Base64UrlEncode(bytes)
     local out = {}
     local n = #bytes
     local i = 1
@@ -2443,14 +3476,14 @@ local function Base64UrlEncode(bytes)
         local b3 = bytes[i + 2]
         local v1 = math.floor(b1 / 4)
         local v2 = (b1 % 4) * 16 + (b2 and math.floor(b2 / 16) or 0)
-        out[#out + 1] = B64_ENC:sub(v1 + 1, v1 + 1)
-        out[#out + 1] = B64_ENC:sub(v2 + 1, v2 + 1)
+        out[#out + 1] = HS_SHARE.B64_ENC:sub(v1 + 1, v1 + 1)
+        out[#out + 1] = HS_SHARE.B64_ENC:sub(v2 + 1, v2 + 1)
         if b2 ~= nil then
             local v3 = (b2 % 16) * 4 + (b3 and math.floor(b3 / 64) or 0)
-            out[#out + 1] = B64_ENC:sub(v3 + 1, v3 + 1)
+            out[#out + 1] = HS_SHARE.B64_ENC:sub(v3 + 1, v3 + 1)
             if b3 ~= nil then
                 local v4 = b3 % 64
-                out[#out + 1] = B64_ENC:sub(v4 + 1, v4 + 1)
+                out[#out + 1] = HS_SHARE.B64_ENC:sub(v4 + 1, v4 + 1)
             end
         end
         i = i + 3
@@ -2458,22 +3491,22 @@ local function Base64UrlEncode(bytes)
     return table.concat(out)
 end
 
-local function Base64UrlDecode(str)
+function HS_SHARE.Base64UrlDecode(str)
     local n = #str
     if n < 2 or (n % 4) == 1 then return nil end
     local out = {}
     local i = 1
     while i <= n do
-        local c1 = B64_DEC[str:byte(i)]
-        local c2 = B64_DEC[str:byte(i + 1)]
+        local c1 = HS_SHARE.B64_DEC[str:byte(i)]
+        local c2 = HS_SHARE.B64_DEC[str:byte(i + 1)]
         if c1 == nil or c2 == nil then return nil end
         out[#out + 1] = c1 * 4 + math.floor(c2 / 16)
         if i + 2 <= n then
-            local c3 = B64_DEC[str:byte(i + 2)]
+            local c3 = HS_SHARE.B64_DEC[str:byte(i + 2)]
             if c3 == nil then return nil end
             out[#out + 1] = (c2 % 16) * 16 + math.floor(c3 / 4)
             if i + 3 <= n then
-                local c4 = B64_DEC[str:byte(i + 3)]
+                local c4 = HS_SHARE.B64_DEC[str:byte(i + 3)]
                 if c4 == nil then return nil end
                 out[#out + 1] = (c3 % 4) * 64 + c4
             elseif (c3 % 4) ~= 0 then
@@ -2487,7 +3520,7 @@ local function Base64UrlDecode(str)
     return out
 end
 
-local function BitXor16(a, b)
+function HS_SHARE.BitXor16(a, b)
     local res, p = 0, 1
     for _ = 1, 16 do
         local ba, bb = a % 2, b % 2
@@ -2499,13 +3532,13 @@ local function BitXor16(a, b)
     return res
 end
 
-local function Crc16Ccitt(bytes, n)
+function HS_SHARE.Crc16Ccitt(bytes, n)
     local crc = 0xFFFF
     for i = 1, n do
-        crc = BitXor16(crc, bytes[i] * 256)
+        crc = HS_SHARE.BitXor16(crc, bytes[i] * 256)
         for _ = 1, 8 do
             if crc >= 0x8000 then
-                crc = BitXor16((crc * 2) % 65536, 0x1021)
+                crc = HS_SHARE.BitXor16((crc * 2) % 65536, 0x1021)
             else
                 crc = (crc * 2) % 65536
             end
@@ -2514,7 +3547,7 @@ local function Crc16Ccitt(bytes, n)
     return crc
 end
 
-local function SanitizeSchemeName(name)
+function HS_SHARE.SanitizeSchemeName(name)
     if type(name) ~= "string" then return "" end
     local s = name:gsub("[%c]", ""):match("^%s*(.-)%s*$") or ""
     if #s <= 36 then return s end
@@ -2530,7 +3563,7 @@ local function SanitizeSchemeName(name)
     return s:sub(1, cut)
 end
 
-local function DecodeFlagsMaskToTable(m)
+function HS_SHARE.DecodeFlagsMaskToTable(m)
     local function has_bit(val, b)
         return math.floor(val / b) % 2 == 1
     end
@@ -2548,8 +3581,8 @@ local function DecodeFlagsMaskToTable(m)
     }
 end
 
-local function EncodeShareCodeFromState(fl, tn, scheme_name)
-    local clean_name = SanitizeSchemeName(scheme_name)
+function HS_SHARE.EncodeShareCodeFromState(fl, tn, scheme_name)
+    local clean_name = HS_SHARE.SanitizeSchemeName(scheme_name)
     local mask = EncodeCustomVisMask(fl)
 
     -- Pick whichever curated preset (0/1/2) produces the FEWEST delta entries -> ultra-short code!
@@ -2599,19 +3632,19 @@ local function EncodeShareCodeFromState(fl, tn, scheme_name)
         bytes[#bytes + 1] = math.floor(q16 / 256) % 256
         bytes[#bytes + 1] = q16 % 256
     end
-    local crc = Crc16Ccitt(bytes, #bytes)
+    local crc = HS_SHARE.Crc16Ccitt(bytes, #bytes)
     bytes[#bytes + 1] = math.floor(crc / 256) % 256
     bytes[#bytes + 1] = crc % 256
 
-    return "HS1-" .. Base64UrlEncode(bytes), #best_diffs, clean_name, best_base
+    return "HS1-" .. HS_SHARE.Base64UrlEncode(bytes), #best_diffs, clean_name, best_base
 end
 
-local function EncodeCurrentShareCode(optional_name)
-    local name = (optional_name ~= nil) and optional_name or current_scheme_name
-    return EncodeShareCodeFromState(GetActiveVisualFlags(), GetActiveVisTune(), name)
+function HS_SHARE.EncodeCurrentShareCode(optional_name)
+    local name = (optional_name ~= nil) and optional_name or HS_SHARE.current_scheme_name
+    return HS_SHARE.EncodeShareCodeFromState(GetActiveVisualFlags(), GetActiveVisTune(), name)
 end
 
-local function TryDecodeJsonText(raw)
+function HS_SHARE.TryDecodeJsonText(raw)
     local fnFast = rawget(GLOBAL, "HyperSmooth_FastJsonDecode")
     if type(fnFast) == "function" then
         local ok_f, ok_dec, tbl = pcall(fnFast, raw)
@@ -2629,13 +3662,13 @@ local function TryDecodeJsonText(raw)
     return false, nil
 end
 
-local function IsFiniteNumber(v)
+function HS_SHARE.IsFiniteNumber(v)
     return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
 end
 
 -- Phase 1 (PURE READ-ONLY): Validates either an HS1-... share code OR a JSON scheme object.
 -- Mutates ZERO live state. Returns (ok, err_zh_or_en, staged_result).
-local function ValidateSharePayload(raw_input)
+function HS_SHARE.ValidateSharePayload(raw_input)
     local ui_zh = ResolveUiIsZh()
     if type(raw_input) ~= "string" then
         return false, ui_zh and "校验失败：分享内容为空" or "Validation failed: empty input", nil
@@ -2647,7 +3680,7 @@ local function ValidateSharePayload(raw_input)
 
     -- Branch A: Raw JSON preset object ({ "flags": {...}, "tune": {...} } or { "active": {...} })
     if trimmed:sub(1, 1) == "{" then
-        local ok_j, obj = TryDecodeJsonText(trimmed)
+        local ok_j, obj = HS_SHARE.TryDecodeJsonText(trimmed)
         if not ok_j or type(obj) ~= "table" then
             return false, ui_zh and "校验失败：JSON 语法损坏（未修改当前配置）" or "Validation failed: malformed JSON (config unchanged)", nil
         end
@@ -2655,7 +3688,7 @@ local function ValidateSharePayload(raw_input)
         if type(src.tune) ~= "table" and type(src.flags) ~= "table" then
             return false, ui_zh and "校验失败：JSON 缺少 tune/flags 字段" or "Validation failed: JSON missing tune/flags", nil
         end
-        local staged_flags = DecodeFlagsMaskToTable(0)
+        local staged_flags = HS_SHARE.DecodeFlagsMaskToTable(0)
         if type(src.flags) == "table" then
             for k, v in pairs(src.flags) do
                 if staged_flags[k] == nil then
@@ -2677,12 +3710,12 @@ local function ValidateSharePayload(raw_input)
                 end
                 if b.is_bool then
                     if type(v) == "boolean" then v = v and 1 or 0 end
-                    if not IsFiniteNumber(v) or (v ~= 0 and v ~= 1) then
+                    if not HS_SHARE.IsFiniteNumber(v) or (v ~= 0 and v ~= 1) then
                         return false, (ui_zh and "校验失败：布尔参数越界 " or "Validation failed: invalid bool ") .. tostring(k), nil
                     end
                     staged_tune[k] = v
                 else
-                    if not IsFiniteNumber(v) or v < (b.min - 1e-4) or v > (b.max + 1e-4) then
+                    if not HS_SHARE.IsFiniteNumber(v) or v < (b.min - 1e-4) or v > (b.max + 1e-4) then
                         return false, string.format(ui_zh and "校验失败：参数 %s 越界 (%.3f..%.3f)" or "Validation failed: %s out of range (%.3f..%.3f)", k, b.min, b.max), nil
                     end
                     staged_tune[k] = ClampTuneValue(k, v)
@@ -2696,7 +3729,7 @@ local function ValidateSharePayload(raw_input)
             flags_mask = EncodeCustomVisMask(staged_flags),
             flags      = staged_flags,
             tune       = staged_tune,
-            name       = SanitizeSchemeName(src.name or ""),
+            name       = HS_SHARE.SanitizeSchemeName(src.name or ""),
             diff_count = diff_count,
         }
     end
@@ -2709,13 +3742,13 @@ local function ValidateSharePayload(raw_input)
     if prefix ~= "HS1" then
         return false, (ui_zh and "校验失败：不支持的分享码版本 " or "Validation failed: unsupported version ") .. prefix, nil
     end
-    local bytes = Base64UrlDecode(body)
+    local bytes = HS_SHARE.Base64UrlDecode(body)
     if not bytes or #bytes < 6 then
         return false, ui_zh and "校验失败：编码损坏或被截断（未修改当前配置）" or "Validation failed: truncated/corrupt Base64 (config unchanged)", nil
     end
     local n = #bytes
     local expected_crc = bytes[n - 1] * 256 + bytes[n]
-    local actual_crc = Crc16Ccitt(bytes, n - 2)
+    local actual_crc = HS_SHARE.Crc16Ccitt(bytes, n - 2)
     if actual_crc ~= expected_crc then
         return false, ui_zh and "校验失败：CRC16 校验不匹配（复制不完整或字符被改）" or "Validation failed: CRC16 checksum mismatch (corrupted code)", nil
     end
@@ -2747,7 +3780,7 @@ local function ValidateSharePayload(raw_input)
         for i = 0, name_len - 1 do
             chars[#chars + 1] = string.char(bytes[pos + i])
         end
-        scheme_name = SanitizeSchemeName(table.concat(chars))
+        scheme_name = HS_SHARE.SanitizeSchemeName(table.concat(chars))
         pos = pos + name_len
     end
 
@@ -2761,7 +3794,7 @@ local function ValidateSharePayload(raw_input)
     end
 
     -- Build brand-new isolated staging tables (live config 100% untouched!)
-    local staged_flags = DecodeFlagsMaskToTable(mask)
+    local staged_flags = HS_SHARE.DecodeFlagsMaskToTable(mask)
     local staged_tune = MakePresetTune(PRESET_TUNE[base_id])
     local seen_ids = {}
     for _ = 1, count do
@@ -2780,7 +3813,7 @@ local function ValidateSharePayload(raw_input)
         else
             val = ClampTuneValue(tk, b.min + (q16 / 65535.0) * (b.max - b.min))
         end
-        if not IsFiniteNumber(val) then
+        if not HS_SHARE.IsFiniteNumber(val) then
             return false, ui_zh and "校验失败：解码数值异常" or "Validation failed: non-finite decoded value", nil
         end
         staged_tune[tk] = val
@@ -2798,7 +3831,7 @@ local function ValidateSharePayload(raw_input)
 end
 
 -- Pretty human-readable JSON serializer (2-space indented, deterministic key order, editable in Notepad/VSCode!)
-local function JsonEscapeStr(s)
+function HS_SHARE.JsonEscapeStr(s)
     return (tostring(s or "")
         :gsub("\\", "\\\\")
         :gsub('"', '\\"')
@@ -2807,22 +3840,22 @@ local function JsonEscapeStr(s)
         :gsub("\t", "\\t"))
 end
 
-local function FormatSchemeJsonBlock(indent, name, fl, tn, preset_id, include_code)
+function HS_SHARE.FormatSchemeJsonBlock(indent, name, fl, tn, preset_id, include_code)
     local sp = indent .. "  "
     local sp2 = sp .. "  "
     local lines = { indent .. "{" }
-    lines[#lines + 1] = string.format('%s"name": "%s",', sp, JsonEscapeStr(name or ""))
+    lines[#lines + 1] = string.format('%s"name": "%s",', sp, HS_SHARE.JsonEscapeStr(name or ""))
     if preset_id ~= nil then
         lines[#lines + 1] = string.format('%s"preset": %d,', sp, preset_id)
     end
     if include_code then
-        local code = EncodeShareCodeFromState(fl, tn, name)
-        lines[#lines + 1] = string.format('%s"code": "%s",', sp, JsonEscapeStr(code))
+        local code = HS_SHARE.EncodeShareCodeFromState(fl, tn, name)
+        lines[#lines + 1] = string.format('%s"code": "%s",', sp, HS_SHARE.JsonEscapeStr(code))
     end
     lines[#lines + 1] = sp .. '"flags": {'
-    for i = 1, #FLAG_KEYS_ORDER do
-        local fk = FLAG_KEYS_ORDER[i]
-        local comma = (i < #FLAG_KEYS_ORDER) and "," or ""
+    for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+        local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
+        local comma = (i < #HS_SHARE.FLAG_KEYS_ORDER) and "," or ""
         lines[#lines + 1] = string.format('%s"%s": %s%s', sp2, fk, fl[fk] and "true" or "false", comma)
     end
     lines[#lines + 1] = sp .. "},"
@@ -2844,11 +3877,11 @@ local function FormatSchemeJsonBlock(indent, name, fl, tn, preset_id, include_co
     return table.concat(lines, "\n")
 end
 
-local function ExportJsonPresetLibrary()
+function HS_SHARE.ExportJsonPresetLibrary()
     local lines = {
         "{",
         '  "schema": "hypersmooth_visual_library_v1",',
-        '  "active": ' .. FormatSchemeJsonBlock("  ", current_scheme_name, GetActiveVisualFlags(), GetActiveVisTune(), current_visual_preset, true):gsub("^  ", "") .. ",",
+        '  "active": ' .. HS_SHARE.FormatSchemeJsonBlock("  ", HS_SHARE.current_scheme_name, GetActiveVisualFlags(), GetActiveVisTune(), current_visual_preset, true):gsub("^  ", "") .. ",",
         '  "library": [',
     }
     local entries = {}
@@ -2857,23 +3890,23 @@ local function ExportJsonPresetLibrary()
         if type(sl) == "table" and type(sl.tune) == "table" then
             entries[#entries + 1] = {
                 name = sl.name or ("Slot_" .. sidx),
-                flags = DecodeFlagsMaskToTable(sl.mask or 0),
+                flags = HS_SHARE.DecodeFlagsMaskToTable(sl.mask or 0),
                 tune = sl.tune,
             }
         end
     end
-    for i = 1, #json_named_library do
-        local item = json_named_library[i]
+    for i = 1, #HS_SHARE.json_named_library do
+        local item = HS_SHARE.json_named_library[i]
         if type(item) == "table" and type(item.tune) == "table" then
             entries[#entries + 1] = {
                 name = item.name or ("Preset_" .. i),
-                flags = DecodeFlagsMaskToTable(item.mask or 0),
+                flags = HS_SHARE.DecodeFlagsMaskToTable(item.mask or 0),
                 tune = item.tune,
             }
         end
     end
     for i = 1, #entries do
-        local blk = FormatSchemeJsonBlock("    ", entries[i].name, entries[i].flags, entries[i].tune, nil, true)
+        local blk = HS_SHARE.FormatSchemeJsonBlock("    ", entries[i].name, entries[i].flags, entries[i].tune, nil, true)
         if i < #entries then blk = blk .. "," end
         lines[#lines + 1] = blk
     end
@@ -2897,7 +3930,7 @@ local function ExportJsonPresetLibrary()
                 for pk in pairs(pcfg.params) do pkeys[#pkeys + 1] = pk end
                 table.sort(pkeys)
             end
-            lines[#lines + 1] = string.format('    "%s": {', JsonEscapeStr(pid))
+            lines[#lines + 1] = string.format('    "%s": {', HS_SHARE.JsonEscapeStr(pid))
             lines[#lines + 1] = string.format('      "enabled": %s,', (pcfg.enabled == true) and "true" or "false")
             if #pkeys == 0 then
                 lines[#lines + 1] = '      "params": {}'
@@ -2908,7 +3941,7 @@ local function ExportJsonPresetLibrary()
                     local pv = pcfg.params[pk]
                     local kcomma = (ki < #pkeys) and "," or ""
                     local vstr = (type(pv) == "boolean") and (pv and "true" or "false") or string.format("%.4f", tonumber(pv) or 0)
-                    lines[#lines + 1] = string.format('        "%s": %s%s', JsonEscapeStr(pk), vstr, kcomma)
+                    lines[#lines + 1] = string.format('        "%s": %s%s', HS_SHARE.JsonEscapeStr(pk), vstr, kcomma)
                 end
                 lines[#lines + 1] = '      }'
             end
@@ -2919,13 +3952,13 @@ local function ExportJsonPresetLibrary()
     lines[#lines + 1] = "}"
     local payload = table.concat(lines, "\n")
     if TheSim and TheSim.SetPersistentString then
-        TheSim:SetPersistentString(JSON_LIB_FILENAME, payload, false)
+        TheSim:SetPersistentString(HS_SHARE.JSON_LIB_FILENAME, payload, false)
     end
     return payload, #entries
 end
 
-local function ParseAndLoadJsonLibraryString(raw_json)
-    local ok_j, doc = TryDecodeJsonText(raw_json)
+function HS_SHARE.ParseAndLoadJsonLibraryString(raw_json)
+    local ok_j, doc = HS_SHARE.TryDecodeJsonText(raw_json)
     if not ok_j or type(doc) ~= "table" or type(doc.library) ~= "table" then
         return false, 0
     end
@@ -2936,12 +3969,12 @@ local function ParseAndLoadJsonLibraryString(raw_json)
         if type(item) == "table" then
             local valid, _, staged = false, nil, nil
             if type(item.code) == "string" and #item.code > 4 then
-                valid, _, staged = ValidateSharePayload(item.code)
+                valid, _, staged = HS_SHARE.ValidateSharePayload(item.code)
             end
             if not valid and (type(item.tune) == "table" or type(item.flags) == "table") then
                 -- Validate inline JSON fields strictly
                 local fl_ok = true
-                local st_fl = DecodeFlagsMaskToTable(0)
+                local st_fl = HS_SHARE.DecodeFlagsMaskToTable(0)
                 if type(item.flags) == "table" then
                     for fk, fv in pairs(item.flags) do
                         if st_fl[fk] == nil or type(fv) ~= "boolean" then fl_ok = false; break end
@@ -2954,18 +3987,18 @@ local function ParseAndLoadJsonLibraryString(raw_json)
                         local b = TUNE_BOUNDS[tk]
                         if not b then fl_ok = false; break end
                         if b.is_bool and type(tv) == "boolean" then tv = tv and 1 or 0 end
-                        if not IsFiniteNumber(tv) or tv < (b.min - 1e-4) or tv > (b.max + 1e-4) then fl_ok = false; break end
+                        if not HS_SHARE.IsFiniteNumber(tv) or tv < (b.min - 1e-4) or tv > (b.max + 1e-4) then fl_ok = false; break end
                         st_tn[tk] = ClampTuneValue(tk, tv)
                     end
                 end
                 if fl_ok then
                     valid = true
-                    staged = { flags_mask = EncodeCustomVisMask(st_fl), tune = st_tn, name = SanitizeSchemeName(item.name or "") }
+                    staged = { flags_mask = EncodeCustomVisMask(st_fl), tune = st_tn, name = HS_SHARE.SanitizeSchemeName(item.name or "") }
                 end
             end
             if valid and staged then
                 loaded_count = loaded_count + 1
-                local sname = SanitizeSchemeName(item.name or staged.name or ("Preset_" .. i))
+                local sname = HS_SHARE.SanitizeSchemeName(item.name or staged.name or ("Preset_" .. i))
                 local slot_num = tonumber(sname:match("^Slot_(%d+)$"))
                 if slot_num and slot_num >= 1 and slot_num <= 3 then
                     if custom_slots[slot_num] == nil then
@@ -2977,7 +4010,7 @@ local function ParseAndLoadJsonLibraryString(raw_json)
             end
         end
     end
-    json_named_library = loaded_extra
+    HS_SHARE.json_named_library = loaded_extra
     if type(doc.plugins) == "table" and type(HS_ExtRuntime) == "table" and type(HS_ExtRuntime.ApplyPersistedMap) == "function" then
         HS_ExtRuntime.ApplyPersistedMap(doc.plugins)
     end
@@ -2986,19 +4019,19 @@ end
 
 if type(HS_ExtRuntime) == "table" and type(HS_ExtRuntime.SetHooks) == "function" then
     HS_ExtRuntime.SetHooks(function()
-        ExportJsonPresetLibrary()
+        HS_SHARE.ExportJsonPresetLibrary()
         if type(HS_PanelNotifySync) == "function" then HS_PanelNotifySync() end
     end, ResolveUiIsZh)
 end
 
-local function ReloadJsonPresetLibrary(cb)
+function HS_SHARE.ReloadJsonPresetLibrary(cb)
     if not (TheSim and TheSim.GetPersistentString) then
         if type(cb) == "function" then cb(false, 0) end
         return false
     end
-    TheSim:GetPersistentString(JSON_LIB_FILENAME, function(ok_r, raw_json)
+    TheSim:GetPersistentString(HS_SHARE.JSON_LIB_FILENAME, function(ok_r, raw_json)
         if ok_r and type(raw_json) == "string" and #raw_json > 2 then
-            local ok_p, cnt = ParseAndLoadJsonLibraryString(raw_json)
+            local ok_p, cnt = HS_SHARE.ParseAndLoadJsonLibraryString(raw_json)
             if type(cb) == "function" then cb(ok_p, cnt) end
         else
             if type(cb) == "function" then cb(false, 0) end
@@ -3008,44 +4041,46 @@ local function ReloadJsonPresetLibrary(cb)
 end
 
 -- Auto-load JSON preset library on startup (non-destructive: validates every entry!)
-ReloadJsonPresetLibrary()
+HS_SHARE.ReloadJsonPresetLibrary()
 
 -- Phase 2 + Phase 3: Strict 3-Phase Transactional Import (Validate -> Atomic Apply -> Persist)
-local function ImportSharePayloadTransactional(raw_input)
+function HS_SHARE.ImportSharePayloadTransactional(raw_input)
     local ui_zh = ResolveUiIsZh()
     -- PHASE 1: Pure read-only validation (zero mutation on failure!)
-    local ok_val, err_msg, staged = ValidateSharePayload(raw_input)
+    local ok_val, err_msg, staged = HS_SHARE.ValidateSharePayload(raw_input)
     if not ok_val or not staged then
         return false, err_msg or (ui_zh and "校验失败" or "Validation failed"), nil
     end
 
     -- Snapshot previous live state for 1-click Undo AND atomic rollback on any apply error
-    local prev_flags = DecodeFlagsMaskToTable(EncodeCustomVisMask(custom_vis_flags))
+    local prev_flags = HS_SHARE.DecodeFlagsMaskToTable(EncodeCustomVisMask(custom_vis_flags))
     local prev_tune = {}
     for i = 1, #TUNE_KEYS do
         prev_tune[TUNE_KEYS[i]] = vis_tune[TUNE_KEYS[i]]
     end
     local prev_preset = current_visual_preset
-    local prev_name = current_scheme_name
+    local prev_name = HS_SHARE.current_scheme_name
+    local prev_builtin = HS_CFG.active_builtin_id
 
     -- PHASE 2: Atomic in-memory apply (save_persist = false until GPU sync succeeds!)
-    for i = 1, #FLAG_KEYS_ORDER do
-        local fk = FLAG_KEYS_ORDER[i]
+    for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+        local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
         custom_vis_flags[fk] = staged.flags[fk] == true
     end
     for i = 1, #TUNE_KEYS do
         local tk = TUNE_KEYS[i]
         vis_tune[tk] = ClampTuneValue(tk, staged.tune[tk])
     end
-    current_scheme_name = staged.name or ""
+    HS_SHARE.current_scheme_name = staged.name or ""
+    HS_CFG.active_builtin_id = nil
     current_visual_preset = HasAnyCustomActive() and 3 or 0
     visual_bench_timer = 12.0
 
     local ok_apply = pcall(SyncToNativePlugin, false)
     if not ok_apply then
         -- Roll back atomically -> corrupted/failed apply leaves prior config 100% intact!
-        for i = 1, #FLAG_KEYS_ORDER do
-            local fk = FLAG_KEYS_ORDER[i]
+        for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+            local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
             custom_vis_flags[fk] = prev_flags[fk]
         end
         for i = 1, #TUNE_KEYS do
@@ -3053,30 +4088,32 @@ local function ImportSharePayloadTransactional(raw_input)
             vis_tune[tk] = prev_tune[tk]
         end
         current_visual_preset = prev_preset
-        current_scheme_name = prev_name
+        HS_SHARE.current_scheme_name = prev_name
+        HS_CFG.active_builtin_id = prev_builtin
         pcall(SyncToNativePlugin, false)
         return false, ui_zh and "应用失败：已自动回滚原配置" or "Apply failed: rolled back to previous config", nil
     end
 
     -- Commit undo record & PHASE 3: Persist to both .cfg and hypersmooth_presets.json!
-    last_import_undo = {
+    HS_SHARE.last_import_undo = {
         flags = prev_flags,
         tune = prev_tune,
         preset = prev_preset,
         name = prev_name,
+        builtin_id = prev_builtin,
     }
     SyncToNativePlugin(true)
-    ExportJsonPresetLibrary()
+    HS_SHARE.ExportJsonPresetLibrary()
     hud_dirty_now = true
     return true, nil, staged
 end
 
-local function UndoLastShareImport()
-    if type(last_import_undo) ~= "table" then return false end
-    local u = last_import_undo
-    last_import_undo = nil
-    for i = 1, #FLAG_KEYS_ORDER do
-        local fk = FLAG_KEYS_ORDER[i]
+function HS_SHARE.UndoLastShareImport()
+    if type(HS_SHARE.last_import_undo) ~= "table" then return false end
+    local u = HS_SHARE.last_import_undo
+    HS_SHARE.last_import_undo = nil
+    for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+        local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
         custom_vis_flags[fk] = u.flags[fk] == true
     end
     for i = 1, #TUNE_KEYS do
@@ -3084,15 +4121,16 @@ local function UndoLastShareImport()
         vis_tune[tk] = ClampTuneValue(tk, u.tune[tk])
     end
     current_visual_preset = u.preset or 0
-    current_scheme_name = u.name or ""
+    HS_SHARE.current_scheme_name = u.name or ""
+    HS_CFG.active_builtin_id = u.builtin_id
     visual_bench_timer = 12.0
     SyncToNativePlugin(true)
-    ExportJsonPresetLibrary()
+    HS_SHARE.ExportJsonPresetLibrary()
     hud_dirty_now = true
     return true
 end
 
-local function TryWriteClipboard(str)
+function HS_SHARE.TryWriteClipboard(str)
     local fnCb = rawget(GLOBAL, "HyperSmooth_SetClipboard")
     if type(fnCb) == "function" then
         local ok, res = pcall(fnCb, str)
@@ -3101,7 +4139,7 @@ local function TryWriteClipboard(str)
     return false
 end
 
-local function TryReadClipboard()
+function HS_SHARE.TryReadClipboard()
     if TheSim and type(TheSim.GetClipboardData) == "function" then
         local ok, txt = pcall(TheSim.GetClipboardData, TheSim)
         if ok and type(txt) == "string" then
@@ -3117,13 +4155,13 @@ rawset(GLOBAL, "c_hsshare", function(arg1, arg2)
         local a1_trim = arg1:match("^%s*(.-)%s*$") or ""
         local a1_lo = a1_trim:lower()
         if a1_lo == "undo" then
-            local ok = UndoLastShareImport()
+            local ok = HS_SHARE.UndoLastShareImport()
             GLOBAL.print(ok
                 and (ui_zh and "[HyperSmooth 分享码] 已撤销上次导入，恢复原配置" or "[HyperSmooth Share] Undid last import")
                 or (ui_zh and "[HyperSmooth 分享码] 没有可撤销的导入记录" or "[HyperSmooth Share] Nothing to undo"))
             return ok
         elseif a1_lo == "check" and type(arg2) == "string" then
-            local ok, err, st = ValidateSharePayload(arg2)
+            local ok, err, st = HS_SHARE.ValidateSharePayload(arg2)
             if ok and st then
                 local title_s = (#st.name > 0) and (" [" .. st.name .. "]") or ""
                 GLOBAL.print(ui_zh
@@ -3134,7 +4172,7 @@ rawset(GLOBAL, "c_hsshare", function(arg1, arg2)
             end
             return ok
         elseif a1_trim:sub(1, 3) == "HS1" or a1_trim:sub(1, 2) == "HS" or a1_trim:sub(1, 1) == "{" then
-            local ok, err, st = ImportSharePayloadTransactional(a1_trim)
+            local ok, err, st = HS_SHARE.ImportSharePayloadTransactional(a1_trim)
             if ok and st then
                 local title_s = (#st.name > 0) and (" [" .. st.name .. "]") or ""
                 GLOBAL.print(ui_zh
@@ -3147,9 +4185,9 @@ rawset(GLOBAL, "c_hsshare", function(arg1, arg2)
         end
     end
     -- Export current look (optional arg1 = scheme title e.g. c_hsshare("暗黑童话"))
-    local code, diffs, cname = EncodeCurrentShareCode(type(arg1) == "string" and arg1 or nil)
-    if #cname > 0 then current_scheme_name = cname end
-    local copied = TryWriteClipboard(code)
+    local code, diffs, cname = HS_SHARE.EncodeCurrentShareCode(type(arg1) == "string" and arg1 or nil)
+    if #cname > 0 then HS_SHARE.current_scheme_name = cname end
+    local copied = HS_SHARE.TryWriteClipboard(code)
     GLOBAL.print(string.format("[HyperSmooth Share] %s (%d chars, %d diffs%s)",
         code, #code, diffs, copied and ", COPIED TO CLIPBOARD" or ""))
     return code
@@ -3159,36 +4197,36 @@ rawset(GLOBAL, "c_hsjson", function(action, name_arg)
     local ui_zh = ResolveUiIsZh()
     local act = type(action) == "string" and action:lower() or "export"
     if act == "export" or act == "save" then
-        if act == "save" and type(name_arg) == "string" and #SanitizeSchemeName(name_arg) > 0 then
-            local cname = SanitizeSchemeName(name_arg)
-            current_scheme_name = cname
+        if act == "save" and type(name_arg) == "string" and #HS_SHARE.SanitizeSchemeName(name_arg) > 0 then
+            local cname = HS_SHARE.SanitizeSchemeName(name_arg)
+            HS_SHARE.current_scheme_name = cname
             local fl = GetActiveVisualFlags()
             local tn = GetActiveVisTune()
             local copy_tn = {}
             for i = 1, #TUNE_KEYS do copy_tn[TUNE_KEYS[i]] = ClampTuneValue(TUNE_KEYS[i], tn[TUNE_KEYS[i]]) end
             local entry = { name = cname, mask = EncodeCustomVisMask(fl), tune = copy_tn }
             local replaced = false
-            for i = 1, #json_named_library do
-                if json_named_library[i].name == cname then
-                    json_named_library[i] = entry
+            for i = 1, #HS_SHARE.json_named_library do
+                if HS_SHARE.json_named_library[i].name == cname then
+                    HS_SHARE.json_named_library[i] = entry
                     replaced = true
                     break
                 end
             end
-            if not replaced then json_named_library[#json_named_library + 1] = entry end
+            if not replaced then HS_SHARE.json_named_library[#HS_SHARE.json_named_library + 1] = entry end
         end
-        local _, cnt = ExportJsonPresetLibrary()
+        local _, cnt = HS_SHARE.ExportJsonPresetLibrary()
         GLOBAL.print(ui_zh
-            and string.format("[HyperSmooth JSON] 已写入 %s（共 %d 套方案）", JSON_LIB_FILENAME, cnt)
-            or string.format("[HyperSmooth JSON] Exported %s (%d presets)", JSON_LIB_FILENAME, cnt))
+            and string.format("[HyperSmooth JSON] 已写入 %s（共 %d 套方案）", HS_SHARE.JSON_LIB_FILENAME, cnt)
+            or string.format("[HyperSmooth JSON] Exported %s (%d presets)", HS_SHARE.JSON_LIB_FILENAME, cnt))
         return true
     elseif act == "reload" then
-        ReloadJsonPresetLibrary(function(ok, cnt)
+        HS_SHARE.ReloadJsonPresetLibrary(function(ok, cnt)
             GLOBAL.print(ok
-                and (ui_zh and string.format("[HyperSmooth JSON] 已热重载 %s（校验载入 %d 套方案）", JSON_LIB_FILENAME, cnt)
-                          or string.format("[HyperSmooth JSON] Reloaded %s (%d valid presets)", JSON_LIB_FILENAME, cnt))
-                or (ui_zh and ("[HyperSmooth JSON] 未找到或格式损坏：" .. JSON_LIB_FILENAME)
-                          or ("[HyperSmooth JSON] Missing or invalid: " .. JSON_LIB_FILENAME)))
+                and (ui_zh and string.format("[HyperSmooth JSON] 已热重载 %s（校验载入 %d 套方案）", HS_SHARE.JSON_LIB_FILENAME, cnt)
+                          or string.format("[HyperSmooth JSON] Reloaded %s (%d valid presets)", HS_SHARE.JSON_LIB_FILENAME, cnt))
+                or (ui_zh and ("[HyperSmooth JSON] 未找到或格式损坏：" .. HS_SHARE.JSON_LIB_FILENAME)
+                          or ("[HyperSmooth JSON] Missing or invalid: " .. HS_SHARE.JSON_LIB_FILENAME)))
         end)
         return true
     elseif act == "list" then
@@ -3196,29 +4234,29 @@ rawset(GLOBAL, "c_hsjson", function(action, name_arg)
         for sidx = 1, 3 do
             if custom_slots[sidx] then names[#names + 1] = custom_slots[sidx].name or ("Slot_" .. sidx) end
         end
-        for i = 1, #json_named_library do
-            names[#names + 1] = json_named_library[i].name
+        for i = 1, #HS_SHARE.json_named_library do
+            names[#names + 1] = HS_SHARE.json_named_library[i].name
         end
         GLOBAL.print("[HyperSmooth JSON Library] " .. (#names > 0 and table.concat(names, ", ") or "(empty)"))
         return names
     elseif act == "load" and type(name_arg) == "string" then
-        local target = SanitizeSchemeName(name_arg)
+        local target = HS_SHARE.SanitizeSchemeName(name_arg)
         local found = nil
         for sidx = 1, 3 do
             local sl = custom_slots[sidx]
             if sl and ((sl.name or ("Slot_" .. sidx)) == target) then found = sl; break end
         end
         if not found then
-            for i = 1, #json_named_library do
-                if json_named_library[i].name == target then found = json_named_library[i]; break end
+            for i = 1, #HS_SHARE.json_named_library do
+                if HS_SHARE.json_named_library[i].name == target then found = HS_SHARE.json_named_library[i]; break end
             end
         end
         if not found then
             GLOBAL.print((ui_zh and "[HyperSmooth JSON] 未找到方案: " or "[HyperSmooth JSON] Preset not found: ") .. target)
             return false
         end
-        local code = EncodeShareCodeFromState(DecodeFlagsMaskToTable(found.mask or 0), found.tune, target)
-        local ok, err = ImportSharePayloadTransactional(code)
+        local code = HS_SHARE.EncodeShareCodeFromState(HS_SHARE.DecodeFlagsMaskToTable(found.mask or 0), found.tune, target)
+        local ok, err = HS_SHARE.ImportSharePayloadTransactional(code)
         GLOBAL.print(ok
             and ((ui_zh and "[HyperSmooth JSON] 已载入方案: " or "[HyperSmooth JSON] Loaded preset: ") .. target)
             or ("[HyperSmooth JSON] " .. tostring(err)))
@@ -3227,6 +4265,564 @@ rawset(GLOBAL, "c_hsjson", function(action, name_arg)
     GLOBAL.print(ui_zh
         and "[HyperSmooth JSON] 用法: c_hsjson('export'|'reload'|'list'|'save'|'load', [方案名])"
         or "[HyperSmooth JSON] Usage: c_hsjson('export'|'reload'|'list'|'save'|'load', [name])")
+end)
+
+-- =============================================================================
+-- HyperShade Built-In Curated Preset Gallery (6 Original Studio-Tuned Presets)
+--   - 100% original HyperShade tuning (zero third-party presets/assets)
+--   - Transactional apply with 1-click Undo + immediate HS1- ShareCode export
+-- =============================================================================
+do
+    local function BuildGalleryTune(base_preset_idx, overrides)
+        local src = PRESET_TUNE[base_preset_idx] or PRESET_TUNE[0]
+        local out = {}
+        for i = 1, #TUNE_KEYS do
+            local tk = TUNE_KEYS[i]
+            out[tk] = src[tk]
+        end
+        if type(overrides) == "table" then
+            for k, v in pairs(overrides) do
+                if TUNE_BOUNDS[k] ~= nil then
+                    out[k] = ClampTuneValue(k, v)
+                end
+            end
+        end
+        return out
+    end
+
+    local function CopyFlags(base_idx, overrides)
+        local src = VISUAL_PRESET_FLAGS[base_idx] or VISUAL_PRESET_FLAGS[0]
+        local out = {}
+        for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+            local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
+            out[fk] = (src[fk] == true)
+        end
+        if type(overrides) == "table" then
+            for k, v in pairs(overrides) do
+                if out[k] ~= nil then
+                    out[k] = (v == true)
+                end
+            end
+        end
+        return out
+    end
+
+    HS_SHARE.BUILTIN_GALLERY = {
+        {
+            id        = "vanilla",
+            preset_id = 0,
+            zh        = "原版纯净",
+            en        = "Vanilla Pure",
+            tag_zh    = "0改动 · 原生泛光",
+            tag_en    = "Stock · Pure Bloom",
+            desc_zh   = "100% 原始画质与原版魔光/火光泛光，不加任何特效，保留 240 帧与低延迟。",
+            desc_en   = "100% untouched stock visuals & vanilla bloom; keeps 240Hz & low-latency.",
+            accent    = { 0.68, 0.76, 0.86 },
+            flags     = CopyFlags(0),
+            tune      = BuildGalleryTune(0),
+        },
+        {
+            id        = "eyecare_hd",
+            preset_id = 1,
+            zh        = "护眼高清",
+            en        = "Eye-Care HD",
+            tag_zh    = "清晰锐利 · 原版配色",
+            tag_en    = "Crisp · True Color",
+            desc_zh   = "BCAS 墨线清晰 + 16×AF + 1.0×高清光照 + 柔光，严格保留原版配色久玩护眼。",
+            desc_en   = "BCAS ink + 16x AF + 1.0x LightMap + gentle glow; true vanilla palette.",
+            accent    = { 0.42, 0.88, 0.72 },
+            flags     = CopyFlags(1),
+            tune      = BuildGalleryTune(1),
+        },
+        {
+            id        = "storybook",
+            preset_id = 2,
+            zh        = "电影绘本",
+            en        = "Cinematic Storybook",
+            tag_zh    = "主力推荐 · 全3D光影",
+            tag_en    = "Signature · Full 3D",
+            desc_zh   = "官方实调主力档：暖阳 ACES、3D 立体受光、流体长影、PBR 海洋、倒影与风动。",
+            desc_en   = "Signature studio look: warm ACES, 3D relief, fluid shadows, PBR sea & wind.",
+            accent    = { 0.96, 0.76, 0.36 },
+            flags     = CopyFlags(2),
+            tune      = BuildGalleryTune(2),
+        },
+        {
+            id        = "crisp_daylight",
+            preset_id = 3,
+            zh        = "清透日系",
+            en        = "Crisp Daylight",
+            tag_zh    = "通透建家 · 基地晒太阳",
+            tag_en    = "Bright · Base Sun",
+            desc_zh   = "清亮白平衡 + 零暗角 + 全地皮基地阳光柱 + 轻盈柔影，建家跑图干净通透。",
+            desc_en   = "Clean bright daylight, zero vignette, all-turf base sunbeams & light shadows.",
+            accent    = { 0.48, 0.84, 1.00 },
+            flags     = CopyFlags(2, { dark_clarity = false, clean_filter = false }),
+            tune      = BuildGalleryTune(2, {
+                sharp = 0.95, ink = 0.90, sprite_detail = 0.80, ground_detail = 0.65,
+                bloom_str = 0.68, bloom_warmth = 0.12, bloom_spread = 0.52, glow_tail = 0.30, god_rays = 0.25,
+                ao_str = 0.95, surface_light = 0.58, shade_warm = 0.55, shade_contrast = 0.45, shade_cool = 0.65, shade_dark = 0.35,
+                shadow_density = 0.36, shadow_soft = 1.35, shadow_point_lights = 1, shadow_point_strength = 0.72,
+                shadow_weather = 0.75, shadow_moon_blue = 0.50,
+                vol_lightrays = 0.90, vol_lightrays_everywhere = 1, vol_cloud_shade = 0.75, vol_canopy_shade = 0.75,
+                vol_ground_fog = 0.00, vol_edge_fog = 0.65,
+                ocean_pbr = 0.75, ocean_sky_refl = 0.75, ocean_sun_glow = 0.70, water_refl_str = 0.45,
+                wind_sway_enabled = 1, wind_sway_strength = 0.45, wind_wake_strength = 0.60, glint_str = 0.40,
+                vfx_fire_embers = 0.80, vfx_ambient_motes = 0.85, vfx_footsteps = 0.85, hitfeel_enabled = 1,
+                exposure = 0.08, temp = -0.06, tint = 0.01, contrast = 0.02, lightness = 0.02, gamma = 1.02,
+                sat = 1.06, vibrance = 0.18, filmic = 0.16, hl_desat = 0.22, sun_fill = 0.22,
+                vignette = 0.00, grain = 0.00, vanilla_cc = 0.88, snow_cap = 0.80,
+            }),
+        },
+        {
+            id        = "cozy_firelight",
+            preset_id = 3,
+            zh        = "篝火暖夜",
+            en        = "Cozy Firelight",
+            tag_zh    = "暖夜营地 · 强篝火投影",
+            tag_en    = "Warm Night · Fire",
+            desc_zh   = "琥珀暖夜调色 + 强 360° 篝火投影 + 升腾火星 + 暗夜洞穴提亮，营地氛围拉满。",
+            desc_en   = "Rich amber nights, bold 360-deg campfire shadows, embers & cave clarity.",
+            accent    = { 1.00, 0.56, 0.30 },
+            flags     = CopyFlags(2, { dark_clarity = true, clean_filter = false }),
+            tune      = BuildGalleryTune(2, {
+                sharp = 0.95, ink = 0.95, sprite_detail = 0.80, ground_detail = 0.70, dark_str = 0.55,
+                bloom_str = 0.96, bloom_warmth = 0.62, bloom_spread = 0.72, bloom_prot = 0.86, glow_tail = 0.62, light_wrap = 0.22, god_rays = 0.25,
+                ao_str = 1.15, surface_light = 0.82, shade_warm = 0.74, shade_contrast = 0.58, shade_cool = 0.76, shade_dark = 0.50,
+                shadow_density = 0.52, shadow_length = 1.12, shadow_soft = 1.25, shadow_point_lights = 1, shadow_point_strength = 0.98,
+                shadow_dusk_point = 1.15, shadow_weather = 0.75, shadow_moon_blue = 0.65, shadow_flash_lights = 1,
+                vol_lightrays = 0.85, vol_lightrays_everywhere = 0, vol_cloud_shade = 0.85, vol_canopy_shade = 0.85,
+                vol_ground_fog = 0.65, vol_edge_fog = 0.80,
+                ocean_pbr = 0.75, ocean_sky_refl = 0.60, ocean_sun_glow = 0.70, water_refl_str = 0.45,
+                wind_sway_enabled = 1, wind_sway_strength = 0.50, wind_wake_strength = 0.65, glint_str = 0.35,
+                vfx_fire_embers = 1.30, vfx_ambient_motes = 0.90, vfx_footsteps = 0.90, hitfeel_enabled = 1,
+                exposure = 0.04, temp = 0.34, tint = -0.03, contrast = 0.05, lightness = 0.00, gamma = 0.98,
+                sat = 1.02, vibrance = 0.24, filmic = 0.38, hl_desat = 0.40, sun_fill = 0.30,
+                vignette = 0.10, grain = 0.00, vanilla_cc = 0.76,
+            }),
+        },
+        {
+            id        = "misty_canopy",
+            preset_id = 3,
+            zh        = "林间晨雾",
+            en        = "Misty Canopy",
+            tag_zh    = "水中木光柱 · 轻雾镜海",
+            tag_en    = "Sunbeams · Mist",
+            desc_zh   = "全域水中木阳光柱 + 树冠斑驳影 + 受光薄雾 + PBR 镜面海与倒影，自然风光首选。",
+            desc_en   = "All-turf sunbeams, dappled canopy shade, lit mist & PBR mirror ocean.",
+            accent    = { 0.46, 0.90, 0.62 },
+            flags     = CopyFlags(2, { dark_clarity = false, clean_filter = false }),
+            tune      = BuildGalleryTune(2, {
+                sharp = 0.92, ink = 0.92, sprite_detail = 0.80, ground_detail = 0.75,
+                bloom_str = 0.86, bloom_warmth = 0.32, bloom_spread = 0.68, glow_tail = 0.48, light_wrap = 0.18, god_rays = 0.55,
+                ao_str = 1.05, surface_light = 0.78, shade_warm = 0.60, shade_contrast = 0.50, shade_cool = 0.78, shade_dark = 0.45,
+                shadow_density = 0.46, shadow_length = 1.10, shadow_soft = 1.38, shadow_point_lights = 1, shadow_point_strength = 0.85,
+                shadow_weather = 0.85, shadow_moon_blue = 0.60, shadow_flash_lights = 1,
+                vol_lightrays = 1.20, vol_lightrays_everywhere = 1, vol_cloud_shade = 1.15, vol_canopy_shade = 1.15,
+                vol_ground_fog = 0.95, vol_edge_fog = 1.00,
+                ocean_pbr = 1.00, ocean_sky_refl = 0.90, ocean_sun_glow = 0.90, water_refl_str = 0.62, water_refl_ripple = 0.60,
+                wind_sway_enabled = 1, wind_sway_strength = 0.72, wind_wake_strength = 0.80, glint_str = 0.55,
+                vfx_fire_embers = 1.00, vfx_ambient_motes = 1.25, vfx_footsteps = 0.95, hitfeel_enabled = 1,
+                exposure = 0.05, temp = 0.14, tint = 0.02, contrast = 0.01, lightness = 0.01, gamma = 1.00,
+                sat = 1.03, vibrance = 0.20, filmic = 0.32, hl_desat = 0.38, sun_fill = 0.34,
+                vignette = 0.06, grain = 0.00, vanilla_cc = 0.82,
+            }),
+        },
+    }
+end
+
+function HS_SHARE.GetActiveBuiltinId()
+    if current_visual_preset == 0 then return "vanilla" end
+    if current_visual_preset == 1 then return "eyecare_hd" end
+    if current_visual_preset == 2 then return "storybook" end
+    return HS_CFG.active_builtin_id
+end
+
+function HS_SHARE.FindBuiltinPreset(id_or_idx)
+    local list = HS_SHARE.BUILTIN_GALLERY or {}
+    if type(id_or_idx) == "number" then
+        return list[id_or_idx]
+    end
+    if type(id_or_idx) == "string" then
+        local key = id_or_idx:lower()
+        for i = 1, #list do
+            if list[i].id == key then
+                return list[i]
+            end
+        end
+    end
+    return nil
+end
+
+function HS_SHARE.ApplyBuiltinPreset(id_or_idx)
+    local ui_zh = ResolveUiIsZh()
+    local entry = HS_SHARE.FindBuiltinPreset(id_or_idx)
+    if not entry then
+        return false, ui_zh and "未找到内置预设" or "Builtin preset not found", nil
+    end
+
+    -- Snapshot previous live state for 1-click Undo!
+    local prev_flags = HS_SHARE.DecodeFlagsMaskToTable(EncodeCustomVisMask(custom_vis_flags))
+    local prev_tune = {}
+    for i = 1, #TUNE_KEYS do
+        prev_tune[TUNE_KEYS[i]] = vis_tune[TUNE_KEYS[i]]
+    end
+    local prev_preset = current_visual_preset
+    local prev_name = HS_SHARE.current_scheme_name
+    local prev_builtin = HS_CFG.active_builtin_id
+
+    if entry.preset_id ~= nil and entry.preset_id >= 0 and entry.preset_id <= 2 then
+        current_visual_preset = entry.preset_id
+        HS_SHARE.current_scheme_name = ui_zh and entry.zh or entry.en
+        HS_CFG.active_builtin_id = entry.id
+    else
+        for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
+            local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
+            custom_vis_flags[fk] = (entry.flags[fk] == true)
+        end
+        for i = 1, #TUNE_KEYS do
+            local tk = TUNE_KEYS[i]
+            vis_tune[tk] = ClampTuneValue(tk, entry.tune[tk])
+        end
+        current_visual_preset = 3
+        HS_SHARE.current_scheme_name = ui_zh and entry.zh or entry.en
+        HS_CFG.active_builtin_id = entry.id
+    end
+
+    visual_bench_timer = 12.0
+    HS_SHARE.last_import_undo = {
+        flags      = prev_flags,
+        tune       = prev_tune,
+        preset     = prev_preset,
+        name       = prev_name,
+        builtin_id = prev_builtin,
+    }
+    SyncToNativePlugin(true)
+    if current_visual_preset == 3 then
+        HS_SHARE.ExportJsonPresetLibrary()
+    end
+    hud_dirty_now = true
+    return true, nil, entry
+end
+
+rawset(GLOBAL, "c_hspreset", function(arg1)
+    local ui_zh = ResolveUiIsZh()
+    local list = HS_SHARE.BUILTIN_GALLERY or {}
+    if arg1 == nil or arg1 == "list" then
+        local active = HS_SHARE.GetActiveBuiltinId()
+        GLOBAL.print(ui_zh
+            and "[HyperShade 预设面板] 内置 6 套原创调试档位（输入 c_hspreset(编号或id) 一键切换）："
+            or "[HyperShade Presets] 6 built-in curated looks (run c_hspreset(index_or_id) to apply):")
+        for i = 1, #list do
+            local p = list[i]
+            local mark = (active == p.id) and "*" or " "
+            GLOBAL.print(string.format("  %s [%d] %-15s %s — %s",
+                mark, i, p.id, ui_zh and p.zh or p.en, ui_zh and p.desc_zh or p.desc_en))
+        end
+        return true
+    end
+    local ok, err, entry = HS_SHARE.ApplyBuiltinPreset(arg1)
+    if ok and entry then
+        GLOBAL.print(ui_zh
+            and string.format("[HyperShade 预设] 已切换至「%s」（可 c_hsshare('undo') 一键撤销）", entry.zh)
+            or string.format("[HyperShade Preset] Applied '%s' (run c_hsshare('undo') to revert)", entry.en))
+        return true
+    end
+    GLOBAL.print("[HyperShade Preset] " .. tostring(err or "unknown preset"))
+    return false
+end)
+
+-- =============================================================================
+-- HyperShade Visual Closed-Loop (Reference Image / Live Frame -> Capability
+-- Whitelist Optimization -> Transactional HS1- Share Code)
+-- Note: HS1- guarantees parameter-state reproduction (final rendered pixels
+-- vary with GPU driver, resolution, scene & backend). Only owned controllable
+-- pipeline parameters are mapped; zero third-party shaders/assets are read.
+-- =============================================================================
+HS_SHARE.Look = {
+    pending     = false,
+    pending_opt = nil,
+    last_result = nil,
+    last_code   = "",
+    -- Owned grading whitelist keys reset before applying newly fitted look
+    whitelist_reset_keys = {
+        "exposure", "temp", "tint", "contrast", "lightness", "gamma",
+        "sat", "vibrance", "filmic", "hl_desat", "sun_fill", "original_mix",
+        "slope_r", "slope_g", "slope_b",
+        "offset_r", "offset_g", "offset_b",
+        "power_r", "power_g", "power_b",
+        "vignette",
+    },
+}
+
+function HS_SHARE.Look.FormatError(err_code, ui_zh)
+    local e = tostring(err_code or "unknown_error")
+    local map_zh = {
+        native_dll_missing            = "需要安装新版 dinput8.dll 原生引擎才能启用视觉特征分析",
+        clipboard_has_text_not_image  = "剪贴板里当前是文字而非图片：请先 Win+Shift+S 截图或右键复制图片/图片文件",
+        clipboard_no_image            = "剪贴板为空或不含图片：请先 Win+Shift+S 截图或复制图片后再试",
+        clipboard_hdrop_not_image     = "剪贴板复制的文件不是常见图片格式（支持 PNG/JPG/BMP/WebP）",
+        clipboard_open_failed         = "暂时无法读取系统剪贴板（可能正被其他程序占用），请重试",
+        dib_truncated_pixels          = "剪贴板位图数据不完整，请重新截图或复制原图",
+        dib_invalid_dimensions        = "参考图尺寸异常，无法分析",
+        reference_image_too_dark      = "参考图几乎全黑，缺少有效色彩与影调信息",
+        no_world_frame_for_same_frame = "未捕获到游戏世界画面（请进入游戏世界后再使用同帧捕获）",
+        wic_decode_stream_failed      = "系统图片解码失败，请换用 PNG/JPG/BMP 或重新截图",
+        wic_decode_file_failed        = "无法打开或解码目标图片文件，请检查路径与格式",
+    }
+    local map_en = {
+        native_dll_missing            = "Updated dinput8.dll native engine is required for visual look matching",
+        clipboard_has_text_not_image  = "Clipboard contains text, not an image: press Win+Shift+S or copy an image first",
+        clipboard_no_image            = "No image found in clipboard: take a screenshot or copy an image file first",
+        clipboard_hdrop_not_image     = "Copied file is not a supported image format (PNG/JPG/BMP/WebP)",
+        clipboard_open_failed         = "Could not open system clipboard right now, please retry",
+        dib_truncated_pixels          = "Clipboard DIB image data is truncated, please re-copy",
+        dib_invalid_dimensions        = "Reference image dimensions are invalid",
+        reference_image_too_dark      = "Reference image is nearly pitch-black (insufficient tonal data)",
+        no_world_frame_for_same_frame = "No world frame captured (enter gameplay before using Same-Frame capture)",
+        wic_decode_stream_failed      = "Windows WIC failed to decode clipboard image",
+        wic_decode_file_failed        = "Failed to open or decode image file path",
+    }
+    if ui_zh and map_zh[e] then return map_zh[e] end
+    if (not ui_zh) and map_en[e] then return map_en[e] end
+    return (ui_zh and "视觉分析失败：" or "Look match failed: ") .. e
+end
+
+function HS_SHARE.Look.ApplyFittedResult(res, opts)
+    local ui_zh = ResolveUiIsZh()
+    if type(res) ~= "table" or type(res.params) ~= "table" then
+        return false, HS_SHARE.Look.FormatError("invalid_result", ui_zh), nil
+    end
+
+    if res.warning == "no_post_colourcube_delta" then
+        local msg = ui_zh
+            and "未检测到 ColourCube 之后的外置后处理变化；若目标效果在滤镜/世界阶段，请截图后点「吸取剪贴板截图」"
+            or "No post-ColourCube shader delta detected; take a screenshot and use Match Clipboard instead"
+        return false, msg, nil
+    end
+
+    -- Clone current player flags & tune so all non-grading settings (shadows/wind/water/combat/FPS) stay untouched!
+    local cur_fl = GetActiveVisualFlags()
+    local cur_tn = GetActiveVisTune()
+    local fl = {}
+    for k, v in pairs(cur_fl) do fl[k] = v end
+    local tn = {}
+    for i = 1, #TUNE_KEYS do
+        local tk = TUNE_KEYS[i]
+        tn[tk] = ClampTuneValue(tk, cur_tn[tk])
+    end
+
+    -- Reset ONLY owned grading whitelist knobs before writing newly fitted values
+    local reset_list = HS_SHARE.Look.whitelist_reset_keys
+    for i = 1, #reset_list do
+        local rk = reset_list[i]
+        if TUNE_BOUNDS[rk] then tn[rk] = TUNE_BOUNDS[rk].default end
+    end
+
+    for k, v in pairs(res.params) do
+        if TUNE_BOUNDS[k] and type(v) == "number" and v == v then
+            tn[k] = ClampTuneValue(k, v)
+        end
+    end
+    fl.tone = true
+    if res.sharp_fitted == true and type(res.params.sharp) == "number" then
+        fl.sharp_bcas = true
+    end
+
+    local mode_tag = (res.mode == "same_frame") and (ui_zh and "同帧捕获" or "FrameMatch")
+        or ((res.mode == "same_scene") and (ui_zh and "同场景匹配" or "ExactMatch")
+            or (ui_zh and "截图风格" or "LookMatch"))
+    local scheme_name = (type(opts) == "table" and type(opts.name) == "string" and #opts.name > 0)
+        and opts.name or mode_tag
+
+    local code = HS_SHARE.EncodeShareCodeFromState(fl, tn, scheme_name)
+    local ok_imp, err_imp = HS_SHARE.ImportSharePayloadTransactional(code)
+    if not ok_imp then
+        return false, tostring(err_imp or "import_failed"), nil
+    end
+
+    if type(opts) == "table" and opts.copy_code == true then
+        HS_SHARE.TryWriteClipboard(code)
+    end
+
+    HS_SHARE.Look.last_result = res
+    HS_SHARE.Look.last_code   = code
+
+    local c_pct = math.floor((tonumber(res.color_confidence) or 0) * 100 + 0.5)
+    local s_pct = math.floor((tonumber(res.spatial_confidence) or 0) * 100 + 0.5)
+    local de_a  = tonumber(res.delta_e_after) or 0
+    local ms_v  = tonumber(res.elapsed_ms) or 0
+    local mode_lbl = (res.mode == "same_frame")
+        and (ui_zh and "同帧后处理匹配" or "Same-Frame")
+        or ((res.mode == "same_scene")
+            and (ui_zh and "同场景精确匹配" or "Same-Scene")
+            or (ui_zh and "通用风格迁移" or "General Look"))
+    local spatial_note
+    if res.mode == "general" then
+        spatial_note = ui_zh and "暗角/泛光建议微调" or "tweak bloom/vig manually"
+    else
+        spatial_note = ui_zh and string.format("空间置信度%d%%", s_pct) or string.format("spatial %d%%", s_pct)
+    end
+    local warn_note = ""
+    if res.warning == "misaligned_fallback_general" then
+        warn_note = ui_zh and "（视角未对齐，已自动转通用迁移）" or " (misaligned -> general)"
+    end
+    local summary = ui_zh
+        and string.format("%s%s · 色彩置信度%d%% · %s · ΔE=%.1f · %.0fms（已生成HS1码，可微调/撤销）",
+            mode_lbl, warn_note, c_pct, spatial_note, de_a, ms_v)
+        or string.format("%s%s · color %d%% · %s · dE=%.1f · %.0fms (HS1 applied, tweak/undo ready)",
+            mode_lbl, warn_note, c_pct, spatial_note, de_a, ms_v)
+
+    toast_msg = ui_zh
+        and string.format("HyperShade %s完成（色彩置信度%d%% · ΔE=%.1f）", mode_lbl, c_pct, de_a)
+        or string.format("HyperShade %s done (color %d%%, dE=%.1f)", mode_lbl, c_pct, de_a)
+    toast_timer = 3.5
+    hud_dirty_now = true
+    return true, summary, code
+end
+
+function HS_SHARE.Look.Start(mode_str, opts)
+    local ui_zh = ResolveUiIsZh()
+    local fnStart = rawget(GLOBAL, "HyperSmooth_StartLookMatch")
+    local fnPoll  = rawget(GLOBAL, "HyperSmooth_PollLookMatch")
+    if type(fnStart) ~= "function" or type(fnPoll) ~= "function" then
+        return false, HS_SHARE.Look.FormatError("native_dll_missing", ui_zh)
+    end
+    local m = (type(mode_str) == "string" and #mode_str > 0) and mode_str or "clipboard"
+    local fp = (type(opts) == "table" and type(opts.file_path) == "string") and opts.file_path or nil
+    local ok_pcall, ok_start, detail
+    if fp then
+        ok_pcall, ok_start, detail = pcall(fnStart, m, fp)
+    else
+        ok_pcall, ok_start, detail = pcall(fnStart, m)
+    end
+    if not ok_pcall then
+        return false, HS_SHARE.Look.FormatError(tostring(ok_start), ui_zh)
+    end
+    if not ok_start then
+        return false, HS_SHARE.Look.FormatError(detail, ui_zh)
+    end
+    HS_SHARE.Look.pending = true
+    HS_SHARE.Look.pending_opt = (type(opts) == "table") and opts or {}
+    return true, detail
+end
+
+function HS_SHARE.Look.TickPoll()
+    if not HS_SHARE.Look.pending then return end
+    local fnPoll = rawget(GLOBAL, "HyperSmooth_PollLookMatch")
+    if type(fnPoll) ~= "function" then
+        HS_SHARE.Look.pending = false
+        return
+    end
+    local ok_p, st, payload = pcall(fnPoll)
+    if not ok_p then
+        HS_SHARE.Look.pending = false
+        return
+    end
+    if st == "capturing" or st == "solving" then
+        return
+    end
+    HS_SHARE.Look.pending = false
+    local opts = HS_SHARE.Look.pending_opt or {}
+    HS_SHARE.Look.pending_opt = nil
+    local cb = opts.on_complete
+
+    if st == "done" and type(payload) == "table" then
+        local ok, msg, code = HS_SHARE.Look.ApplyFittedResult(payload, opts)
+        if type(cb) == "function" then
+            pcall(cb, ok, msg, code, payload)
+        elseif GLOBAL.print then
+            GLOBAL.print("[HyperShade Look] " .. tostring(msg))
+            if code then GLOBAL.print("[HyperShade HS1] " .. tostring(code)) end
+        end
+    elseif st == "error" then
+        local msg = HS_SHARE.Look.FormatError(payload, ResolveUiIsZh())
+        if type(cb) == "function" then
+            pcall(cb, false, msg, nil, nil)
+        elseif GLOBAL.print then
+            GLOBAL.print("[HyperShade Look] " .. msg)
+        end
+    end
+end
+
+HS_SHARE.Look.ConsoleCmd = function(arg1, arg2)
+    local ui_zh = ResolveUiIsZh()
+    local a1 = type(arg1) == "string" and (arg1:match("^%s*(.-)%s*$") or ""):lower() or "clipboard"
+    if a1 == "undo" then
+        local ok = HS_SHARE.UndoLastShareImport()
+        GLOBAL.print(ok
+            and (ui_zh and "[HyperShade 视觉闭环] 已撤销上次风格匹配，恢复原配置" or "[HyperShade Look] Reverted to previous config")
+            or (ui_zh and "[HyperShade 视觉闭环] 没有可撤销记录" or "[HyperShade Look] Nothing to undo"))
+        return ok
+    elseif a1 == "caps" or a1 == "whitelist" then
+        local fnCaps = rawget(GLOBAL, "HyperSmooth_GetLookCapabilities")
+        if type(fnCaps) ~= "function" then
+            GLOBAL.print(HS_SHARE.Look.FormatError("native_dll_missing", ui_zh))
+            return false
+        end
+        local caps = fnCaps() or {}
+        local keys = {}
+        for i = 1, #caps do
+            keys[#keys + 1] = string.format("%s[%.2f..%.2f]", tostring(caps[i].key), caps[i].min or 0, caps[i].max or 0)
+        end
+        GLOBAL.print(string.format("[HyperShade Capability Whitelist (%d)] %s", #caps, table.concat(keys, ", ")))
+        return caps
+    end
+
+    local opts = { copy_code = false }
+    local mode = "clipboard"
+    if a1 == "general" or a1 == "exact" or a1 == "same_scene" or a1 == "same_frame" or a1 == "frame" then
+        mode = a1
+    elseif a1 == "file" and type(arg2) == "string" and #arg2 > 0 then
+        mode = "file"
+        opts.file_path = arg2
+    end
+
+    local ok, err = HS_SHARE.Look.Start(mode, opts)
+    if ok then
+        GLOBAL.print(ui_zh
+            and "[HyperShade 视觉闭环] 已在后台线程启动特征分析与参数拟合（完成后自动应用并输出 HS1- 分享码）..."
+            or "[HyperShade Look] Started background visual analysis & fitting (will auto-apply & print HS1- code)...")
+    else
+        GLOBAL.print("[HyperShade Look] " .. tostring(err))
+    end
+    return ok
+end
+rawset(GLOBAL, "c_hslook", HS_SHARE.Look.ConsoleCmd)
+rawset(GLOBAL, "c_hsmatch", HS_SHARE.Look.ConsoleCmd)
+
+rawset(GLOBAL, "c_hsclip", function(on)
+    local ui_zh = ResolveUiIsZh()
+    if type(on) == "boolean" then
+        HS_CFG.clip_cursor = on
+    elseif type(on) == "number" then
+        HS_CFG.clip_cursor = (on ~= 0)
+    else
+        HS_CFG.clip_cursor = not (HS_CFG.clip_cursor == true)
+    end
+    SyncToNativePlugin(true)
+    GLOBAL.print(ui_zh
+        and ("[HyperSmooth] 双屏防甩出鼠标锁: " .. (HS_CFG.clip_cursor and "开 (ESC/控制台/切屏自动解锁)" or "关"))
+        or ("[HyperSmooth] Dual-Monitor Cursor Lock: " .. (HS_CFG.clip_cursor and "ON (auto-unlocks on Pause/Console/Alt+Tab)" or "OFF")))
+end)
+
+rawset(GLOBAL, "c_hscrashreport", function()
+    local ui_zh = ResolveUiIsZh()
+    local fnPath = rawget(GLOBAL, "HyperSmooth_GetCrashReportPath")
+    local p = ""
+    if type(fnPath) == "function" then
+        local ok_p, res_p = pcall(fnPath)
+        if ok_p and type(res_p) == "string" then p = res_p end
+    end
+    if #p > 0 then
+        GLOBAL.print(ui_zh
+            and ("[HyperSmooth 崩溃侦探] 已就绪! 崩溃后将自动生成中英双语归因报告 -> " .. p)
+            or ("[HyperSmooth Crash Detective] Armed! Auto-writes bilingual blame report on crash -> " .. p))
+    else
+        GLOBAL.print(ui_zh
+            and "[HyperSmooth 崩溃侦探] 需要原生 bin64/dinput8.dll v2.9.5 支持"
+            or "[HyperSmooth Crash Detective] Requires native bin64/dinput8.dll v2.9.5")
+    end
 end)
 
 rawset(GLOBAL, "c_hsbench", function(on)
@@ -3252,7 +4848,7 @@ end)
 --    are refreshed from disk after Workshop download -> fixes false
 --    SERVER_MODS_WORKSHOP_VERSION_MISMATCH ("服务器正在运行旧版本模组")!
 --------------------------------------------------------------------------------
-if FAST_MOD_SCAN and KnownModIndex and KnownModIndex.LoadModInfo then
+if HS_CFG.FAST_MOD_SCAN and KnownModIndex and KnownModIndex.LoadModInfo then
     local fast_scan_bypass = 0
     local function WrapBypass(fn_name)
         local orig = KnownModIndex[fn_name]
@@ -3300,7 +4896,7 @@ end
 --------------------------------------------------------------------------------
 -- 2. Skip Top Popular Mods Steam Query ("Getting top mod details...", 3-13s)
 --------------------------------------------------------------------------------
-if SKIP_TOP_MODS_QUERY and TheSim and getmetatable then
+if HS_CFG.SKIP_TOP_MODS_QUERY and TheSim and getmetatable then
     pcall(function()
         local mt = getmetatable(TheSim)
         local idx = mt and mt.__index
@@ -3321,7 +4917,7 @@ end
 --    Keeps vanilla "forest"/"cave" AND active character prefabs hot in client
 --    RAM across BACKEND shard migrations; cleanly unloads ALL on FRONTEND.
 --------------------------------------------------------------------------------
-if KEEP_SHARD_ASSETS and TheSim and getmetatable then
+if HS_CFG.KEEP_SHARD_ASSETS and TheSim and getmetatable then
     pcall(function()
         local mt = getmetatable(TheSim)
         local idx = mt and mt.__index
@@ -3506,7 +5102,7 @@ end
 -- 4. Skip Blocking MOTD Network Wait: mark MOTD ready from local cache immediately.
 --    Does NOT affect Steam/Klei online login, skins, or multiplayer.
 --------------------------------------------------------------------------------
-if SKIP_MOTD_DELAY then
+if HS_CFG.SKIP_MOTD_DELAY then
     AddClassPostConstruct("motdmanager", function(self)
         local old_DownloadMotdInfo = self.DownloadMotdInfo
         if old_DownloadMotdInfo then
@@ -3536,6 +5132,174 @@ end
 --       and preserving 100% of focalpoint, screenoffset & shake) syncs Sprite +
 --       Dynamic Light + Camera onto one single 240Hz curve!
 --------------------------------------------------------------------------------
+-- v2.9.5-B Pure Client-Side Combat Hit-Feel State, Directional Camera Punch (B4) & Live Preview
+HS_HITFEEL = {
+    punch_t      = 99.0,
+    punch_dur    = 0.135,
+    punch_dx     = 0.0,
+    punch_dz     = 0.0,
+    punch_amp    = 0.0,
+    preview_idx  = 0,
+    recent_hits  = {},
+    last_sweep_t = 0.0,
+}
+
+function HS_HITFEEL.NowSec()
+    local fnReal = rawget(GLOBAL, "GetTimeRealSeconds")
+    if type(fnReal) == "function" then
+        local v = fnReal()
+        if type(v) == "number" then return v end
+    end
+    local fnClk = (GLOBAL.os and GLOBAL.os.clock) or os.clock
+    return (type(fnClk) == "function") and (fnClk() or 0.0) or 0.0
+end
+
+function HS_HITFEEL.IsActive()
+    if current_visual_preset == 0 then return false end
+    local tn = GetActiveVisTune()
+    return ClampTuneValue("hitfeel_enabled", tn.hitfeel_enabled) > 0.5
+end
+
+function HS_HITFEEL.DedupAllow(key, cooldown_sec)
+    if key == nil then return true end
+    local now = HS_HITFEEL.NowSec()
+    local prev = HS_HITFEEL.recent_hits[key]
+    if prev ~= nil and (now - prev) >= 0.0 and (now - prev) < (cooldown_sec or 0.12) then
+        return false
+    end
+    HS_HITFEEL.recent_hits[key] = now
+    if (now - HS_HITFEEL.last_sweep_t) > 1.5 then
+        HS_HITFEEL.last_sweep_t = now
+        local cnt = 0
+        for _ in pairs(HS_HITFEEL.recent_hits) do cnt = cnt + 1 end
+        if cnt > 64 then
+            for k, ts in pairs(HS_HITFEEL.recent_hits) do
+                if (now - ts) > 0.8 or (now - ts) < 0.0 then
+                    HS_HITFEEL.recent_hits[k] = nil
+                end
+            end
+        end
+    end
+    return true
+end
+
+function HS_HITFEEL.ClassifyStyle(player, work_hint, is_heavy_hit)
+    if work_hint == "CHOP" then return 5 end
+    if work_hint == "MINE" then return 6 end
+    local inv = player and player.replica and player.replica.inventory or nil
+    local hand = nil
+    if inv and type(inv.GetEquippedItem) == "function" then
+        local slots = rawget(GLOBAL, "EQUIPSLOTS")
+        local hand_slot = (type(slots) == "table" and slots.HANDS) or "hands"
+        local ok, item = pcall(inv.GetEquippedItem, inv, hand_slot)
+        if ok then hand = item end
+    end
+    local p = (hand and type(hand.prefab) == "string") and hand.prefab:lower() or ""
+    if p ~= "" then
+        if p:find("nightsword") or p:find("voidcloth") or p:find("shadow") or p:find("nightmare") or p:find("ruins_bat") or p:find("dread") or p:find("dark") then
+            return 2
+        elseif p:find("lunar") or p:find("glasscutter") or p:find("moonglass") or p:find("brightshade") or p:find("ice") or p:find("frost") then
+            return 3
+        elseif p:find("fire") or p:find("torch") or p:find("lighter") or p:find("ember") or p:find("magma") or p:find("flame") or p:find("willow") then
+            return 4
+        elseif p:find("hammer") or p:find("trident") or p:find("morningstar") or p:find("whip") or p:find("club") or p:find("mace") or p:find("greatsword") or p:find("hambat") then
+            return 1
+        end
+    end
+    if work_hint == "electric" then return 3 end
+    if work_hint == "fire" then return 4 end
+    if work_hint == "dark" or work_hint == "shadow" then return 2 end
+    return is_heavy_hit and 1 or 0
+end
+
+-- Screen shake intentionally removed (0.00px camera offset): replaced by B4 C++ Attacker Follow-Through Lunge
+-- + Localized Hit-Point Ground Glow + Native DST VFXEffect ground-physics debris & sparks!
+function HS_HITFEEL.AddCameraPunch()
+    HS_HITFEEL.punch_amp = 0.0
+    HS_HITFEEL.punch_t   = 99.0
+end
+
+function HS_HITFEEL.StepCameraPunch()
+    return 0.0, 0.0
+end
+
+function HS_HITFEEL.EmitImpact(tx, ty, tz, px, py, pz, intensity, style, is_self_hit, is_work, dedup_key)
+    if not HS_HITFEEL.IsActive() then return false end
+    if not HS_HITFEEL.DedupAllow(dedup_key, is_work and 0.11 or 0.12) then return false end
+    local dx, dz = 1.0, 0.0
+    if type(px) == "number" and type(pz) == "number" then
+        local vx, vz = (tx - px), (tz - pz)
+        local dlen = math.sqrt(vx * vx + vz * vz)
+        if dlen > 1e-4 then
+            dx, dz = vx / dlen, vz / dlen
+        else
+            local player = rawget(GLOBAL, "ThePlayer")
+            local tf = player and player.Transform or nil
+            if tf and type(tf.GetRotation) == "function" then
+                local ok, rot = pcall(tf.GetRotation, tf)
+                if ok and type(rot) == "number" then
+                    local rad = rot * (math.pi / 180.0)
+                    dx, dz = math.cos(rad), -math.sin(rad)
+                end
+            end
+        end
+    end
+    local inten = math.max(0.25, math.min(1.60, type(intensity) == "number" and intensity or 1.0))
+    local sty = (type(style) == "number") and math.floor(style + 0.5) or 0
+    local fnTrig = rawget(GLOBAL, "HyperSmooth_TriggerImpact")
+    if type(fnTrig) == "function" then
+        pcall(fnTrig, tx, ty or 0.0, tz, dx, dz, inten, sty, false, true)
+        if not is_self_hit and type(px) == "number" and type(pz) == "number" then
+            pcall(fnTrig, px, py or 0.0, pz, dx, dz, inten * 0.85, sty, true, false)
+        end
+    end
+    if type(HS_VFX) == "table" and type(HS_VFX.OnImpact) == "function" then
+        pcall(HS_VFX.OnImpact, tx, ty or 0.0, tz, px, py or 0.0, pz, inten, sty, is_work == true)
+    end
+    return true
+end
+
+function HS_HITFEEL.PreviewImpact()
+    if current_visual_preset == 0 or ClampTuneValue("hitfeel_enabled", GetActiveVisTune().hitfeel_enabled) <= 0.5 then
+        ApplyTuneValue("hitfeel_enabled", 1)
+    else
+        local fnCombat = rawget(GLOBAL, "HyperSmooth_SetCombatConfig")
+        if type(fnCombat) == "function" then
+            local tn = GetActiveVisTune()
+            pcall(fnCombat, true,
+                ClampTuneValue("hitfeel_hitstop", tn.hitfeel_hitstop),
+                ClampTuneValue("hitfeel_recoil", tn.hitfeel_recoil),
+                ClampTuneValue("hitfeel_flash", tn.hitfeel_flash),
+                ClampTuneValue("hitfeel_vfx", tn.hitfeel_vfx),
+                ClampTuneValue("hitfeel_campunch", tn.hitfeel_campunch))
+        end
+    end
+    local styles = { 0, 2, 3, 4, 1 }
+    HS_HITFEEL.preview_idx = (HS_HITFEEL.preview_idx % #styles) + 1
+    local style = styles[HS_HITFEEL.preview_idx]
+    local px, py, pz = 0.0, 0.0, 0.0
+    local dirX, dirZ = 1.0, 0.0
+    local player = rawget(GLOBAL, "ThePlayer")
+    if player ~= nil and player.Transform ~= nil then
+        if type(player.Transform.GetWorldPosition) == "function" then
+            local ok, x, y, z = pcall(player.Transform.GetWorldPosition, player.Transform)
+            if ok and type(x) == "number" and type(z) == "number" then
+                px, py, pz = x, (type(y) == "number" and y or 0.0), z
+            end
+        end
+        if type(player.Transform.GetRotation) == "function" then
+            local ok, rot = pcall(player.Transform.GetRotation, player.Transform)
+            if ok and type(rot) == "number" then
+                local rad = rot * (math.pi / 180.0)
+                dirX, dirZ = math.cos(rad), -math.sin(rad)
+            end
+        end
+    end
+    local tx = px + dirX * 1.8
+    local tz = pz + dirZ * 1.8
+    return HS_HITFEEL.EmitImpact(tx, py, tz, px, py, pz, (style == 1) and 1.25 or 1.05, style, false, false, nil)
+end
+
 do
     local REF_FPS = 60.0
     local REF_DT = 1.0 / REF_FPS
@@ -3559,6 +5323,7 @@ do
         end
 
         local ct_target = nil
+        local ct_need_reset = true
         local ct_clock = 0.0
         local ct_last_t = 0.0
         local ct_snap_t = 0.0
@@ -3571,6 +5336,10 @@ do
         if type(old_Snap) == "function" then
             self.Snap = function(cam, ...)
                 ct_target = nil
+                ct_need_reset = true
+                if HS_HITFEEL ~= nil then
+                    HS_HITFEEL.punch_t = 99.0
+                end
                 return old_Snap(cam, ...)
             end
         end
@@ -3578,6 +5347,7 @@ do
         self.Update = function(cam, dt, dontupdatepos)
             if dt == nil or dt <= 0 or dt > 0.25 or cam.paused then
                 ct_target = nil
+                ct_need_reset = true
                 return old_Update(cam, dt, dontupdatepos)
             end
 
@@ -3594,11 +5364,32 @@ do
 
             if cam240_active then
                 local rx, ry, rz = cam.target.Transform:GetWorldPosition()
+                local fnCamSmooth = rawget(GLOBAL, "HyperSmooth_SmoothCameraTarget")
                 if rx == nil then
                     ct_target = nil
+                    ct_need_reset = true
                     cam240_active = false
+                elseif type(fnCamSmooth) == "function" then
+                    -- Unified Main-Thread C++ PLL Snapshot-Timeline Lockstep (0.00px phase error vs Character Sprite!)
+                    local need_reset = ct_need_reset or ct_target ~= cam.target or (ct_clock - ct_last_t) > 0.16
+                    if need_reset then
+                        fnCamSmooth(rx, ry, rz, 1)
+                        fnCamSmooth(rx, ry, rz, 0)
+                        ct_target = cam.target
+                        ct_need_reset = false
+                        ct_last_t = ct_clock
+                    else
+                        local sx, sy, sz = fnCamSmooth(rx, ry, rz, 0)
+                        if sx ~= nil and sy ~= nil and sz ~= nil then
+                            dx = sx - rx
+                            dy = sy - ry
+                            dz = sz - rz
+                        end
+                        ct_last_t = ct_clock
+                    end
                 elseif ct_target ~= cam.target or (ct_clock - ct_last_t) > 0.16 then
                     ct_target = cam.target
+                    ct_need_reset = false
                     ct_prev_x, ct_prev_y, ct_prev_z = rx, ry, rz
                     ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
                     ct_snap_t = ct_clock
@@ -3622,8 +5413,8 @@ do
                         local disp_x = ct_prev_x + (ct_raw_x - ct_prev_x) * prev_a
                         local disp_y = ct_prev_y + (ct_raw_y - ct_prev_y) * prev_a
                         local disp_z = ct_prev_z + (ct_raw_z - ct_prev_z) * prev_a
-                        if gap < 0.009 then
-                            ct_fast_streak = math.min(8, ct_fast_streak + 1)
+                        if gap < 0.0075 then
+                            ct_fast_streak = math.min(16, ct_fast_streak + 1)
                         else
                             ct_fast_streak = 0
                             if gap >= 0.014 and gap <= 0.12 then
@@ -3636,7 +5427,7 @@ do
                         ct_snap_t = ct_clock
                     end
 
-                    if ct_fast_streak < 2 then
+                    if ct_fast_streak < 6 then
                         local elapsed = ct_clock - ct_snap_t
                         local alpha = (ct_period > 1e-4) and math.min(1.0, math.max(0.0, elapsed / ct_period)) or 1.0
                         local sx = ct_prev_x + (ct_raw_x - ct_prev_x) * alpha
@@ -3650,6 +5441,7 @@ do
                 end
             else
                 ct_target = nil
+                ct_need_reset = true
             end
 
             local orig_pan = cam.pangain
@@ -3658,7 +5450,7 @@ do
             local orig_cdist = cam.continuousdistancegain
             local eff_pan = orig_pan
 
-            if SMOOTH_CAMERA then
+            if HS_CFG.SMOOTH_CAMERA then
                 eff_pan = EffectiveGain(orig_pan, dt)
                 cam.pangain = eff_pan
                 cam.headinggain = EffectiveGain(orig_heading, dt)
@@ -3668,7 +5460,7 @@ do
 
             old_Update(cam, dt, dontupdatepos)
 
-            if SMOOTH_CAMERA then
+            if HS_CFG.SMOOTH_CAMERA then
                 cam.pangain = orig_pan
                 cam.headinggain = orig_heading
                 cam.distancegain = orig_dist
@@ -3693,6 +5485,19 @@ do
                     end
                 end
             end
+
+            if HS_HITFEEL ~= nil and HS_HITFEEL.punch_t < HS_HITFEEL.punch_dur and cam.currentpos ~= nil and type(cam.Apply) == "function" then
+                local pox, poz = HS_HITFEEL.StepCameraPunch(dt)
+                if pox ~= 0.0 or poz ~= 0.0 then
+                    local spx, spy, spz = cam.currentpos.x, cam.currentpos.y, cam.currentpos.z
+                    cam.currentpos.x = spx + pox
+                    cam.currentpos.z = spz + poz
+                    cam:Apply()
+                    cam.currentpos.x = spx
+                    cam.currentpos.y = spy
+                    cam.currentpos.z = spz
+                end
+            end
         end
     end)
 end
@@ -3704,7 +5509,7 @@ end
 --    b) MapScreen: fix hardcoded 1/60 zoom step (4x too fast @ 240Hz).
 --    c) DeployHelper: fix frame-counted delay=2 decay (eliminates placement ring flicker @ 240Hz).
 --------------------------------------------------------------------------------
-if SMOOTH_UI_240HZ then
+if HS_CFG.SMOOTH_UI_240HZ then
     local function WrapSmoothScrollList(self)
         local old_OnUpdate = self.OnUpdate
         if not old_OnUpdate then
@@ -3777,6 +5582,7 @@ if SMOOTH_UI_240HZ then
         local ft_target = nil
         local ft_clock = 0.0
         local ft_last_t = 0.0
+        local ft_sample_t = 0.0
         local ft_snap_t = 0.0
         local ft_period = 1.0 / 30.0
         local ft_fast_streak = 0
@@ -3792,8 +5598,10 @@ if SMOOTH_UI_240HZ then
         end
 
         self.OnUpdate = function(ft, dt)
-            if not current_skeletal_tween or dt == nil or dt <= 0 or dt > 0.25
-                or ft.target == nil or not ft.target:IsValid() then
+            if not current_skeletal_tween or not HasNativePlugin()
+                or dt == nil or dt <= 0 or dt > 0.25
+                or ft.target == nil or not ft.target:IsValid()
+                or (ft.target.components ~= nil and ft.target.components.locomotor ~= nil) then
                 ft_target = nil
                 return old_OnUpdate(ft, dt)
             end
@@ -3820,6 +5628,7 @@ if SMOOTH_UI_240HZ then
                 ft_target = ft.target
                 ft_prev_x, ft_prev_y, ft_prev_z = rx, ry, rz
                 ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
+                ft_sample_t = ft_clock
                 ft_snap_t = ft_clock
                 ft_last_t = ft_clock
                 ft_period = 1.0 / 30.0
@@ -3832,26 +5641,34 @@ if SMOOTH_UI_240HZ then
                 if move_sq > 25.0 then
                     ft_prev_x, ft_prev_y, ft_prev_z = rx, ry, rz
                     ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
+                    ft_sample_t = ft_clock
                     ft_snap_t = ft_clock
                     ft_fast_streak = 0
                 elseif move_sq > 1e-6 then
-                    local gap = ft_clock - ft_snap_t
-                    local prev_a = (ft_period > 1e-4) and math.min(1.0, math.max(0.0, gap / ft_period)) or 1.0
+                    -- Separate true raw-sample interval (ft_sample_t) from back-anchored segment
+                    -- start (ft_snap_t) so 115/120Hz continuous motion never doubles gap or lags!
+                    local sample_gap = ft_clock - ft_sample_t
+                    local seg_elapsed = ft_clock - ft_snap_t
+                    local prev_a = (ft_fast_streak >= 2) and 1.0
+                        or ((ft_period > 1e-4) and math.min(1.0, math.max(0.0, seg_elapsed / ft_period)) or 1.0)
                     local disp_x = ft_prev_x + (ft_raw_x - ft_prev_x) * prev_a
                     local disp_y = ft_prev_y + (ft_raw_y - ft_prev_y) * prev_a
                     local disp_z = ft_prev_z + (ft_raw_z - ft_prev_z) * prev_a
-                    if gap < 0.009 then
+                    if sample_gap < 0.012 then
                         ft_fast_streak = math.min(8, ft_fast_streak + 1)
-                    else
+                    elseif sample_gap > 0.015 then
                         ft_fast_streak = 0
-                        if gap >= 0.014 and gap <= 0.12 then
-                            local clamped_gap = math.min(0.095, math.max(0.015, gap))
+                        if sample_gap <= 0.12 then
+                            local clamped_gap = math.min(0.095, math.max(0.015, sample_gap))
                             ft_period = ft_period * 0.70 + clamped_gap * 0.30
                         end
                     end
                     ft_prev_x, ft_prev_y, ft_prev_z = disp_x, disp_y, disp_z
                     ft_raw_x, ft_raw_y, ft_raw_z = rx, ry, rz
-                    ft_snap_t = ft_clock
+                    ft_sample_t = ft_clock
+                    -- Anchor segment start one render frame back (clamped to 0.5*period) so the
+                    -- arrival frame advances smoothly (alpha > 0) instead of repeating a frozen pose!
+                    ft_snap_t = ft_clock - math.min(dt, ft_period * 0.50)
                 end
 
                 if ft_fast_streak < 2 then
@@ -4108,6 +5925,198 @@ if SMOOTH_UI_240HZ then
     InstallDeployHelperDedup()
     AddSimPostInit(InstallDeployHelperDedup)
 
+    -- Geometric Placement (workshop-351325790) High-FPS Adaptive Optimizer:
+    -- Keeps main placer cursor at true 240Hz 0ms response while throttling background grid refresh
+    -- to high-FPS budgets (~0.4-1.2ms/frame) and adding a ~8Hz stationary cooldown to avoid 240Hz thrashing.
+    AddSimPostInit(function()
+        local ok_pl, Placer = pcall(GLOBAL.require, "components/placer")
+        if not ok_pl or type(Placer) ~= "table"
+            or type(Placer.RefreshBuildGrid) ~= "function"
+            or type(Placer.RefreshGridPoint) ~= "function"
+            or type(Placer.TestPoint) ~= "function"
+            or Placer._hs_geo_opt then
+            return
+        end
+        Placer._hs_geo_opt = true
+
+        local GEO_IDLE_SENTINEL = { false, false }
+        local fnRealSec = rawget(GLOBAL, "GetTimeRealSeconds")
+        local fnClock = (GLOBAL.os and GLOBAL.os.clock) or os.clock
+        local function GeoNow()
+            if type(fnRealSec) == "function" then
+                local v = fnRealSec()
+                if type(v) == "number" then return v end
+            end
+            return (type(fnClock) == "function") and (fnClock() or 0.0) or 0.0
+        end
+        local function StripSentinels(q)
+            if type(q) ~= "table" then return false end
+            local stripped = false
+            for idx = #q, 1, -1 do
+                if q[idx] == GEO_IDLE_SENTINEL then
+                    local last_i = #q
+                    q[idx] = q[last_i]
+                    q[last_i] = nil
+                    stripped = true
+                end
+            end
+            return stripped
+        end
+
+        local orig_TestPoint = Placer.TestPoint
+        Placer.TestPoint = function(cmp, inst, pt, ...)
+            local sim = rawget(GLOBAL, "TheSim")
+            local tick = (sim and type(sim.GetTick) == "function") and sim:GetTick() or nil
+            if cmp ~= nil and inst ~= nil and inst == cmp.inst
+                and pt ~= nil and type(pt.x) == "number" and type(pt.z) == "number" and tick ~= nil then
+                local rot = cmp._rot
+                if type(rot) ~= "number" and inst.Transform ~= nil and type(inst.Transform.GetRotation) == "function" then
+                    rot = inst.Transform:GetRotation() or 0
+                end
+                local qx = math.floor(pt.x * 1000 + 0.5)
+                local qz = math.floor(pt.z * 1000 + 0.5)
+                local qrot = math.floor((type(rot) == "number" and rot or 0) * 100 + 0.5)
+                local builder = cmp.builder
+                local inv_rep = builder and builder.inst and builder.inst.replica and builder.inst.replica.inventory or nil
+                local active_item = (inv_rep and type(inv_rep.GetActiveItem) == "function") and inv_rep:GetActiveItem() or nil
+                if cmp._hs_gtp_tick == tick
+                    and cmp._hs_gtp_inst == inst
+                    and cmp._hs_gtp_qx == qx and cmp._hs_gtp_qz == qz and cmp._hs_gtp_qrot == qrot
+                    and cmp._hs_gtp_act == active_item
+                    and cmp._hs_gtp_inv == cmp.invobject and cmp._hs_gtp_rec == cmp.recipe
+                    and cmp._hs_gtp_tfn == cmp.testfn and cmp._hs_gtp_ptfn == cmp.placeTestFn then
+                    latency_stats.placer_skip = latency_stats.placer_skip + 1
+                    rawset(GLOBAL, "HS_PLACER_SKIP_COUNT", latency_stats.placer_skip)
+                    return cmp._hs_gtp_res
+                end
+                local res = orig_TestPoint(cmp, inst, pt, ...)
+                cmp._hs_gtp_tick = tick
+                cmp._hs_gtp_inst = inst
+                cmp._hs_gtp_qx   = qx
+                cmp._hs_gtp_qz   = qz
+                cmp._hs_gtp_qrot = qrot
+                cmp._hs_gtp_act  = active_item
+                cmp._hs_gtp_inv  = cmp.invobject
+                cmp._hs_gtp_rec  = cmp.recipe
+                cmp._hs_gtp_tfn  = cmp.testfn
+                cmp._hs_gtp_ptfn = cmp.placeTestFn
+                cmp._hs_gtp_res  = res
+                return res
+            end
+            return orig_TestPoint(cmp, inst, pt, ...)
+        end
+
+        if type(Placer.BuildGridPoint) == "function" then
+            local orig_BuildGridPoint = Placer.BuildGridPoint
+            Placer.BuildGridPoint = function(cmp, ...)
+                if cmp ~= nil then
+                    cmp._hs_geo_urgent = true
+                    cmp._hs_geo_idle_until = 0.0
+                end
+                return orig_BuildGridPoint(cmp, ...)
+            end
+        end
+
+        if type(Placer.RemoveBuildGrid) == "function" then
+            local orig_RemoveBuildGrid = Placer.RemoveBuildGrid
+            Placer.RemoveBuildGrid = function(cmp, ...)
+                if cmp ~= nil then
+                    cmp._hs_geo_urgent = false
+                    cmp._hs_geo_idle_until = 0.0
+                end
+                return orig_RemoveBuildGrid(cmp, ...)
+            end
+        end
+
+        if type(Placer.OnUpdate) == "function" then
+            local orig_PlacerOnUpdate = Placer.OnUpdate
+            Placer.OnUpdate = function(cmp, dt, ...)
+                if cmp == nil then
+                    return orig_PlacerOnUpdate(cmp, dt, ...)
+                end
+                local now = GeoNow()
+                local q = cmp.refresh_queue
+                if cmp.build_grid ~= nil and type(q) == "table" and #q == 0
+                    and now < (cmp._hs_geo_idle_until or 0.0) and not cmp._hs_geo_urgent then
+                    q[1] = GEO_IDLE_SENTINEL
+                end
+                local ok, r1, r2 = pcall(orig_PlacerOnUpdate, cmp, dt, ...)
+                StripSentinels(cmp.refresh_queue)
+                if not ok then
+                    GLOBAL.error(r1)
+                end
+                return r1, r2
+            end
+        end
+
+        Placer.RefreshBuildGrid = function(cmp, time_remaining)
+            local q = cmp and cmp.refresh_queue or nil
+            if type(q) ~= "table" then
+                if cmp ~= nil then cmp._hs_geo_urgent = false end
+                return
+            end
+            if #q == 1 and q[1] == GEO_IDLE_SENTINEL then
+                q[1] = nil
+                cmp._hs_geo_urgent = false
+                return
+            end
+            if StripSentinels(q) then
+                cmp._hs_geo_urgent = true
+                cmp._hs_geo_idle_until = 0.0
+            end
+            if #q == 0 then
+                cmp._hs_geo_urgent = false
+                cmp._hs_geo_idle_until = GeoNow() + 0.12
+                return
+            end
+
+            local budget = nil
+            local tfps = current_target_fps
+            if tfps == 0 or tfps > 60 then
+                local frame_sec = (tfps > 0) and (1.0 / tfps) or (1.0 / 240.0)
+                local cap = cmp._hs_geo_urgent
+                    and math.max(0.0006, frame_sec * 0.22)
+                    or  math.max(0.00035, frame_sec * 0.10)
+                if type(time_remaining) == "number" then
+                    if time_remaining <= 0 then
+                        return
+                    end
+                    budget = math.min(time_remaining, cap)
+                else
+                    budget = cmp._hs_geo_urgent
+                        and math.max(0.0012, frame_sec * 0.30)
+                        or  math.max(0.0005, frame_sec * 0.14)
+                end
+            else
+                if type(time_remaining) == "number" then
+                    if time_remaining <= 0 then
+                        return
+                    end
+                    budget = math.max(0.0004, time_remaining - 0.0005)
+                end
+            end
+
+            local t0 = (budget ~= nil) and GeoNow() or 0.0
+            local done = 0
+            while #q > 0 do
+                local idx = #q
+                local item = q[idx]
+                q[idx] = nil
+                if type(item) == "table" and item[1] ~= false then
+                    cmp:RefreshGridPoint(item[1], item[2])
+                    done = done + 1
+                    if budget ~= nil and done % 4 == 0 and #q > 0 then
+                        if (GeoNow() - t0) >= budget then
+                            return
+                        end
+                    end
+                end
+            end
+            cmp._hs_geo_urgent = false
+            cmp._hs_geo_idle_until = GeoNow() + 0.12
+        end
+    end)
+
     local _dbg_tbl = rawget(GLOBAL, "debug")
     local _dbg_getinfo = (type(_dbg_tbl) == "table" and type(_dbg_tbl.getinfo) == "function") and _dbg_tbl.getinfo or nil
     local function IsVanillaComponentFn(fn, file_pat)
@@ -4145,7 +6154,7 @@ end
 --       or UI screens; skips ~75% redundant 240Hz C++ GetEntitiesAtScreenPoint scans).
 --    (v2.2.1+: removed HoverText SetString wrapper for 100% ShowMe / Insight RPC compatibility.)
 --------------------------------------------------------------------------------
-if REDUCE_240HZ_CHURN then
+if HS_CFG.REDUCE_240HZ_CHURN then
     local _dbg_getinfo_df = (type(GLOBAL.debug) == "table" and type(GLOBAL.debug.getinfo) == "function") and GLOBAL.debug.getinfo or nil
     AddComponentPostInit("distancefade", function(self)
         if self.OnWallUpdate ~= nil and _dbg_getinfo_df ~= nil then
@@ -4492,17 +6501,21 @@ if REDUCE_240HZ_CHURN then
                 local cm = self.craftingmenu
                 if cm ~= nil and cm._hs_deferred_refresh then
                     local need_rebuild = cm._hs_deferred_rebuild
-                    cm._hs_deferred_refresh = false
-                    cm._hs_deferred_rebuild = false
-                    if cm.sort_class == nil or cm.sort_class.Refresh == nil or not cm.sort_class:Refresh() then
-                        if need_rebuild and type(cm.ApplyFilters) == "function" then
-                            cm:ApplyFilters()
-                        elseif cm.recipe_grid ~= nil and type(cm.recipe_grid.RefreshView) == "function" then
-                            cm.recipe_grid:RefreshView()
+                    local ok_ref = pcall(function()
+                        if cm.sort_class == nil or cm.sort_class.Refresh == nil or not cm.sort_class:Refresh() then
+                            if need_rebuild and type(cm.ApplyFilters) == "function" then
+                                cm:ApplyFilters()
+                            elseif cm.recipe_grid ~= nil and type(cm.recipe_grid.RefreshView) == "function" then
+                                cm.recipe_grid:RefreshView()
+                            end
                         end
-                    end
-                    if cm.details_root ~= nil and type(cm.details_root.Refresh) == "function" then
-                        cm.details_root:Refresh()
+                        if cm.details_root ~= nil and type(cm.details_root.Refresh) == "function" then
+                            cm.details_root:Refresh()
+                        end
+                    end)
+                    if ok_ref then
+                        cm._hs_deferred_refresh = false
+                        cm._hs_deferred_rebuild = false
                     end
                 end
                 return orig_Open(self, search, ...)
@@ -4957,7 +6970,7 @@ local toast_msg = nil
 local active_sim_tick_hz = 30
 
 local function TryActivate60HzSim(source_label)
-    if not AUTO_60HZ_SIM or active_sim_tick_hz == 60 then
+    if not HS_CFG.AUTO_60HZ_SIM or active_sim_tick_hz == 60 then
         return
     end
     local fnSetSim = rawget(GLOBAL, "HyperSmooth_SetSimTickRate")
@@ -5040,7 +7053,7 @@ end
 -- Channel 2: Replicated "hypercore_sim60" tag on world_network prefabs (zero RPC dependency!)
 for _, net_prefab in ipairs({ "forest_network", "cave_network", "lavaarena_network", "quagmire_network" }) do
     AddPrefabPostInit(net_prefab, function(inst)
-        if not AUTO_60HZ_SIM then return end
+        if not HS_CFG.AUTO_60HZ_SIM then return end
         if inst and inst.HasTag and inst:HasTag("hypercore_sim60") then
             TryActivate60HzSim("WorldNetTag")
         elseif inst and inst.DoTaskInTime then
@@ -5054,7 +7067,7 @@ for _, net_prefab in ipairs({ "forest_network", "cave_network", "lavaarena_netwo
 end
 
 AddSimPostInit(function()
-    if not AUTO_60HZ_SIM then return end
+    if not HS_CFG.AUTO_60HZ_SIM then return end
     local w = GLOBAL.TheWorld
     if w ~= nil then
         if (w.HasTag and w:HasTag("hypercore_sim60")) or (w.net and w.net.HasTag and w.net:HasTag("hypercore_sim60")) then
@@ -5869,6 +7882,9 @@ AddClassPostConstruct("screens/playerhud", function(self)
                 end
             end
         end
+        if HS_SHARE.Look and HS_SHARE.Look.pending then
+            HS_SHARE.Look.TickPoll()
+        end
         if visual_bench_timer > 0 then
             visual_bench_timer = visual_bench_timer - (dt or 0)
         end
@@ -5925,7 +7941,7 @@ AddClassPostConstruct("screens/playerhud", function(self)
 
             local metric_str
             if is_detail then
-                if SHOW_1PCT_LOW and has_native_stats then
+                if HS_CFG.SHOW_1PCT_LOW and has_native_stats then
                     metric_str = ui_zh
                         and string.format("帧率 %.0f · 最低帧 %.0f · 帧时 %.1fms%s%s", avg_val, low1_val, p99_val, sim_badge, gl_badge)
                         or string.format("FPS %.0f · 1%%L %.0f · Frame %.1fms%s%s", avg_val, low1_val, p99_val, sim_badge, gl_badge)
@@ -6088,9 +8104,32 @@ HS_PanelApi = {
     SetPreset = function(preset_id)
         if type(preset_id) ~= "number" or preset_id < 0 or preset_id > 3 then return end
         current_visual_preset = preset_id
+        if preset_id == 0 then
+            HS_CFG.active_builtin_id = "vanilla"
+            HS_SHARE.current_scheme_name = ""
+        elseif preset_id == 1 then
+            HS_CFG.active_builtin_id = "eyecare_hd"
+            HS_SHARE.current_scheme_name = ""
+        elseif preset_id == 2 then
+            HS_CFG.active_builtin_id = "storybook"
+            HS_SHARE.current_scheme_name = ""
+        end
         visual_bench_timer = 12.0
         SyncToNativePlugin(true)
         hud_dirty_now = true
+    end,
+    GetBuiltinPresets = function()
+        return HS_SHARE.BUILTIN_GALLERY or {}
+    end,
+    ApplyBuiltinPreset = function(id_or_idx)
+        local ok, err, entry = HS_SHARE.ApplyBuiltinPreset(id_or_idx)
+        if ok and entry then
+            local ui_zh = ResolveUiIsZh()
+            toast_msg = ui_zh and ("画质预设 -> " .. entry.zh) or ("Visual Preset -> " .. entry.en)
+            toast_timer = 2.8
+            hud_dirty_now = true
+        end
+        return ok, err, entry
     end,
     ToggleVisualFlag = function(field)
         if type(field) ~= "string" or custom_vis_flags[field] == nil then return end
@@ -6098,6 +8137,7 @@ HS_PanelApi = {
         custom_vis_flags[field] = not custom_vis_flags[field]
         EnsureFlagTuneOnToggle(field, custom_vis_flags[field])
         current_visual_preset = HasAnyCustomActive() and 3 or 0
+        HS_CFG.active_builtin_id = nil
         visual_bench_timer = 12.0
         SyncToNativePlugin(true)
         hud_dirty_now = true
@@ -6115,6 +8155,11 @@ HS_PanelApi = {
         local b = TUNE_BOUNDS[field]
         if not (b and b.is_bool) then return end
         local cur_on = (GetActiveVisTune()[field] or 0) > 0.5
+        if field == "vol_lightrays_everywhere" and (not cur_on) then
+            if ClampTuneValue("vol_lightrays", GetActiveVisTune().vol_lightrays) <= 0.001 then
+                ApplyTuneValue("vol_lightrays", 0.85)
+            end
+        end
         ApplyTuneValue(field, cur_on and 0 or 1)
     end,
     ResetTuneField = function(field)
@@ -6142,6 +8187,7 @@ HS_PanelApi = {
             custom_vis_flags.clean_filter = HasAnyCleanFilterTune(vis_tune)
         end
         current_visual_preset = HasAnyCustomActive() and 3 or 0
+        HS_CFG.active_builtin_id = nil
         visual_bench_timer = 12.0
         SyncToNativePlugin(true)
         hud_dirty_now = true
@@ -6215,6 +8261,7 @@ HS_PanelApi = {
             custom_vis_flags.tone = false
         end
         current_visual_preset = HasAnyCustomActive() and 3 or 0
+        HS_CFG.active_builtin_id = nil
         visual_bench_timer = 12.0
         SyncToNativePlugin(true)
         hud_dirty_now = true
@@ -6222,7 +8269,7 @@ HS_PanelApi = {
     SaveCustomSlot = function(slot_idx)
         local ok = SaveUserCustomSlot(slot_idx)
         if ok then
-            ExportJsonPresetLibrary()
+            HS_SHARE.ExportJsonPresetLibrary()
             local ui_zh = ResolveUiIsZh()
             toast_msg = ui_zh and ("已保存方案至自存槽 " .. tostring(slot_idx)) or ("Saved Look to Slot " .. tostring(slot_idx))
             toast_timer = 2.5
@@ -6242,19 +8289,19 @@ HS_PanelApi = {
         return ok
     end,
     PreviewShareCode = function(scheme_name)
-        return EncodeCurrentShareCode(scheme_name)
+        return HS_SHARE.EncodeCurrentShareCode(scheme_name)
     end,
     ExportShareCode = function(scheme_name)
-        local code, diffs, cname, base_id = EncodeCurrentShareCode(scheme_name)
-        if #cname > 0 then current_scheme_name = cname end
-        local copied = TryWriteClipboard(code)
+        local code, diffs, cname, base_id = HS_SHARE.EncodeCurrentShareCode(scheme_name)
+        if #cname > 0 then HS_SHARE.current_scheme_name = cname end
+        local copied = HS_SHARE.TryWriteClipboard(code)
         return code, copied, diffs, cname, base_id
     end,
     ValidateShareCode = function(raw_str)
-        return ValidateSharePayload(raw_str)
+        return HS_SHARE.ValidateSharePayload(raw_str)
     end,
     ImportShareCode = function(raw_str)
-        local ok, err, staged = ImportSharePayloadTransactional(raw_str)
+        local ok, err, staged = HS_SHARE.ImportSharePayloadTransactional(raw_str)
         if ok then
             local ui_zh = ResolveUiIsZh()
             local lbl = (staged and #staged.name > 0) and ("：" .. staged.name) or ""
@@ -6264,7 +8311,7 @@ HS_PanelApi = {
         return ok, err, staged
     end,
     UndoLastImport = function()
-        local ok = UndoLastShareImport()
+        local ok = HS_SHARE.UndoLastShareImport()
         if ok then
             local ui_zh = ResolveUiIsZh()
             toast_msg = ui_zh and "已撤销导入，恢复原配置" or "Reverted to previous config"
@@ -6273,7 +8320,7 @@ HS_PanelApi = {
         return ok
     end,
     ExportJsonLibrary = function()
-        local payload, cnt = ExportJsonPresetLibrary()
+        local payload, cnt = HS_SHARE.ExportJsonPresetLibrary()
         local ui_zh = ResolveUiIsZh()
         toast_msg = ui_zh and ("已导出 JSON 方案库 (" .. tostring(cnt) .. "套)") or ("Exported JSON library (" .. tostring(cnt) .. ")")
         toast_timer = 2.5
@@ -6281,10 +8328,21 @@ HS_PanelApi = {
         return payload, cnt
     end,
     ReloadJsonLibrary = function(cb)
-        return ReloadJsonPresetLibrary(cb)
+        return HS_SHARE.ReloadJsonPresetLibrary(cb)
     end,
-    ReadClipboard = TryReadClipboard,
-    SetClipboard = TryWriteClipboard,
+    ReadClipboard = HS_SHARE.TryReadClipboard,
+    SetClipboard = HS_SHARE.TryWriteClipboard,
+    StartLookMatch = function(mode_str, on_complete)
+        return HS_SHARE.Look.Start(mode_str, { copy_code = false, on_complete = on_complete })
+    end,
+    GetLookCapabilities = function()
+        local fnCaps = rawget(GLOBAL, "HyperSmooth_GetLookCapabilities")
+        if type(fnCaps) == "function" then
+            local ok, caps = pcall(fnCaps)
+            if ok and type(caps) == "table" then return caps end
+        end
+        return {}
+    end,
     GetExtSnapshot = function()
         if type(HS_ExtRuntime) == "table" and type(HS_ExtRuntime.GetSnapshot) == "function" then
             return HS_ExtRuntime.GetSnapshot()
@@ -6323,8 +8381,15 @@ HS_PanelApi = {
         custom_vis_flags.tone = HasAnyGradingTune(vis_tune)
         custom_vis_flags.clean_filter = HasAnyCleanFilterTune(vis_tune)
         current_visual_preset = HasAnyCustomActive() and 3 or 0
+        HS_CFG.active_builtin_id = nil
         SyncToNativePlugin(true)
         hud_dirty_now = true
+    end,
+    PreviewHitFeel = function()
+        if HS_HITFEEL ~= nil then
+            return HS_HITFEEL.PreviewImpact()
+        end
+        return false
     end,
     ToggleSkeletal = function()
         local ui_zh = ResolveUiIsZh()
@@ -6344,6 +8409,16 @@ HS_PanelApi = {
             and ("低延迟模式 -> " .. (current_low_latency and "开" or "关"))
             or ("Low Latency -> " .. (current_low_latency and "ON" or "OFF"))
         toast_timer = 2.5
+        hud_dirty_now = true
+    end,
+    ToggleClipCursor = function()
+        local ui_zh = ResolveUiIsZh()
+        HS_CFG.clip_cursor = not (HS_CFG.clip_cursor == true)
+        SyncToNativePlugin(true)
+        toast_msg = ui_zh
+            and ("双屏防甩出鼠标锁 -> " .. (HS_CFG.clip_cursor and "开 (ESC/切屏自动解锁)" or "关"))
+            or ("Dual-Monitor Cursor Lock -> " .. (HS_CFG.clip_cursor and "ON (Auto-unlocks on Pause/Alt+Tab)" or "OFF"))
+        toast_timer = 2.8
         hud_dirty_now = true
     end,
     CycleHudMode = CycleHudStateWithToast,
@@ -6436,6 +8511,9 @@ HS_PanelApi = {
             preset            = current_visual_preset,
             flags             = GetActiveVisualFlags(),
             tune              = GetActiveVisTune(),
+            bounds            = TUNE_BOUNDS,
+            bundles           = (type(HS_PanelApi.GetBundles) == "function") and HS_PanelApi.GetBundles() or {},
+            ui_mode           = (type(HS_UI) == "table" and HS_UI.mode) or "simple",
             bcas_coexist      = IsExternalBcasActive(),
             has_world_studio  = HasNativeWorldStudio(),
             slot_saved        = {
@@ -6443,12 +8521,14 @@ HS_PanelApi = {
                 [2] = custom_slots[2] ~= nil,
                 [3] = custom_slots[3] ~= nil,
             },
-            scheme_name       = current_scheme_name,
-            has_undo          = last_import_undo ~= nil,
+            scheme_name       = HS_SHARE.current_scheme_name,
+            active_builtin_id = HS_SHARE.GetActiveBuiltinId(),
+            has_undo          = HS_SHARE.last_import_undo ~= nil,
             has_clip_write    = type(rawget(GLOBAL, "HyperSmooth_SetClipboard")) == "function",
-            json_lib_count    = #json_named_library,
+            json_lib_count    = #HS_SHARE.json_named_library,
             skeletal          = current_skeletal_tween,
             low_latency       = current_low_latency,
+            clip_cursor       = HS_CFG.clip_cursor == true,
             hud_show          = current_show_fps_hud,
             hud_mode          = current_hud_mode,
             mod_lang          = current_mod_lang,
@@ -6486,6 +8566,87 @@ HS_PanelApi = {
         }
     end,
 }
+
+-- v2.9.5 Panel redesign: plain-language "bundle" switches for Simple mode + persisted UI mode
+HS_UI = { mode = "simple" }
+if TheSim and type(TheSim.GetPersistentString) == "function" then
+    TheSim:GetPersistentString("hypersmooth_ui.cfg", function(ok_u, str_u)
+        if ok_u and (str_u == "pro" or str_u == "simple") then
+            HS_UI.mode = str_u
+        end
+    end)
+end
+
+function HS_PanelApi.GetUiMode()
+    return HS_UI.mode
+end
+
+function HS_PanelApi.SetUiMode(m)
+    if m ~= "pro" and m ~= "simple" then return false end
+    HS_UI.mode = m
+    if TheSim and type(TheSim.SetPersistentString) == "function" then
+        TheSim:SetPersistentString("hypersmooth_ui.cfg", m, false)
+    end
+    return true
+end
+
+function HS_PanelApi.GetBundles()
+    local fl = GetActiveVisualFlags()
+    local tn = GetActiveVisTune()
+    return {
+        smooth  = current_skeletal_tween == true,
+        lowlat  = current_low_latency == true,
+        clarity = fl.cas == true,
+        glow    = fl.soft_bloom == true,
+        world3d = ClampTuneValue("shadow_density", tn.shadow_density) > 0.001
+            or ClampTuneValue("surface_light", tn.surface_light) > 0.001
+            or ClampTuneValue("water_refl_str", tn.water_refl_str) > 0.001,
+        hitfeel = current_visual_preset ~= 0 and ClampTuneValue("hitfeel_enabled", tn.hitfeel_enabled) > 0.5,
+    }
+end
+
+function HS_PanelApi.ToggleBundle(id)
+    local b = HS_PanelApi.GetBundles()
+    if id == "smooth" then
+        HS_PanelApi.ToggleSkeletal()
+    elseif id == "lowlat" then
+        HS_PanelApi.ToggleLowLatency()
+    elseif id == "clarity" or id == "glow" then
+        local keys = (id == "clarity") and { "cas", "af16", "mip_sharp" } or { "soft_bloom", "ao" }
+        local target = not b[id]
+        local fl = GetActiveVisualFlags()
+        for i = 1, #keys do
+            if (fl[keys[i]] == true) ~= target then
+                HS_PanelApi.ToggleVisualFlag(keys[i])
+                fl = GetActiveVisualFlags()
+            end
+        end
+    elseif id == "world3d" then
+        local on = not b.world3d
+        ApplyTuneValue("surface_light", on and 0.75 or 0.0)
+        ApplyTuneValue("shadow_density", on and 0.45 or 0.0)
+        ApplyTuneValue("water_refl_str", on and 0.48 or 0.0)
+        ApplyTuneValue("wind_sway_enabled", on and 1 or 0)
+        ApplyTuneValue("vfx_fire_embers", on and 0.85 or 0.0)
+        ApplyTuneValue("vfx_ambient_motes", on and 0.75 or 0.0)
+        ApplyTuneValue("vol_lightrays", on and 0.85 or 0.0)
+        ApplyTuneValue("vol_cloud_shade", on and 0.85 or 0.0)
+        ApplyTuneValue("vol_canopy_shade", on and 0.75 or 0.0)
+        ApplyTuneValue("ocean_pbr", on and 0.80 or 0.0)
+        ApplyTuneValue("ocean_sky_refl", on and 0.70 or 0.0)
+        ApplyTuneValue("ocean_sun_glow", on and 0.75 or 0.0)
+        ApplyTuneValue("vol_edge_fog", on and 0.85 or 0.0)
+        ApplyTuneValue("vol_ground_fog", on and 0.70 or 0.0)
+        if on then ApplyTuneValue("shadow_point_lights", 1) end
+    elseif id == "hitfeel" then
+        local on = not b.hitfeel
+        HS_PanelApi.ToggleTuneBool("hitfeel_enabled")
+        ApplyTuneValue("vfx_footsteps", on and 0.80 or 0.0)
+    else
+        return false
+    end
+    return true
+end
 
 rawset(GLOBAL, "c_hshud", function(arg1, arg2)
     for _, a in ipairs({ arg1, arg2 }) do
@@ -6750,7 +8911,7 @@ local function InstallOptionsScreenLazyControls()
             scr._hs_force_ctrl = true
             local ok_r, r1, r2 = pcall(orig_rebuild_ctrl, scr, ...)
             scr._hs_force_ctrl = false
-            if not ok_r then error(r1, 0) end
+            if not ok_r then GLOBAL.error(r1, 0) end
             return r1, r2
         end
     end

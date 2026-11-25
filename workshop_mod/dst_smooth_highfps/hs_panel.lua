@@ -17,6 +17,7 @@ local pairs = G.pairs
 local ipairs = G.ipairs
 local string = G.string
 local math = G.math
+local table = G.table
 
 local ok_req, Widget, Image, ImageButton, Text = pcall(function()
     return G.require("widgets/widget"),
@@ -36,6 +37,7 @@ local panel_root = nil
 local panel_visible = false
 local panel_refresh_fn = nil
 local panel_telemetry_fn = nil
+local panel_ui_mode = "simple"
 
 local function IsChineseLocale()
     if type(HS_IsUiZh) == "function" then
@@ -81,453 +83,952 @@ local function CreateLiveCustomizerPanel(hud)
     local panel = root:AddChild(Widget("HyperSmoothLivePanelBody"))
     panel:SetPosition(-244, -10, 0)
 
-    -- Subtle warm charcoal translucent backdrop + crisp border frame
-    local border = panel:AddChild(Image("images/global.xml", "square.tex"))
-    border:ScaleToSize(W + 4, H + 4)
-    border:SetTint(0.76, 0.62, 0.34, 0.64)
+    -- All shared widget registries live in tables to stay far below Lua 5.1's 200-local / 60-upvalue limits.
+    local UI = { zh_now = is_zh, info = nil, pro_chrome = {} }
+    local pages = {}
+    local ApplyMode = nil
 
-    local bg = panel:AddChild(Image("images/global.xml", "square.tex"))
-    bg:ScaleToSize(W, H)
-    bg:SetTint(0.07, 0.07, 0.09, 0.90)
+    -- ------------------------------------------------------------------------
+    -- Tiny widget factory helpers (only methods present on every DST widget build)
+    -- ------------------------------------------------------------------------
+    local function NewImage(parent, x, y, w, h, r, g, b, a)
+        local im = parent:AddChild(Image("images/global.xml", "square.tex"))
+        im:ScaleToSize(w, h)
+        im:SetPosition(x, y, 0)
+        im:SetTint(r, g, b, a)
+        return im
+    end
 
-    -- Header bar
-    local title = panel:AddChild(Text(FONT_BODY, 21, is_zh and "HyperSmooth v2.8.0 画质光影工坊" or "HyperSmooth v2.8.0 Visual Studio"))
-    title:SetPosition(-18, H * 0.5 - 22, 0)
-    title:SetColour(0.96, 0.85, 0.56, 1.0)
+    local function NewText(parent, size, str, x, y, w, h, align, r, g, b, a, font)
+        local t = parent:AddChild(Text(font or FONT_BODY, size, str or ""))
+        if w then t:SetRegionSize(w, h or (size + 6)) end
+        if align then t:SetHAlign(align) end
+        t:SetPosition(x, y, 0)
+        if r then t:SetColour(r, g, b, a or 1.0) end
+        t:SetClickable(false)
+        return t
+    end
 
-    local close_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    close_btn.scale_on_focus = false
-    close_btn.move_on_click = false
-    close_btn:ForceImageSize(32, 24)
-    close_btn:SetPosition(W * 0.5 - 24, H * 0.5 - 22, 0)
-    close_btn:SetText("X")
-    close_btn:SetTextSize(18)
-    close_btn:SetFont(FONT_NUM)
-    close_btn:SetTextColour(0.95, 0.55, 0.55, 1.0)
-    close_btn:SetTextFocusColour(1.0, 0.78, 0.78, 1.0)
-    close_btn:SetOnClick(function()
+    -- Chained focus handlers (a widget can have several listeners: hover glow + description bar ...)
+    local function OnFocus(w, gainfn, losefn)
+        if w == nil or type(w.SetOnGainFocus) ~= "function" then return end
+        local lst = rawget(w, "_hs_focus")
+        if lst == nil then
+            lst = { gain = {}, lose = {} }
+            G.rawset(w, "_hs_focus", lst)
+            w:SetOnGainFocus(function()
+                for i = 1, #lst.gain do lst.gain[i]() end
+            end)
+            if type(w.SetOnLoseFocus) == "function" then
+                w:SetOnLoseFocus(function()
+                    for i = 1, #lst.lose do lst.lose[i]() end
+                end)
+            end
+        end
+        if gainfn then lst.gain[#lst.gain + 1] = gainfn end
+        if losefn then lst.lose[#lst.lose + 1] = losefn end
+    end
+
+    -- Hover glow + press flash overlay (animated by the root OnUpdate; never touched by state refresh)
+    UI.fx_active = {}
+    local function FxKick(fx) UI.fx_active[fx] = true end
+    local function PressFX(btn)
+        local fx = rawget(btn, "_hs_fx")
+        if fx then
+            fx.press = 1.0
+            FxKick(fx)
+        end
+    end
+
+    local function NewButton(parent, x, y, w, h, str, size, onclick, font, nofx)
+        local fx = nil
+        if not nofx then
+            fx = { hover = 0.0, hover_t = 0.0, press = 0.0 }
+            fx.img = NewImage(parent, x, y, w, h, 1.0, 0.95, 0.80, 0.0)
+        end
+        local btn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        btn.scale_on_focus = false
+        btn.move_on_click = false
+        btn:ForceImageSize(w, h)
+        btn:SetPosition(x, y, 0)
+        if str ~= nil then
+            btn:SetText(str)
+            btn:SetTextSize(size or 14)
+            btn:SetFont(font or FONT_BODY)
+        end
+        if fx then
+            G.rawset(btn, "_hs_fx", fx)
+            OnFocus(btn,
+                function() fx.hover_t = 1.0; FxKick(fx) end,
+                function() fx.hover_t = 0.0; FxKick(fx) end)
+        end
+        if onclick then
+            btn:SetOnClick(function()
+                if fx then fx.press = 1.0; FxKick(fx) end
+                onclick()
+            end)
+        end
+        return btn
+    end
+
+    local function DoRefresh()
+        if panel_refresh_fn then panel_refresh_fn() end
+    end
+
+    -- Plain-language text wrapper (CJK = 1 unit, ASCII = 0.52 unit; breaks EN at spaces)
+    local function WrapText(s, max_units, max_lines)
+        if type(s) ~= "string" or s == "" then return "" end
+        local lines, cur, cur_u, last_sp = {}, {}, 0.0, nil
+        local function Flush()
+            lines[#lines + 1] = table.concat(cur)
+            cur, cur_u, last_sp = {}, 0.0, nil
+        end
+        for ch in string.gmatch(s, "[%z\1-\127\194-\244][\128-\191]*") do
+            local u = (#ch == 1) and 0.52 or 1.0
+            if ch == "\n" then
+                Flush()
+            else
+                if cur_u + u > max_units then
+                    if ch ~= " " and last_sp ~= nil then
+                        local carry = {}
+                        for j = last_sp + 1, #cur do carry[#carry + 1] = cur[j] end
+                        for j = #cur, last_sp, -1 do cur[j] = nil end
+                        Flush()
+                        cur = carry
+                        for j = 1, #cur do cur_u = cur_u + ((#cur[j] == 1) and 0.52 or 1.0) end
+                    else
+                        Flush()
+                    end
+                end
+                if not (ch == " " and #cur == 0) then
+                    cur[#cur + 1] = ch
+                    cur_u = cur_u + u
+                    if ch == " " then last_sp = #cur end
+                end
+            end
+        end
+        if #cur > 0 then Flush() end
+        if max_lines and #lines > max_lines then
+            lines[max_lines] = lines[max_lines] .. "..."
+            for j = #lines, max_lines + 1, -1 do lines[j] = nil end
+        end
+        return table.concat(lines, "\n")
+    end
+    UI.WrapText = WrapText
+
+    -- Sliding pill switch (replaces ugly [ON]/[OFF] text)
+    local function MakeSwitch(parent, x, y)
+        local sw = { x = x, y = y }
+        sw.track = NewImage(parent, x, y, 36, 16, 0.22, 0.24, 0.30, 0.95)
+        sw.knob = NewImage(parent, x - 9, y, 12, 12, 0.66, 0.69, 0.75, 1.0)
+        return sw
+    end
+    local function SetSwitch(sw, on)
+        if not sw then return end
+        if on then
+            sw.track:SetTint(0.14, 0.64, 0.56, 0.98)
+            sw.knob:SetTint(1.0, 1.0, 1.0, 1.0)
+            sw.knob:SetPosition(sw.x + 9, sw.y, 0)
+        else
+            sw.track:SetTint(0.22, 0.24, 0.30, 0.95)
+            sw.knob:SetTint(0.66, 0.69, 0.75, 1.0)
+            sw.knob:SetPosition(sw.x - 9, sw.y, 0)
+        end
+    end
+
+    -- ------------------------------------------------------------------------
+    -- Frame: deep-navy glass body, amber hairline, header band
+    -- ------------------------------------------------------------------------
+    NewImage(panel, 0, 0, W + 4, H + 4, 0.95, 0.74, 0.36, 0.50)
+    NewImage(panel, 0, 0, W, H, 0.046, 0.054, 0.074, 0.95)
+    NewImage(panel, 0, H * 0.5 - 24, W, 48, 0.078, 0.092, 0.130, 0.99)
+    NewImage(panel, 0, H * 0.5 - 48, W, 2, 0.95, 0.74, 0.36, 0.85)
+
+    UI.title = NewText(panel, 22, "HyperShade", -W * 0.5 + 112, H * 0.5 - 17, 210, 28, G.ANCHOR_LEFT, 0.98, 0.80, 0.42, 1.0)
+    UI.subtitle = NewText(panel, 12, "", -W * 0.5 + 102, H * 0.5 - 37, 200, 16, G.ANCHOR_LEFT, 0.62, 0.70, 0.80, 0.95)
+
+    -- Feedback QQ group (always visible in both modes); click = copy group number to clipboard
+    UI.QQ_GROUP = "978808336"
+    UI.qq_btn = NewButton(panel, W * 0.5 - 104, H * 0.5 - 37, 196, 18, "", 13, function()
+        local fnClip = rawget(G, "HyperSmooth_SetClipboard")
+        local copied = false
+        if type(fnClip) == "function" then
+            local okc, res = pcall(fnClip, UI.QQ_GROUP)
+            copied = okc and (res ~= false)
+        end
+        UI.qq_flash = copied and 1 or 2
+        local fnNow = rawget(G, "GetTimeRealSeconds")
+        UI.qq_flash_t = (type(fnNow) == "function") and fnNow() or 0
+        DoRefresh()
+    end)
+    UI.qq_btn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
+
+    local close_btn = NewButton(panel, W * 0.5 - 24, H * 0.5 - 22, 32, 24, "X", 18, function()
         if type(HS_TogglePanel) == "function" then
             HS_TogglePanel(false)
         end
-    end)
+    end, FONT_NUM)
+    close_btn:SetTextColour(0.95, 0.55, 0.55, 1.0)
+    close_btn:SetTextFocusColour(1.0, 0.78, 0.78, 1.0)
 
-    -- Native bin64/dinput8.dll Version & Update Alert Strip
-    local dll_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
-    dll_bg:ScaleToSize(W - 22, 22)
-    dll_bg:SetPosition(0, H * 0.5 - 49, 0)
-    dll_bg:SetTint(0.08, 0.18, 0.13, 0.86)
-
-    local dll_txt = panel:AddChild(Text(FONT_BODY, 14, ""))
-    dll_txt:SetRegionSize(W - 28, 20)
-    dll_txt:SetPosition(0, H * 0.5 - 49, 0)
-    dll_txt:SetColour(0.50, 1.0, 0.68, 0.96)
-    dll_txt:SetClickable(false)
-
-    -- Live Telemetry Strip
-    local tele_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
-    tele_bg:ScaleToSize(W - 22, 42)
-    tele_bg:SetPosition(0, H * 0.5 - 86, 0)
-    tele_bg:SetTint(0.03, 0.04, 0.06, 0.72)
-
-    local tele1 = panel:AddChild(Text(FONT_BODY, 15, ""))
-    tele1:SetRegionSize(W - 26, 20)
-    tele1:SetPosition(0, H * 0.5 - 77, 0)
-    tele1:SetColour(0.50, 1.0, 0.68, 0.96)
-
-    local tele2 = panel:AddChild(Text(FONT_BODY, 14, ""))
-    tele2:SetRegionSize(W - 26, 20)
-    tele2:SetPosition(0, H * 0.5 - 95, 0)
-    tele2:SetColour(0.78, 0.86, 0.96, 0.92)
-
-    -- 4 Quick Preset Pills (0=Vanilla, 1=EyeHD, 2=Cinema Studio, 3=Custom)
-    local preset_labels_zh = { [0] = "原版纯净", [1] = "护眼高清", [2] = "电影光影", [3] = "自定义" }
-    local preset_labels_en = { [0] = "Vanilla",  [1] = "EyeHD",    [2] = "Cinema",   [3] = "Custom" }
-    local preset_btns = {}
-    local pp_w, pp_gap = 90, 6
-    local pp_start = -1.5 * (pp_w + pp_gap)
-    local preset_y = H * 0.5 - 124
-    for pid = 0, 3 do
-        local px = pp_start + pid * (pp_w + pp_gap)
-        local pbg = panel:AddChild(Image("images/global.xml", "square.tex"))
-        pbg:ScaleToSize(pp_w, 24)
-        pbg:SetPosition(px, preset_y, 0)
-        pbg:SetTint(0.14, 0.14, 0.18, 0.90)
-
-        local pb = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        pb.scale_on_focus = false
-        pb.move_on_click = false
-        pb:ForceImageSize(pp_w, 24)
-        pb:SetPosition(px, preset_y, 0)
-        pb:SetText(is_zh and preset_labels_zh[pid] or preset_labels_en[pid])
-        pb:SetTextSize(15)
-        pb:SetFont(FONT_BODY)
-        pb:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
-        pb:SetOnClick(function()
-            api.SetPreset(pid)
-            if panel_refresh_fn then panel_refresh_fn() end
+    -- ------------------------------------------------------------------------
+    -- Mode switch: [Simple] [Pro] [Preset Gallery]
+    -- ------------------------------------------------------------------------
+    local mode_defs = {
+        { id = "simple", x = -126, zh = "简易模式", en = "Simple" },
+        { id = "pro",    x =    0, zh = "专业模式", en = "Pro" },
+    }
+    UI.mode_btns = {}
+    for i = 1, #mode_defs do
+        local md = mode_defs[i]
+        local mbg = NewImage(panel, md.x, H * 0.5 - 62, 120, 22, 0.12, 0.14, 0.19, 0.95)
+        local mbtn = NewButton(panel, md.x, H * 0.5 - 62, 120, 22, is_zh and md.zh or md.en, 14, function()
+            if panel_ui_mode ~= md.id then
+                panel_ui_mode = md.id
+                if type(api.SetUiMode) == "function" then pcall(api.SetUiMode, md.id) end
+                if ApplyMode then ApplyMode() end
+                DoRefresh()
+            end
         end)
-        preset_btns[#preset_btns + 1] = { id = pid, bg = pbg, btn = pb }
+        mbtn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
+        UI.mode_btns[i] = { id = md.id, zh = md.zh, en = md.en, bg = mbg, btn = mbtn }
+    end
+    UI.preset_card = { visible = false, cards = {} }
+    do
+        local pc = UI.preset_card
+        pc.top_bg = NewImage(panel, 126, H * 0.5 - 62, 120, 22, 0.16, 0.22, 0.28, 0.95)
+        pc.top_btn = NewButton(panel, 126, H * 0.5 - 62, 120, 22, is_zh and "预设面板" or "Presets", 14, function()
+            if UI.TogglePresetCard then UI.TogglePresetCard() end
+        end)
+        pc.top_btn:SetTextColour(0.76, 0.94, 1.0, 1.0)
+        pc.top_btn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
     end
 
-    -- 8-Tab Switcher: [1:总览] [2:锐化] [3:调色] [4:CDL] [5:辉光] [6:光影] [7:海滤] [8:扩展]
-    local active_tab = 1
-    local tab_y = H * 0.5 - 153
+    -- ------------------------------------------------------------------------
+    -- Status strip (2 short lines): live FPS / ping + native engine connection
+    -- ------------------------------------------------------------------------
+    UI.st_bg = NewImage(panel, 0, H * 0.5 - 91, W - 22, 32, 0.035, 0.045, 0.065, 0.80)
+    UI.st1 = NewText(panel, 14, "", 0, H * 0.5 - 83, W - 26, 18, nil, 0.52, 1.0, 0.70, 0.96)
+    UI.st2 = NewText(panel, 13, "", 0, H * 0.5 - 99, W - 26, 16, nil, 0.70, 0.82, 0.94, 0.92)
+
+    -- ------------------------------------------------------------------------
+    -- Pro-only chrome: compact preset pills + 7 category tabs
+    -- ------------------------------------------------------------------------
+    local preset_labels_zh = { [0] = "原版纯净", [1] = "护眼高清", [2] = "电影光影", [3] = "自定义" }
+    local preset_labels_en = { [0] = "Vanilla",  [1] = "EyeHD",    [2] = "Cinema",   [3] = "Custom" }
+    local preset_desc_zh = { [0] = "不改动画面", [1] = "清晰·不变色", [2] = "光影全开", [3] = "我的参数" }
+    local preset_desc_en = { [0] = "No changes", [1] = "Crisp, true color", [2] = "Full lighting", [3] = "My own tuning" }
+    local preset_btns = {}
+    local pp_w, pp_gap = 90, 6
+    local preset_y = 209
+    for pid = 0, 3 do
+        local px = -189 + pp_w * 0.5 + pid * (pp_w + pp_gap) + 3
+        local pbg = NewImage(panel, px, preset_y, pp_w, 22, 0.14, 0.14, 0.18, 0.90)
+        local pb = NewButton(panel, px, preset_y, pp_w, 22, is_zh and preset_labels_zh[pid] or preset_labels_en[pid], 15, function()
+            api.SetPreset(pid)
+            DoRefresh()
+        end)
+        pb:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
+        preset_btns[#preset_btns + 1] = { id = pid, bg = pbg, btn = pb }
+        UI.pro_chrome[#UI.pro_chrome + 1] = pbg
+        UI.pro_chrome[#UI.pro_chrome + 1] = pb
+    end
+
+    local active_tab = 2
     local tab_roots = {}
     for tid = 1, 8 do
         tab_roots[tid] = panel:AddChild(Widget("HS_Tab_" .. tid))
-        if tid > 1 then tab_roots[tid]:Hide() end
+        if tid ~= 1 then tab_roots[tid]:Hide() end
     end
-
     local tab_defs = {
-        { id = 1, zh = "总览", en = "Main" },
-        { id = 2, zh = "锐化", en = "Shrp" },
-        { id = 3, zh = "调色", en = "Tone" },
-        { id = 4, zh = "CDL",  en = "CDL"  },
-        { id = 5, zh = "辉光", en = "Glow" },
-        { id = 6, zh = "光影", en = "Lit"  },
-        { id = 7, zh = "海滤", en = "Sea"  },
-        { id = 8, zh = "扩展", en = "Ext"  },
+        { id = 2, zh = "清晰", en = "Clarity" },
+        { id = 3, zh = "色彩", en = "Color" },
+        { id = 4, zh = "光影", en = "Light" },
+        { id = 5, zh = "水景", en = "Water" },
+        { id = 6, zh = "动作", en = "Motion" },
+        { id = 7, zh = "系统", en = "System" },
+        { id = 8, zh = "扩展", en = "Ext" },
     }
     local tab_btns = {}
-    local tw_w, tw_gap = 45, 2.5
-    local tw_start = -3.5 * (tw_w + tw_gap)
+    local tw_w, tw_gap = 52, 2.5
     for i = 1, #tab_defs do
         local td = tab_defs[i]
-        local tx = tw_start + (i - 1) * (tw_w + tw_gap)
-        local tbg = panel:AddChild(Image("images/global.xml", "square.tex"))
-        tbg:ScaleToSize(tw_w, 24)
-        tbg:SetPosition(tx, tab_y, 0)
-        tbg:SetTint(0.14, 0.16, 0.22, 0.90)
-
-        local tbtn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        tbtn.scale_on_focus = false
-        tbtn.move_on_click = false
-        tbtn:ForceImageSize(tw_w, 24)
-        tbtn:SetPosition(tx, tab_y, 0)
-        tbtn:SetText(is_zh and td.zh or td.en)
-        tbtn:SetTextSize(13)
-        tbtn:SetFont(FONT_BODY)
-        tbtn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
-        tbtn:SetOnClick(function()
+        local tx = -189 + tw_w * 0.5 + (i - 1) * (tw_w + tw_gap)
+        local tbg = NewImage(panel, tx, 180, tw_w, 24, 0.14, 0.16, 0.22, 0.90)
+        local tbtn = NewButton(panel, tx, 180, tw_w, 24, is_zh and td.zh or td.en, 14, function()
             active_tab = td.id
-            for tid = 1, 8 do
-                if tid == active_tab then
-                    tab_roots[tid]:Show()
-                else
-                    tab_roots[tid]:Hide()
-                end
-            end
-            if panel_refresh_fn then panel_refresh_fn() end
+            if ApplyMode then ApplyMode() end
+            DoRefresh()
         end)
+        tbtn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
         tab_btns[i] = { id = td.id, zh = td.zh, en = td.en, bg = tbg, btn = tbtn }
+        UI.pro_chrome[#UI.pro_chrome + 1] = tbg
+        UI.pro_chrome[#UI.pro_chrome + 1] = tbtn
     end
 
-    -- Helper: section banner inside a tab
+    -- ------------------------------------------------------------------------
+    -- Description bar (Pro): plain-language explanation of the hovered/clicked option
+    -- ------------------------------------------------------------------------
+    local function ShowInfo(info)
+        UI.info = info
+        if not UI.desc_title then return end
+        local zh_now = UI.zh_now == true
+        local head = zh_now and info.zh or info.en
+        local body = zh_now and info.dzh or info.den
+        UI.desc_title:SetString(head or "")
+        UI.desc_body:SetString(WrapText(body or "", 29.0, 2))
+    end
+    local function BindInfo(w, info)
+        if w ~= nil and info ~= nil then
+            OnFocus(w, function() ShowInfo(info) end, nil)
+        end
+    end
+    UI.ShowInfo = ShowInfo
+
+    -- ------------------------------------------------------------------------
+    -- Section banner + stepper row + toggle row + group reset
+    -- ------------------------------------------------------------------------
     local section_banners = {}
     local function AddSectionBanner(parent, ry, zh_s, en_s, tint)
-        local sbg = parent:AddChild(Image("images/global.xml", "square.tex"))
-        sbg:ScaleToSize(W - 22, 20)
-        sbg:SetPosition(0, ry, 0)
-        sbg:SetTint(tint[1], tint[2], tint[3], tint[4])
-
-        local stxt = parent:AddChild(Text(FONT_BODY, 13, is_zh and zh_s or en_s))
-        stxt:SetRegionSize(W - 28, 18)
-        stxt:SetPosition(0, ry, 0)
-        stxt:SetColour(0.86, 0.94, 1.0, 0.96)
-        stxt:SetClickable(false)
+        local sbg = NewImage(parent, 0, ry, W - 22, 20, tint[1], tint[2], tint[3], tint[4])
+        local stxt = NewText(parent, 13, is_zh and zh_s or en_s, 0, ry, W - 28, 18, nil, 0.88, 0.94, 1.0, 0.96)
         section_banners[#section_banners + 1] = { txt = stxt, zh = zh_s, en = en_s }
         return sbg, stxt
     end
 
-    -- Helper: uniform numeric stepper row with clickable center single-reset readout!
-    local all_steppers = {}
-    local function AddStepperRow(parent, ry, row_h, def)
-        local rbg = parent:AddChild(Image("images/global.xml", "square.tex"))
-        rbg:ScaleToSize(W - 22, row_h)
-        rbg:SetPosition(0, ry, 0)
-        rbg:SetTint(0.11, 0.12, 0.16, 0.78)
+    -- ------------------------------------------------------------------------
+    -- Slider stepper: label | [-] ---o------ [+] | value
+    --   * drag the knob / click the rail to set a value (mouse position calibrated through widget world positions)
+    --   * [-]/[+] press once = 1 step, hold = auto-repeat (accelerating)
+    --   * amber tick on the rail marks the default value; knob magnets to it
+    --   * click the value to reset to default
+    -- ------------------------------------------------------------------------
+    local TRACK_X0, TRACK_W = 10, 96
+    local function NowSec()
+        local fn = rawget(G, "GetTimeRealSeconds")
+        if type(fn) == "function" then
+            local v = fn()
+            if type(v) == "number" then return v end
+        end
+        return 0
+    end
 
-        local rlbl = parent:AddChild(Text(FONT_BODY, 14, is_zh and def.zh or def.en))
-        rlbl:SetRegionSize(216, row_h - 2)
-        rlbl:SetHAlign(G.ANCHOR_LEFT)
-        rlbl:SetPosition(-73, ry, 0)
-        rlbl:SetColour(0.90, 0.93, 0.96, 1.0)
-        rlbl:SetClickable(false)
-
-        local bh = row_h - 4
-        local minus_bg = parent:AddChild(Image("images/global.xml", "square.tex"))
-        minus_bg:ScaleToSize(28, bh)
-        minus_bg:SetPosition(58, ry, 0)
-        minus_bg:SetTint(0.22, 0.22, 0.28, 0.92)
-
-        local minus_btn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        minus_btn.scale_on_focus = false
-        minus_btn.move_on_click = false
-        minus_btn:ForceImageSize(28, bh)
-        minus_btn:SetPosition(58, ry, 0)
-        minus_btn:SetText("-")
-        minus_btn:SetTextSize(16)
-        minus_btn:SetFont(FONT_NUM)
-        minus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
-        minus_btn:SetOnClick(function()
-            if type(api.StepTune) == "function" then
-                api.StepTune(def.key, -def.step)
-                if panel_refresh_fn then panel_refresh_fn() end
+    local function PaintKnob(sw)
+        if sw.active then
+            if sw.hot then
+                sw.knob_edge:SetTint(0.98, 0.78, 0.38, 1.0)
+            else
+                sw.knob_edge:SetTint(0.20, 0.72, 0.64, 1.0)
             end
-        end)
+            sw.knob:SetTint(0.95, 0.99, 1.0, 1.0)
+        else
+            sw.knob_edge:SetTint(0.32, 0.36, 0.42, 1.0)
+            sw.knob:SetTint(0.66, 0.70, 0.76, 1.0)
+        end
+    end
 
-        local val_btn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        val_btn.scale_on_focus = false
-        val_btn.move_on_click = false
-        val_btn:ForceImageSize(68, bh)
-        val_btn:SetPosition(108, ry, 0)
-        val_btn:SetText("")
-        val_btn:SetTextSize(13)
-        val_btn:SetFont(FONT_NUM)
-        val_btn:SetTextColour(0.45, 1.0, 0.72, 1.0)
-        val_btn:SetTextFocusColour(1.0, 0.96, 0.68, 1.0)
-        val_btn:SetOnClick(function()
+    local function MouseFrac(sw)
+        local TI = rawget(G, "TheInput")
+        if not (TI and type(TI.GetScreenPosition) == "function"
+                and type(sw.hit.GetWorldPosition) == "function"
+                and type(sw.ref.GetWorldPosition) == "function") then
+            return nil
+        end
+        local mp = TI:GetScreenPosition()
+        local c = sw.hit:GetWorldPosition()
+        local r = sw.ref:GetWorldPosition()
+        if not (mp and c and r and mp.x and c.x and r.x) then return nil end
+        local half = r.x - c.x
+        if half < 2 then return nil end
+        return (mp.x - c.x) / (2 * half) + 0.5
+    end
+
+    local function DragApply(sw, force)
+        local frac = MouseFrac(sw)
+        if frac == nil then return false end
+        if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
+        local b = UI.bounds and UI.bounds[sw.key] or nil
+        if not b then return false end
+        local span = b.max - b.min
+        if span <= 0 then return false end
+        local q = span / 200
+        local v = b.min + math.floor(frac * span / q + 0.5) * q
+        if math.abs(v - (b.default or v)) <= span * 0.02 then v = b.default end
+        local t = NowSec()
+        if force or ((t - (sw.drag_t or 0)) >= 0.05 and math.abs(v - (sw.drag_v or -1e9)) > q * 0.5) then
+            sw.drag_t = t
+            sw.drag_v = v
+            api.SetTune(sw.key, v)
+            DoRefresh()
+        end
+        return true
+    end
+
+    local function DragBegin(sw)
+        if UI.slider_bad then return end
+        if not UI.bounds then
+            local sn = api.GetSnapshot()
+            UI.bounds = sn and sn.bounds or nil
+        end
+        local f = MouseFrac(sw)
+        if f == nil then return end
+        if f < -0.25 or f > 1.25 then
+            UI.slider_bad = true
+            if G.print then G.print("[HyperSmooth] slider drag disabled: mouse/widget coordinate mismatch (use -/+ buttons)") end
+            return
+        end
+        UI.drag = sw
+        sw.drag_v = nil
+        sw.hot = true
+        PaintKnob(sw)
+        DragApply(sw, true)
+    end
+
+    local all_steppers = {}
+    UI.steppers = all_steppers
+    local function AddStepperRow(parent, ry, row_h, def)
+        local rbg = NewImage(parent, 0, ry, W - 22, row_h, 0.095, 0.108, 0.145, 0.90)
+        local mark = NewImage(parent, -W * 0.5 + 12.5, ry, 3, row_h, 0.95, 0.74, 0.36, 0.0)
+        local rlbl = NewText(parent, 14, is_zh and def.zh or def.en, -101, ry, 160, row_h - 2, G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
+        local info_btn = NewButton(parent, -101, ry, 160, row_h, nil, nil, function() ShowInfo(def) end)
+        local bh = row_h - 4
+        local tc = TRACK_X0 + TRACK_W * 0.5
+
+        -- [-] (press = step, hold = auto-repeat)
+        NewImage(parent, -8, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        local minus_btn = NewButton(parent, -8, ry, 22, bh, "-", 18, nil, FONT_NUM)
+        minus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
+
+        -- rail + fill + default tick + knob
+        NewImage(parent, tc, ry, TRACK_W + 8, 8, 0.12, 0.14, 0.19, 1.0)
+        NewImage(parent, tc, ry, TRACK_W, 4, 0.025, 0.032, 0.05, 1.0)
+        local fill = NewImage(parent, TRACK_X0 + 0.5, ry, 1, 4, 0.20, 0.72, 0.64, 0.95)
+        local tick = NewImage(parent, TRACK_X0, ry, 2, 12, 0.95, 0.74, 0.36, 0.0)
+        local knob_edge = NewImage(parent, TRACK_X0, ry, 10, 18, 0.20, 0.72, 0.64, 1.0)
+        local knob = NewImage(parent, TRACK_X0, ry, 6, 14, 0.95, 0.99, 1.0, 1.0)
+        local ref = NewImage(parent, tc + TRACK_W * 0.5, ry, 1, 1, 0.0, 0.0, 0.0, 0.0)
+        local hit = NewButton(parent, tc, ry, TRACK_W + 14, row_h, nil, nil, nil, nil, true)
+
+        -- [+]
+        NewImage(parent, 120, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        local plus_btn = NewButton(parent, 120, ry, 22, bh, "+", 18, nil, FONT_NUM)
+        plus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
+
+        -- value readout (click = reset to default)
+        local val_btn = NewButton(parent, 160, ry, 52, bh, "", 13, function()
             if type(api.ResetTuneField) == "function" then
                 api.ResetTuneField(def.key)
-                if panel_refresh_fn then panel_refresh_fn() end
+                DoRefresh()
             end
-        end)
-
-        local plus_bg = parent:AddChild(Image("images/global.xml", "square.tex"))
-        plus_bg:ScaleToSize(28, bh)
-        plus_bg:SetPosition(158, ry, 0)
-        plus_bg:SetTint(0.22, 0.22, 0.28, 0.92)
-
-        local plus_btn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        plus_btn.scale_on_focus = false
-        plus_btn.move_on_click = false
-        plus_btn:ForceImageSize(28, bh)
-        plus_btn:SetPosition(158, ry, 0)
-        plus_btn:SetText("+")
-        plus_btn:SetTextSize(16)
-        plus_btn:SetFont(FONT_NUM)
-        plus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
-        plus_btn:SetOnClick(function()
-            if type(api.StepTune) == "function" then
-                api.StepTune(def.key, def.step)
-                if panel_refresh_fn then panel_refresh_fn() end
-            end
-        end)
+            ShowInfo(def)
+        end, FONT_NUM)
+        val_btn:SetTextColour(0.45, 1.0, 0.72, 1.0)
+        val_btn:SetTextFocusColour(1.0, 0.96, 0.68, 1.0)
 
         local entry = {
-            key = def.key, flag = def.flag, native_ws = def.native_ws, fmt = def.fmt, scale = def.scale,
-            zh = def.zh, en = def.en, bg = rbg, lbl = rlbl, val_btn = val_btn,
+            key = def.key, flag = def.flag, native_ws = def.native_ws, skeletal_only = def.skeletal_only,
+            hitfeel_only = def.hitfeel_only, fmt = def.fmt, scale = def.scale, zh = def.zh, en = def.en,
+            bg = rbg, lbl = rlbl, val_btn = val_btn, fill = fill, mark = mark, tick = tick,
+            knob = knob, knob_edge = knob_edge, hit = hit, ref = ref, ry = ry, bh = bh,
+            minus = minus_btn, plus = plus_btn,
+            active = true, hot = false,
         }
+
+        local function StepOnce(sign)
+            if type(api.StepTune) == "function" then
+                api.StepTune(def.key, sign * def.step)
+                DoRefresh()
+            end
+            ShowInfo(def)
+        end
+        local function BindStep(btn, sign)
+            if type(btn.SetOnDown) == "function" then
+                btn:SetOnDown(function()
+                    PressFX(btn)
+                    StepOnce(sign)
+                    UI.hold = { fn = function() StepOnce(sign) end, t = 0.0, nxt = 0.40 }
+                end)
+            else
+                btn:SetOnClick(function()
+                    PressFX(btn)
+                    StepOnce(sign)
+                end)
+            end
+        end
+        BindStep(minus_btn, -1)
+        BindStep(plus_btn, 1)
+
+        if type(hit.SetOnDown) == "function" then
+            hit:SetOnDown(function() DragBegin(entry) end)
+        end
+        hit:SetOnClick(function()
+            if not UI.drag then
+                if not UI.bounds then
+                    local sn = api.GetSnapshot()
+                    UI.bounds = sn and sn.bounds or nil
+                end
+                if not UI.slider_bad then DragApply(entry, true) end
+            end
+            ShowInfo(def)
+        end)
+        OnFocus(hit,
+            function() entry.hot = true; PaintKnob(entry) end,
+            function() if UI.drag ~= entry then entry.hot = false; PaintKnob(entry) end end)
+
+        BindInfo(info_btn, def)
+        BindInfo(minus_btn, def)
+        BindInfo(hit, def)
+        BindInfo(plus_btn, def)
+        BindInfo(val_btn, def)
+
         all_steppers[#all_steppers + 1] = entry
         return entry
     end
 
-    -- Helper: group reset button at bottom of each tuning tab
+    -- Toggle row: label (+ optional short description) | sliding switch
+    local toggle_widgets = {}
+    local function DoToggle(def)
+        local s = def.src
+        if s == "tune" then
+            if type(api.ToggleTuneBool) == "function" then api.ToggleTuneBool(def.key) end
+        elseif s == "flag" then
+            api.ToggleVisualFlag(def.key)
+        elseif s == "skeletal" then
+            api.ToggleSkeletal()
+        elseif s == "lowlat" then
+            api.ToggleLowLatency()
+        elseif s == "clip" then
+            if type(api.ToggleClipCursor) == "function" then api.ToggleClipCursor() end
+        elseif s == "hud" then
+            if type(api.CycleHudMode) == "function" then api.CycleHudMode() end
+        elseif s == "bundle" then
+            if type(api.ToggleBundle) == "function" then api.ToggleBundle(def.key) end
+        end
+        DoRefresh()
+        ShowInfo(def)
+    end
+    local function AddToggleRow(parent, ry, row_h, def)
+        local big = (def.big == true)
+        local rbg = NewImage(parent, 0, ry, W - 22, row_h, 0.095, 0.108, 0.145, 0.90)
+        local rbtn = NewButton(parent, 0, ry, W - 22, row_h, nil, nil, function() DoToggle(def) end)
+        local rlbl = NewText(parent, big and 15 or 14, is_zh and def.zh or def.en, -35, ry + (big and 8 or 0), 292, big and 20 or (row_h - 2), G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
+        local dlbl = nil
+        if big then
+            dlbl = NewText(parent, 12, is_zh and def.hzh or def.hen, -35, ry - 9, 292, 16, G.ANCHOR_LEFT, 0.58, 0.66, 0.76, 0.95)
+        end
+        local entry = { def = def, bg = rbg, lbl = rlbl, dlbl = dlbl }
+        if def.src == "hud" then
+            entry.val = NewText(parent, 14, "", 143, ry, 74, 20, G.ANCHOR_RIGHT, 0.55, 0.58, 0.64, 0.88)
+        else
+            entry.sw = MakeSwitch(parent, 160, ry)
+        end
+        BindInfo(rbtn, def)
+        toggle_widgets[#toggle_widgets + 1] = entry
+        return entry
+    end
+
     local tab_reset_btns = {}
     local function AddGroupResetButton(parent, ry, zh_lbl, en_lbl, keys)
-        local rbg = parent:AddChild(Image("images/global.xml", "square.tex"))
-        rbg:ScaleToSize(W - 22, 24)
-        rbg:SetPosition(0, ry, 0)
-        rbg:SetTint(0.20, 0.16, 0.12, 0.90)
-
-        local rbtn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        rbtn.scale_on_focus = false
-        rbtn.move_on_click = false
-        rbtn:ForceImageSize(W - 22, 24)
-        rbtn:SetPosition(0, ry, 0)
-        rbtn:SetText(is_zh and zh_lbl or en_lbl)
-        rbtn:SetTextSize(14)
-        rbtn:SetFont(FONT_BODY)
-        rbtn:SetTextColour(0.96, 0.86, 0.62, 1.0)
-        rbtn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
-        rbtn:SetOnClick(function()
+        NewImage(parent, 0, ry, W - 22, 20, 0.20, 0.16, 0.12, 0.90)
+        local rbtn = NewButton(parent, 0, ry, W - 22, 20, is_zh and zh_lbl or en_lbl, 13, function()
             if type(api.ResetTuneGroup) == "function" then
                 api.ResetTuneGroup(keys)
-                if panel_refresh_fn then panel_refresh_fn() end
+                DoRefresh()
             end
         end)
+        rbtn:SetTextColour(0.96, 0.86, 0.62, 1.0)
+        rbtn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
         tab_reset_btns[#tab_reset_btns + 1] = { btn = rbtn, zh = zh_lbl, en = en_lbl }
     end
 
-    -- =========================================================================
-    -- TAB 1: Overview — 10 Visual Master Toggles + 3 Engine Switches + 3 Save Slots
-    -- =========================================================================
-    local tab1 = tab_roots[1]
-    local vis_rows = {
-        { key = "af16",         zh = "16× 各向异性过滤 (斜视角清晰)",       en = "16x Anisotropic Filtering" },
-        { key = "full_lm",      zh = "全分辨率 1.0× 光照图 (0ms热切)",     en = "1.0x Full-Res LightMap" },
-        { key = "mip_sharp",    zh = "原生纹理防虚化 (MipLodBias)",         en = "Native Mipmap Sharpness" },
-        { key = "cas",          zh = "BCAS 双边锐化与反卷积墨线修复",       en = "BCAS Bilateral Sharp & Ink" },
-        { key = "ao",           zh = "实体温和接地阴影与防爆白",           en = "Soft Entity Contact Shadow" },
-        { key = "env",          zh = "柔和近岸与雨天湿土微调",             en = "Soft Shoreline & Rain Wetness" },
-        { key = "soft_bloom",   zh = "护眼防过曝柔光泛光 (开泛光生效)",     en = "Eye-Care Soft Bloom (Bloom ON)" },
-        { key = "tone",         zh = "电影调色、CDL 与 ACES 高光保护",     en = "Cinematic Grading & CDL/ACES" },
-        { key = "dark_clarity", zh = "暗夜与洞穴护眼层次提亮",             en = "Dark/Cave Clarity + LUT Fix" },
-        { key = "clean_filter", zh = "滤镜净化快捷开关 (理智/雪/沙)",       en = "Clean Filters Master Toggle" },
-    }
-    local row_widgets = {}
-    for i = 1, #vis_rows do
-        local rv = vis_rows[i]
-        local ry = 148 - (i - 1) * 26
-
-        local rbg = tab1:AddChild(Image("images/global.xml", "square.tex"))
-        rbg:ScaleToSize(W - 22, 22)
-        rbg:SetPosition(0, ry, 0)
-        rbg:SetTint(0.11, 0.12, 0.15, 0.72)
-
-        local rbtn = tab1:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        rbtn.scale_on_focus = false
-        rbtn.move_on_click = false
-        rbtn:ForceImageSize(W - 22, 22)
-        rbtn:SetPosition(0, ry, 0)
-        rbtn:SetOnClick(function()
-            api.ToggleVisualFlag(rv.key)
-            if panel_refresh_fn then panel_refresh_fn() end
-        end)
-
-        local rlbl = tab1:AddChild(Text(FONT_BODY, 14, is_zh and rv.zh or rv.en))
-        rlbl:SetRegionSize(296, 20)
-        rlbl:SetHAlign(G.ANCHOR_LEFT)
-        rlbl:SetPosition(-33, ry, 0)
-        rlbl:SetClickable(false)
-
-        local rval = tab1:AddChild(Text(FONT_BODY, 13, ""))
-        rval:SetRegionSize(64, 20)
-        rval:SetHAlign(G.ANCHOR_RIGHT)
-        rval:SetPosition(148, ry, 0)
-        rval:SetClickable(false)
-
-        row_widgets[i] = { key = rv.key, zh = rv.zh, en = rv.en, bg = rbg, lbl = rlbl, val = rval }
-    end
-
-    local div = tab1:AddChild(Image("images/global.xml", "square.tex"))
-    div:ScaleToSize(W - 26, 2)
-    div:SetPosition(0, -104, 0)
-    div:SetTint(0.76, 0.62, 0.34, 0.38)
-
-    local eng_rows = {
-        { key = "skeletal", zh = "240Hz 全场景补帧 (骨骼+粒子+镜头)", en = "240Hz Smooth (Anim+VFX+Cam)" },
-        { key = "lowlat",   zh = "1帧硬件低延迟与急甩防漏",           en = "1-Frame Reflex + Flick Rescue" },
-        { key = "hudmode",  zh = "右上角 HUD 模式 (简洁/详细/隐藏)",   en = "Top-Right HUD (Compact/Detail/Off)" },
-    }
-    local eng_widgets = {}
-    for i = 1, #eng_rows do
-        local ev = eng_rows[i]
-        local ry = -121 - (i - 1) * 27
-
-        local rbg = tab1:AddChild(Image("images/global.xml", "square.tex"))
-        rbg:ScaleToSize(W - 22, 23)
-        rbg:SetPosition(0, ry, 0)
-        rbg:SetTint(0.10, 0.14, 0.17, 0.78)
-
-        local rbtn = tab1:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        rbtn.scale_on_focus = false
-        rbtn.move_on_click = false
-        rbtn:ForceImageSize(W - 22, 23)
-        rbtn:SetPosition(0, ry, 0)
-        rbtn:SetOnClick(function()
-            if ev.key == "skeletal" then
-                api.ToggleSkeletal()
-            elseif ev.key == "lowlat" then
-                api.ToggleLowLatency()
-            elseif type(api.CycleHudMode) == "function" then
-                api.CycleHudMode()
-            end
-            if panel_refresh_fn then panel_refresh_fn() end
-        end)
-
-        local rlbl = tab1:AddChild(Text(FONT_BODY, 14, is_zh and ev.zh or ev.en))
-        rlbl:SetRegionSize(284, 20)
-        rlbl:SetHAlign(G.ANCHOR_LEFT)
-        rlbl:SetPosition(-39, ry, 0)
-        rlbl:SetClickable(false)
-
-        local rval = tab1:AddChild(Text(FONT_BODY, 13, ""))
-        rval:SetRegionSize(74, 20)
-        rval:SetHAlign(G.ANCHOR_RIGHT)
-        rval:SetPosition(143, ry, 0)
-        rval:SetClickable(false)
-
-        eng_widgets[i] = { key = ev.key, zh = ev.zh, en = ev.en, lbl = rlbl, val = rval }
-    end
-
-    -- 3 Player Self-Save Custom Preset Slots (Save / Load 1..3)
-    AddSectionBanner(tab1, -205, "玩家自存方案槽 (可存 3 套私人配方 · 重启不丢)", "Player Custom Slots (Save / Load 3 Personal Looks)", { 0.18, 0.15, 0.10, 0.86 })
+    -- Slot row: "我的方案" + 3 x [Save][Load]
     local slot_widgets = {}
-    local sb_w, sb_gap = 58, 5
-    local sb_start = -2.5 * (sb_w + sb_gap)
-    for sidx = 1, 3 do
-        local idx_c = sidx
-        local sx_save = sb_start + (sidx - 1) * 2 * (sb_w + sb_gap)
-        local sx_load = sx_save + (sb_w + sb_gap)
-
-        local sbg = tab1:AddChild(Image("images/global.xml", "square.tex"))
-        sbg:ScaleToSize(sb_w, 25)
-        sbg:SetPosition(sx_save, -234, 0)
-        sbg:SetTint(0.24, 0.19, 0.12, 0.92)
-
-        local sbtn = tab1:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        sbtn.scale_on_focus = false
-        sbtn.move_on_click = false
-        sbtn:ForceImageSize(sb_w, 25)
-        sbtn:SetPosition(sx_save, -234, 0)
-        sbtn:SetText(is_zh and ("存槽" .. idx_c) or ("Sav" .. idx_c))
-        sbtn:SetTextSize(14)
-        sbtn:SetFont(FONT_BODY)
-        sbtn:SetTextColour(1.0, 0.88, 0.58, 1.0)
-        sbtn:SetOnClick(function()
-            if type(api.SaveCustomSlot) == "function" then
-                api.SaveCustomSlot(idx_c)
-                if panel_refresh_fn then panel_refresh_fn() end
-            end
-        end)
-
-        local lbg = tab1:AddChild(Image("images/global.xml", "square.tex"))
-        lbg:ScaleToSize(sb_w, 25)
-        lbg:SetPosition(sx_load, -234, 0)
-        lbg:SetTint(0.12, 0.22, 0.28, 0.92)
-
-        local lbtn = tab1:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        lbtn.scale_on_focus = false
-        lbtn.move_on_click = false
-        lbtn:ForceImageSize(sb_w, 25)
-        lbtn:SetPosition(sx_load, -234, 0)
-        lbtn:SetText(is_zh and ("读槽" .. idx_c) or ("Lod" .. idx_c))
-        lbtn:SetTextSize(14)
-        lbtn:SetFont(FONT_BODY)
-        lbtn:SetTextColour(0.68, 0.92, 1.0, 1.0)
-        lbtn:SetOnClick(function()
-            if type(api.LoadCustomSlot) == "function" then
-                api.LoadCustomSlot(idx_c)
-                if panel_refresh_fn then panel_refresh_fn() end
-            end
-        end)
-        slot_widgets[idx_c] = { idx = idx_c, sbtn = sbtn, lbg = lbg, lbtn = lbtn }
+    local function MakeSlotRow(parent, ry)
+        NewText(parent, 13, is_zh and "我的方案" or "My Looks", -153, ry, 68, 20, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.95)
+        UI.slot_lbl_cnt = (UI.slot_lbl_cnt or 0) + 1
+        local sb_w, sb_gap = 42, 3
+        for sidx = 1, 3 do
+            local idx_c = sidx
+            local gx = -110 + (sidx - 1) * (2 * sb_w + sb_gap + 12)
+            local sx_save = gx + sb_w * 0.5
+            local sx_load = sx_save + sb_w + sb_gap
+            NewImage(parent, sx_save, ry, sb_w, 24, 0.24, 0.19, 0.12, 0.92)
+            local sbtn = NewButton(parent, sx_save, ry, sb_w, 24, is_zh and ("存" .. idx_c) or ("S" .. idx_c), 14, function()
+                if type(api.SaveCustomSlot) == "function" then
+                    api.SaveCustomSlot(idx_c)
+                    DoRefresh()
+                end
+            end)
+            sbtn:SetTextColour(1.0, 0.88, 0.58, 1.0)
+            local lbg = NewImage(parent, sx_load, ry, sb_w, 24, 0.12, 0.22, 0.28, 0.92)
+            local lbtn = NewButton(parent, sx_load, ry, sb_w, 24, is_zh and ("读" .. idx_c) or ("L" .. idx_c), 14, function()
+                if type(api.LoadCustomSlot) == "function" then
+                    api.LoadCustomSlot(idx_c)
+                    DoRefresh()
+                end
+            end)
+            lbtn:SetTextColour(0.68, 0.92, 1.0, 1.0)
+            slot_widgets[#slot_widgets + 1] = { idx = idx_c, sbtn = sbtn, lbg = lbg, lbtn = lbtn }
+        end
     end
 
-    -- Share Code & JSON Library Card Toggle Button (in Tab 1 bottom area)
-    local share_card = nil
-    local share_open_bg = tab1:AddChild(Image("images/global.xml", "square.tex"))
-    share_open_bg:ScaleToSize(W - 22, 25)
-    share_open_bg:SetPosition(0, -267, 0)
-    share_open_bg:SetTint(0.24, 0.20, 0.11, 0.94)
+    -- ------------------------------------------------------------------------
+    -- Accordion pages (Pro): one section open at a time, rows created once and re-laid out
+    -- ------------------------------------------------------------------------
+    local ROWS = {}
+    local function S(key, step, fmt, scale, gate, zh, en, dzh, den)
+        local r = { kind = "step", key = key, step = step, fmt = fmt, scale = scale, zh = zh, en = en, dzh = dzh, den = den }
+        if gate == "native" then r.native_ws = true
+        elseif gate == "skel" then r.skeletal_only = true
+        elseif gate == "hit" then r.hitfeel_only = true
+        elseif gate then r.flag = gate end
+        ROWS[key] = r
+    end
+    local function T(key, zh, en, dzh, den)
+        ROWS[key] = { kind = "toggle", src = "tune", key = key, zh = zh, en = en, dzh = dzh, den = den }
+    end
+    local function F(key, zh, en, dzh, den)
+        ROWS["flag_" .. key] = { kind = "toggle", src = "flag", key = key, zh = zh, en = en, dzh = dzh, den = den }
+    end
+    local function E(id, src, zh, en, dzh, den)
+        ROWS["eng_" .. id] = { kind = "toggle", src = src, key = id, zh = zh, en = en, dzh = dzh, den = den }
+    end
 
-    local share_open_btn = tab1:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    share_open_btn.scale_on_focus = false
-    share_open_btn.move_on_click = false
-    share_open_btn:ForceImageSize(W - 22, 25)
-    share_open_btn:SetPosition(0, -267, 0)
-    share_open_btn:SetText(is_zh and "分享 / 导入画质方案码 (HS1 / JSON)" or "Share / Import Preset Code (HS1 / JSON)")
-    share_open_btn:SetTextSize(14)
-    share_open_btn:SetFont(FONT_BODY)
+    local function MakeSectionHeader(parent, sd, onclick)
+        local hroot = parent:AddChild(Widget("HS_SecHdr"))
+        local hdr = { root = hroot }
+        hdr.bg = NewImage(hroot, 0, 0, W - 22, 24, 0.13, 0.16, 0.22, 0.96)
+        hdr.accent = NewImage(hroot, -W * 0.5 + 12, 0, 4, 24, 0.95, 0.74, 0.36, 0.95)
+        hdr.lbl = NewText(hroot, 14, "", -22, 0, 300, 22, G.ANCHOR_LEFT, 0.96, 0.92, 0.80, 1.0)
+        hdr.badge = NewText(hroot, 12, "", 160, 0, 54, 20, G.ANCHOR_RIGHT, 0.60, 0.68, 0.78, 0.95)
+        hdr.btn = NewButton(hroot, 0, 0, W - 22, 24, nil, nil, onclick)
+        return hdr
+    end
+
+    local function LayoutPage(page)
+        local y = 164
+        for si = 1, #page.secs do
+            local sec = page.secs[si]
+            local open = (page.open == si)
+            sec.hdr.root:SetPosition(0, y - 12, 0)
+            y = y - 26
+            for ri = 1, #sec.rows do
+                local r = sec.rows[ri]
+                if open then
+                    r.root:SetPosition(0, y - (r.h + 2) * 0.5, 0)
+                    r.root:Show()
+                    y = y - (r.h + 2)
+                else
+                    r.root:Hide()
+                end
+            end
+            if open then y = y - 4 end
+        end
+    end
+
+    local function BuildRow(rc, rs)
+        if rs.custom then
+            rs.build(rc)
+            return rs.h or 24
+        end
+        local def = ROWS[rs.id]
+        if def == nil then
+            return 24
+        end
+        if def.kind == "step" then
+            AddStepperRow(rc, 0, 24, def)
+        else
+            AddToggleRow(rc, 0, 24, def)
+        end
+        return 24
+    end
+
+    local function BuildProPage(tid, secs, reset_zh, reset_en)
+        local root_t = tab_roots[tid]
+        local page = { secs = {}, open = 1 }
+        local reset_keys = {}
+        for si = 1, #secs do
+            local sd = secs[si]
+            local sec = { zh = sd.zh, en = sd.en, rows = {}, count = 0 }
+            for ri = 1, #sd.rows do
+                local rs0 = sd.rows[ri]
+                local def0 = (not rs0.custom) and ROWS[rs0.id] or nil
+                if def0 then
+                    sec.count = sec.count + 1
+                    if def0.kind == "step" or def0.src == "tune" then
+                        reset_keys[#reset_keys + 1] = def0.key
+                    end
+                end
+            end
+            sec.hdr = MakeSectionHeader(root_t, sd, function()
+                page.open = (page.open == si) and 0 or si
+                LayoutPage(page)
+                DoRefresh()
+            end)
+            for ri = 1, #sd.rows do
+                local rc = root_t:AddChild(Widget("HS_Row"))
+                local h = BuildRow(rc, sd.rows[ri])
+                rc:Hide()
+                sec.rows[#sec.rows + 1] = { root = rc, h = h }
+            end
+            page.secs[si] = sec
+        end
+        LayoutPage(page)
+        if reset_zh then
+            AddGroupResetButton(root_t, -261, reset_zh, reset_en, reset_keys)
+        end
+        pages[tid] = page
+    end
+    UI.BuildProPage = BuildProPage
+
+    -- ------------------------------------------------------------------------
+    -- Plain-language option catalogue (name + one-sentence explanation, ZH/EN)
+    -- Gate: flag name = needs that master flag; "native" = needs dinput8.dll world studio;
+    --       "skel" = needs 240Hz engine; "hit" = needs Hit-Feel master switch.
+    -- ------------------------------------------------------------------------
+    -- Clarity
+    F("cas", "边缘锐化（总开关）", "Edge Sharpening (master)", "让画面线条与边缘更清晰锐利，手绘风格效果最明显。", "Crisper outlines and edges; most visible on hand-drawn art.")
+    S("sharp", 0.15, "%.0f%%", 100, "cas", "锐化强度", "Sharpen Strength", "边缘越利越清晰，过高会出现白边。推荐 80%~100%。", "Higher = crisper edges; too high causes halos. Try 80-100%.")
+    S("ink", 0.15, "%.0f%%", 100, "cas", "墨线加深", "Ink Line Boost", "加深角色和物体的黑色描边，让线条更有力。", "Darkens the black outlines on characters and objects.")
+    F("af16", "斜视角贴图清晰", "Sharp Angled Textures", "地面和斜着看的贴图更清楚，几乎不耗性能（16× 各向异性）。", "Ground and angled textures stay clear. Nearly free (16x anisotropic).")
+    F("mip_sharp", "贴图防发糊", "Anti-Blur Textures", "缩小或远处的贴图保持清晰，不再糊成一团。", "Keeps distant or shrunk textures sharp instead of blurry.")
+    S("mip_bias", 0.05, "%+.2f", 1, "mip_sharp", "贴图清晰度偏移", "Texture Bias", "数值越负越清晰，太负可能闪烁。推荐 -0.45。", "More negative = sharper, but may shimmer. Recommended -0.45.")
+    F("full_lm", "高清光照图", "HD Light Map", "光照与黑暗的边缘更细腻，夜晚火光更精致（1.0× 分辨率）。", "Finer light/dark edges and nicer firelight at night (1.0x resolution).")
+    S("deconv_gate", 0.005, "%.3f", 1, "cas", "墨线识别门限", "Ink Edge Threshold", "多强的边缘才算墨线。调低会处理更多细线。", "How strong an edge must be to count as ink. Lower = more thin lines.")
+    S("deconv_penetr", 0.10, "%.0f%%", 100, "cas", "暗部墨线穿透", "Ink in Dark Areas", "让深色区域里的墨线也被加强。", "Also boosts ink lines that sit inside dark areas.")
+    S("anti_ring", 0.10, "%.0f%%", 100, "cas", "防白边光晕", "Anti-Halo", "抑制锐化产生的亮边/暗边，越高越干净。", "Suppresses bright/dark halos from sharpening. Higher = cleaner.")
+    S("dark_prot", 0.05, "%.0f%%", 100, "cas", "暗部保护", "Shadow Protection", "避免暗处被锐化压成死黑。", "Stops dark areas from being crushed to pure black.")
+    S("chroma_prot", 0.10, "%.0f%%", 100, "cas", "色边保护", "Color Edge Guard", "避免彩色边缘出现偏色杂边。", "Avoids color fringes along colored edges.")
+    S("noise_reduce", 0.10, "%.0f%%", 100, "cas", "平坦区去噪", "Flat-Area Denoise", "纯色区域不放大噪点，让画面更干净。", "Keeps flat areas clean instead of amplifying noise.")
+    S("range_sigma", 0.04, "%.2f", 1, "cas", "边缘判断宽容度", "Edge Tolerance", "高级参数：越大越多像素参与平滑，一般不用动。", "Advanced: larger = more pixels get smoothed. Usually leave as is.")
+    S("spatial_sigma", 0.15, "%.2f", 1, "cas", "平滑范围", "Smoothing Radius", "高级参数：平滑时参考的像素半径，一般不用动。", "Advanced: pixel radius used when smoothing. Usually leave as is.")
+    S("noise_floor", 0.004, "%.3f", 1, "cas", "噪声底线", "Noise Floor", "高级参数：低于此强度的细节视为噪点。", "Advanced: details weaker than this are treated as noise.")
+    S("ar_l_over", 0.005, "%.3f", 1, "cas", "亮边过冲上限", "Light Overshoot Cap", "高级参数：限制亮边最多亮出多少，防止白边。", "Advanced: caps how bright an edge can overshoot.")
+    S("ar_d_over", 0.005, "%.3f", 1, "cas", "暗边过冲上限", "Dark Overshoot Cap", "高级参数：限制暗边最多暗出多少，防止黑边。", "Advanced: caps how dark an edge can overshoot.")
+    S("dither", 0.25, "%.0f%%", 100, "cas", "防色带抖动", "Anti-Banding Dither", "渐变的天空、阴影不再出现一条条色带。", "Removes visible bands in gradients such as sky and shadows.")
+    S("sprite_detail", 0.10, "%.0f%%", 100, "native", "角色边缘精修", "Sprite Edge Polish", "高分辨率屏幕上让角色边缘更干净、墨线更实。需 DLL。", "Cleaner sprite edges and bolder ink on hi-res screens. Needs DLL.")
+    S("ground_detail", 0.10, "%.0f%%", 100, "native", "地面细腻纹理", "Ground Micro-Texture", "给地皮增加细小的颗粒质感，近看更有层次。需 DLL。", "Adds fine grain to the ground so it looks richer up close. Needs DLL.")
+
+    -- Color
+    F("tone", "电影调色（总开关）", "Cinematic Grading (master)", "开启后，下面的调色参数才会生效。", "The grading values below only take effect when this is on.")
+    S("exposure", 0.05, "%+.2f", 1, "tone", "曝光", "Exposure", "整体变亮或变暗。", "Makes the whole picture brighter or darker.")
+    S("temp", 0.08, "%+.2f", 1, "tone", "色温（冷↔暖）", "Temperature", "往右偏暖黄，往左偏冷蓝。", "Right = warmer/yellow, left = cooler/blue.")
+    S("contrast", 0.03, "%+.0f%%", 100, "tone", "对比度", "Contrast", "明暗反差，越高越浓烈。", "Light/dark difference. Higher = punchier.")
+    S("sat", 0.05, "%.0f%%", 100, "tone", "饱和度", "Saturation", "颜色鲜艳程度，100% 为原样。", "How vivid colors are. 100% = unchanged.")
+    S("vibrance", 0.05, "%+.0f%%", 100, "tone", "智能鲜艳度", "Smart Vibrance", "只提升偏灰的颜色，不会让本来鲜艳的颜色过艳。", "Boosts dull colors only; vivid ones are left alone.")
+    S("tint", 0.05, "%+.2f", 1, "tone", "色调（绿↔品红）", "Tint (green/magenta)", "微调画面偏绿或偏紫红。", "Nudges the picture toward green or magenta.")
+    S("lightness", 0.02, "%+.2f", 1, "tone", "整体明度", "Lightness Offset", "整体加亮或压暗，不改变对比。", "Brightens or darkens everything without changing contrast.")
+    S("gamma", 0.04, "%.2f", 1, "tone", "中间调亮度", "Midtone Gamma", "调整中间调亮度，最暗和最亮基本不变。", "Adjusts midtones; deepest shadows and highlights stay similar.")
+    S("filmic", 0.10, "%.0f%%", 100, "tone", "电影高光曲线", "Filmic Highlights", "高光更柔和不过曝，像电影胶片（ACES）。", "Softer, non-clipping highlights like film (ACES).")
+    S("hl_desat", 0.10, "%.0f%%", 100, "tone", "高光去饱和", "Highlight Desat.", "最亮处略微发白，防止颜色溢出。", "Very bright areas turn slightly white to avoid color blowout.")
+    S("sun_fill", 0.10, "%.0f%%", 100, "tone", "天光补光", "Sun Fill Light", "左上方天光对画面的补光，增加空间感。", "Directional fill from the upper-left sky for more depth.")
+    S("original_mix", 0.10, "%.0f%%", 100, "tone", "回退原画比例", "Original Mix", "与原版画面混合的比例，100% 等于没调色。", "Blend with the original picture; 100% = no grading.")
+    S("slope_r", 0.04, "%.2f", 1, "tone", "亮部 · 红", "Highlights · Red", "专业调色(Slope)：亮部红色倍率。", "Pro grading (Slope): red gain in highlights.")
+    S("slope_g", 0.04, "%.2f", 1, "tone", "亮部 · 绿", "Highlights · Green", "专业调色(Slope)：亮部绿色倍率。", "Pro grading (Slope): green gain in highlights.")
+    S("slope_b", 0.04, "%.2f", 1, "tone", "亮部 · 蓝", "Highlights · Blue", "专业调色(Slope)：亮部蓝色倍率。", "Pro grading (Slope): blue gain in highlights.")
+    S("offset_r", 0.02, "%+.2f", 1, "tone", "暗部 · 红", "Shadows · Red", "专业调色(Offset)：给暗部整体加/减红色。", "Pro grading (Offset): adds/removes red in shadows.")
+    S("offset_g", 0.02, "%+.2f", 1, "tone", "暗部 · 绿", "Shadows · Green", "专业调色(Offset)：给暗部整体加/减绿色。", "Pro grading (Offset): adds/removes green in shadows.")
+    S("offset_b", 0.02, "%+.2f", 1, "tone", "暗部 · 蓝", "Shadows · Blue", "专业调色(Offset)：给暗部整体加/减蓝色。", "Pro grading (Offset): adds/removes blue in shadows.")
+    S("power_r", 0.04, "%.2f", 1, "tone", "中间调 · 红", "Midtones · Red", "专业调色(Power)：中间调红色曲线。", "Pro grading (Power): red curve in midtones.")
+    S("power_g", 0.04, "%.2f", 1, "tone", "中间调 · 绿", "Midtones · Green", "专业调色(Power)：中间调绿色曲线。", "Pro grading (Power): green curve in midtones.")
+    S("power_b", 0.04, "%.2f", 1, "tone", "中间调 · 蓝", "Midtones · Blue", "专业调色(Power)：中间调蓝色曲线。", "Pro grading (Power): blue curve in midtones.")
+    S("vignette", 0.03, "%.0f%%", 100, "tone", "边缘暗角", "Edge Vignette", "画面四周压暗，视线更集中在中心。", "Darkens the screen edges to focus attention on the center.")
+    S("grain", 0.04, "%.0f%%", 100, "tone", "胶片颗粒", "Film Grain", "加入细微的动态颗粒，有胶片质感。", "Adds subtle animated grain for a film look.")
+    S("vanilla_cc", 0.10, "%.0f%%", 100, nil, "官方季节滤镜", "Official Season Filter", "游戏自带的四季/昼夜色调强度，100% 为原版。", "Strength of the game's own season/day colors; 100% = vanilla.")
+    S("snow_cap", 0.10, "%.0f%%", 100, nil, "冬季积雪遮挡", "Winter Snow Overlay", "冬天屏幕边缘的积雪遮挡程度，调低看得更清。", "How much snow covers the screen in winter; lower to see more.")
+    T("sanity_color", "低理智保持原色", "Keep Color at Low Sanity", "理智很低时画面不再变灰暗。", "The screen no longer turns grey when sanity is low.")
+    T("distort_free", "低理智去晃动", "No Sanity Wobble", "理智很低时画面不再扭曲波动。", "The screen no longer warps when sanity is low.")
+    T("sand_filter", "沙尘暴护眼", "Hide Sandstorm Dust", "夏季沙尘暴时隐藏遮挡视野的风沙层。", "Hides the view-blocking dust layer during summer sandstorms.")
+    F("clean_filter", "滤镜净化（一键）", "Clean Filters (one-click)", "一键应用上面几项护眼选项。", "Applies the eye-care filter options above in one click.")
+
+    -- Light & Glow & Shadow
+    F("soft_bloom", "柔光泛光（总开关）", "Soft Bloom (master)", "灯光、火焰周围有柔和光晕。需在游戏设置里开启泛光。", "Soft halos around lights and fire. Turn on Bloom in game settings.")
+    S("bloom_str", 0.10, "%.0f%%", 100, "soft_bloom", "光晕强度", "Bloom Strength", "光晕有多明显。", "How visible the glow is.")
+    S("bloom_warmth", 0.15, "%+.0f%%", 100, "soft_bloom", "光晕冷暖", "Glow Warmth", "往右偏暖橙，往左偏冷蓝。", "Right = warm orange, left = cool blue.")
+    S("bloom_spread", 0.10, "%.0f%%", 100, "soft_bloom", "光晕扩散范围", "Glow Spread", "越大越柔越宽，越小越紧凑。", "Larger = softer and wider; smaller = tighter.")
+    S("god_rays", 0.15, "%.0f%%", 100, "soft_bloom", "屏幕日光束", "Screen Sun Rays", "太阳方向的屏幕斜向光晕，白天氛围感。", "Screen-space light shafts from the sun for daytime atmosphere.")
+    S("vol_lightrays", 0.15, "%.0f%%", 100, nil, "林间 3D 体积光柱", "3D Forest Light Rays", "在森林/桦树林/洞穴生成真·世界空间斜射光柱（白天暖金/黄昏橙红/满月银白），走近自动柔隐不挡脸。0 为关闭。", "True 3D world-space light shafts in forests & caves (gold by day, amber at dusk, silver at full moon). Auto-fades up close. 0 = off.")
+    T("vol_lightrays_everywhere", "全域/基地晒太阳光柱", "Sunbeams Everywhere (Base)", "开启后不仅限森林，连基地草地、地砖和任意地上树旁也会自然洒下水中木斜射阳光柱（纯客户端公服可用）。默认关闭。", "Spawns Waterlogged-style 3D sunbeams across bases, planted trees & all walkable surface turfs—not just forests (client-only, public-server safe). Default off.")
+    S("vol_ground_fog", 0.15, "%.0f%%", 100, nil, "林间/沼泽/洞穴受光地雾", "Lit Ground Mist", "在森林/沼泽/洞穴地面浮起轻薄水平迷雾，吃真实世界光照图（篝火旁泛暖金、暗处泛幽蓝），角色脚下留空不挡视野。0 为关闭。", "Subtle horizontal mist over forest, marsh & cave floors lit by the true world lightmap (warm near campfires, cool in shade). 0 = off.")
+    S("vfx_fire_embers", 0.15, "%.0f%%", 100, nil, "篝火升腾火星", "Fire Embers", "火堆/火炉上方飘起细碎火星（吸热火堆为冰蓝星火），配柔光氛围极佳。0 为关闭。", "Rising warm embers above fires (icy sparks on endo fires). Pairs with Soft Bloom. 0 = off.")
+    S("vfx_ambient_motes", 0.15, "%.0f%%", 100, nil, "空气光尘与孢子", "Ambient Motes", "白昼微光尘、秋冬落叶、洞穴荧光孢子，轻度点缀不挡视野。0 为关闭。", "Subtle sun motes, seasonal leaves, and glowing cave spores. 0 = off.")
+    S("bloom_thresh", 0.04, "%.2f", 1, "soft_bloom", "起晕亮度门槛", "Glow Threshold", "多亮的东西才会发光，调低则更多物体发光。", "How bright something must be to glow. Lower = more glowing things.")
+    S("bloom_knee", 0.10, "%.0f%%", 100, "soft_bloom", "过渡柔和度", "Glow Softness", "光晕出现得更平滑，防止突然炸白。", "Makes the glow ramp in smoothly instead of popping.")
+    S("bloom_chr", 0.05, "%+.0f%%", 100, "soft_bloom", "光晕饱和度", "Glow Saturation", "光晕颜色的浓淡。", "How colorful the glow is.")
+    S("bloom_prot", 0.05, "%.0f%%", 100, "soft_bloom", "防洗白保护", "Anti-Washout", "高亮区域不会被光晕冲成一片白。", "Stops bright areas from washing out to white.")
+    S("bloom_compress", 0.05, "%.0f%%", 100, "soft_bloom", "高光保色", "Highlight Color Keep", "亮部压一压，保留颜色不发白。", "Compresses highlights so they keep their color.")
+    S("glow_tail", 0.10, "%.0f%%", 100, "soft_bloom", "夜晚光晕长尾", "Night Glow Tail", "夜里光晕边缘更自然地渐隐。", "Glow edges fade out more naturally at night.")
+    S("light_wrap", 0.10, "%.0f%%", 100, "soft_bloom", "暗部空气光", "Dark Air Light", "暗处也有一层薄薄的光雾包裹。", "A thin haze of light wraps around dark areas.")
+    S("glow_rim", 0.10, "%.0f%%", 100, "soft_bloom", "光源轮廓光", "Light Rim", "光源附近一圈细亮边。", "A thin bright rim near light sources.")
+    F("ao", "接地阴影（总开关）", "Contact Shadow (master)", "人物、生物脚下有柔和的接地阴影，更有立体感。", "Soft shadows under characters and creatures for more depth.")
+    S("ao_str", 0.15, "%.0f%%", 100, "ao", "接地阴影强度", "Contact Shadow", "脚下阴影的深浅。", "How dark the shadow under feet is.")
+    S("surface_light", 0.15, "%.0f%%", 100, "native", "3D 立体受光", "3D Surface Light", "物体按光照方向出现明暗面，更像立体物件。需 DLL。", "Objects get lit and shaded sides like real 3D. Needs DLL.")
+    S("shade_warm", 0.10, "%.0f%%", 100, "native", "受光面冷暖", "Lit Side Warmth", "朝光的一面偏冷或偏暖。", "Whether the lit side looks cool or warm.")
+    S("shade_contrast", 0.10, "%.0f%%", 100, "native", "明暗反差", "Light/Dark Contrast", "立体明暗面的反差大小。", "Contrast between lit and shaded sides.")
+    S("shade_cool", 0.10, "%.0f%%", 100, "native", "背光面偏蓝", "Backlit Cool Tint", "背光的一面带点冷蓝，更有空气感。", "Backlit side gets a cool-blue tint for atmosphere.")
+    S("shade_dark", 0.10, "%.0f%%", 100, "native", "背光面压暗", "Backlit Darkening", "背光的一面压暗多少。", "How dark the backlit side becomes.")
+    F("dark_clarity", "夜晚/洞穴提亮（总开关）", "Night/Cave Clarity (master)", "夜里和洞穴的暗部更容易看清细节。", "Dark areas at night and in caves show more detail.")
+    S("dark_str", 0.15, "%.0f%%", 100, "dark_clarity", "提亮强度", "Clarity Strength", "暗部提亮多少。", "How much dark areas are lifted.")
+    S("shadow_density", 0.10, "%.0f%%", 100, "native", "长影浓度", "Long Shadow Density", "树木、建筑投出的斜长阴影有多浓。0 为关闭。需 DLL。", "How dark long shadows from trees and buildings are. 0 = off. Needs DLL.")
+    S("vol_cloud_shade", 0.15, "%.0f%%", 100, nil, "动态流动云影", "Drifting Cloud Shadows", "利用官方原生阴影器让大尺度柔和云影缓慢掠过草原与海面，打破白天死平均匀亮度。0 为关闭。", "Native C++ ShadeRenderer drifting soft cloud shadows across plains & oceans by day. 0 = off.")
+    S("vol_canopy_shade", 0.15, "%.0f%%", 100, nil, "密林树冠斑驳影", "Forest Canopy Shade", "走进常青林/桦树林时地面浮现随风摇曳的树叶碎影，与林间体积光柱明暗呼应。0 为关闭。", "Dappled swaying tree-canopy shade on forest floors, pairing with 3D light rays. 0 = off.")
+    T("shadow_point_lights", "篝火/提灯真实投影", "Firelight Shadows", "火光和提灯周围的物体向四周投影。", "Objects near fire and lanterns cast shadows in all directions.")
+    T("shadow_night", "夜间火光反向投影", "Night Light Shadows", "夜晚阴影方向跟着火光走。", "At night shadows follow the direction of firelight.")
+    S("shadow_length", 0.10, "%.2fx", 1, "native", "影子长度", "Shadow Length", "影子拉得多长。", "How long shadows are stretched.")
+    S("shadow_soft", 0.10, "%.2f", 1, "native", "阴影边缘柔和度", "Shadow Softness", "0 为像素级锐利剪影，越大阴影边缘越柔虚。", "0 = pixel-crisp silhouette; larger = softer, blurrier edges.")
+    S("shadow_point_strength", 0.10, "%.0f%%", 100, "native", "火光投影强度", "Firelight Shadows", "篝火/提灯投影有多明显。", "How visible firelight shadows are.")
+    S("shadow_entity_recv", 0.08, "%.0f%%", 100, "native", "树荫遮挡人物", "Shade on Characters", "走进树荫时角色会变暗。", "Characters get darker when walking into shade.")
+    S("shadow_oval_keep", 0.08, "%.0f%%", 100, "native", "保留原版脚底圆影", "Vanilla Foot Shadow", "0 = 有长影时完全隐藏原版黑圆圈（无长影/远火源自动恢复），100% = 始终保留。", "0 = cleanly hide vanilla oval under live shadows (auto-restores in darkness/far from fire); 100% = always keep.")
+    S("shadow_fade", 0.10, "%.0f%%", 100, "native", "阴影渐隐", "Shadow Fade", "影子远端渐渐变淡，更自然。", "Shadows fade toward their far end for a natural look.")
+    S("shadow_sway", 0.10, "%.0f%%", 100, "native", "树冠摇曳", "Canopy Sway", "阴影随风轻轻晃动的幅度。", "How much shadows sway gently in the wind.")
+    S("shadow_smooth", 0.10, "%.0f%%", 100, "native", "光影平滑", "Light Smoothing", "太阳与阴影移动更平滑，避免跳变。", "Smoother sun/shadow motion without jumps.")
+    S("shadow_weather", 0.15, "%.0f%%", 100, "native", "雨雪与四季衰减", "Weather & Season Fade", "雨雪天阴影平滑变淡、冬天柔和、夏天更浓（100% = 雨雪×0.6 / 冬×0.8 / 夏×1.2）。0 为关闭。", "Smoothly dims sun shadows in rain/snow & winter and boosts in summer (100% = rain 0.6x / winter 0.8x / summer 1.2x). 0 = off.")
+    S("shadow_moon_blue", 0.15, "%.0f%%", 100, "native", "满月自动冷蓝影", "Full-Moon Blue Tint", "白天保持自定义影色（如纯黑），仅满月自动切换幽蓝月影。0 为关闭。", "Keeps your tint by day/dusk (e.g. pure black) and automatically shifts to moonlit blue on full moons. 0 = off.")
+    S("shadow_dusk_point", 0.15, "%.0f%%", 100, "native", "黄昏火影强度", "Dusk Firelight Shadows", "独立控制黄昏时段火堆/提灯是否投影。0 = 黄昏仅留太阳影，入夜再出火影。", "Controls firelight shadows independently at dusk. 0 = solar shadows only at dusk, fire shadows at night.")
+    S("shadow_min_height", 0.10, "%.2f", 1, "native", "过滤低矮小物影", "Filter Low Clutter", "隐藏低于此高度的地面掉落物与矮花杂物投影（0.85 可净空地物，保留树木角色建筑）。0 为全部投影。", "Skips shadows for low ground drops & tiny flowers below this world height (0.85 cleans clutter while keeping trees/mobs/structures). 0 = cast all.")
+    T("shadow_flash_lights", "闪电/瞬光动态影", "Lightning & Flash Shadows", "闪电、爆炸等瞬态强光打出 1 秒淡出瞬影。", "Lightning strikes and explosive flashes cast brief 1s decaying dynamic shadows.")
+    S("shadow_tint_r", 0.08, "%.2f", 1, "native", "阴影颜色 · 红", "Shadow Color · Red", "阴影的颜色偏向（默认偏蓝紫）。", "Color cast of shadows (default leans blue-purple).")
+    S("shadow_tint_g", 0.08, "%.2f", 1, "native", "阴影颜色 · 绿", "Shadow Color · Green", "阴影的颜色偏向（默认偏蓝紫）。", "Color cast of shadows (default leans blue-purple).")
+    S("shadow_tint_b", 0.08, "%.2f", 1, "native", "阴影颜色 · 蓝", "Shadow Color · Blue", "阴影的颜色偏向（默认偏蓝紫）。", "Color cast of shadows (default leans blue-purple).")
+    T("shadow_hd", "超清阴影画布", "Ultra-HD Shadow Canvas", "阴影更精细（2048 超清分辨率，锐影轮廓极清晰），略增显存。", "Ultra-crisp shadows (2048 resolution for razor-sharp silhouettes) at a modest VRAM cost.")
+    T("shadow_skip_nightmare", "暗影生物不投影", "No Shadow on Shadow Creatures", "影怪本来就是影子，不再多投一个。", "Shadow creatures are shadows already, so they cast none.")
+
+    -- Water & Nature
+    S("ocean_pbr", 0.15, "%.0f%%", 100, "native", "PBR 立体海浪与水色", "PBR Ocean Waves & Tint", "实时 3 层解析法线海浪、视差立体水纹、菲涅尔立体受光与浅滩/深海色差。0 为原版海水。需 DLL。", "Real-time 3-octave analytic PBR waves, parallax heightfield, Fresnel diffuse & shallow/deep tint. 0 = vanilla. Needs DLL.")
+    S("ocean_sky_refl", 0.15, "%.0f%%", 100, "native", "海面天空流云倒影", "Sky & Cloud Reflection", "在海面上实时映射缓慢飘动的镜面天穹云影，随菲涅尔视角自然渐变。0 为关闭。需 DLL。", "Procedural drifting sky & cloud reflections across the ocean modulated by Fresnel angle. 0 = off. Needs DLL.")
+    S("ocean_sun_glow", 0.15, "%.0f%%", 100, "native", "海面日月碎金高光", "Sun/Moon Mie Glint", "跟踪实时太阳/满月方位在细碎波纹上折射出物理级米氏散射碎金粼光。0 为关闭。需 DLL。", "Physically-based Mie specular sun/moon sparkle tracking live celestial direction across micro-ripples. 0 = off. Needs DLL.")
+    T("ocean_hide_waves", "隐藏原版 2D 纸片浪", "Hide Vanilla 2D Waves", "开启后在 GPU 端瞬间隐藏原版 2D 纸片海浪，搭配 PBR 海洋呈现极净丝滑镜面海（随时可切回）。", "Instantly hides vanilla 2D paper sea wave sprites on the GPU for an ultra-clean PBR mirror ocean (reversible anytime).")
+    S("vol_edge_fog", 0.15, "%.0f%%", 100, nil, "世界海界边缘体积雾", "World-Edge Ocean Mist", "在世界深海/虚空边缘自动平铺缓慢飘动的大尺度受光海雾，柔化地图尽头锯齿边界。0 为关闭。", "Drifting horizontal lightmap-lit mist blanketing ocean & abyss world edges to soften the void boundary. 0 = off.")
+    S("glint_str", 0.10, "%.0f%%", 100, "native", "海面波光强度", "Sea Sparkle", "海面闪闪发光的焦散光纹。需 DLL。", "Sparkling caustic light patterns on the sea. Needs DLL.")
+    S("glint_density", 0.04, "%.2f", 1, "native", "光纹锐利度", "Sparkle Sharpness", "光纹线条的清晰程度。", "How crisp the light patterns are.")
+    S("glint_grain", 0.15, "%.2f", 1, "native", "光纹颗粒大小", "Sparkle Grain", "光纹是细碎还是粗大。", "Whether sparkles are fine or coarse.")
+    S("glint_soft", 0.10, "%.0f%%", 100, "native", "浅滩与海色融合", "Shallows Blend", "浅水沙底与海水颜色融合程度。", "How the sandy bottom blends into the sea color.")
+    S("water_refl_str", 0.10, "%.0f%%", 100, "native", "水面倒影强度", "Water Reflection", "海边的树、船会倒映在水里。内陆/洞穴无消耗。", "Trees and boats reflect in water. Free inland and in caves.")
+    S("water_refl_ripple", 0.10, "%.0f%%", 100, "native", "倒影波动", "Reflection Ripple", "倒影随海浪晃动扭曲的程度。", "How much reflections wobble with the waves.")
+    T("wind_sway_enabled", "植被风动（开关）", "Foliage Sway (switch)", "草和树微风摇曳，走过草丛会被拨开。", "Grass and trees sway in the breeze and part when you walk through.")
+    S("wind_sway_strength", 0.10, "%.0f%%", 100, "native", "微风摇曳幅度", "Breeze Strength", "草木摇摆幅度。", "How much plants sway.")
+    S("wind_wake_strength", 0.10, "%.0f%%", 100, "native", "穿行拨草幅度", "Walk-Through Parting", "走过草丛时被拨开的幅度。", "How much grass parts as you walk through.")
+    F("env", "近岸/雨天湿润（总开关）", "Shore & Rain Wetness (master)", "靠近海岸、下雨时地面更有湿润质感。", "Ground looks wetter near shores and in the rain.")
+    S("env_str", 0.15, "%.0f%%", 100, "env", "湿润强度", "Wetness Strength", "湿润质感的强弱。", "How strong the wet look is.")
+
+    -- Motion & Combat
+    E("skeletal", "skeletal", "240Hz 超顺滑补帧", "240Hz Ultra-Smooth", "让角色、怪物、粒子、镜头从 30 帧变丝滑，不影响联机判定。", "Characters, mobs, particles and camera glide smoothly. Gameplay unaffected.")
+    S("anim_crossfade", 5.0, "%.0fms", 1, "skel", "动作切换融合", "Action Blend Time", "跑→停、跑→砍之间平滑过渡，单位毫秒。", "Smooth transitions between run, stop and attack (milliseconds).")
+    S("anim_spline", 0.10, "%.0f%%", 100, "skel", "曲线平滑", "Curve Smoothing", "让肢体摆动更圆润不生硬，100% 最平滑。", "Rounder, less stiff limb motion. 100% = smoothest.")
+    S("vfx_footsteps", 0.15, "%.0f%%", 100, nil, "角色地皮微尘", "Footstep Particles", "跑动/骑牛时按地皮带起脚步尘、冬日雪沫、雨天水花和草叶（站立 0 消耗）。0 为关闭。", "Velocity-driven dust, snow puffs, rain splashes & grass rustle when moving. 0 = off.")
+    T("hitfeel_enabled", "打击感表演（总开关）", "Hit-Feel (master)", "开启后，挥砍与受击会有顿帧、前冲、闪光与落地物理碎屑（零屏幕晃动）。只改显示，不改判定。", "Adds hit-stop, strike lunge, flash & ground-physics impact sparks (zero screen shake). Visual only.")
+    S("hitfeel_hitstop", 0.15, "%.0f%%", 100, "hit", "卡肉顿帧", "Hit Stop", "命中时画面微微定格，手感更扎实。", "A tiny freeze on impact for a heavier feel.")
+    S("hitfeel_recoil", 0.15, "%.0f%%", 100, "hit", "受击震颤与弹性", "Recoil & Squash", "被打的一方会震一下、被压扁再弹回。", "The target shakes, squashes and bounces back.")
+    S("hitfeel_flash", 0.15, "%.0f%%", 100, "hit", "受击闪光", "Hit Flash", "被打的瞬间闪一下亮光。", "A bright flash the instant something is hit.")
+    S("hitfeel_campunch", 0.15, "%.0f%%", 100, "hit", "出招前冲回弹", "Strike Lunge", "出刀命中时角色沿出招方向轻微前冲再回弹，零镜头晃动不晕屏。", "Character leans slightly into each strike and settles back. Zero screen shake.")
+    S("hitfeel_vfx", 0.15, "%.0f%%", 100, "hit", "刀光火花与碎屑", "Slash & Impact FX", "挥砍月牙刀光、刀尖流光、命中局部地光，以及真落地物理的木屑/碎石/火星。", "Slash arcs, weapon-tip glints, localized hit glow, plus ground-physics wood chips, rocks & sparks.")
+
+    -- System
+    E("lowlat", "lowlat", "低延迟操作", "Low-Latency Input", "减少操作到画面反馈的延迟，急甩鼠标也不丢点击。", "Less delay from input to screen, and fast mouse flicks never drop clicks.")
+    E("clipcursor", "clip", "双屏防甩出鼠标", "Dual-Monitor Cursor Lock", "多显示器时鼠标不会被甩出游戏窗口（暂停/切屏自动解除）。", "Keeps the mouse inside the game on multi-monitor setups (auto-unlocks on pause/Alt-Tab).")
+    E("hudmode", "hud", "左上角性能显示", "Performance Overlay", "点击切换：简洁 / 详细 / 隐藏。", "Click to cycle: Compact / Detailed / Hidden.")
+
+    -- ========================================================================
+    -- HOME (Simple mode): style cards, 6 plain-language feature cards, 4 quick sliders
+    -- ========================================================================
+    local tab1 = tab_roots[1]
+    do
+        local _, btxt = AddSectionBanner(tab1, 208, "① 先选一个画面风格", "1. Pick a look", { 0.16, 0.14, 0.10, 0.88 })
+        if btxt then
+            btxt:SetRegionSize(276, 18)
+            btxt:SetHAlign(G.ANCHOR_LEFT)
+            btxt:SetPosition(-46, 208, 0)
+        end
+        local pc = UI.preset_card
+        pc.home_open_bg = NewImage(tab1, 142, 208, 86, 18, 0.24, 0.30, 0.36, 0.95)
+        pc.home_open_btn = NewButton(tab1, 142, 208, 86, 18, is_zh and "6套预设 >>" or "6 Presets >>", 12, function()
+            if UI.TogglePresetCard then UI.TogglePresetCard() end
+        end)
+        pc.home_open_btn:SetTextColour(1.0, 0.90, 0.62, 1.0)
+        pc.home_open_btn:SetTextFocusColour(1.0, 0.98, 0.82, 1.0)
+    end
+    local home_cards = {}
+    for pid = 0, 3 do
+        local cx = -144 + pid * 96
+        local cborder = NewImage(tab1, cx, 172, 92, 48, 0.95, 0.74, 0.36, 0.0)
+        local cbg = NewImage(tab1, cx, 172, 88, 44, 0.10, 0.115, 0.15, 0.96)
+        local cname = NewText(tab1, 15, "", cx, 181, 86, 20, nil, 0.90, 0.93, 0.96, 1.0)
+        local cdesc = NewText(tab1, 12, "", cx, 163, 86, 16, nil, 0.58, 0.66, 0.76, 0.95)
+        NewButton(tab1, cx, 172, 88, 44, nil, nil, function()
+            api.SetPreset(pid)
+            DoRefresh()
+        end)
+        home_cards[#home_cards + 1] = { id = pid, border = cborder, bg = cbg, name = cname, desc = cdesc }
+    end
+
+    AddSectionBanner(tab1, 130, "② 常用功能（点一下开 / 关）", "2. Main features (click to toggle)", { 0.10, 0.18, 0.20, 0.88 })
+    local home_defs = {
+        { src = "bundle", key = "smooth", zh = "240 帧超顺滑", en = "Ultra-Smooth 240 FPS",
+          hzh = "角色、怪物、镜头动作从 30 帧变丝滑", hen = "Characters, mobs & camera glide smoothly",
+          dzh = "让角色、怪物、粒子、镜头从 30 帧变丝滑，不影响联机判定。", den = "Characters, mobs, particles and camera glide smoothly. Gameplay unaffected." },
+        { src = "bundle", key = "lowlat", zh = "低延迟操作", en = "Low-Latency Input",
+          hzh = "走位、攻击响应更快，急甩鼠标不丢点击", hen = "Faster response; fast mouse flicks never miss",
+          dzh = "减少操作到画面反馈的延迟，急甩鼠标也不丢点击。", den = "Less delay from input to screen, and fast flicks never drop clicks." },
+        { src = "bundle", key = "clarity", zh = "画面更清晰", en = "Sharper Picture",
+          hzh = "线条锐利、斜视角贴图不糊", hen = "Crisp lines; angled textures stay clear",
+          dzh = "同时开启边缘锐化、16× 各向异性与贴图防发糊。", den = "Turns on edge sharpening, 16x anisotropic filtering and anti-blur textures together." },
+        { src = "bundle", key = "glow", zh = "柔光与接地阴影", en = "Soft Glow & Contact Shadow",
+          hzh = "火光有柔和光晕，脚下有接地阴影", hen = "Soft halos around fire; shadows under feet",
+          dzh = "同时开启柔光泛光与脚下接地阴影。泛光需在游戏设置里打开。", den = "Turns on soft bloom and contact shadows. Bloom must be enabled in game settings." },
+        { src = "bundle", key = "world3d", zh = "立体光影与氛围微粒", en = "3D Light, Shadows & Atmosphere",
+          hzh = "长影、立体受光、倒影、篝火火星与光尘", hen = "Long shadows, 3D lighting, reflections, embers & motes",
+          dzh = "开启长影、3D 立体受光、水面倒影、植被风动，以及篝火火星与环境光尘。", den = "Long shadows, 3D surface light, reflections, foliage sway, fire embers & ambient motes." },
+        { src = "bundle", key = "hitfeel", zh = "无震动打击感与脚步尘", en = "Zero-Shake Hit-Feel & Footsteps",
+          hzh = "卡肉前冲、手绘落地碎屑火星与地皮脚步尘", hen = "Hit-stop, lunge, ground-physics sparks & footsteps",
+          dzh = "挥砍与受击的顿帧、出招前冲、落地木屑/碎石/火星及角色地皮微尘（零屏幕晃动）。", den = "Hit-stop, strike lunge, ground-physics wood chips/rocks/sparks & footstep dust (zero screen shake)." },
+    }
+    for i = 1, #home_defs do
+        home_defs[i].big = true
+        AddToggleRow(tab1, 100 - (i - 1) * 38, 34, home_defs[i])
+    end
+
+    AddSectionBanner(tab1, -124, "③ 快速调节（点右侧数值可复位）", "3. Quick tuning (click value to reset)", { 0.14, 0.14, 0.20, 0.88 })
+    local home_slider_keys = { "sharp", "bloom_str", "shadow_density", "temp" }
+    for i = 1, #home_slider_keys do
+        AddStepperRow(tab1, -148 - (i - 1) * 29, 26, ROWS[home_slider_keys[i]])
+    end
+
+    MakeSlotRow(tab1, -268)
+
+    -- Bottom bar: restore vanilla | share | go Pro
+    local function HomeBottomButton(x, w, tint)
+        local bgw = NewImage(tab1, x, -307, w, 30, tint[1], tint[2], tint[3], tint[4])
+        return bgw
+    end
+    HomeBottomButton(-126, 122, { 0.30, 0.22, 0.12, 0.94 })
+    local home_reset_btn = NewButton(tab1, -126, -307, 122, 30, is_zh and "恢复原版纯净" or "Restore Vanilla", 15, function()
+        api.SetPreset(0)
+        DoRefresh()
+    end)
+    home_reset_btn:SetTextColour(1.0, 0.88, 0.58, 1.0)
+    home_reset_btn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
+
+    HomeBottomButton(0, 122, { 0.24, 0.20, 0.11, 0.94 })
+    local share_open_btn = NewButton(tab1, 0, -307, 122, 30, is_zh and "分享 / 导入方案码" or "Share / Import", 15)
     share_open_btn:SetTextColour(1.0, 0.90, 0.62, 1.0)
     share_open_btn:SetTextFocusColour(1.0, 0.98, 0.80, 1.0)
+
+    HomeBottomButton(126, 122, { 0.12, 0.24, 0.30, 0.94 })
+    local home_pro_btn = NewButton(tab1, 126, -307, 122, 30, is_zh and "专业调参 >>" or "Pro Tuning >>", 15, function()
+        panel_ui_mode = "pro"
+        if type(api.SetUiMode) == "function" then pcall(api.SetUiMode, "pro") end
+        if ApplyMode then ApplyMode() end
+        DoRefresh()
+    end)
+    home_pro_btn:SetTextColour(0.68, 0.92, 1.0, 1.0)
+    home_pro_btn:SetTextFocusColour(0.88, 0.98, 1.0, 1.0)
+
 
     -- =========================================================================
     -- Floating Share & JSON Library Card (docked left of Studio Panel, zero pause!)
     -- Strict 3-Phase Transactional Import: Validate -> Atomic Apply -> Persist
     -- =========================================================================
-    local SW, SH = 356, 392
+    local SW, SH = 356, 480
     share_card = panel:AddChild(Widget("HS_ShareCodeCard"))
     share_card:SetPosition(-(W * 0.5 + SW * 0.5 + 10), -10, 0)
     share_card:Hide()
@@ -541,7 +1042,7 @@ local function CreateLiveCustomizerPanel(hud)
     sc_bg:ScaleToSize(SW, SH)
     sc_bg:SetTint(0.08, 0.08, 0.11, 0.96)
 
-    local sc_title = share_card:AddChild(Text(FONT_BODY, 18, is_zh and "HyperSmooth · 画质方案分享" or "HyperSmooth · Share Preset"))
+    local sc_title = share_card:AddChild(Text(FONT_BODY, 18, is_zh and "HyperShade · 方案分享与视觉闭环" or "HyperShade · Share & Look Match"))
     sc_title:SetPosition(-16, SH * 0.5 - 22, 0)
     sc_title:SetColour(0.96, 0.86, 0.58, 1.0)
 
@@ -568,22 +1069,22 @@ local function CreateLiveCustomizerPanel(hud)
     local sc_cur_lbl = share_card:AddChild(Text(FONT_BODY, 15, is_zh and "当前方案：原版纯净" or "Active: Vanilla Pure"))
     sc_cur_lbl:SetRegionSize(SW - 96, 20)
     sc_cur_lbl:SetHAlign(G.ANCHOR_LEFT)
-    sc_cur_lbl:SetPosition(-36, 144, 0)
+    sc_cur_lbl:SetPosition(-36, 184, 0)
     sc_cur_lbl:SetColour(0.96, 0.96, 0.98, 1.0)
 
     local sc_saved_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_saved_bg:ScaleToSize(58, 20)
-    sc_saved_bg:SetPosition(SW * 0.5 - 41, 144, 0)
+    sc_saved_bg:SetPosition(SW * 0.5 - 41, 184, 0)
     sc_saved_bg:SetTint(0.11, 0.32, 0.19, 0.96)
 
     local sc_saved_txt = share_card:AddChild(Text(FONT_BODY, 12, is_zh and "已保存" or "Saved"))
-    sc_saved_txt:SetPosition(SW * 0.5 - 41, 144, 0)
+    sc_saved_txt:SetPosition(SW * 0.5 - 41, 184, 0)
     sc_saved_txt:SetColour(0.56, 1.0, 0.72, 1.0)
 
     local sc_sub_lbl = share_card:AddChild(Text(FONT_BODY, 12, is_zh and "自定义着色器参数 · 留空标题可生成极致短码" or "Custom shader params · blank title = shortest code"))
     sc_sub_lbl:SetRegionSize(SW - 24, 16)
     sc_sub_lbl:SetHAlign(G.ANCHOR_LEFT)
-    sc_sub_lbl:SetPosition(0, 124, 0)
+    sc_sub_lbl:SetPosition(0, 165, 0)
     sc_sub_lbl:SetColour(0.66, 0.72, 0.80, 0.92)
 
     local function MakeOptionalTextEdit(parent, px, py, ew, eh, limit, prompt_s)
@@ -630,28 +1131,28 @@ local function CreateLiveCustomizerPanel(hud)
         return ""
     end
 
-    local sc_name_ed, sc_name_is_ed = MakeOptionalTextEdit(share_card, 0, 98, SW - 24, 24, 36, is_zh and "方案标题（可选，如：暗黑童话）" or "Preset title (optional)")
+    local sc_name_ed, sc_name_is_ed = MakeOptionalTextEdit(share_card, 0, 140, SW - 24, 24, 36, is_zh and "方案标题（可选，如：暗黑童话）" or "Preset title (optional)")
 
     -- Share code preview strip + integrated Copy button on the right
     local sc_code_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_code_bg:ScaleToSize(SW - 24, 32)
-    sc_code_bg:SetPosition(0, 62, 0)
+    sc_code_bg:SetPosition(0, 106, 0)
     sc_code_bg:SetTint(0.05, 0.08, 0.11, 0.94)
 
     local sc_code_txt = share_card:AddChild(Text(FONT_NUM, 13, ""))
     sc_code_txt:SetRegionSize(SW - 120, 24)
     sc_code_txt:SetHAlign(G.ANCHOR_LEFT)
-    sc_code_txt:SetPosition(-44, 62, 0)
+    sc_code_txt:SetPosition(-44, 106, 0)
     sc_code_txt:SetColour(0.54, 1.0, 0.74, 0.98)
 
     local sc_status_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
-    sc_status_bg:ScaleToSize(SW - 24, 38)
-    sc_status_bg:SetPosition(0, -162, 0)
+    sc_status_bg:ScaleToSize(SW - 24, 54)
+    sc_status_bg:SetPosition(0, -196, 0)
     sc_status_bg:SetTint(0.10, 0.13, 0.17, 0.88)
 
-    local sc_status_txt = share_card:AddChild(Text(FONT_BODY, 13, ""))
-    sc_status_txt:SetRegionSize(SW - 32, 34)
-    sc_status_txt:SetPosition(0, -162, 0)
+    local sc_status_txt = share_card:AddChild(Text(FONT_BODY, 12, ""))
+    sc_status_txt:SetRegionSize(SW - 32, 48)
+    sc_status_txt:SetPosition(0, -196, 0)
     sc_status_txt:SetColour(0.80, 0.88, 0.96, 0.95)
 
     local function SetShareStatus(kind, msg)
@@ -670,14 +1171,14 @@ local function CreateLiveCustomizerPanel(hud)
 
     local sc_copy_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_copy_bg:ScaleToSize(82, 24)
-    sc_copy_bg:SetPosition(SW * 0.5 - 57, 62, 0)
+    sc_copy_bg:SetPosition(SW * 0.5 - 57, 106, 0)
     sc_copy_bg:SetTint(0.18, 0.32, 0.22, 0.96)
 
     local sc_copy_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     sc_copy_btn.scale_on_focus = false
     sc_copy_btn.move_on_click = false
     sc_copy_btn:ForceImageSize(82, 24)
-    sc_copy_btn:SetPosition(SW * 0.5 - 57, 62, 0)
+    sc_copy_btn:SetPosition(SW * 0.5 - 57, 106, 0)
     sc_copy_btn:SetText(is_zh and "复制分享码" or "Copy Code")
     sc_copy_btn:SetTextSize(13)
     sc_copy_btn:SetFont(FONT_BODY)
@@ -703,14 +1204,14 @@ local function CreateLiveCustomizerPanel(hud)
 
     local sc_json_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_json_bg:ScaleToSize(SW - 24, 24)
-    sc_json_bg:SetPosition(0, 28, 0)
+    sc_json_bg:SetPosition(0, 73, 0)
     sc_json_bg:SetTint(0.14, 0.20, 0.28, 0.94)
 
     local sc_json_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     sc_json_btn.scale_on_focus = false
     sc_json_btn.move_on_click = false
     sc_json_btn:ForceImageSize(SW - 24, 24)
-    sc_json_btn:SetPosition(0, 28, 0)
+    sc_json_btn:SetPosition(0, 73, 0)
     sc_json_btn:SetText(is_zh and "导出全部方案至 hypersmooth_presets.json" or "Export All to hypersmooth_presets.json")
     sc_json_btn:SetTextSize(13)
     sc_json_btn:SetFont(FONT_BODY)
@@ -727,16 +1228,16 @@ local function CreateLiveCustomizerPanel(hud)
 
     local sc_div = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_div:ScaleToSize(SW - 24, 2)
-    sc_div:SetPosition(0, 6, 0)
+    sc_div:SetPosition(0, 52, 0)
     sc_div:SetTint(0.76, 0.62, 0.34, 0.40)
 
     local sc_imp_lbl = share_card:AddChild(Text(FONT_BODY, 14, is_zh and "导入其他玩家的方案（先校验、再应用、最后保存）" or "Import Player Preset (Validate -> Apply -> Save)"))
     sc_imp_lbl:SetRegionSize(SW - 24, 20)
     sc_imp_lbl:SetHAlign(G.ANCHOR_LEFT)
-    sc_imp_lbl:SetPosition(0, -14, 0)
+    sc_imp_lbl:SetPosition(0, 34, 0)
     sc_imp_lbl:SetColour(0.92, 0.94, 0.98, 0.96)
 
-    local sc_imp_ed, sc_imp_is_ed = MakeOptionalTextEdit(share_card, 0, -44, SW - 24, 26, 384, is_zh and "粘贴 HyperSmooth 分享码（留空则读剪贴板）" or "Paste HS1-... share code (blank = read clipboard)")
+    local sc_imp_ed, sc_imp_is_ed = MakeOptionalTextEdit(share_card, 0, 6, SW - 24, 26, 384, is_zh and "粘贴 HS1- 分享码（留空则读剪贴板）" or "Paste HS1-... share code (blank = read clipboard)")
 
     local function GetImportCandidateText()
         local s = ReadEditString(sc_imp_ed, sc_imp_is_ed)
@@ -756,14 +1257,14 @@ local function CreateLiveCustomizerPanel(hud)
     -- Button 1: Dry-Run Validate ONLY (touches ZERO live settings!)
     local sc_chk_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_chk_bg:ScaleToSize(96, 26)
-    sc_chk_bg:SetPosition(-118, -82, 0)
+    sc_chk_bg:SetPosition(-118, -30, 0)
     sc_chk_bg:SetTint(0.18, 0.22, 0.30, 0.94)
 
     local sc_chk_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     sc_chk_btn.scale_on_focus = false
     sc_chk_btn.move_on_click = false
     sc_chk_btn:ForceImageSize(96, 26)
-    sc_chk_btn:SetPosition(-118, -82, 0)
+    sc_chk_btn:SetPosition(-118, -30, 0)
     sc_chk_btn:SetText(is_zh and "导入前校验" or "Validate")
     sc_chk_btn:SetTextSize(14)
     sc_chk_btn:SetFont(FONT_BODY)
@@ -786,14 +1287,14 @@ local function CreateLiveCustomizerPanel(hud)
     -- Button 2: Transactional Paste & Safe Import (Validate -> Atomic Apply -> Persist!)
     local sc_go_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_go_bg:ScaleToSize(140, 26)
-    sc_go_bg:SetPosition(4, -82, 0)
+    sc_go_bg:SetPosition(4, -30, 0)
     sc_go_bg:SetTint(0.28, 0.22, 0.11, 0.96)
 
     local sc_go_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     sc_go_btn.scale_on_focus = false
     sc_go_btn.move_on_click = false
     sc_go_btn:ForceImageSize(140, 26)
-    sc_go_btn:SetPosition(4, -82, 0)
+    sc_go_btn:SetPosition(4, -30, 0)
     sc_go_btn:SetText(is_zh and "安全导入并应用" or "Safe Import")
     sc_go_btn:SetTextSize(14)
     sc_go_btn:SetFont(FONT_BODY)
@@ -817,14 +1318,14 @@ local function CreateLiveCustomizerPanel(hud)
     -- Button 3: 1-Click Undo Last Import
     local sc_undo_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_undo_bg:ScaleToSize(80, 26)
-    sc_undo_bg:SetPosition(124, -82, 0)
+    sc_undo_bg:SetPosition(124, -30, 0)
     sc_undo_bg:SetTint(0.22, 0.15, 0.18, 0.92)
 
     local sc_undo_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
     sc_undo_btn.scale_on_focus = false
     sc_undo_btn.move_on_click = false
     sc_undo_btn:ForceImageSize(80, 26)
-    sc_undo_btn:SetPosition(124, -82, 0)
+    sc_undo_btn:SetPosition(124, -30, 0)
     sc_undo_btn:SetText(is_zh and "撤销导入" or "Undo")
     sc_undo_btn:SetTextSize(14)
     sc_undo_btn:SetFont(FONT_BODY)
@@ -837,16 +1338,96 @@ local function CreateLiveCustomizerPanel(hud)
         end
     end)
 
-    local sc_hint = share_card:AddChild(Text(FONT_BODY, 12, is_zh and "坏码/越界值均在校验层拦截 · 控制台支持 c_hsshare / c_hsjson" or "Corrupt codes blocked pre-apply · Console: c_hsshare / c_hsjson"))
-    sc_hint:SetRegionSize(SW - 24, 18)
-    sc_hint:SetPosition(0, -120, 0)
+    local sc_hint = share_card:AddChild(Text(FONT_BODY, 11, is_zh and "坏码拦截 · 控制台: c_hsshare / c_hslook / c_hsjson" or "Corrupt codes blocked · Console: c_hsshare / c_hslook"))
+    sc_hint:SetRegionSize(SW - 24, 16)
+    sc_hint:SetPosition(0, -56, 0)
     sc_hint:SetColour(0.64, 0.70, 0.78, 0.90)
+
+    -- Visual Closed-Loop Section (stored in UI.look_card to consume 0 extra locals!)
+    UI.look_card = {}
+    do
+        local lc = UI.look_card
+        lc.div = share_card:AddChild(Image("images/global.xml", "square.tex"))
+        lc.div:ScaleToSize(SW - 24, 2)
+        lc.div:SetPosition(0, -72, 0)
+        lc.div:SetTint(0.32, 0.66, 0.72, 0.45)
+
+        lc.title = share_card:AddChild(Text(FONT_BODY, 14, is_zh and "视觉闭环 · 从任意截图拟合 HS1- 分享码" or "Visual Closed-Loop · Match Image -> HS1-"))
+        lc.title:SetRegionSize(SW - 24, 18)
+        lc.title:SetHAlign(G.ANCHOR_LEFT)
+        lc.title:SetPosition(0, -89, 0)
+        lc.title:SetColour(0.58, 0.92, 1.0, 0.98)
+
+        lc.sub = share_card:AddChild(Text(FONT_BODY, 11, is_zh and "Win+Shift+S/复制图片即可 · 仅映射自有可控管线（参数状态复现）" or "Copy any screenshot/image · Owned pipeline knobs only (param state)"))
+        lc.sub:SetRegionSize(SW - 24, 16)
+        lc.sub:SetHAlign(G.ANCHOR_LEFT)
+        lc.sub:SetPosition(0, -106, 0)
+        lc.sub:SetColour(0.66, 0.74, 0.82, 0.92)
+
+        local function TriggerLookMatch(mode_str)
+            local zh_now = IsChineseLocale()
+            if type(api.StartLookMatch) ~= "function" then
+                SetShareStatus("err", zh_now and "当前未加载视觉分析接口" or "Look Match API unavailable")
+                return
+            end
+            SetShareStatus("info", zh_now
+                and "正在后台线程解码并拟合视觉特征（主线程 0 阻塞）..."
+                or "Decoding & fitting visual features on worker thread...")
+            local ok_s, detail = api.StartLookMatch(mode_str, function(ok_r, msg_r, code_r)
+                if ok_r then
+                    if type(code_r) == "string" and #code_r > 0 then
+                        sc_code_txt:SetString(code_r)
+                    end
+                    SetShareStatus("ok", tostring(msg_r or ""))
+                    if panel_refresh_fn then panel_refresh_fn() end
+                else
+                    SetShareStatus("err", tostring(msg_r or ""))
+                end
+            end)
+            if not ok_s then
+                SetShareStatus("err", tostring(detail or (zh_now and "启动失败" or "Start failed")))
+            end
+        end
+
+        lc.cb_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
+        lc.cb_bg:ScaleToSize(160, 28)
+        lc.cb_bg:SetPosition(-84, -135, 0)
+        lc.cb_bg:SetTint(0.11, 0.28, 0.34, 0.96)
+
+        lc.cb_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        lc.cb_btn.scale_on_focus = false
+        lc.cb_btn.move_on_click = false
+        lc.cb_btn:ForceImageSize(160, 28)
+        lc.cb_btn:SetPosition(-84, -135, 0)
+        lc.cb_btn:SetText(is_zh and "吸取剪贴板截图" or "Match Clipboard")
+        lc.cb_btn:SetTextSize(14)
+        lc.cb_btn:SetFont(FONT_BODY)
+        lc.cb_btn:SetTextColour(0.68, 0.96, 1.0, 1.0)
+        lc.cb_btn:SetOnClick(function() TriggerLookMatch("clipboard") end)
+
+        lc.fr_bg = share_card:AddChild(Image("images/global.xml", "square.tex"))
+        lc.fr_bg:ScaleToSize(160, 28)
+        lc.fr_bg:SetPosition(84, -135, 0)
+        lc.fr_bg:SetTint(0.16, 0.24, 0.30, 0.94)
+
+        lc.fr_btn = share_card:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
+        lc.fr_btn.scale_on_focus = false
+        lc.fr_btn.move_on_click = false
+        lc.fr_btn:ForceImageSize(160, 28)
+        lc.fr_btn:SetPosition(84, -135, 0)
+        lc.fr_btn:SetText(is_zh and "同帧捕获滤镜" or "Capture Frame")
+        lc.fr_btn:SetTextSize(14)
+        lc.fr_btn:SetFont(FONT_BODY)
+        lc.fr_btn:SetTextColour(0.84, 0.92, 1.0, 1.0)
+        lc.fr_btn:SetOnClick(function() TriggerLookMatch("same_frame") end)
+    end
 
     local function RefreshShareCardHeader(snap, zh_now)
         local pnames = zh_now and preset_labels_zh or preset_labels_en
         local cur_nm = (type(snap.scheme_name) == "string" and #snap.scheme_name > 0)
             and snap.scheme_name
             or (pnames[snap.preset] or (zh_now and "自定义" or "Custom"))
+        sc_title:SetString(zh_now and "HyperShade · 方案分享与视觉闭环" or "HyperShade · Share & Look Match")
         sc_cur_lbl:SetString((zh_now and "当前方案：" or "Active: ") .. cur_nm)
         sc_saved_txt:SetString(zh_now and "已保存" or "Saved")
         sc_sub_lbl:SetString(zh_now
@@ -856,13 +1437,21 @@ local function CreateLiveCustomizerPanel(hud)
             and "导入其他玩家的方案（先校验、再应用、最后保存）"
             or "Import Player Preset (Validate -> Apply -> Save)")
         sc_hint:SetString(zh_now
-            and "坏码/越界值均在校验层拦截 · 控制台支持 c_hsshare / c_hsjson"
-            or "Corrupt codes blocked pre-apply · Console: c_hsshare / c_hsjson")
+            and "坏码拦截 · 控制台: c_hsshare / c_hslook / c_hsjson"
+            or "Corrupt codes blocked · Console: c_hsshare / c_hslook")
+        if UI.look_card then
+            UI.look_card.title:SetString(zh_now and "视觉闭环 · 从任意截图拟合 HS1- 分享码" or "Visual Closed-Loop · Match Image -> HS1-")
+            UI.look_card.sub:SetString(zh_now
+                and "Win+Shift+S/复制图片即可 · 仅映射自有可控管线（参数状态复现）"
+                or "Copy any screenshot/image · Owned pipeline knobs only (param state)")
+            UI.look_card.cb_btn:SetText(zh_now and "吸取剪贴板截图" or "Match Clipboard")
+            UI.look_card.fr_btn:SetText(zh_now and "同帧捕获滤镜" or "Capture Frame")
+        end
         if sc_name_is_ed and sc_name_ed and sc_name_ed.SetTextPrompt then
             pcall(sc_name_ed.SetTextPrompt, sc_name_ed, zh_now and "方案标题（可选，如：暗黑童话）" or "Preset title (optional)", { 0.52, 0.56, 0.64, 0.85 })
         end
         if sc_imp_is_ed and sc_imp_ed and sc_imp_ed.SetTextPrompt then
-            pcall(sc_imp_ed.SetTextPrompt, sc_imp_ed, zh_now and "粘贴 HyperSmooth 分享码（留空则读剪贴板）" or "Paste HS1-... share code (blank = read clipboard)", { 0.52, 0.56, 0.64, 0.85 })
+            pcall(sc_imp_ed.SetTextPrompt, sc_imp_ed, zh_now and "粘贴 HS1- 分享码（留空则读剪贴板）" or "Paste HS1-... share code (blank = read clipboard)", { 0.52, 0.56, 0.64, 0.85 })
         end
         if share_card_visible and type(api.PreviewShareCode) == "function" then
             local preview = api.PreviewShareCode()
@@ -872,9 +1461,13 @@ local function CreateLiveCustomizerPanel(hud)
         end
     end
 
-    share_open_btn:SetOnClick(function()
+    local function ToggleShareCard()
         share_card_visible = not share_card_visible
         if share_card_visible then
+            if UI.preset_card and UI.preset_card.visible then
+                UI.preset_card.visible = false
+                if UI.preset_card.root then UI.preset_card.root:Hide() end
+            end
             if panel_refresh_fn then panel_refresh_fn() end
             SetShareStatus("info", IsChineseLocale()
                 and "已就绪：点击“复制分享码”分享当前画面，或粘贴他人分享码先校验后导入"
@@ -884,49 +1477,216 @@ local function CreateLiveCustomizerPanel(hud)
         else
             share_card:Hide()
         end
-    end)
-
-    -- =========================================================================
-    -- TAB 2: Sharpen — Complete BCAS Pro + Ink Deconv + Bilateral + AURA (14 Knobs)
-    -- =========================================================================
-    local tab2 = tab_roots[2]
-    local tab2_defs = {
-        { key = "sharp",         flag = "cas", step = 0.15,  fmt = "%.0f%%", scale = 100, zh = "BCAS 双边锐化强度",     en = "BCAS Bilateral Sharp" },
-        { key = "ink",           flag = "cas", step = 0.15,  fmt = "%.0f%%", scale = 100, zh = "手绘墨线反卷积强度",    en = "Ink Deconv Strength" },
-        { key = "deconv_gate",   flag = "cas", step = 0.005, fmt = "%.3f",   scale = 1,   zh = "墨线边缘触发门限",      en = "Ink Edge Gate" },
-        { key = "deconv_penetr", flag = "cas", step = 0.10,  fmt = "%.0f%%", scale = 100, zh = "墨线暗部穿透率",        en = "Ink Dark Penetration" },
-        { key = "anti_ring",     flag = "cas", step = 0.10,  fmt = "%.0f%%", scale = 100, zh = "AURA 防白边光晕抑制",   en = "AURA Anti-Ringing" },
-        { key = "dark_prot",     flag = "cas", step = 0.05,  fmt = "%.0f%%", scale = 100, zh = "暗部防死黑保护",        en = "Dark Edge Protection" },
-        { key = "chroma_prot",   flag = "cas", step = 0.10,  fmt = "%.0f%%", scale = 100, zh = "色彩边缘防色散保护",    en = "Chroma Edge Protect" },
-        { key = "noise_reduce",  flag = "cas", step = 0.10,  fmt = "%.0f%%", scale = 100, zh = "平坦区防放噪抑制",      en = "Flat Noise Reduction" },
-        { key = "range_sigma",   flag = "cas", step = 0.04,  fmt = "%.2f",   scale = 1,   zh = "双边值域核 RangeSigma", en = "Bilateral RangeSigma" },
-        { key = "spatial_sigma", flag = "cas", step = 0.15,  fmt = "%.2f",   scale = 1,   zh = "双边空间核 SpatialSig", en = "Bilateral SpatialSig" },
-        { key = "noise_floor",   flag = "cas", step = 0.004, fmt = "%.3f",   scale = 1,   zh = "噪声基底阈值",          en = "Noise Floor" },
-        { key = "ar_l_over",     flag = "cas", step = 0.005, fmt = "%.3f",   scale = 1,   zh = "AURA 亮边过冲上限",     en = "AURA Light Overshoot" },
-        { key = "ar_d_over",     flag = "cas", step = 0.005, fmt = "%.3f",   scale = 1,   zh = "AURA 暗边过冲上限",     en = "AURA Dark Overshoot" },
-        { key = "dither",        flag = "cas", step = 0.25,  fmt = "%.0f%%", scale = 100, zh = "8-bit TPDF 防色带抖动", en = "8-Bit TPDF Dither" },
-    }
-    local tab2_keys = {}
-    for i = 1, #tab2_defs do
-        tab2_keys[i] = tab2_defs[i].key
-        AddStepperRow(tab2, 148 - (i - 1) * 28, 24, tab2_defs[i])
     end
-    AddGroupResetButton(tab2, -262, "重置本页 BCAS 锐化与墨线参数为默认", "Reset BCAS & Ink Defaults", tab2_keys)
+    UI.ToggleShareCard = ToggleShareCard
+    share_open_btn:SetOnClick(ToggleShareCard)
 
     -- =========================================================================
-    -- TAB 3: Color — Coexist Banner + 4 Quick Style Starters + 12 Grading Knobs
+    -- Floating Curated Preset Gallery Card (6 Original HyperShade Looks)
+    --   - Docked left of main panel (mutually exclusive with Share Card)
+    --   - Built inside UI.preset_card to consume 0 extra locals!
     -- =========================================================================
-    local tab3 = tab_roots[3]
-    local coexist_bg = tab3:AddChild(Image("images/global.xml", "square.tex"))
-    coexist_bg:ScaleToSize(W - 22, 20)
-    coexist_bg:SetPosition(0, 150, 0)
-    coexist_bg:SetTint(0.10, 0.18, 0.24, 0.86)
+    do
+        local pc = UI.preset_card
+        local PW, PH = 356, 516
+        pc.root = panel:AddChild(Widget("HS_PresetGalleryCard"))
+        pc.root:SetPosition(-(W * 0.5 + PW * 0.5 + 10), -10, 0)
+        pc.root:Hide()
 
-    local coexist_txt = tab3:AddChild(Text(FONT_BODY, 13, ""))
-    coexist_txt:SetRegionSize(W - 28, 18)
-    coexist_txt:SetPosition(0, 150, 0)
-    coexist_txt:SetColour(0.76, 0.92, 1.0, 0.95)
-    coexist_txt:SetClickable(false)
+        NewImage(pc.root, 0, 0, PW + 4, PH + 4, 0.76, 0.62, 0.34, 0.72)
+        NewImage(pc.root, 0, 0, PW, PH, 0.062, 0.072, 0.098, 0.97)
+        NewImage(pc.root, 0, PH * 0.5 - 22, PW, 44, 0.088, 0.104, 0.145, 0.99)
+        NewImage(pc.root, 0, PH * 0.5 - 44, PW, 2, 0.95, 0.74, 0.36, 0.75)
+
+        pc.title = NewText(pc.root, 18, is_zh and "HyperShade · 预设面板" or "HyperShade · Preset Gallery",
+            -16, PH * 0.5 - 17, PW - 56, 22, G.ANCHOR_LEFT, 0.98, 0.84, 0.48, 1.0)
+        pc.sub = NewText(pc.root, 11, is_zh and "6 套官方实调预设 · 点选即生效，可随时滑块微调或撤销" or "6 curated HyperShade looks · 1-click apply, editable & undoable",
+            -6, PH * 0.5 - 35, PW - 36, 16, G.ANCHOR_LEFT, 0.68, 0.76, 0.86, 0.94)
+
+        pc.close_btn = NewButton(pc.root, PW * 0.5 - 20, PH * 0.5 - 18, 28, 22, "X", 16, function()
+            pc.visible = false
+            pc.root:Hide()
+            DoRefresh()
+        end, FONT_NUM)
+        pc.close_btn:SetTextColour(0.95, 0.55, 0.55, 1.0)
+        pc.close_btn:SetTextFocusColour(1.0, 0.78, 0.78, 1.0)
+
+        pc.status_bg = NewImage(pc.root, 0, -234, PW - 24, 34, 0.09, 0.13, 0.19, 0.90)
+        pc.status_txt = NewText(pc.root, 12, "", 0, -234, PW - 34, 30, nil, 0.82, 0.90, 0.98, 0.96)
+        pc.SetStatus = function(kind, msg)
+            if kind == "ok" then
+                pc.status_bg:SetTint(0.09, 0.24, 0.15, 0.94)
+                pc.status_txt:SetColour(0.54, 1.0, 0.72, 1.0)
+            elseif kind == "err" then
+                pc.status_bg:SetTint(0.30, 0.10, 0.10, 0.94)
+                pc.status_txt:SetColour(1.0, 0.68, 0.68, 1.0)
+            else
+                pc.status_bg:SetTint(0.09, 0.13, 0.19, 0.90)
+                pc.status_txt:SetColour(0.82, 0.90, 0.98, 0.96)
+            end
+            pc.status_txt:SetString(msg or "")
+        end
+
+        local list = (type(api.GetBuiltinPresets) == "function") and api.GetBuiltinPresets() or {}
+        pc.cards = {}
+        local card_w, card_h, stride = PW - 24, 56, 62
+        local start_y = 172
+        for idx = 1, math.min(#list, 6) do
+            local item = list[idx]
+            local cy = start_y - (idx - 1) * stride
+            local acc = item.accent or { 0.95, 0.74, 0.36 }
+
+            local cborder = NewImage(pc.root, 0, cy, card_w + 4, card_h + 4, 0.95, 0.74, 0.36, 0.0)
+            local cbg = NewImage(pc.root, 0, cy, card_w, card_h, 0.095, 0.108, 0.145, 0.95)
+            local cbar = NewImage(pc.root, -card_w * 0.5 + 2, cy, 4, card_h, acc[1], acc[2], acc[3], 0.95)
+            local cname = NewText(pc.root, 15, is_zh and item.zh or item.en, -54, cy + 13, 200, 20, G.ANCHOR_LEFT, 0.94, 0.96, 0.98, 1.0)
+            local ctag_bg = NewImage(pc.root, 104, cy + 13, 114, 18, 0.13, 0.17, 0.24, 0.92)
+            local ctag = NewText(pc.root, 11, is_zh and item.tag_zh or item.tag_en, 104, cy + 13, 110, 16, nil, acc[1], acc[2], acc[3], 1.0)
+            local cdesc = NewText(pc.root, 11, WrapText(is_zh and item.desc_zh or item.desc_en, 28.0, 2),
+                4, cy - 11, card_w - 18, 26, G.ANCHOR_LEFT, 0.68, 0.76, 0.85, 0.95)
+            local cbtn = NewButton(pc.root, 0, cy, card_w, card_h, nil, nil, function()
+                if type(api.ApplyBuiltinPreset) == "function" then
+                    local ok_p, err_p, applied = api.ApplyBuiltinPreset(item.id)
+                    local zh_now = IsChineseLocale()
+                    if ok_p and applied then
+                        pc.SetStatus("ok", zh_now
+                            and string.format("已切换「%s」· 可在右侧自由微调或点下方撤销", applied.zh)
+                            or string.format("Applied '%s' · tweak on right or click Undo", applied.en))
+                    else
+                        pc.SetStatus("err", tostring(err_p or (zh_now and "切换失败" or "Apply failed")))
+                    end
+                    DoRefresh()
+                end
+            end)
+
+            pc.cards[#pc.cards + 1] = {
+                item = item, border = cborder, bg = cbg, bar = cbar,
+                name = cname, tag_bg = ctag_bg, tag = ctag, desc = cdesc, btn = cbtn,
+            }
+        end
+
+        NewImage(pc.root, 0, -172, PW - 24, 1, 0.76, 0.62, 0.34, 0.35)
+
+        pc.undo_bg = NewImage(pc.root, -112, -195, 104, 26, 0.22, 0.15, 0.18, 0.92)
+        pc.undo_btn = NewButton(pc.root, -112, -195, 104, 26, is_zh and "撤销切换" or "Undo", 14, function()
+            local zh_now = IsChineseLocale()
+            if type(api.UndoLastImport) == "function" and api.UndoLastImport() then
+                pc.SetStatus("info", zh_now and "已撤销切换，恢复至上一步配置" or "Reverted to previous configuration")
+                DoRefresh()
+            else
+                pc.SetStatus("info", zh_now and "当前没有可撤销的切换记录" or "Nothing to undo yet")
+            end
+        end)
+        pc.undo_btn:SetTextColour(0.95, 0.78, 0.82, 1.0)
+        pc.undo_btn:SetTextFocusColour(1.0, 0.92, 0.94, 1.0)
+
+        pc.share_bg = NewImage(pc.root, 0, -195, 112, 26, 0.14, 0.24, 0.30, 0.94)
+        pc.share_btn = NewButton(pc.root, 0, -195, 112, 26, is_zh and "分享 / 吸色码" or "Share / Match", 13, function()
+            ToggleShareCard()
+        end)
+        pc.share_btn:SetTextColour(0.72, 0.94, 1.0, 1.0)
+        pc.share_btn:SetTextFocusColour(0.92, 0.98, 1.0, 1.0)
+
+        pc.van_bg = NewImage(pc.root, 112, -195, 104, 26, 0.28, 0.21, 0.11, 0.94)
+        pc.van_btn = NewButton(pc.root, 112, -195, 104, 26, is_zh and "原版纯净" or "Vanilla Pure", 14, function()
+            if type(api.ApplyBuiltinPreset) == "function" then
+                api.ApplyBuiltinPreset("vanilla")
+                local zh_now = IsChineseLocale()
+                pc.SetStatus("ok", zh_now
+                    and "已恢复 100% 原版纯净画质（原生泛光 · 不影响 240 帧）"
+                    or "Restored 100% Vanilla Pure visuals (stock bloom · keeps 240Hz)")
+                DoRefresh()
+            end
+        end)
+        pc.van_btn:SetTextColour(1.0, 0.88, 0.58, 1.0)
+        pc.van_btn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
+
+        pc.Refresh = function(snap, zh_now)
+            if pc.top_btn then
+                pc.top_btn:SetText(zh_now and (pc.visible and "预设面板 ●" or "预设面板") or (pc.visible and "Presets ●" or "Presets"))
+                if pc.visible then
+                    pc.top_bg:SetTint(0.18, 0.38, 0.44, 0.98)
+                    pc.top_btn:SetTextColour(0.98, 0.96, 0.74, 1.0)
+                else
+                    pc.top_bg:SetTint(0.14, 0.20, 0.26, 0.94)
+                    pc.top_btn:SetTextColour(0.76, 0.94, 1.0, 1.0)
+                end
+            end
+            if pc.home_open_btn then
+                pc.home_open_btn:SetText(zh_now and "6套预设 >>" or "6 Presets >>")
+            end
+            pc.title:SetString(zh_now and "HyperShade · 预设面板" or "HyperShade · Preset Gallery")
+            pc.sub:SetString(zh_now
+                and "6 套官方实调预设 · 点选即生效，可随时滑块微调或撤销"
+                or "6 curated HyperShade looks · 1-click apply, editable & undoable")
+            pc.undo_btn:SetText(zh_now and "撤销切换" or "Undo")
+            pc.share_btn:SetText(zh_now and "分享 / 吸色码" or "Share / Match")
+            pc.van_btn:SetText(zh_now and "原版纯净" or "Vanilla Pure")
+            if snap.has_undo then
+                pc.undo_bg:SetTint(0.28, 0.16, 0.20, 0.95)
+                pc.undo_btn:SetTextColour(1.0, 0.82, 0.86, 1.0)
+            else
+                pc.undo_bg:SetTint(0.14, 0.13, 0.16, 0.78)
+                pc.undo_btn:SetTextColour(0.56, 0.58, 0.64, 0.85)
+            end
+
+            local active_id = snap.active_builtin_id
+            for i = 1, #pc.cards do
+                local c = pc.cards[i]
+                local it = c.item
+                local is_act = (active_id ~= nil and active_id == it.id)
+                local acc = it.accent or { 0.95, 0.74, 0.36 }
+                c.name:SetString(zh_now and it.zh or it.en)
+                c.tag:SetString(zh_now and it.tag_zh or it.tag_en)
+                c.desc:SetString(WrapText(zh_now and it.desc_zh or it.desc_en, 28.0, 2))
+                if is_act then
+                    c.border:SetTint(0.95, 0.74, 0.36, 0.96)
+                    c.bg:SetTint(0.20, 0.16, 0.09, 0.98)
+                    c.name:SetColour(1.0, 0.92, 0.62, 1.0)
+                    c.tag_bg:SetTint(0.32, 0.25, 0.12, 0.96)
+                    c.tag:SetColour(1.0, 0.94, 0.72, 1.0)
+                    c.desc:SetColour(0.88, 0.84, 0.72, 1.0)
+                else
+                    c.border:SetTint(0.95, 0.74, 0.36, 0.0)
+                    c.bg:SetTint(0.095, 0.108, 0.145, 0.95)
+                    c.name:SetColour(0.90, 0.93, 0.97, 1.0)
+                    c.tag_bg:SetTint(0.13, 0.17, 0.24, 0.92)
+                    c.tag:SetColour(acc[1], acc[2], acc[3], 0.98)
+                    c.desc:SetColour(0.66, 0.74, 0.84, 0.95)
+                end
+            end
+        end
+
+        UI.TogglePresetCard = function(force_vis)
+            if force_vis == nil then
+                pc.visible = not pc.visible
+            else
+                pc.visible = (force_vis == true)
+            end
+            if pc.visible then
+                if share_card_visible then
+                    share_card_visible = false
+                    share_card:Hide()
+                end
+                pc.SetStatus("info", IsChineseLocale()
+                    and "点选任意预设立即生效 · 控制台 c_hspreset() 也可快速切换"
+                    or "Click any preset to apply live · console: c_hspreset()")
+                pc.root:Show()
+                pc.root:MoveToFront()
+            else
+                pc.root:Hide()
+            end
+            DoRefresh()
+        end
+    end
+
+    -- ========================================================================
+    -- PRO PAGES (7 categories x accordion sections). Rows reference the option catalogue above.
+    -- ========================================================================
+    UI.texts = {}
+    local function RegText(btn, zh, en)
+        UI.texts[#UI.texts + 1] = { btn = btn, zh = zh, en = en }
+    end
 
     local mood_defs = {
         { id = "neutral", zh = "中性原色", en = "Neutral" },
@@ -935,271 +1695,165 @@ local function CreateLiveCustomizerPanel(hud)
         { id = "film",    zh = "胶片电影", en = "Filmic"  },
     }
     local mood_btns = {}
-    for i = 1, #mood_defs do
-        local md = mood_defs[i]
-        local mx = pp_start + (i - 1) * (pp_w + pp_gap)
-        local mbg = tab3:AddChild(Image("images/global.xml", "square.tex"))
-        mbg:ScaleToSize(pp_w, 24)
-        mbg:SetPosition(mx, 123, 0)
-        mbg:SetTint(0.18, 0.16, 0.22, 0.90)
+    local function BuildMoodRow(rc)
+        for i = 1, #mood_defs do
+            local md = mood_defs[i]
+            local mx = -144 + (i - 1) * 96
+            NewImage(rc, mx, 0, 90, 26, 0.18, 0.16, 0.22, 0.92)
+            local mbtn = NewButton(rc, mx, 0, 90, 26, is_zh and md.zh or md.en, 14, function()
+                if type(api.ApplyColorMood) == "function" then
+                    api.ApplyColorMood(md.id)
+                    DoRefresh()
+                end
+            end)
+            mbtn:SetTextColour(0.95, 0.92, 0.82, 1.0)
+            mbtn:SetTextFocusColour(1.0, 0.98, 0.72, 1.0)
+            mood_btns[i] = { id = md.id, zh = md.zh, en = md.en, btn = mbtn }
+        end
+    end
 
-        local mbtn = tab3:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        mbtn.scale_on_focus = false
-        mbtn.move_on_click = false
-        mbtn:ForceImageSize(pp_w, 24)
-        mbtn:SetPosition(mx, 123, 0)
-        mbtn:SetText(is_zh and md.zh or md.en)
-        mbtn:SetTextSize(14)
-        mbtn:SetFont(FONT_BODY)
-        mbtn:SetTextColour(0.95, 0.92, 0.82, 1.0)
-        mbtn:SetTextFocusColour(1.0, 0.98, 0.72, 1.0)
-        mbtn:SetOnClick(function()
-            if type(api.ApplyColorMood) == "function" then
-                api.ApplyColorMood(md.id)
-                if panel_refresh_fn then panel_refresh_fn() end
+    local function BuildHitTestRow(rc)
+        NewImage(rc, 0, 0, W - 22, 26, 0.28, 0.17, 0.12, 0.94)
+        local b = NewButton(rc, 0, 0, W - 22, 26,
+            is_zh and "原地演示打击效果（点一次换一种）" or "Test Hit-Feel (click to cycle styles)", 14, function()
+            if type(api.PreviewHitFeel) == "function" then
+                api.PreviewHitFeel()
+                DoRefresh()
             end
         end)
-        mood_btns[i] = { id = md.id, zh = md.zh, en = md.en, btn = mbtn }
+        b:SetTextColour(1.0, 0.90, 0.62, 1.0)
+        b:SetTextFocusColour(1.0, 0.98, 0.80, 1.0)
+        RegText(b, "原地演示打击效果（点一次换一种）", "Test Hit-Feel (click to cycle styles)")
     end
 
-    local tab3_defs = {
-        { key = "exposure",     flag = "tone", step = 0.05, fmt = "%+.2f",  scale = 1,   zh = "画面曝光 (EV)",         en = "Exposure (EV)" },
-        { key = "temp",         flag = "tone", step = 0.08, fmt = "%+.2f",  scale = 1,   zh = "白平衡色温 (冷/暖)",    en = "White Balance Temp" },
-        { key = "tint",         flag = "tone", step = 0.05, fmt = "%+.2f",  scale = 1,   zh = "白平衡色调 (绿/品红)",  en = "White Balance Tint" },
-        { key = "contrast",     flag = "tone", step = 0.03, fmt = "%+.0f%%",scale = 100, zh = "画面对比度",            en = "Contrast" },
-        { key = "lightness",    flag = "tone", step = 0.02, fmt = "%+.2f",  scale = 1,   zh = "全局明度偏移",          en = "Lightness Offset" },
-        { key = "gamma",        flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "伽马曲线 (Gamma)",      en = "Gamma Curve" },
-        { key = "sat",          flag = "tone", step = 0.05, fmt = "%.0f%%", scale = 100, zh = "全局饱和度",            en = "Saturation" },
-        { key = "vibrance",     flag = "tone", step = 0.05, fmt = "%+.0f%%",scale = 100, zh = "自然鲜艳度 (Vibrance)", en = "Smart Vibrance" },
-        { key = "filmic",       flag = "tone", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "ACES 电影高光曲线",     en = "ACES Filmic Curve" },
-        { key = "hl_desat",     flag = "tone", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "高光防溢色去饱和",      en = "Highlight Desat" },
-        { key = "sun_fill",     flag = "tone", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "左上角天光定向补光",    en = "Directional Sun Fill" },
-        { key = "original_mix", flag = "tone", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "原画混合度 (回退比例)", en = "Original Image Mix" },
-    }
-    local tab3_keys = {}
-    for i = 1, #tab3_defs do
-        tab3_keys[i] = tab3_defs[i].key
-        AddStepperRow(tab3, 93 - (i - 1) * 28, 24, tab3_defs[i])
+    local function BuildSlotsRow(rc)
+        MakeSlotRow(rc, 0)
     end
-    AddGroupResetButton(tab3, -262, "重置本页电影调色为中性原色", "Reset Color Grading to Neutral", tab3_keys)
 
-    -- =========================================================================
-    -- TAB 4: Pro ASC CDL (Slope / Offset / Power x RGB) + Film Vignette & Grain (11)
-    -- =========================================================================
-    local tab4 = tab_roots[4]
-    AddSectionBanner(tab4, 150, "ASC CDL 三段专业调色 (斜率/暗部/幂次) + 电影氛围", "ASC CDL Color Grading (Slope/Offset/Power) + Film", { 0.16, 0.14, 0.22, 0.86 })
-    local tab4_defs = {
-        { key = "slope_r",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 高光斜率 · 红 (Slope R)",  en = "CDL Slope Red" },
-        { key = "slope_g",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 高光斜率 · 绿 (Slope G)",  en = "CDL Slope Green" },
-        { key = "slope_b",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 高光斜率 · 蓝 (Slope B)",  en = "CDL Slope Blue" },
-        { key = "offset_r", flag = "tone", step = 0.02, fmt = "%+.2f",  scale = 1,   zh = "CDL 暗部偏移 · 红 (Offset R)", en = "CDL Offset Red" },
-        { key = "offset_g", flag = "tone", step = 0.02, fmt = "%+.2f",  scale = 1,   zh = "CDL 暗部偏移 · 绿 (Offset G)", en = "CDL Offset Green" },
-        { key = "offset_b", flag = "tone", step = 0.02, fmt = "%+.2f",  scale = 1,   zh = "CDL 暗部偏移 · 蓝 (Offset B)", en = "CDL Offset Blue" },
-        { key = "power_r",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 中间调幂 · 红 (Power R)",  en = "CDL Power Red" },
-        { key = "power_g",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 中间调幂 · 绿 (Power G)",  en = "CDL Power Green" },
-        { key = "power_b",  flag = "tone", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "CDL 中间调幂 · 蓝 (Power B)",  en = "CDL Power Blue" },
-        { key = "vignette", flag = "tone", step = 0.03, fmt = "%.0f%%", scale = 100, zh = "电影边缘暗角 (Vignette)",      en = "Edge Vignette" },
-        { key = "grain",    flag = "tone", step = 0.04, fmt = "%.0f%%", scale = 100, zh = "动态胶片颗粒 (8Hz 时钟)",      en = "Animated Film Grain" },
-    }
-    local tab4_keys = {}
-    for i = 1, #tab4_defs do
-        tab4_keys[i] = tab4_defs[i].key
-        AddStepperRow(tab4, 120 - (i - 1) * 32, 27, tab4_defs[i])
+    local function BuildShareRow(rc)
+        NewImage(rc, 0, 0, W - 22, 26, 0.24, 0.20, 0.11, 0.94)
+        local b = NewButton(rc, 0, 0, W - 22, 26,
+            is_zh and "分享 / 导入方案码 (HS1 / JSON)" or "Share / Import Preset Code (HS1 / JSON)", 14, function()
+            if UI.ToggleShareCard then UI.ToggleShareCard() end
+        end)
+        b:SetTextColour(1.0, 0.90, 0.62, 1.0)
+        b:SetTextFocusColour(1.0, 0.98, 0.80, 1.0)
+        RegText(b, "分享 / 导入方案码 (HS1 / JSON)", "Share / Import Preset Code (HS1 / JSON)")
     end
-    AddGroupResetButton(tab4, -262, "重置本页 CDL 与电影氛围为默认", "Reset CDL & Film Atmosphere", tab4_keys)
 
-    -- =========================================================================
-    -- TAB 5: Multi-Level Glow Pyramid & Atmospheric FX (12 Knobs)
-    -- =========================================================================
-    local tab5 = tab_roots[5]
-    AddSectionBanner(tab5, 150, "多级 Kawase 柔光金字塔 + 空气散射/光束 (开泛光生效)", "Multi-Level Glow Pyramid & Air FX (Bloom ON)", { 0.22, 0.16, 0.10, 0.86 })
-    local tab5_defs = {
-        { key = "bloom_str",      flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "柔光泛光总强度",          en = "Bloom Intensity" },
-        { key = "bloom_thresh",   flag = "soft_bloom", step = 0.04, fmt = "%.2f",   scale = 1,   zh = "起晕高亮阈值",            en = "Bloom Threshold" },
-        { key = "bloom_knee",     flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "柔光软肩过渡 (防炸白)",   en = "Soft Knee Shoulder" },
-        { key = "bloom_chr",      flag = "soft_bloom", step = 0.05, fmt = "%+.0f%%",scale = 100, zh = "辉光色彩饱和度",          en = "Glow Saturation" },
-        { key = "bloom_prot",     flag = "soft_bloom", step = 0.05, fmt = "%.0f%%", scale = 100, zh = "高光防洗白屏幕保护",      en = "Screen Protect" },
-        { key = "bloom_warmth",   flag = "soft_bloom", step = 0.15, fmt = "%+.0f%%",scale = 100, zh = "辉光冷暖偏移 (蓝/暖橙)",  en = "Glow Warmth" },
-        { key = "bloom_spread",   flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "光晕扩散半径 (紧致/宽)",  en = "Halo Spread" },
-        { key = "bloom_compress", flag = "soft_bloom", step = 0.05, fmt = "%.0f%%", scale = 100, zh = "辉光高光保色压肩",        en = "Highlight Compress" },
-        { key = "glow_tail",      flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "夜空长尾衰减抬升",        en = "Long-Tail Lift" },
-        { key = "light_wrap",     flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "暗部空气光包裹散射",      en = "Dark Air Light Wrap" },
-        { key = "glow_rim",       flag = "soft_bloom", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "光源附近 1px 轮廓光",     en = "Luminous Edge Rim" },
-        { key = "god_rays",       flag = "soft_bloom", step = 0.15, fmt = "%.0f%%", scale = 100, zh = "日晷斜向空气光束",        en = "Sun Crepuscular Rays" },
-    }
-    local tab5_keys = {}
-    for i = 1, #tab5_defs do
-        tab5_keys[i] = tab5_defs[i].key
-        AddStepperRow(tab5, 121 - (i - 1) * 30, 26, tab5_defs[i])
+    local function BuildRestoreRow(rc)
+        NewImage(rc, 0, 0, W - 22, 26, 0.30, 0.22, 0.12, 0.94)
+        local b = NewButton(rc, 0, 0, W - 22, 26,
+            is_zh and "一键恢复原版纯净（不影响 240 帧与低延迟）" or "Restore Vanilla Look (keeps 240Hz & low-latency)", 14, function()
+            api.SetPreset(0)
+            DoRefresh()
+        end)
+        b:SetTextColour(1.0, 0.88, 0.58, 1.0)
+        b:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
+        RegText(b, "一键恢复原版纯净（不影响 240 帧与低延迟）", "Restore Vanilla Look (keeps 240Hz & low-latency)")
     end
-    AddGroupResetButton(tab5, -262, "重置本页柔光与空气光效为默认", "Reset Glow & Air FX Defaults", tab5_keys)
 
-    -- =========================================================================
-    -- TAB 6: Native World 3D Surface Light (9) + Fluid Ground Shadows v2 (11)
-    --        Organized with clean 2-pill sub-switcher so every row stays spacious!
-    -- =========================================================================
-    local bool_filter_widgets = {}
-    local UpdateTab6SubVisual = nil
-    do
-        local tab6 = tab_roots[6]
-        local tab6_sub = 1
-        local tab6_sub_roots = {
-            tab6:AddChild(Widget("HS_Tab6_Light")),
-            tab6:AddChild(Widget("HS_Tab6_Shadows")),
-        }
-        tab6_sub_roots[2]:Hide()
-        local tab6_sub_btns = {}
-        local tab6_sub_defs = {
-            { id = 1, x = -94, zh = "3D 立体受光与细节 (9)", en = "3D Surface Light (9)" },
-            { id = 2, x =  94, zh = "动态流体阴影 v2 (11)",  en = "Fluid Shadows v2 (11)" },
-        }
-        UpdateTab6SubVisual = function(zh_now)
-            for i = 1, 2 do
-                local sb = tab6_sub_btns[i]
-                if sb then
-                    sb.btn:SetText(zh_now and sb.zh or sb.en)
-                    if tab6_sub == sb.id then
-                        sb.bg:SetTint(0.22, 0.34, 0.46, 0.96)
-                        sb.btn:SetTextColour(0.98, 0.96, 0.78, 1.0)
-                    else
-                        sb.bg:SetTint(0.12, 0.13, 0.17, 0.86)
-                        sb.btn:SetTextColour(0.72, 0.76, 0.82, 0.92)
-                    end
-                end
-            end
-        end
-        for i = 1, 2 do
-            local sd = tab6_sub_defs[i]
-            local sbg = tab6:AddChild(Image("images/global.xml", "square.tex"))
-            sbg:ScaleToSize(184, 24)
-            sbg:SetPosition(sd.x, 152, 0)
-            sbg:SetTint(0.12, 0.13, 0.17, 0.86)
-            local sbtn = tab6:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-            sbtn.scale_on_focus = false
-            sbtn.move_on_click = false
-            sbtn:ForceImageSize(184, 24)
-            sbtn:SetFont(FONT_BODY)
-            sbtn:SetTextSize(13)
-            sbtn:SetText(is_zh and sd.zh or sd.en)
-            sbtn:SetPosition(sd.x, 152, 0)
-            sbtn:SetOnClick(function()
-                tab6_sub = sd.id
-                for j = 1, 2 do
-                    if j == tab6_sub then tab6_sub_roots[j]:Show() else tab6_sub_roots[j]:Hide() end
-                end
-                if panel_refresh_fn then panel_refresh_fn() end
-            end)
-            tab6_sub_btns[i] = { id = sd.id, zh = sd.zh, en = sd.en, bg = sbg, btn = sbtn }
-        end
-
-        local tab6_light_defs = {
-            { key = "mip_bias",       flag = "mip_sharp",    step = 0.05, fmt = "%+.2f",  scale = 1,   zh = "纹理防虚化 MipLodBias",    en = "Texture MipLodBias" },
-            { key = "ao_str",         flag = "ao",           step = 0.15, fmt = "%.0f%%", scale = 100, zh = "实体接地接触影强度",       en = "Entity Contact AO" },
-            { key = "env_str",        flag = "env",          step = 0.15, fmt = "%.0f%%", scale = 100, zh = "近岸与雨天湿土强度",       en = "Shoreline & Rain Wet" },
-            { key = "dark_str",       flag = "dark_clarity", step = 0.15, fmt = "%.0f%%", scale = 100, zh = "暗夜与洞穴护眼提亮",       en = "Dark/Cave Clarity" },
-            { key = "surface_light",  native_ws = true,      step = 0.15, fmt = "%.0f%%", scale = 100, zh = "3D 实体立体受光强度",      en = "3D Entity Surface Light" },
-            { key = "shade_warm",     native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "受光面冷暖 (0冷/50中/暖)", en = "Lit Face Warmth" },
-            { key = "shade_contrast", native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "立体明暗反差幅度",         en = "3D Relief Contrast" },
-            { key = "shade_cool",     native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "背光面独立冷蓝偏色",       en = "Backlight Cool Blue" },
-            { key = "shade_dark",     native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "背光面独立压暗深度",       en = "Backlight Dark Depth" },
-        }
-        local tab6_shad_defs = {
-            { key = "shadow_density", native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "动态斜投影长影浓度",       en = "Projected Shadow Density" },
-            { key = "shadow_length",  native_ws = true,      step = 0.10, fmt = "%.2fx",  scale = 1,   zh = "长影拉伸倍率 (影长)",      en = "Shadow Length Multiplier" },
-            { key = "shadow_soft",    native_ws = true,      step = 0.15, fmt = "%.2f",   scale = 1,   zh = "9-Tap 半影边缘柔和度",     en = "9-Tap Penumbra Softness" },
-            { key = "shadow_fade",    native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "高度渐变衰减 (根实梢虚)",  en = "Height Penumbra Fade" },
-            { key = "shadow_sway",    native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "树冠微风连续摇曳幅度",     en = "Canopy Wind Sway Amp" },
-            { key = "shadow_smooth",  native_ws = true,      step = 0.10, fmt = "%.0f%%", scale = 100, zh = "光影轨迹平滑阻尼 (dt)",    en = "Light Trajectory Damping" },
-            { key = "shadow_tint_r",  native_ws = true,      step = 0.08, fmt = "%.2f",   scale = 1,   zh = "长影色彩 · 红 (Tint R)",   en = "Shadow Tint Red" },
-            { key = "shadow_tint_g",  native_ws = true,      step = 0.08, fmt = "%.2f",   scale = 1,   zh = "长影色彩 · 绿 (Tint G)",   en = "Shadow Tint Green" },
-            { key = "shadow_tint_b",  native_ws = true,      step = 0.08, fmt = "%.2f",   scale = 1,   zh = "长影色彩 · 蓝 (Tint B)",   en = "Shadow Tint Blue" },
-        }
-        local tab6_keys = {}
-        for i = 1, #tab6_light_defs do
-            tab6_keys[#tab6_keys + 1] = tab6_light_defs[i].key
-            AddStepperRow(tab6_sub_roots[1], 118 - (i - 1) * 34, 28, tab6_light_defs[i])
-        end
-        for i = 1, #tab6_shad_defs do
-            tab6_keys[#tab6_keys + 1] = tab6_shad_defs[i].key
-            AddStepperRow(tab6_sub_roots[2], 122 - (i - 1) * 31, 25, tab6_shad_defs[i])
-        end
-
-        local function AddBoolTuneRow(parent, ry, row_h, bd)
-            local rbg = parent:AddChild(Image("images/global.xml", "square.tex"))
-            rbg:ScaleToSize(W - 22, row_h)
-            rbg:SetPosition(0, ry, 0)
-            rbg:SetTint(0.11, 0.12, 0.16, 0.78)
-
-            local rbtn = parent:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-            rbtn.scale_on_focus = false
-            rbtn.move_on_click = false
-            rbtn:ForceImageSize(W - 22, row_h)
-            rbtn:SetPosition(0, ry, 0)
-            rbtn:SetOnClick(function()
-                if type(api.ToggleTuneBool) == "function" then
-                    api.ToggleTuneBool(bd.key)
-                    if panel_refresh_fn then panel_refresh_fn() end
-                end
-            end)
-
-            local rlbl = parent:AddChild(Text(FONT_BODY, 14, is_zh and bd.zh or bd.en))
-            rlbl:SetRegionSize(284, 22)
-            rlbl:SetHAlign(G.ANCHOR_LEFT)
-            rlbl:SetPosition(-39, ry, 0)
-            rlbl:SetClickable(false)
-
-            local rval = parent:AddChild(Text(FONT_BODY, 14, ""))
-            rval:SetRegionSize(74, 22)
-            rval:SetHAlign(G.ANCHOR_RIGHT)
-            rval:SetPosition(143, ry, 0)
-            rval:SetClickable(false)
-
-            bool_filter_widgets[#bool_filter_widgets + 1] = { key = bd.key, zh = bd.zh, en = bd.en, bg = rbg, lbl = rlbl, val = rval }
-        end
-
-        local tab6_bool_defs = {
-            { key = "shadow_hd",             zh = "1.0× 全分辨率阴影画布 (消跳格)", en = "1.0x Full-Res Shadow Canvas" },
-            { key = "shadow_skip_nightmare", zh = "影怪 / 暗影生物纯净免投影",      en = "No Shadow on Shadow Creatures" },
-        }
-        for i = 1, #tab6_bool_defs do
-            tab6_keys[#tab6_keys + 1] = tab6_bool_defs[i].key
-            AddBoolTuneRow(tab6_sub_roots[2], 122 - (8 + i) * 31, 25, tab6_bool_defs[i])
-        end
-
-        AddGroupResetButton(tab6, -262, "重置本页立体受光与动态阴影为默认", "Reset 3D Lighting & Fluid Shadows", tab6_keys)
-
-        -- =========================================================================
-        -- TAB 7: Native Ocean Caustics (4) + Independent Reversible Vanilla Filters (6)
-        -- =========================================================================
-        local tab7 = tab_roots[7]
-        AddSectionBanner(tab7, 150, "原生海面焦散波光与浅滩沙底 (零额外实体 · 0过绘)", "Native Procedural Ocean Caustics & Sandy Shallows", { 0.08, 0.20, 0.24, 0.88 })
-        local tab7_ocean_defs = {
-            { key = "glint_str",     native_ws = true, step = 0.10, fmt = "%.0f%%", scale = 100, zh = "海面焦散波光强度",       en = "Ocean Caustics Strength" },
-            { key = "glint_density", native_ws = true, step = 0.04, fmt = "%.2f",   scale = 1,   zh = "焦散光网锐利增益",       en = "Caustic Web Gain" },
-            { key = "glint_grain",   native_ws = true, step = 0.15, fmt = "%.2f",   scale = 1,   zh = "波光细碎颗粒频率",       en = "Caustic Grain Scale" },
-            { key = "glint_soft",    native_ws = true, step = 0.10, fmt = "%.0f%%", scale = 100, zh = "浅滩沙底与海色融合",     en = "Shallow Sand & Sea Blend" },
-        }
-        for i = 1, #tab7_ocean_defs do
-            AddStepperRow(tab7, 121 - (i - 1) * 30, 26, tab7_ocean_defs[i])
-        end
-
-        AddSectionBanner(tab7, -2, "原版滤镜独立接管 & 夜间火堆投影 (无损可逆)", "Reversible Vanilla Filters & Night Light Shadows", { 0.14, 0.18, 0.24, 0.86 })
-        AddStepperRow(tab7, -31, 26, { key = "vanilla_cc", step = 0.10, fmt = "%.0f%%", scale = 100, zh = "官方季节滤镜强度 (LUT)", en = "Vanilla ColourCube LUT" })
-        AddStepperRow(tab7, -61, 26, { key = "snow_cap",   step = 0.10, fmt = "%.0f%%", scale = 100, zh = "冬季积雪覆盖上限",       en = "Winter Snow Overlay Cap" })
-
-        local bool_filter_defs = {
-            { key = "sanity_color", zh = "低理智保色 (去灰暗滤镜)",   en = "Clean Low-Sanity Color" },
-            { key = "distort_free", zh = "低理智去波纹晃动",          en = "No Sanity Distortion" },
-            { key = "sand_filter",  zh = "夏季沙尘暴风沙护眼隐藏",    en = "Hide Sandstorm Dust" },
-            { key = "shadow_night", zh = "夜间火堆/提灯反方向真投影", en = "Night Torch/Fire Shadows" },
-        }
-        for i = 1, #bool_filter_defs do
-            AddBoolTuneRow(tab7, -91 - (i - 1) * 30, 26, bool_filter_defs[i])
-        end
-
-        AddGroupResetButton(tab7, -262, "重置本页海面波光与原版滤镜为默认", "Reset Ocean & Vanilla Filters",
-            { "glint_str", "glint_density", "glint_grain", "glint_soft", "vanilla_cc", "snow_cap", "sanity_color", "distort_free", "sand_filter", "shadow_night" })
+    local function BuildDiagRow(rc)
+        NewImage(rc, 0, 0, W - 22, 48, 0.040, 0.050, 0.075, 0.92)
+        UI.diag1 = NewText(rc, 12, "", 0, 15, W - 34, 16, G.ANCHOR_LEFT, 0.62, 0.90, 0.74, 0.96)
+        UI.diag2 = NewText(rc, 12, "", 0, 0, W - 34, 16, G.ANCHOR_LEFT, 0.70, 0.80, 0.92, 0.92)
+        UI.diag3 = NewText(rc, 12, "", 0, -15, W - 34, 16, G.ANCHOR_LEFT, 0.62, 0.68, 0.78, 0.90)
     end
+
+    -- 清晰 (Clarity)
+    BuildProPage(2, {
+        { zh = "常用：锐化与贴图", en = "Essentials: Sharpness & Textures", rows = {
+            { id = "flag_cas" }, { id = "sharp" }, { id = "ink" }, { id = "flag_af16" },
+            { id = "flag_mip_sharp" }, { id = "mip_bias" }, { id = "flag_full_lm" } } },
+        { zh = "锐化高级参数（一般不用动）", en = "Advanced Sharpening (usually leave)", rows = {
+            { id = "deconv_gate" }, { id = "deconv_penetr" }, { id = "anti_ring" }, { id = "dark_prot" },
+            { id = "chroma_prot" }, { id = "noise_reduce" }, { id = "range_sigma" }, { id = "spatial_sigma" },
+            { id = "noise_floor" }, { id = "ar_l_over" }, { id = "ar_d_over" }, { id = "dither" } } },
+        { zh = "高清细节补强", en = "High-DPI Detail", rows = { { id = "sprite_detail" }, { id = "ground_detail" } } },
+    }, "重置本页「清晰」为默认", "Reset Clarity Defaults")
+
+    -- 色彩 (Color)
+    BuildProPage(3, {
+        { zh = "常用：一键风格与基础色调", en = "Essentials: Looks & Basic Tone", rows = {
+            { custom = true, h = 26, build = BuildMoodRow },
+            { id = "flag_tone" }, { id = "exposure" }, { id = "temp" }, { id = "contrast" },
+            { id = "sat" }, { id = "vibrance" } } },
+        { zh = "高级调色", en = "Advanced Grading", rows = {
+            { id = "tint" }, { id = "lightness" }, { id = "gamma" }, { id = "filmic" },
+            { id = "hl_desat" }, { id = "sun_fill" }, { id = "original_mix" } } },
+        { zh = "专业 CDL 三段调色 + 胶片", en = "Pro CDL Grading + Film", rows = {
+            { id = "slope_r" }, { id = "slope_g" }, { id = "slope_b" },
+            { id = "offset_r" }, { id = "offset_g" }, { id = "offset_b" },
+            { id = "power_r" }, { id = "power_g" }, { id = "power_b" },
+            { id = "vignette" }, { id = "grain" } } },
+        { zh = "原版滤镜接管（随时可逆）", en = "Vanilla Filters (always reversible)", rows = {
+            { id = "vanilla_cc" }, { id = "snow_cap" }, { id = "sanity_color" },
+            { id = "distort_free" }, { id = "sand_filter" }, { id = "flag_clean_filter" } } },
+    }, "重置本页「色彩」为默认", "Reset Color Defaults")
+
+    -- 光影 (Light & Shadow)
+    BuildProPage(4, {
+        { zh = "柔光辉光与体积光雾（常用）", en = "Soft Glow, Light Rays & Mist", rows = {
+            { id = "flag_soft_bloom" }, { id = "bloom_str" }, { id = "bloom_warmth" },
+            { id = "bloom_spread" }, { id = "god_rays" }, { id = "vol_lightrays" },
+            { id = "vol_lightrays_everywhere" }, { id = "vol_ground_fog" },
+            { id = "vfx_fire_embers" }, { id = "vfx_ambient_motes" } } },
+        { zh = "柔光辉光（高级）", en = "Soft Glow (Advanced)", rows = {
+            { id = "bloom_thresh" }, { id = "bloom_knee" }, { id = "bloom_chr" }, { id = "bloom_prot" },
+            { id = "bloom_compress" }, { id = "glow_tail" }, { id = "light_wrap" }, { id = "glow_rim" } } },
+        { zh = "立体受光与接地阴影", en = "3D Light & Contact Shadow", rows = {
+            { id = "flag_ao" }, { id = "ao_str" }, { id = "surface_light" }, { id = "shade_warm" },
+            { id = "shade_contrast" }, { id = "shade_cool" }, { id = "shade_dark" },
+            { id = "flag_dark_clarity" }, { id = "dark_str" } } },
+        { zh = "动态长影与自然投影（常用）", en = "Long, Cloud & Canopy Shadows", rows = {
+            { id = "shadow_density" }, { id = "vol_cloud_shade" }, { id = "vol_canopy_shade" },
+            { id = "shadow_point_lights" }, { id = "shadow_night" },
+            { id = "shadow_length" }, { id = "shadow_soft" }, { id = "shadow_hd" } } },
+        { zh = "动态长影（高级）", en = "Long Shadows (Advanced)", rows = {
+            { id = "shadow_point_strength" }, { id = "shadow_dusk_point" }, { id = "shadow_flash_lights" },
+            { id = "shadow_weather" }, { id = "shadow_moon_blue" }, { id = "shadow_min_height" },
+            { id = "shadow_entity_recv" }, { id = "shadow_oval_keep" },
+            { id = "shadow_fade" }, { id = "shadow_sway" }, { id = "shadow_smooth" },
+            { id = "shadow_tint_r" }, { id = "shadow_tint_g" }, { id = "shadow_tint_b" },
+            { id = "shadow_skip_nightmare" } } },
+    }, "重置本页「光影」为默认", "Reset Light Defaults")
+
+    -- 水景 (Water & Nature)
+    BuildProPage(5, {
+        { zh = "PBR 镜面海洋与海界迷雾", en = "PBR Mirror Ocean & Edge Mist", rows = {
+            { id = "ocean_pbr" }, { id = "ocean_sky_refl" }, { id = "ocean_sun_glow" },
+            { id = "ocean_hide_waves" }, { id = "vol_edge_fog" } } },
+        { zh = "海面焦散与近岸倒影", en = "Sea Caustics & Coastal Refl.", rows = {
+            { id = "glint_str" }, { id = "glint_density" }, { id = "glint_grain" },
+            { id = "glint_soft" }, { id = "water_refl_str" }, { id = "water_refl_ripple" } } },
+        { zh = "植被风动", en = "Foliage Sway", rows = {
+            { id = "wind_sway_enabled" }, { id = "wind_sway_strength" }, { id = "wind_wake_strength" } } },
+        { zh = "近岸与雨天湿润", en = "Shore & Rain Wetness", rows = { { id = "flag_env" }, { id = "env_str" } } },
+    }, "重置本页「水景」为默认", "Reset Water Defaults")
+
+    -- 动作 (Motion & Combat)
+    BuildProPage(6, {
+        { zh = "动作流畅与地皮微尘", en = "Smooth Motion & Footsteps", rows = {
+            { id = "eng_skeletal" }, { id = "anim_crossfade" }, { id = "anim_spline" },
+            { id = "vfx_footsteps" } } },
+        { zh = "无震动打击感表演", en = "Zero-Shake Combat Hit-Feel", rows = {
+            { id = "hitfeel_enabled" }, { id = "hitfeel_hitstop" }, { id = "hitfeel_recoil" },
+            { id = "hitfeel_flash" }, { id = "hitfeel_campunch" }, { id = "hitfeel_vfx" },
+            { custom = true, h = 26, build = BuildHitTestRow } } },
+    }, "重置本页「动作」为默认", "Reset Motion Defaults")
+
+    -- 系统 (System)
+    BuildProPage(7, {
+        { zh = "输入与显示", en = "Input & Display", rows = {
+            { id = "eng_lowlat" }, { id = "eng_clipcursor" }, { id = "eng_hudmode" } } },
+        { zh = "我的方案与分享", en = "My Looks & Sharing", rows = {
+            { custom = true, h = 28, build = BuildSlotsRow },
+            { custom = true, h = 26, build = BuildShareRow },
+            { custom = true, h = 26, build = BuildRestoreRow } } },
+        { zh = "运行诊断（给开发者/反馈用）", en = "Diagnostics (for bug reports)", rows = {
+            { custom = true, h = 48, build = BuildDiagRow } } },
+    }, nil, nil)
+
 
     -- =========================================================================
     -- TAB 8: Extensions — HS_EXT_V1 Standard Shader Plugin Manager & GPU Profiler
@@ -1664,79 +2318,62 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     -- =========================================================================
-    -- Bottom Action Bar: 1-Click Vanilla Pure Restore + Close
+    -- Description bar (Pro only) + mode application
     -- =========================================================================
-    local bot_y = -H * 0.5 + 24
-    local reset_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
-    reset_bg:ScaleToSize(206, 26)
-    reset_bg:SetPosition(-86, bot_y, 0)
-    reset_bg:SetTint(0.32, 0.24, 0.12, 0.92)
+    UI.default_info = {
+        zh = "说明栏", en = "Help",
+        dzh = "把鼠标移到任意选项上（或点一下名称），这里会用大白话告诉你它是干什么的。",
+        den = "Hover over (or click) any option and a plain-language explanation shows up here.",
+    }
+    UI.pro_chrome[#UI.pro_chrome + 1] = NewImage(panel, 0, -299, W - 22, 52, 0.035, 0.045, 0.068, 0.92)
+    UI.pro_chrome[#UI.pro_chrome + 1] = NewImage(panel, -W * 0.5 + 12, -299, 3, 52, 0.95, 0.74, 0.36, 0.90)
+    UI.desc_title = NewText(panel, 14, "", 0, -283, W - 40, 18, G.ANCHOR_LEFT, 0.98, 0.84, 0.50, 1.0)
+    UI.desc_body = NewText(panel, 12, "", 0, -303, W - 40, 30, G.ANCHOR_LEFT, 0.78, 0.84, 0.92, 0.96)
+    UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_title
+    UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_body
 
-    local reset_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    reset_btn.scale_on_focus = false
-    reset_btn.move_on_click = false
-    reset_btn:ForceImageSize(206, 26)
-    reset_btn:SetPosition(-86, bot_y, 0)
-    reset_btn:SetText(is_zh and "一键恢复原版纯净" or "Restore Vanilla Pure")
-    reset_btn:SetTextSize(16)
-    reset_btn:SetFont(FONT_BODY)
-    reset_btn:SetTextColour(1.0, 0.88, 0.58, 1.0)
-    reset_btn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
-    reset_btn:SetOnClick(function()
-        api.SetPreset(0)
-        if panel_refresh_fn then panel_refresh_fn() end
-    end)
-
-    local hide_bg = panel:AddChild(Image("images/global.xml", "square.tex"))
-    hide_bg:ScaleToSize(156, 26)
-    hide_bg:SetPosition(104, bot_y, 0)
-    hide_bg:SetTint(0.16, 0.16, 0.20, 0.92)
-
-    local hide_btn = panel:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    hide_btn.scale_on_focus = false
-    hide_btn.move_on_click = false
-    hide_btn:ForceImageSize(156, 26)
-    hide_btn:SetPosition(104, bot_y, 0)
-    hide_btn:SetText(is_zh and "隐藏面板" or "Close Panel")
-    hide_btn:SetTextSize(16)
-    hide_btn:SetFont(FONT_BODY)
-    hide_btn:SetTextColour(0.85, 0.88, 0.92, 1.0)
-    hide_btn:SetTextFocusColour(1.0, 1.0, 1.0, 1.0)
-    hide_btn:SetOnClick(function()
-        if type(HS_TogglePanel) == "function" then
-            HS_TogglePanel(false)
+    ApplyMode = function()
+        local pro = (panel_ui_mode == "pro")
+        if pro then tab_roots[1]:Hide() else tab_roots[1]:Show() end
+        for tid = 2, 8 do
+            if pro and tid == active_tab then tab_roots[tid]:Show() else tab_roots[tid]:Hide() end
         end
-    end)
+        for i = 1, #UI.pro_chrome do
+            local cw = UI.pro_chrome[i]
+            if pro then cw:Show() else cw:Hide() end
+        end
+    end
 
     local function RefreshTelemetry()
         local snap = api.GetSnapshot()
         local zh_now = (snap.ui_zh ~= nil) and (snap.ui_zh == true) or IsChineseLocale()
-        local exp_ver = tostring(snap.expected_dll_ver or "2.8.0")
+        local exp_ver = tostring(snap.expected_dll_ver or "2.9.5")
+        local ver = tostring(snap.dll_ver or exp_ver)
         if snap.dll_status == "ok" then
-            dll_bg:SetTint(0.08, 0.20, 0.14, 0.86)
-            dll_txt:SetColour(0.50, 1.0, 0.68, 0.96)
-            dll_txt:SetString(zh_now
-                and string.format("已直连 bin64/dinput8.dll v%s (%s)", tostring(snap.dll_ver or exp_ver), snap.has_world_studio and "原生3D光影+长影+海面就绪" or "基础桥接")
-                or string.format("bin64/dinput8.dll v%s Connected (%s)", tostring(snap.dll_ver or exp_ver), snap.has_world_studio and "Native 3D/Shadow/Sea OK" or "Base Bridge"))
+            UI.st_bg:SetTint(0.04, 0.12, 0.09, 0.84)
+            UI.st2:SetColour(0.50, 1.0, 0.68, 0.96)
+            UI.st2:SetString(zh_now
+                and string.format("● 原生引擎已连接 v%s%s", ver, snap.has_world_studio and "（3D 光影可用）" or "（基础功能）")
+                or string.format("● Native engine connected v%s%s", ver, snap.has_world_studio and " (3D lighting ready)" or " (basic)"))
         elseif snap.dll_status == "outdated" then
-            dll_bg:SetTint(0.46, 0.24, 0.06, 0.94)
-            dll_txt:SetColour(1.0, 0.90, 0.42, 1.0)
-            dll_txt:SetString(zh_now
-                and string.format("旧版 dinput8.dll (%s)，请手动替换 v%s 防崩溃", tostring(snap.dll_ver or "old"), exp_ver)
-                or string.format("Outdated dinput8.dll (%s) -> Please Update to v%s", tostring(snap.dll_ver or "old"), exp_ver))
+            UI.st_bg:SetTint(0.22, 0.12, 0.03, 0.92)
+            UI.st2:SetColour(1.0, 0.90, 0.42, 1.0)
+            UI.st2:SetString(zh_now
+                and string.format("● dinput8.dll 版本过旧 (%s)，请更新到 v%s", ver, exp_ver)
+                or string.format("● Outdated dinput8.dll (%s) - please update to v%s", ver, exp_ver))
         else
-            dll_bg:SetTint(0.36, 0.19, 0.07, 0.90)
-            dll_txt:SetColour(1.0, 0.82, 0.48, 1.0)
-            dll_txt:SetString(zh_now
-                and string.format("未检测到新版 dinput8.dll (后处理可用 · 3D光影需装v%s)", exp_ver)
-                or string.format("No v%s dinput8.dll (PostFX OK · 3D/Shadow needs DLL)", exp_ver))
+            UI.st_bg:SetTint(0.20, 0.11, 0.04, 0.88)
+            UI.st2:SetColour(1.0, 0.82, 0.48, 1.0)
+            UI.st2:SetString(zh_now
+                and string.format("● 未检测到新版 dinput8.dll（基础功能可用，3D 光影需 v%s）", exp_ver)
+                or string.format("● New dinput8.dll not found (basics OK; 3D lighting needs v%s)", exp_ver))
         end
 
         local net_s = ""
         if snap.net_connected and (snap.ping_avg or -1) >= 0 then
             if zh_now then
                 net_s = ((snap.loss_cur or 0) >= 0.5)
-                    and string.format(" | 延迟%dms(%.0f%%)", snap.ping_avg, snap.loss_cur)
+                    and string.format(" | 延迟%dms(丢包%.0f%%)", snap.ping_avg, snap.loss_cur)
                     or string.format(" | 延迟%dms", snap.ping_avg)
             else
                 net_s = ((snap.loss_cur or 0) >= 0.5)
@@ -1745,40 +2382,108 @@ local function CreateLiveCustomizerPanel(hud)
             end
         end
         local t1 = zh_now
-            and string.format("[%s] 帧率%.0f · 低帧%.0f · 忙时%.1fms%s",
-                tostring(snap.render_backend or "D3D9"),
-                snap.avg_fps or 0, snap.low1_fps or 0, snap.busy_ms or 0, net_s)
-            or string.format("[%s] FPS %.0f · 1%%L %.0f · Busy %.1fms%s",
-                tostring(snap.render_backend or "D3D9"),
-                snap.avg_fps or 0, snap.low1_fps or 0, snap.busy_ms or 0, net_s)
-        if (snap.vram_mb or 0) > 0.5 then
-            t1 = t1 .. string.format(" · %.0fMB", snap.vram_mb)
-        end
-        tele1:SetString(t1)
+            and string.format("帧率 %.0f · 低帧 %.0f%s", snap.avg_fps or 0, snap.low1_fps or 0, net_s)
+            or string.format("FPS %.0f · 1%%Low %.0f%s", snap.avg_fps or 0, snap.low1_fps or 0, net_s)
+        UI.st1:SetString(string.format("[%s] ", tostring(snap.render_backend or "D3D9")) .. t1)
 
-        local t2
-        if zh_now then
+        if UI.diag1 then
+            UI.diag1:SetString(zh_now
+                and string.format("后端 %s · 峰值忙时 %.1fms · 显存 %.0fMB · DLL %s", tostring(snap.render_backend or "D3D9"), snap.busy_ms or 0, snap.vram_mb or 0, tostring(snap.dll_status or "none"))
+                or string.format("Backend %s · busy %.1fms · VRAM %.0fMB · DLL %s", tostring(snap.render_backend or "D3D9"), snap.busy_ms or 0, snap.vram_mb or 0, tostring(snap.dll_status or "none")))
             local lat_s = snap.d3d9ex_active
-                and string.format("队列%d/%d", snap.cur_lat or 1, snap.orig_lat or 3)
-                or (snap.has_dll and string.format("队列%d", snap.cur_lat or 3) or "无DLL")
-            local vb_s = ((snap.vb_hit_pct or 0) > 0)
-                and string.format("缓冲池%.0f%%", snap.vb_hit_pct)
-                or string.format("光照%.1fx", snap.lm_scale or 0.5)
-            t2 = string.format("%s · %s · 优先%d · 异步存%d · 防漏+%d",
-                lat_s, vb_s, snap.rpc_imm or 0, snap.async_save_ok or 0, snap.flick_rescues or 0)
-        else
-            local lat_s = snap.d3d9ex_active
-                and string.format("Lat %d/%d", snap.cur_lat or 1, snap.orig_lat or 3)
-                or (snap.has_dll and string.format("Lat %d", snap.cur_lat or 3) or "NoDLL")
-            local vb_s = ((snap.vb_hit_pct or 0) > 0)
-                and string.format("VB %.0f%%", snap.vb_hit_pct)
-                or string.format("LM %.1fx", snap.lm_scale or 0.5)
-            t2 = string.format("%s · %s · QoS %d · Save %d(%d) · Flick+%d",
-                lat_s, vb_s, snap.rpc_imm or 0, snap.async_save_ok or 0, snap.async_save_comp or 0, snap.flick_rescues or 0)
+                and string.format("%d/%d", snap.cur_lat or 1, snap.orig_lat or 3)
+                or (snap.has_dll and tostring(snap.cur_lat or 3) or "-")
+            UI.diag2:SetString(zh_now
+                and string.format("渲染队列 %s · 缓冲池 %.0f%% · 优先包 %d · 异步存档 %d · 防漏点击 %d", lat_s, snap.vb_hit_pct or 0, snap.rpc_imm or 0, snap.async_save_ok or 0, snap.flick_rescues or 0)
+                or string.format("Queue %s · VB %.0f%% · QoS %d · AsyncSave %d · FlickRescue %d", lat_s, snap.vb_hit_pct or 0, snap.rpc_imm or 0, snap.async_save_ok or 0, snap.flick_rescues or 0))
+            UI.diag3:SetString(zh_now
+                and ("反馈/交流 QQ 群：" .. UI.QQ_GROUP .. "（截图本区 + dst_fps_plugin.log）")
+                or ("Feedback QQ group: " .. UI.QQ_GROUP .. " (screenshot + dst_fps_plugin.log)"))
         end
-        tele2:SetString(t2)
-        if active_tab == 8 then
+        -- QQ group header button (copy feedback flash auto-expires after ~2.5s)
+        local fnNow = rawget(G, "GetTimeRealSeconds")
+        local now_t = (type(fnNow) == "function") and fnNow() or 0
+        if UI.qq_flash and (now_t - (UI.qq_flash_t or 0)) > 2.5 then
+            UI.qq_flash = nil
+        end
+        if UI.qq_flash == 1 then
+            UI.qq_btn:SetText(zh_now and "已复制群号，去 QQ 粘贴搜索" or "Copied! Paste in QQ search")
+            UI.qq_btn:SetTextColour(0.50, 1.0, 0.70, 1.0)
+        elseif UI.qq_flash == 2 then
+            UI.qq_btn:SetText(zh_now and ("QQ群 " .. UI.QQ_GROUP .. "（请手动输入）") or ("QQ group " .. UI.QQ_GROUP .. " (type manually)"))
+            UI.qq_btn:SetTextColour(1.0, 0.85, 0.50, 1.0)
+        else
+            UI.qq_btn:SetText(zh_now and ("反馈交流群 " .. UI.QQ_GROUP .. "（点击复制）") or ("QQ " .. UI.QQ_GROUP .. " (click to copy)"))
+            UI.qq_btn:SetTextColour(0.98, 0.80, 0.42, 1.0)
+        end
+        if panel_ui_mode == "pro" and active_tab == 8 then
             RefreshExtTab(zh_now)
+        end
+    end
+
+    local function ToggleIsOn(d, snap, fl, tn)
+        local s = d.src
+        if s == "tune" then return (tonumber(tn[d.key]) or 0) > 0.5 end
+        if s == "flag" then return fl[d.key] == true end
+        if s == "skeletal" then return snap.skeletal == true end
+        if s == "lowlat" then return snap.low_latency == true end
+        if s == "clip" then return snap.clip_cursor == true end
+        if s == "hud" then return snap.hud_show ~= false end
+        if s == "bundle" then
+            local b = snap.bundles
+            return type(b) == "table" and b[d.key] == true
+        end
+        return false
+    end
+
+    local function RefreshStepper(sw, snap, fl, tn, zh_now)
+        sw.lbl:SetString(zh_now and sw.zh or sw.en)
+        local rawv = tonumber(tn[sw.key]) or 0
+        sw.val_btn:SetText(string.format(sw.fmt, rawv * sw.scale))
+        local active = true
+        if sw.flag ~= nil then
+            active = (fl[sw.flag] == true)
+        elseif sw.skeletal_only then
+            active = (snap.skeletal == true) and (snap.has_dll == true)
+        elseif sw.native_ws then
+            active = (snap.has_world_studio == true) and (snap.preset ~= 0)
+        elseif sw.hitfeel_only then
+            active = (tonumber(tn.hitfeel_enabled) or 0) > 0.5 and (snap.preset ~= 0)
+        end
+        sw.active = active
+        local b = (type(snap.bounds) == "table") and snap.bounds[sw.key] or nil
+        if b and b.max > b.min then
+            local span = b.max - b.min
+            local frac = (rawv - b.min) / span
+            if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
+            local kx = TRACK_X0 + frac * TRACK_W
+            sw.knob:SetPosition(kx, sw.ry, 0)
+            sw.knob_edge:SetPosition(kx, sw.ry, 0)
+            local fw = frac * TRACK_W
+            if fw < 0.5 then fw = 0.5 end
+            sw.fill:ScaleToSize(fw, 4)
+            sw.fill:SetPosition(TRACK_X0 + fw * 0.5, sw.ry, 0)
+            if active then
+                sw.fill:SetTint(0.20, 0.72, 0.64, 0.95)
+            else
+                sw.fill:SetTint(0.30, 0.34, 0.40, 0.70)
+            end
+            local dfrac = ((b.default or b.min) - b.min) / span
+            if dfrac < 0 then dfrac = 0 elseif dfrac > 1 then dfrac = 1 end
+            sw.tick:SetPosition(TRACK_X0 + dfrac * TRACK_W, sw.ry, 0)
+            sw.tick:SetTint(0.95, 0.74, 0.36, active and 0.80 or 0.40)
+            local changed = math.abs(rawv - (b.default or rawv)) > 1e-4
+            sw.mark:SetTint(0.95, 0.74, 0.36, changed and 0.95 or 0.0)
+        end
+        PaintKnob(sw)
+        if active then
+            sw.bg:SetTint(0.095, 0.108, 0.145, 0.90)
+            sw.lbl:SetColour(0.92, 0.95, 0.98, 1.0)
+            sw.val_btn:SetTextColour(0.45, 1.0, 0.72, 1.0)
+        else
+            sw.bg:SetTint(0.08, 0.085, 0.11, 0.70)
+            sw.lbl:SetColour(0.58, 0.62, 0.68, 0.88)
+            sw.val_btn:SetTextColour(0.56, 0.60, 0.66, 0.85)
         end
     end
 
@@ -1788,24 +2493,61 @@ local function CreateLiveCustomizerPanel(hud)
         local fl = snap.flags or {}
         local tn = snap.tune or {}
         local slots = snap.slot_saved or {}
+        UI.zh_now = zh_now
+        if type(snap.bounds) == "table" then UI.bounds = snap.bounds end
 
-        title:SetString(zh_now and "HyperSmooth v2.8.0 画质光影工坊" or "HyperSmooth v2.8.0 Visual Studio")
-        reset_btn:SetText(zh_now and "一键恢复原版纯净" or "Restore Vanilla Pure")
-        hide_btn:SetText(zh_now and "隐藏面板" or "Close Panel")
-        share_open_btn:SetText(zh_now and "分享 / 导入画质方案码 (HS1 / JSON)" or "Share / Import Preset Code (HS1 / JSON)")
-        sc_title:SetString(zh_now and "HyperSmooth · 画质方案分享" or "HyperSmooth · Share Preset")
+        UI.subtitle:SetString(zh_now and "超帧与视觉引擎 v2.9.5（原HS）" or "240FPS & Visual Engine v2.9.5")
+        share_open_btn:SetText(zh_now and "分享 / 导入方案码" or "Share / Import")
+        home_reset_btn:SetText(zh_now and "恢复原版纯净" or "Restore Vanilla")
+        home_pro_btn:SetText(zh_now and "专业调参 >>" or "Pro Tuning >>")
+        sc_title:SetString(zh_now and "HyperShade · 方案分享与视觉闭环" or "HyperShade · Share & Look Match")
         sc_copy_btn:SetText(zh_now and "复制分享码" or "Copy Code")
         sc_json_btn:SetText(zh_now and "导出全部方案至 hypersmooth_presets.json" or "Export All to hypersmooth_presets.json")
         sc_chk_btn:SetText(zh_now and "导入前校验" or "Validate")
         sc_go_btn:SetText(zh_now and "安全导入并应用" or "Safe Import")
         sc_undo_btn:SetText(zh_now and "撤销导入" or "Undo")
         RefreshShareCardHeader(snap, zh_now)
-        UpdateTab6SubVisual(zh_now)
+        if UI.preset_card and UI.preset_card.Refresh then
+            UI.preset_card.Refresh(snap, zh_now)
+        end
         RefreshExtTab(zh_now)
 
         for i = 1, #section_banners do
             local sb = section_banners[i]
             sb.txt:SetString(zh_now and sb.zh or sb.en)
+        end
+        for i = 1, #UI.texts do
+            local tx = UI.texts[i]
+            tx.btn:SetText(zh_now and tx.zh or tx.en)
+        end
+
+        for i = 1, #UI.mode_btns do
+            local mb = UI.mode_btns[i]
+            mb.btn:SetText(zh_now and mb.zh or mb.en)
+            if panel_ui_mode == mb.id then
+                mb.bg:SetTint(0.42, 0.31, 0.12, 0.97)
+                mb.btn:SetTextColour(1.0, 0.92, 0.62, 1.0)
+            else
+                mb.bg:SetTint(0.12, 0.14, 0.19, 0.92)
+                mb.btn:SetTextColour(0.70, 0.75, 0.82, 0.95)
+            end
+        end
+
+        for i = 1, #home_cards do
+            local hc = home_cards[i]
+            hc.name:SetString(zh_now and preset_labels_zh[hc.id] or preset_labels_en[hc.id])
+            hc.desc:SetString(zh_now and preset_desc_zh[hc.id] or preset_desc_en[hc.id])
+            if snap.preset == hc.id then
+                hc.border:SetTint(0.95, 0.74, 0.36, 0.95)
+                hc.bg:SetTint(0.22, 0.17, 0.08, 0.98)
+                hc.name:SetColour(1.0, 0.92, 0.62, 1.0)
+                hc.desc:SetColour(0.86, 0.78, 0.60, 1.0)
+            else
+                hc.border:SetTint(0.95, 0.74, 0.36, 0.0)
+                hc.bg:SetTint(0.10, 0.115, 0.15, 0.96)
+                hc.name:SetColour(0.86, 0.89, 0.94, 1.0)
+                hc.desc:SetColour(0.58, 0.66, 0.76, 0.95)
+            end
         end
 
         for i = 1, #preset_btns do
@@ -1832,11 +2574,11 @@ local function CreateLiveCustomizerPanel(hud)
             end
         end
 
-        for i = 1, 3 do
+        for i = 1, #slot_widgets do
             local sw = slot_widgets[i]
-            local has_s = slots[i] == true
-            sw.sbtn:SetText(zh_now and ("存槽" .. i) or ("Sav" .. i))
-            sw.lbtn:SetText(zh_now and (has_s and ("读槽" .. i) or ("空槽" .. i)) or (has_s and ("Lod" .. i) or ("Emp" .. i)))
+            local has_s = slots[sw.idx] == true
+            sw.sbtn:SetText(zh_now and ("存" .. sw.idx) or ("S" .. sw.idx))
+            sw.lbtn:SetText(zh_now and (has_s and ("读" .. sw.idx) or ("空" .. sw.idx)) or (has_s and ("L" .. sw.idx) or ("-" .. sw.idx)))
             if has_s then
                 sw.lbg:SetTint(0.12, 0.26, 0.32, 0.94)
                 sw.lbtn:SetTextColour(0.56, 0.96, 1.0, 1.0)
@@ -1844,20 +2586,6 @@ local function CreateLiveCustomizerPanel(hud)
                 sw.lbg:SetTint(0.12, 0.13, 0.16, 0.76)
                 sw.lbtn:SetTextColour(0.52, 0.56, 0.62, 0.84)
             end
-        end
-
-        if snap.bcas_coexist == true then
-            coexist_bg:SetTint(0.42, 0.28, 0.08, 0.92)
-            coexist_txt:SetColour(1.0, 0.88, 0.48, 1.0)
-            coexist_txt:SetString(zh_now
-                and "检测到 BCAS Studio 共存：后处理与原生光影已自动让位"
-                or "BCAS Studio Detected: PostFX & World Studio Auto-Yielded")
-        else
-            coexist_bg:SetTint(0.10, 0.18, 0.24, 0.86)
-            coexist_txt:SetColour(0.74, 0.92, 1.0, 0.95)
-            coexist_txt:SetString(zh_now
-                and "单 Pass 全自由电影调色 (零硬编码覆盖 · 点击数值单项复位)"
-                or "1-Pass Free Cinema Grading (Zero Hardcodes · Click Value Reset)")
         end
 
         for i = 1, #mood_btns do
@@ -1870,93 +2598,130 @@ local function CreateLiveCustomizerPanel(hud)
         end
 
         for i = 1, #all_steppers do
-            local sw = all_steppers[i]
-            sw.lbl:SetString(zh_now and sw.zh or sw.en)
-            local rawv = tonumber(tn[sw.key]) or 0
-            sw.val_btn:SetText(string.format(sw.fmt, rawv * sw.scale))
-            local active = true
-            if sw.flag ~= nil then
-                active = (fl[sw.flag] == true)
-            elseif sw.native_ws then
-                active = (snap.has_world_studio == true) and (snap.preset ~= 0)
-            end
-            if active then
-                sw.bg:SetTint(0.11, 0.14, 0.18, 0.82)
-                sw.lbl:SetColour(0.92, 0.95, 0.98, 1.0)
-                sw.val_btn:SetTextColour(0.45, 1.0, 0.72, 1.0)
-            else
-                sw.bg:SetTint(0.10, 0.10, 0.13, 0.68)
-                sw.lbl:SetColour(0.62, 0.65, 0.70, 0.88)
-                sw.val_btn:SetTextColour(0.56, 0.60, 0.66, 0.85)
-            end
+            RefreshStepper(all_steppers[i], snap, fl, tn, zh_now)
         end
 
-        local on_txt  = zh_now and "[开]" or "[ON]"
-        local off_txt = zh_now and "[关]" or "[OFF]"
-
-        for i = 1, #bool_filter_widgets do
-            local bw = bool_filter_widgets[i]
-            bw.lbl:SetString(zh_now and bw.zh or bw.en)
-            local on = (tonumber(tn[bw.key]) or 0) > 0.5
-            bw.val:SetString(on and on_txt or off_txt)
-            if on then
-                bw.bg:SetTint(0.12, 0.22, 0.16, 0.84)
-                bw.lbl:SetColour(0.92, 0.98, 0.94, 1.0)
-                bw.val:SetColour(0.42, 1.0, 0.62, 1.0)
-            else
-                bw.bg:SetTint(0.11, 0.12, 0.15, 0.74)
-                bw.lbl:SetColour(0.75, 0.78, 0.82, 0.92)
-                bw.val:SetColour(0.55, 0.58, 0.64, 0.88)
-            end
-        end
-
-        for i = 1, #row_widgets do
-            local rw = row_widgets[i]
-            rw.lbl:SetString(zh_now and rw.zh or rw.en)
-            local on = fl[rw.key] == true
-            rw.val:SetString(on and on_txt or off_txt)
-            if on then
-                rw.bg:SetTint(0.12, 0.22, 0.16, 0.82)
-                rw.lbl:SetColour(0.92, 0.98, 0.94, 1.0)
-                rw.val:SetColour(0.42, 1.0, 0.62, 1.0)
-            else
-                rw.bg:SetTint(0.11, 0.12, 0.15, 0.72)
-                rw.lbl:SetColour(0.75, 0.78, 0.82, 0.92)
-                rw.val:SetColour(0.55, 0.58, 0.64, 0.88)
-            end
-        end
-
-        for i = 1, #eng_widgets do
-            local ew = eng_widgets[i]
-            ew.lbl:SetString(zh_now and ew.zh or ew.en)
-            if ew.key == "hudmode" then
-                local show = (snap.hud_show ~= false)
+        local hud_show = (snap.hud_show ~= false)
+        for i = 1, #toggle_widgets do
+            local tw = toggle_widgets[i]
+            local d = tw.def
+            tw.lbl:SetString(zh_now and d.zh or d.en)
+            if tw.dlbl then tw.dlbl:SetString(zh_now and d.hzh or d.hen) end
+            if d.src == "hud" then
                 local detail = (snap.hud_mode == "detail")
-                local htxt = not show
+                tw.val:SetString(not hud_show
                     and (zh_now and "[隐藏]" or "[Off]")
-                    or (detail and (zh_now and "[详细]" or "[Detail]") or (zh_now and "[简洁]" or "[Compact]"))
-                ew.val:SetString(htxt)
-                if show then
-                    ew.lbl:SetColour(0.88, 0.96, 1.0, 1.0)
-                    ew.val:SetColour(0.42, 0.92, 1.0, 1.0)
+                    or (detail and (zh_now and "[详细]" or "[Detail]") or (zh_now and "[简洁]" or "[Compact]")))
+                if hud_show then
+                    tw.val:SetColour(0.42, 0.92, 1.0, 1.0)
+                    tw.lbl:SetColour(0.92, 0.95, 0.98, 1.0)
                 else
-                    ew.lbl:SetColour(0.68, 0.72, 0.76, 0.90)
-                    ew.val:SetColour(0.55, 0.58, 0.64, 0.88)
+                    tw.val:SetColour(0.55, 0.58, 0.64, 0.88)
+                    tw.lbl:SetColour(0.78, 0.82, 0.88, 0.95)
                 end
             else
-                local on = (ew.key == "skeletal") and snap.skeletal or snap.low_latency
-                ew.val:SetString(on and on_txt or off_txt)
+                local on = ToggleIsOn(d, snap, fl, tn)
+                SetSwitch(tw.sw, on)
                 if on then
-                    ew.lbl:SetColour(0.88, 0.96, 1.0, 1.0)
-                    ew.val:SetColour(0.42, 0.92, 1.0, 1.0)
+                    tw.bg:SetTint(0.09, 0.19, 0.18, 0.93)
+                    tw.lbl:SetColour(0.92, 0.99, 0.96, 1.0)
                 else
-                    ew.lbl:SetColour(0.68, 0.72, 0.76, 0.90)
-                    ew.val:SetColour(0.55, 0.58, 0.64, 0.88)
+                    tw.bg:SetTint(0.095, 0.108, 0.145, 0.90)
+                    tw.lbl:SetColour(0.78, 0.82, 0.88, 0.95)
                 end
             end
+        end
+
+        for tid = 2, 7 do
+            local page = pages[tid]
+            if page then
+                for si = 1, #page.secs do
+                    local sec = page.secs[si]
+                    local open = (page.open == si)
+                    sec.hdr.lbl:SetString((open and "-  " or "+  ") .. (zh_now and sec.zh or sec.en))
+                    sec.hdr.badge:SetString(sec.count > 0 and ("(" .. sec.count .. ")") or "")
+                    if open then
+                        sec.hdr.bg:SetTint(0.19, 0.25, 0.34, 0.98)
+                    else
+                        sec.hdr.bg:SetTint(0.13, 0.16, 0.22, 0.96)
+                    end
+                end
+            end
+        end
+
+        if UI.info then
+            ShowInfo(UI.info)
+        else
+            ShowInfo(UI.default_info)
         end
         RefreshTelemetry()
     end
+
+
+    -- Per-frame UI animation: hover glow / press flash, [-]/[+] hold-repeat, slider drag
+    root.OnUpdate = function(self, dt)
+        if not panel_visible then
+            if UI.hold then UI.hold = nil end
+            if UI.drag then
+                UI.drag.hot = false
+                PaintKnob(UI.drag)
+                UI.drag = nil
+            end
+            return
+        end
+        if type(dt) ~= "number" or dt <= 0 then return end
+        if dt > 0.1 then dt = 0.1 end
+        for fx in pairs(UI.fx_active) do
+            fx.hover = fx.hover + (fx.hover_t - fx.hover) * math.min(1.0, dt * 16.0)
+            fx.press = fx.press * math.max(0.0, 1.0 - dt * 7.0)
+            local a = fx.hover * 0.10 + fx.press * 0.28
+            if math.abs(fx.hover - fx.hover_t) < 0.01 and fx.press < 0.01 then
+                fx.hover = fx.hover_t
+                fx.press = 0.0
+                a = fx.hover * 0.10
+                UI.fx_active[fx] = nil
+            end
+            fx.img:SetTint(1.0, 0.95, 0.80, a)
+        end
+        local TI = rawget(G, "TheInput")
+        local down = false
+        if TI ~= nil and type(TI.IsMouseDown) == "function" then
+            down = TI:IsMouseDown(rawget(G, "MOUSEBUTTON_LEFT") or 1000) and true or false
+        end
+        if UI.hold then
+            if down then
+                local h = UI.hold
+                h.t = h.t + dt
+                local guard = 0
+                while h.t >= h.nxt and guard < 4 do
+                    h.fn()
+                    h.nxt = h.nxt + ((h.t > 1.6) and 0.03 or 0.07)
+                    guard = guard + 1
+                end
+            else
+                UI.hold = nil
+            end
+        end
+        if UI.drag then
+            local sw = UI.drag
+            if down then
+                DragApply(sw, false)
+            else
+                DragApply(sw, true)
+                sw.hot = false
+                PaintKnob(sw)
+                UI.drag = nil
+            end
+        end
+    end
+    if type(root.StartUpdating) == "function" then root:StartUpdating() end
+    G.rawset(G, "HS_PanelDebug", UI)
+
+    if type(api.GetUiMode) == "function" then
+        local okm, m = pcall(api.GetUiMode)
+        if okm and (m == "pro" or m == "simple") then panel_ui_mode = m end
+    end
+    ApplyMode()
 
     panel_refresh_fn = RefreshStates
     panel_telemetry_fn = RefreshTelemetry
@@ -1976,6 +2741,7 @@ function HS_TogglePanel(force_state)
     if not (panel_root and panel_root.inst and panel_root.inst:IsValid()) then
         local ok, built = pcall(CreateLiveCustomizerPanel, hud)
         if not (ok and built) then
+            if G.print then G.print("[HyperSmooth] ERROR: Panel build failed: " .. tostring(built)) end
             return false
         end
         panel_root = built

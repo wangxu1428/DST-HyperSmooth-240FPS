@@ -6,42 +6,42 @@ local function L(zh, en)
     return en
 end
 
-name = L("HyperSmooth 高刷稳帧与极速加载", "HyperSmooth 240FPS & FastLoad")
+name = L("HyperShade · 饥荒超帧与视觉引擎（原 HyperSmooth）", "DST HyperShade — 240FPS & Visual Engine (formerly HyperSmooth)")
 description = L([[
-纯客户端 240 帧骨骼/位移/影子/粒子/动态光源/镜头全场景补帧、Native OpenGL 硬件加速（完整兼容 Steam 社区界面）、因果 3 通道 RPC QoS、Async libdeflate 零堵帧存盘、三层 80 旋钮实时画质光影工坊、事务级 HS1 分享码与 HS_EXT_V1 标准 Shader 扩展管线（全自动识别官方中英文语言并支持局内热切换）。
+纯客户端 240 帧骨骼/位移/影子/粒子/动态光源/镜头全场景补帧、Native OpenGL 硬件加速（完整兼容 Steam 社区界面）、世界空间独立 ShadowMask FBO 流体阴影与 360° 多光源篝火/提灯动态投影 + 沿岸实景平面水面倒影 + 真·白名单植被风动与穿行拨草、原生崩溃侦探与双屏防甩出鼠标锁、全参数实时画质光影工坊、视觉风格闭环（任意截图吸色拟合自有管线参数 → HS1 分享码）与 HS_EXT_V1 标准 Shader 扩展管线（全自动识别官方中英文语言并支持局内热切换）。
 
-【v2.8.0 全栈旗舰更新】
-1. 原生引擎全链路提速（Native GL/VBPool + 因果 RPC QoS + Async Save）：
-   - 支持 auto / opengl / d3d9 后端路由（Desktop OpenGL 兼容 ES2 + 原生 Steam Overlay 零冲突）、32MB 双轨 GPU 缓冲池（VBPool）+ 2D 精灵/UI 多纹理合批，显著削减大基地与 Boss 峰值期渲染线程卡顿；
-   - 因果安全 3 通道 RakNet::RPC4 QoS（战斗/走位/切装 100% 独占 Ch0 最高优先级）+ 500ms 实时 Ping/丢包遥测；
-   - Async libdeflate+Base64 后台存盘队列，消除 >=4KB 持久化存档卡顿。
-2. 三层 80 旋钮全自由画质光影工坊（默认 100% 原版纯净，零硬编码覆盖）：
-   - 一楼单 Pass 后处理：BCAS Pro 双边锐化、手绘墨线反卷积、AURA 防白边、电影调色、ASC CDL（Slope/Offset/Power）、多级辉光金字塔/丁达尔光束、胶片颗粒、独立可逆原版滤镜（理智色/扭曲/积雪上限/沙尘暴）；
-   - 二楼 & 三楼原生 C++ 世界光影：3D 实体浮雕受光（合批零损耗）、程序化海面焦散波光与浅滩沙底、240Hz 连续阻尼流体投影（1.0x 全分辨率阴影画布 + 9-Tap 柔和半影 + 高度衰减/微风摇曳 + 影怪免投影，关游戏自带泛光依然生效）；
-   - 8 标签局内实时面板（c_hsmenu()，点击数值单项复位）+ 3 个玩家自存槽。
-3. 事务级 HS1 画质分享码 & 可读 JSON 方案库（hypersmooth_presets.json）：
-   - 支持可选中文标题 + CRC-16 校验短码、一键复制剪贴板；严格执行「先只读校验 → 再原子应用 → 最后落盘」，坏码/越界参数绝不覆盖当前配置，并支持一键撤销导入。
-4. HS_EXT_V1 标准 Shader 扩展接口 + 硬件 GPU 耗时计费：
-   - 开放 GLOBAL.HyperSmooth.RegisterPlugin 标准管线（6 执行阶段、互斥组、共享昼夜/雨雪上下文总线、单插件异常熔断隔离），Tab 8「扩展」自动生成第三方滑块并实时显示 0 停顿硬件 GL_TIME_ELAPSED GPU 耗时（ms）。
+【v2.9.5 全栈演进更新（HyperShade 视觉闭环 + M1 性能 + M2 工具 + M3 水面倒影 + M4 白名单风动 + 多光源动态投影）】
+1. 视觉风格闭环（零外部部件 · 内置原生特征分析）：
+   - 玩家只需 Win+Shift+S 截图或复制任意参考图片（ReShade、其他游戏、参考画面），在分享卡片点击「吸取剪贴板截图」或控制台输入 c_hslook()，即可在后台线程自动解码缩放并提取 Oklab 视觉特征，严格映射至 HyperShade 自有可控管线参数白名单，一键生成可复现参数状态、可滑块微调、可一键撤销的 HS1- 分享码（仅基于用户提供图片提取视觉统计特征，不读取/复制任何第三方模组着色器、素材或代码）。
+2. 360° 多光源近场动态投影（最多 3 盏篝火/火坑/提灯/星杖/火把）：
+   - 夜晚/洞穴绕火源移动时，合批建筑与蒙皮树木/生物的影子同步 360° 实时背离火源旋转并随距离自然拉长衰减；黄昏与满月自动平滑交接日/月平行影，零额外 FBO 显存占用。
+3. 沿岸真·平面水面倒影（M3 · 内陆/洞穴 0 开销）：
+   - 独立 512×512 RGBA8+DEPTH16 双缓冲透视精确平面倒影 FBO，仅当帧内出现海洋绘制时按需激活（内陆与洞穴 0 Draw / 0.00ms），与原生海浪噪声波纹同步扭曲并自动接入原版光照图；默认 0% 纯净原版。
+4. 真·白名单植被微风摇曳 & 玩家穿行分浪拨草（M4 · 100% 刚体建筑防果冻）：
+   - 严格通过官方植物/树木标签白名单 + L1 缓存 16KB 量化空间哈希在 GPU 顶点阶段驱动草丛/树苗/浆果丛/芦苇微风与穿行拨草、树木仅树冠随风摇曳且与树影同相位锁步，建筑/墙体/玩家 100% 刚体不动。
+5. 渲染状态去重加速 + 崩溃侦探 + 双屏防甩出鼠标锁（M1 + M2）：
+   - Stencil/PolygonOffset 纳入 GL 状态缓存消除多余合批打断，崩溃自动生成中英双语 hypersmooth_crash_report.txt；Tab 1 与 c_hsclip() 支持双屏防甩出鼠标锁（ESC/控制台/切屏/崩溃 100% 自动解锁）。
+6. 内置 6 套官方实调预设面板 + 100% 原版纯净保障：
+   - 面板顶部与简易模式一键打开「预设面板」（原版纯净 / 护眼高清 / 电影绘本 / 清透日系 / 篝火暖夜 / 林间晨雾，全套原创调试档位，支持一键撤销与滑块微调）；选择「原版纯净」时严格保持原版 0.25× 泛光采样与魔光护符/火光原生亮度，不附加任何画面改动。
 ]], [[
-Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + full Steam Overlay compatibility) + 32MB GPU VBPool & sprite/UI batching, causal 3-channel RPC QoS + live Ping/Loss telemetry, async libdeflate save offload, 80-knob 3-floor real-time Visual & Lighting Studio, transactional HS1 share codes, and the open HS_EXT_V1 Standard Shader Extension Platform (auto-detects official DST language with live ZH/EN switching).
+Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Overlay compatibility), World-Space ShadowMask FBO fluid shadows with 360-deg Top-3 campfire/lantern dynamic point shadows, coastal-only true planar water reflections, strict tag-whitelisted GPU foliage wind-sway & player parting wake, zero-heap Crash Detective + safe Dual-Monitor Cursor Lock, real-time Visual & Lighting Studio with 6 built-in curated presets, Visual Closed-Loop (any reference screenshot -> HyperShade owned capability whitelist -> transactional HS1 share code), and the HS_EXT_V1 Shader Extension Platform.
 
-[v2.8.0 Flagship Release]
-1. Native Engine Acceleration (Native GL/VBPool + Causal RPC QoS + Async Save):
-   - Auto/OpenGL/D3D9 backend routing (Desktop OpenGL ES2 compatibility with full Steam Overlay support), 32MB 2-frame deferred-retire GPU VBPool, and multi-texture 2D sprite/UI batching;
-   - Causal 3-channel RakNet::RPC4 QoS keeping combat/movement/equip RPCs strictly on Ch0 IMMEDIATE_PRIORITY, plus live 500ms Ping/Packet-Loss HUD telemetry;
-   - Background libdeflate+Base64 save-commit pipeline under full Win32/CRT safety barriers.
-2. 80-Knob 3-Floor Real-Time Visual & Lighting Studio (100% Vanilla Pure by Default):
-   - Post-FX Studio: BCAS Pro bilateral sharpening, ink deconvolution, AURA anti-overshoot, cinema grading, ASC CDL, multi-level glow pyramid / god rays, film grain, and reversible vanilla filter controls (sanity tint, distortion, snow cap, sandstorm);
-   - Native C++ World Lighting: zero-batch-loss 3D entity relief shading, procedural ocean caustics & sandy shallows, and 240Hz dt-damped fluid ground shadows (1.0x full-res canvas + 9-tap soft penumbra + height fade/canopy sway + shadow-creature exclusion, works safely with Game Bloom OFF);
-   - 8-Tab live sidebar (c_hsmenu()) with click-value single reset and 3 player custom slots.
-3. Transactional HS1 Share Codes & Human-Readable JSON Preset Library (hypersmooth_presets.json):
-   - Compact CRC-16 share codes with optional UTF-8 titles and 1-click clipboard copy; strict Validate -> Atomic Apply -> Persist transaction (corrupt codes never overwrite live config) + 1-click Undo.
-4. Open HS_EXT_V1 Standard Shader Extension Interface + Hardware GPU Profiler:
-   - Standardized 6-stage PostProcessor pipeline (GLOBAL.HyperSmooth.RegisterPlugin) with shared world context uniforms, exclusive groups, fault-isolation circuit breaker, auto-generated Tab 8 plugin UI, and zero-stall hardware GL_TIME_ELAPSED GPU timing (ms).
+[v2.9.5 Full-Stack Milestone (HyperShade Visual Closed-Loop + Built-In Preset Gallery + M1-M4 + Multi-Light Shadows)]
+1. Visual Closed-Loop (Zero External Tools - Built into dinput8.dll):
+   - Copy any screenshot or image file (Win+Shift+S / Ctrl+C / ReShade / other games / reference art) and click "Match Clipboard" (or run c_hslook()) to analyze Oklab tonal/color features on a background thread and fit ONLY HyperShade's owned controllable pipeline parameters into a transactional HS1- share code (reproducible parameter state, editable sliders, 1-click Undo; never reads or copies third-party mod shaders, assets, or code).
+2. 360-Degree Top-3 Near-Field Point-Light Shadows (Campfires, Firepits, Lanterns, Starcallers, Torches):
+   - Radial 360-deg shadows for batched & skinned entities with smooth dusk/full-moon cross-fade, GL_MAX on Native GL & strength-prioritized DEPTH16 on ANGLE D3D9, and zero extra FBO VRAM.
+3. True Planar Water Reflections (M3 - 0.00ms Inland & in Caves):
+   - Dedicated 512x512 RGBA8+DEPTH16 ping-pong perspective-exact planar reflection FBO active ONLY on coastal ocean frames, wave-distorted via native ocean noise and lit by the game lightmap (default 0% in Vanilla Pure).
+4. Strict Tag-Whitelist Foliage Wind-Sway & Player Parting Wake (M4 - 100% Rigid Buildings):
+   - 16KB L1-cache O(1) spatial hash fed by official plant/tree tags (strictly excluding structures/walls/chests/players) driving GPU vertex sway & grass wake phase-locked to tree shadows; instant 0ms zero-out on Preset 0.
+5. State-Cache Stencil/PolyOff Dedup + Crash Detective + Dual-Monitor Cursor Lock (M1 + M2):
+   - Eliminates redundant Stencil/PolygonOffset batch flushes; writes bilingual hypersmooth_crash_report.txt with module+RVA stack & Lua Mod blame; opt-in ClipCursor in Tab 1 / c_hsclip() with guaranteed auto-unlock on Pause/Console/Alt+Tab/Crash.
+6. Built-In 6-Preset Curated Gallery + 100% Untouched Vanilla Pure:
+   - 1-click "Presets" gallery panel (Vanilla Pure / Eye-Care HD / Cinematic Storybook / Crisp Daylight / Cozy Firelight / Misty Canopy — 100% original HyperShade looks, editable & 1-click Undo); Vanilla Pure strictly keeps stock 0.25x BloomSampler & Magiluminescence brightness with zero added visual effects.
 ]])
 author = "Hakimi Tech Lab"
-version = "2.8.0"
+version = "2.9.5"
 
 api_version = 10
 dst_compatible = true
@@ -120,7 +120,7 @@ configuration_options = {
         options = {
             { description = L("原版纯净 (默认)", "Vanilla Pure (Default)"), data = 0 },
             { description = L("护眼高清 (关泛光全效)", "Eye-Care HD (Works w/ Bloom Off)"), data = 1 },
-            { description = L("柔和绘本", "Soft Storybook"), data = 2 },
+            { description = L("电影绘本 (全特效推荐)", "Cinematic Storybook (Recommended)"), data = 2 },
             { description = L("自定义 (按下方独立开关)", "Custom (Use Toggles Below)"), data = 3 },
         },
         default = 0,

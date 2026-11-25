@@ -90,6 +90,7 @@ struct BatchProgInfo {
     int32_t  locMatrixW         = -1;
     int32_t  locColourXform     = -1;
     int32_t  locFloatParams     = -1;
+    int32_t  locParams          = -1;
     int32_t  locPos2dUv         = -1;
     int32_t  locBatchWpos       = -1;
     int32_t  locBatchCMult      = -1;
@@ -102,6 +103,7 @@ struct BatchProgInfo {
     int32_t  samplerUnit1       = 1;
     int32_t  samplerUnit5       = 5;
     float    lastFloatParamsZ   = 0.0f;
+    float    lastParamsY        = 0.0f;
 };
 
 struct GlBatchOps {
@@ -125,6 +127,7 @@ struct GlBatchOps {
     using GetBufferParameteriv_t     = void (WINAPI*)(uint32_t target, uint32_t pname, int32_t* params);
     using GetBufferSubData_t         = void (WINAPI*)(uint32_t target, ptrdiff_t offset, ptrdiff_t size, void* data);
     using SyncStateAfterFlush_t      = void (*)(uint32_t activeUnit, uint32_t arrayBuf, uint32_t elemBuf, uint32_t batchWposLoc, void* ctx);
+    using ShadowMirrorBatch_t        = void (*)(uint32_t indexCount, void* ctx);
 
     GenBuffers_t               glGenBuffers               = nullptr;
     DeleteBuffers_t            glDeleteBuffers            = nullptr;
@@ -146,6 +149,7 @@ struct GlBatchOps {
     GetBufferParameteriv_t     glGetBufferParameteriv     = nullptr;
     GetBufferSubData_t         glGetBufferSubData         = nullptr;
     SyncStateAfterFlush_t      onPostFlushRestore         = nullptr;
+    ShadowMirrorBatch_t        onShadowMirrorBatch        = nullptr;
     void*                      callbackCtx                = nullptr;
 };
 
@@ -708,6 +712,41 @@ public:
     uint32_t CurrentProgramId() const noexcept { return curProgId_; }
     bool IsCurrentProgramEligible() const noexcept { return curProg_ && curProg_->eligible; }
     int32_t CurrentBatchActiveLoc() const noexcept { return curProg_ ? curProg_->locBatchActive : -1; }
+    uint32_t ActiveUnit() const noexcept { return activeUnit_; }
+    uint32_t BoundArrayBuf() const noexcept { return boundArrayBuf_; }
+    uint32_t BoundElemBuf() const noexcept { return boundElemBuf_; }
+    void GetAttribState(uint32_t index, AttribState& out, bool& enabled) const noexcept {
+        if (index < 16u) {
+            out = attribs_[index];
+            enabled = (attribEnMask_ & static_cast<uint16_t>(1u << index)) != 0u;
+        } else {
+            out = {};
+            enabled = false;
+        }
+    }
+    void GetAttrib0State(AttribState& out, bool& enabled) const noexcept {
+        GetAttribState(0u, out, enabled);
+    }
+    void SetShadowHints(bool skipTranslucent, bool hasCamRight, float camRightX, float camRightZ,
+                        float minShadowHeight = 0.0f) noexcept {
+        skipTranslucentShadows_ = skipTranslucent;
+        hasCamRight_            = hasCamRight;
+        camRightX_              = camRightX;
+        camRightZ_              = camRightZ;
+        minShadowHeight_        = (minShadowHeight > 0.0f) ? minShadowHeight : 0.0f;
+    }
+    const float* LastFlushShadowBoundsXZ() const noexcept {
+        return lastFlushHasShadowBounds_ ? lastFlushShadowBounds_ : nullptr;
+    }
+    const float* CurrentMatrixW() const noexcept {
+        return hasMatrixW_ ? curMatrixW_ : nullptr;
+    }
+    bool IsCurrentMatrixWStanding() const noexcept {
+        if (!hasMatrixW_) return false;
+        const float* m = curMatrixW_;
+        const float c1LenSq = m[4] * m[4] + m[5] * m[5] + m[6] * m[6];
+        return (c1LenSq > 1e-8f) && ((m[5] * m[5]) > 0.1225f * c1LenSq);
+    }
     uint32_t LastRejectCode() const noexcept { return lastRejectCode_; }
     void ClearLastRejectCode() noexcept { lastRejectCode_ = 0; }
     void GetDiagState(bool& hasMatW, float& fpZ, uint16_t& enMask, AttribState& posAttr,
@@ -732,21 +771,57 @@ public:
         foundSz = shadowCache_.PeekSize(queryBuf);
     }
 
-    void ResetContext(void* newCtx) {
-        // Context changed or destroyed: drop GPU handles without deleting on wrong context.
+    void ReleaseGpuResources() noexcept {
+        if (ops_.glDeleteBuffers) {
+            for (uint32_t i = 0; i < kRingSlots; ++i) {
+                if (vboIds_[i] != 0u) {
+                    ops_.glDeleteBuffers(1, &vboIds_[i]);
+                    vboIds_[i] = 0u;
+                }
+                if (iboIds_[i] != 0u) {
+                    ops_.glDeleteBuffers(1, &iboIds_[i]);
+                    iboIds_[i] = 0u;
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < kRingSlots; ++i) {
+                vboIds_[i] = 0u;
+                iboIds_[i] = 0u;
+            }
+        }
+        ringReady_  = false;
+        ringFailed_ = false;
+        ringIdx_    = 0u;
+    }
+
+    void ResetContext(void* newCtx, bool deleteGpuOnCurrentCtx = false) {
+        if (deleteGpuOnCurrentCtx) {
+            ReleaseGpuResources();
+        } else if (newCtx != curCtx_ || newCtx == nullptr) {
+            ringReady_  = false;
+            ringFailed_ = false;
+            ringIdx_    = 0u;
+            for (uint32_t i = 0; i < kRingSlots; ++i) {
+                vboIds_[i] = 0u;
+                iboIds_[i] = 0u;
+            }
+        }
+        // When newCtx == curCtx_ && newCtx != nullptr && !deleteGpuOnCurrentCtx (e.g., failed
+        // same-context eglMakeCurrent where pre-switch cleanup was skipped), preserve live
+        // vboIds_/iboIds_/ringReady_ so handles are NEVER orphaned and ReleaseGpuResources()
+        // still frees every allocated buffer cleanly!
         curCtx_          = newCtx;
-        ringReady_       = false;
-        ringFailed_      = false;
-        ringIdx_         = 0;
         maxTexSlots_     = 0;
         texUnitsProbed_  = false;
-        for (uint32_t i = 0; i < kRingSlots; ++i) {
-            vboIds_[i] = 0;
-            iboIds_[i] = 0;
-        }
         vertCount_       = 0;
         indexCount_      = 0;
         batchTexCount_   = 0;
+        batchHasShadowCaster_ = false;
+        shadowMinX_ = 1e30f;
+        shadowMaxX_ = -1e30f;
+        shadowMinZ_ = 1e30f;
+        shadowMaxZ_ = -1e30f;
+        lastFlushHasShadowBounds_ = false;
         curProg_          = nullptr;
         curProgId_        = 0;
         hasMatrixW_       = false;
@@ -800,6 +875,12 @@ public:
                 shadowCache_.OnDelete(buffers[i]);
                 if (buffers[i] == boundArrayBuf_) boundArrayBuf_ = 0;
                 if (buffers[i] == boundElemBuf_) boundElemBuf_ = 0;
+                for (uint32_t a = 0; a < 16u; ++a) {
+                    if (attribs_[a].buffer == buffers[i]) {
+                        attribs_[a].buffer = 0;
+                        attribs_[a].valid  = false;
+                    }
+                }
             }
         }
     }
@@ -974,9 +1055,12 @@ public:
     }
 
     void OnUniform3fv(int32_t location, int32_t count, const float* v) {
-        if (curProg_ && curProg_->eligible && location >= 0 &&
-            location == curProg_->locFloatParams && count == 1 && v != nullptr) {
-            curProg_->lastFloatParamsZ = v[2];
+        if (curProg_ && curProg_->eligible && location >= 0 && count == 1 && v != nullptr) {
+            if (location == curProg_->locFloatParams) {
+                curProg_->lastFloatParamsZ = v[2];
+            } else if (location == curProg_->locParams) {
+                curProg_->lastParamsY = v[1];
+            }
         }
         if (HasPending()) Flush(FlushReason::Uni3);
     }
@@ -1004,8 +1088,18 @@ public:
         }
     }
 
+    static inline float Smoothstep01(float e0, float e1, float x) noexcept {
+        float t = (x - e0) / (e1 - e0);
+        if (t <= 0.0f) return 0.0f;
+        if (t >= 1.0f) return 1.0f;
+        return t * t * (3.0f - 2.0f * t);
+    }
+
     // Returns true if draw call was absorbed into the sprite batch!
-    bool TryBatchDrawArrays(uint32_t mode, int32_t first, int32_t count) {
+    bool TryBatchDrawArrays(uint32_t mode, int32_t first, int32_t count,
+                            uint8_t foliageClass = 0u,
+                            float foliageSwayBase = 0.0f,
+                            float foliageWakeBase = 0.0f) {
         if (!CanBatchBase(mode) || first < 0 || count < 3 ||
             static_cast<uint32_t>(count) > kMaxSingleDrawVerts) {
             return false;
@@ -1037,6 +1131,25 @@ public:
         const float rLen = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
         const float invR = (rLen > 1e-4f) ? (1.0f / rLen) : 1.0f;
         const float rux = m[0] * invR, ruy = m[1] * invR, ruz = m[2] * invR;
+        const bool isStanding = IsCurrentMatrixWStanding();
+        const bool canShadow  = isStanding &&
+                                (!skipTranslucentShadows_ || curCMult_[3] >= 0.72f) &&
+                                (curProg_->lastParamsY <= 0.35f);
+        const float shadowFlag = canShadow ? 1.0f : 0.0f;
+        const bool doFoliage = isStanding &&
+            ((foliageClass == 1u && (std::fabs(foliageSwayBase) > 1e-4f || std::fabs(foliageWakeBase) > 1e-4f)) ||
+             (foliageClass == 2u && std::fabs(foliageSwayBase) > 1e-4f));
+        float swayAxisX = 0.70710678f, swayAxisZ = -0.70710678f;
+        if (doFoliage) {
+            const float ax = hasCamRight_ ? camRightX_ : rux;
+            const float az = hasCamRight_ ? camRightZ_ : ruz;
+            const float aLen = std::sqrt(ax * ax + az * az);
+            if (aLen > 1e-4f) {
+                swayAxisX = ax / aLen;
+                swayAxisZ = az / aLen;
+            }
+        }
+        float maxWy = -1e9f;
         for (uint32_t k = 0; k < vCount; ++k) {
             const float* src = reinterpret_cast<const float*>(vBase + (static_cast<size_t>(first) + k) * stride);
             const float x = src[0], y = src[1], uEnc = src[2], v = src[3];
@@ -1049,14 +1162,31 @@ public:
             const float dx = m[0] * x + m[4] * y;
             const float dy = m[1] * x + m[5] * y;
             const float dz = m[2] * x + m[6] * y;
+            float wx = dx + m[12];
+            const float wy = dy + m[13];
+            if (wy > maxWy) maxWy = wy;
+            float wz = dz + m[14];
+            float horizOff = 0.0f;
+            if (doFoliage && dy > 0.06f) {
+                if (foliageClass == 1u) {
+                    horizOff = foliageSwayBase * Smoothstep01(0.08f, 1.35f, dy) +
+                               foliageWakeBase * Smoothstep01(0.06f, 1.10f, dy);
+                } else {
+                    const float b2 = Smoothstep01(1.00f, 3.80f, dy);
+                    const float hc = (dy < 8.0f) ? dy : 8.0f;
+                    horizOff = foliageSwayBase * (b2 * b2) * (0.18f + 0.025f * hc);
+                }
+                wx += swayAxisX * horizOff;
+                wz += swayAxisZ * horizOff;
+            }
             BatchedVertex& dst = verts_[vertCount_++];
-            dst.x    = x;
-            dst.y    = y;
+            dst.x    = shadowFlag;
+            dst.y    = m[13];
             dst.u    = uEnc;
             dst.v    = v;
-            dst.wx   = dx + m[12];
-            dst.wy   = dy + m[13];
-            dst.wz   = dz + m[14];
+            dst.wx   = wx;
+            dst.wy   = wy;
+            dst.wz   = wz;
             dst.slot = static_cast<float>(slot);
             dst.mr   = curCMult_[0];
             dst.mg   = curCMult_[1];
@@ -1065,7 +1195,21 @@ public:
             dst.ar   = curCAdd_[0];
             dst.ag   = curCAdd_[1];
             dst.ab   = curCAdd_[2];
-            dst.pad  = dx * rux + dy * ruy + dz * ruz;
+            dst.pad  = (hasCamRight_ ? (dx * camRightX_ + dz * camRightZ_)
+                                     : (dx * rux + dy * ruy + dz * ruz)) + horizOff;
+        }
+        if (canShadow) {
+            if (minShadowHeight_ <= 0.01f || maxWy >= minShadowHeight_) {
+                batchHasShadowCaster_ = true;
+                if (m[12] < shadowMinX_) shadowMinX_ = m[12];
+                if (m[12] > shadowMaxX_) shadowMaxX_ = m[12];
+                if (m[14] < shadowMinZ_) shadowMinZ_ = m[14];
+                if (m[14] > shadowMaxZ_) shadowMaxZ_ = m[14];
+            } else {
+                for (uint32_t k = 0; k < vCount; ++k) {
+                    verts_[baseOutVert + k].x = 0.0f;
+                }
+            }
         }
         if (!isStrip) {
             for (uint32_t k = 0; k < vCount; ++k) {
@@ -1093,7 +1237,10 @@ public:
     }
 
     // Returns true if draw call was absorbed into the sprite batch!
-    bool TryBatchDrawElements(uint32_t mode, int32_t count, uint32_t type, const void* indicesPtr) {
+    bool TryBatchDrawElements(uint32_t mode, int32_t count, uint32_t type, const void* indicesPtr,
+                              uint8_t foliageClass = 0u,
+                              float foliageSwayBase = 0.0f,
+                              float foliageWakeBase = 0.0f) {
         if (!CanBatchBase(mode) || type != kGlUnsignedShort || count < 3) {
             return false;
         }
@@ -1157,7 +1304,26 @@ public:
         const float rLen = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
         const float invR = (rLen > 1e-4f) ? (1.0f / rLen) : 1.0f;
         const float rux = m[0] * invR, ruy = m[1] * invR, ruz = m[2] * invR;
+        const bool isStanding = IsCurrentMatrixWStanding();
+        const bool canShadow  = isStanding &&
+                                (!skipTranslucentShadows_ || curCMult_[3] >= 0.72f) &&
+                                (curProg_->lastParamsY <= 0.35f);
+        const float shadowFlag = canShadow ? 1.0f : 0.0f;
+        const bool doFoliage = isStanding &&
+            ((foliageClass == 1u && (std::fabs(foliageSwayBase) > 1e-4f || std::fabs(foliageWakeBase) > 1e-4f)) ||
+             (foliageClass == 2u && std::fabs(foliageSwayBase) > 1e-4f));
+        float swayAxisX = 0.70710678f, swayAxisZ = -0.70710678f;
+        if (doFoliage) {
+            const float ax = hasCamRight_ ? camRightX_ : rux;
+            const float az = hasCamRight_ ? camRightZ_ : ruz;
+            const float aLen = std::sqrt(ax * ax + az * az);
+            if (aLen > 1e-4f) {
+                swayAxisX = ax / aLen;
+                swayAxisZ = az / aLen;
+            }
+        }
         // Copy only the referenced vertex span [minIdx .. maxIdx] into our batch VBO!
+        float maxWy = -1e9f;
         for (uint32_t k = 0; k < spanVerts; ++k) {
             const float* src = reinterpret_cast<const float*>(vBase + (static_cast<size_t>(minIdx) + k) * stride);
             const float x = src[0], y = src[1], uEnc = src[2], v = src[3];
@@ -1165,14 +1331,31 @@ public:
             const float dx = m[0] * x + m[4] * y;
             const float dy = m[1] * x + m[5] * y;
             const float dz = m[2] * x + m[6] * y;
+            float wx = dx + m[12];
+            const float wy = dy + m[13];
+            if (wy > maxWy) maxWy = wy;
+            float wz = dz + m[14];
+            float horizOff = 0.0f;
+            if (doFoliage && dy > 0.06f) {
+                if (foliageClass == 1u) {
+                    horizOff = foliageSwayBase * Smoothstep01(0.08f, 1.35f, dy) +
+                               foliageWakeBase * Smoothstep01(0.06f, 1.10f, dy);
+                } else {
+                    const float b2 = Smoothstep01(1.00f, 3.80f, dy);
+                    const float hc = (dy < 8.0f) ? dy : 8.0f;
+                    horizOff = foliageSwayBase * (b2 * b2) * (0.18f + 0.025f * hc);
+                }
+                wx += swayAxisX * horizOff;
+                wz += swayAxisZ * horizOff;
+            }
             BatchedVertex& dst = verts_[vertCount_++];
-            dst.x    = x;
-            dst.y    = y;
+            dst.x    = shadowFlag;
+            dst.y    = m[13];
             dst.u    = uEnc;
             dst.v    = v;
-            dst.wx   = dx + m[12];
-            dst.wy   = dy + m[13];
-            dst.wz   = dz + m[14];
+            dst.wx   = wx;
+            dst.wy   = wy;
+            dst.wz   = wz;
             dst.slot = static_cast<float>(slot >= 0 ? slot : 0);
             dst.mr   = curCMult_[0];
             dst.mg   = curCMult_[1];
@@ -1181,7 +1364,21 @@ public:
             dst.ar   = curCAdd_[0];
             dst.ag   = curCAdd_[1];
             dst.ab   = curCAdd_[2];
-            dst.pad  = dx * rux + dy * ruy + dz * ruz;
+            dst.pad  = (hasCamRight_ ? (dx * camRightX_ + dz * camRightZ_)
+                                     : (dx * rux + dy * ruy + dz * ruz)) + horizOff;
+        }
+        if (canShadow) {
+            if (minShadowHeight_ <= 0.01f || maxWy >= minShadowHeight_) {
+                batchHasShadowCaster_ = true;
+                if (m[12] < shadowMinX_) shadowMinX_ = m[12];
+                if (m[12] > shadowMaxX_) shadowMaxX_ = m[12];
+                if (m[14] < shadowMinZ_) shadowMinZ_ = m[14];
+                if (m[14] > shadowMaxZ_) shadowMaxZ_ = m[14];
+            } else {
+                for (uint32_t k = 0; k < spanVerts; ++k) {
+                    verts_[baseOutVert + k].x = 0.0f;
+                }
+            }
         }
         if (!isStrip) {
             for (uint32_t k = 0; k < rawCount; ++k) {
@@ -1219,9 +1416,22 @@ public:
         const uint32_t flushVerts   = vertCount_;
         const uint32_t flushIndices = indexCount_;
         const uint32_t flushTexCnt  = batchTexCount_;
+        const bool     mirrorShadow = batchHasShadowCaster_;
+        lastFlushHasShadowBounds_ = mirrorShadow && (shadowMinX_ <= shadowMaxX_) && (shadowMinZ_ <= shadowMaxZ_);
+        if (lastFlushHasShadowBounds_) {
+            lastFlushShadowBounds_[0] = shadowMinX_;
+            lastFlushShadowBounds_[1] = shadowMaxX_;
+            lastFlushShadowBounds_[2] = shadowMinZ_;
+            lastFlushShadowBounds_[3] = shadowMaxZ_;
+        }
         vertCount_     = 0;
         indexCount_    = 0;
         batchTexCount_ = 0;
+        batchHasShadowCaster_ = false;
+        shadowMinX_ = 1e30f;
+        shadowMaxX_ = -1e30f;
+        shadowMinZ_ = 1e30f;
+        shadowMaxZ_ = -1e30f;
 
         if (!curProg_ || !curProg_->eligible || !EnsureGpuRingReady()) {
             return;
@@ -1285,6 +1495,12 @@ public:
         ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(flushIndices), kGlUnsignedShort, nullptr);
         ++stats_.flushes;
 
+        // Zero-copy World-Space ShadowMask FBO mirror: reuses the ALREADY-UPLOADED Ring VBO/IBO,
+        // ALREADY-BOUND GL_TEXTURE6..13 atlases, and ALREADY-ENABLED attribs 0/5/6/7 in 1 draw call!
+        if (mirrorShadow && ops_.onShadowMirrorBatch) {
+            ops_.onShadowMirrorBatch(flushIndices, ops_.callbackCtx);
+        }
+
         // Restore GL state cleanly so subsequent unbatched DST draws & gl_state_cache stay 100% exact!
         ops_.glUniform1f(curProg_->locBatchActive, 0.0f);
         ops_.glDisableVertexAttribArray(wposLoc);
@@ -1319,6 +1535,7 @@ private:
 
     bool CanBatchBase(uint32_t mode) {
         if (!enabled_) { lastRejectCode_ = 1; return false; }
+        if (ringFailed_) { lastRejectCode_ = 13; return false; }
         if (mode != kGlTriangles && mode != kGlTriangleStrip) { lastRejectCode_ = 2; return false; }
         if (!curProg_ || !curProg_->eligible) { lastRejectCode_ = 3; return false; }
         if (!hasMatrixW_) { lastRejectCode_ = 4; return false; }
@@ -1341,6 +1558,20 @@ private:
         const AttribState& attr = attribs_[posLoc];
         if (!attr.valid || attr.size != 4 || attr.type != kGlFloat || attr.normalized != 0) { lastRejectCode_ = 10; return false; }
         if (attr.stride != 0 && attr.stride != 16) { lastRejectCode_ = 11; return false; }
+        if (!ops_.glBindBuffer || !ops_.glActiveTexture || !ops_.glBindTexture ||
+            !ops_.glUniform1f || !ops_.glVertexAttribPointer ||
+            !ops_.glEnableVertexAttribArray || !ops_.glDisableVertexAttribArray ||
+            !ops_.glDrawElements) {
+            ringFailed_ = true;
+            lastRejectCode_ = 13;
+            return false;
+        }
+        // Fail-closed BEFORE accepting the very first sprite draw: if GPU ring allocation fails,
+        // reject immediately (and permanently for this context) so ALL draws run on vanilla path!
+        if (!ringReady_ && !EnsureGpuRingReady()) {
+            lastRejectCode_ = 13;
+            return false;
+        }
         EnsureCpuStagingReady();
         lastRejectCode_ = 0;
         return true;
@@ -1365,20 +1596,47 @@ private:
 
     bool EnsureGpuRingReady() {
         if (ringReady_) return true;
-        if (ringFailed_ || !ops_.glGenBuffers || !ops_.glBindBuffer || !ops_.glBufferData) return false;
+        if (ringFailed_) return false;
+        if (!ops_.glGenBuffers || !ops_.glBindBuffer || !ops_.glBufferData || !ops_.glGetBufferParameteriv) {
+            ringFailed_ = true;
+            return false;
+        }
         if (verts_.empty()) verts_.resize(kMaxBatchVerts);
         if (indices_.empty()) indices_.resize(kMaxBatchIndices);
+        for (uint32_t i = 0; i < kRingSlots; ++i) {
+            vboIds_[i] = 0u;
+            iboIds_[i] = 0u;
+        }
         ops_.glGenBuffers(static_cast<int32_t>(kRingSlots), vboIds_);
         ops_.glGenBuffers(static_cast<int32_t>(kRingSlots), iboIds_);
+        constexpr ptrdiff_t kVboSlotBytes = static_cast<ptrdiff_t>(kMaxBatchVerts * sizeof(BatchedVertex));
+        constexpr ptrdiff_t kIboSlotBytes = static_cast<ptrdiff_t>(kMaxBatchIndices * sizeof(uint16_t));
         for (uint32_t i = 0; i < kRingSlots; ++i) {
             if (vboIds_[i] == 0u || iboIds_[i] == 0u) {
+                ops_.glBindBuffer(kGlArrayBuffer, boundArrayBuf_);
+                ops_.glBindBuffer(kGlElementArrayBuffer, boundElemBuf_);
+                ReleaseGpuResources();
                 ringFailed_ = true;
                 return false;
             }
             ops_.glBindBuffer(kGlArrayBuffer, vboIds_[i]);
-            ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kMaxBatchVerts * sizeof(BatchedVertex)), nullptr, kGlStreamDraw);
+            ops_.glBufferData(kGlArrayBuffer, kVboSlotBytes, nullptr, kGlStreamDraw);
+            int32_t vAllocBytes = 0;
+            ops_.glGetBufferParameteriv(kGlArrayBuffer, kGlBufferSize, &vAllocBytes);
+
             ops_.glBindBuffer(kGlElementArrayBuffer, iboIds_[i]);
-            ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kMaxBatchIndices * sizeof(uint16_t)), nullptr, kGlStreamDraw);
+            ops_.glBufferData(kGlElementArrayBuffer, kIboSlotBytes, nullptr, kGlStreamDraw);
+            int32_t iAllocBytes = 0;
+            ops_.glGetBufferParameteriv(kGlElementArrayBuffer, kGlBufferSize, &iAllocBytes);
+
+            if (vAllocBytes < static_cast<int32_t>(kVboSlotBytes) ||
+                iAllocBytes < static_cast<int32_t>(kIboSlotBytes)) {
+                ops_.glBindBuffer(kGlArrayBuffer, boundArrayBuf_);
+                ops_.glBindBuffer(kGlElementArrayBuffer, boundElemBuf_);
+                ReleaseGpuResources();
+                ringFailed_ = true;
+                return false;
+            }
         }
         ops_.glBindBuffer(kGlArrayBuffer, boundArrayBuf_);
         ops_.glBindBuffer(kGlElementArrayBuffer, boundElemBuf_);
@@ -1548,6 +1806,18 @@ private:
     uint32_t                   indexCount_ = 0;
     uint32_t                   batchTexIds_[kMaxBatchTexSlots] = {};
     uint32_t                   batchTexCount_ = 0;
+    bool                       batchHasShadowCaster_   = false;
+    float                      shadowMinX_             = 1e30f;
+    float                      shadowMaxX_             = -1e30f;
+    float                      shadowMinZ_             = 1e30f;
+    float                      shadowMaxZ_             = -1e30f;
+    float                      lastFlushShadowBounds_[4] = { 1e30f, -1e30f, 1e30f, -1e30f };
+    bool                       lastFlushHasShadowBounds_ = false;
+    bool                       skipTranslucentShadows_ = true;
+    bool                       hasCamRight_            = false;
+    float                      camRightX_              = 0.707f;
+    float                      camRightZ_              = -0.707f;
+    float                      minShadowHeight_        = 0.0f;
 
     BatchProgInfo* curProg_          = nullptr;
     uint32_t       curProgId_        = 0;

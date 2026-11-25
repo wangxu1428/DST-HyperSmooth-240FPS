@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -84,6 +85,19 @@ struct ThreadState {
     uint32_t frontFace       = kInvalidId;
     int8_t   depthMask       = -1;
     int8_t   colorMask       = -1;
+    uint32_t stencilFunc     = kInvalidId;
+    int32_t  stencilRef      = 0;
+    uint32_t stencilFuncMask = 0;
+    bool     stencilFuncValid = false;
+    uint32_t stencilWriteMask = 0;
+    bool     stencilWriteMaskValid = false;
+    uint32_t stencilOpFail   = kInvalidId;
+    uint32_t stencilOpZfail  = kInvalidId;
+    uint32_t stencilOpZpass  = kInvalidId;
+    bool     stencilOpValid  = false;
+    float    polyOffFactor   = 0.0f;
+    float    polyOffUnits    = 0.0f;
+    bool     polyOffValid    = false;
     uint16_t attribKnownMask   = 0;
     uint16_t attribEnabledMask = 0;
     bool     vpValid         = false;
@@ -166,9 +180,22 @@ struct ThreadState {
         cullFace          = kInvalidId;
         depthFunc         = kInvalidId;
         frontFace         = kInvalidId;
-        depthMask         = -1;
-        colorMask         = -1;
-        attribKnownMask   = 0;
+        depthMask             = -1;
+        colorMask             = -1;
+        stencilFunc           = kInvalidId;
+        stencilRef            = 0;
+        stencilFuncMask       = 0;
+        stencilFuncValid      = false;
+        stencilWriteMask      = 0;
+        stencilWriteMaskValid = false;
+        stencilOpFail         = kInvalidId;
+        stencilOpZfail        = kInvalidId;
+        stencilOpZpass        = kInvalidId;
+        stencilOpValid        = false;
+        polyOffFactor         = 0.0f;
+        polyOffUnits          = 0.0f;
+        polyOffValid          = false;
+        attribKnownMask       = 0;
         attribEnabledMask = 0;
         vpValid           = false;
         scValid           = false;
@@ -299,121 +326,286 @@ struct ThreadState {
         }
     }
 
-    bool ShouldCallBlendFunc(uint32_t sfactor, uint32_t dfactor) {
+    // Split peek + commit helpers for raster/viewport state hooks:
+    //   1) Call Is*Redundant(...) BEFORE flushing pending Sprite/UI batches. On cache HIT it
+    //      records the hit and returns true so the hook skips the redundant GL call without
+    //      touching the batch. On cache MISS it counts the call WITHOUT mutating the cache!
+    //   2) Flush pending Sprite/UI batches (ShadowV2 / WaterRefl capture the TRUE pre-change
+    //      GPU state from glCache!).
+    //   3) Call Record*(...) and invoke the real GL driver function.
+    bool IsBlendFuncRedundant(uint32_t sfactor, uint32_t dfactor) {
         ++batchCalls;
         if (blendSrc == sfactor && blendDst == dfactor) {
             ++batchHits;
-            return false;
+            return true;
         }
+        return false;
+    }
+    void RecordBlendFunc(uint32_t sfactor, uint32_t dfactor) noexcept {
         blendSrc = sfactor;
         blendDst = dfactor;
+    }
+    bool ShouldCallBlendFunc(uint32_t sfactor, uint32_t dfactor) {
+        if (IsBlendFuncRedundant(sfactor, dfactor)) return false;
+        RecordBlendFunc(sfactor, dfactor);
         return true;
     }
 
-    bool ShouldCallBlendEquation(uint32_t mode) {
+    bool IsBlendEquationRedundant(uint32_t mode) {
         ++batchCalls;
         if (blendEq == mode) {
             ++batchHits;
-            return false;
+            return true;
         }
+        return false;
+    }
+    void RecordBlendEquation(uint32_t mode) noexcept {
         blendEq = mode;
+    }
+    bool ShouldCallBlendEquation(uint32_t mode) {
+        if (IsBlendEquationRedundant(mode)) return false;
+        RecordBlendEquation(mode);
         return true;
     }
 
-    bool ShouldCallCullFace(uint32_t mode) {
+    bool IsCullFaceRedundant(uint32_t mode) {
         ++batchCalls;
         if (cullFace == mode) {
             ++batchHits;
-            return false;
+            return true;
         }
+        return false;
+    }
+    void RecordCullFace(uint32_t mode) noexcept {
         cullFace = mode;
+    }
+    bool ShouldCallCullFace(uint32_t mode) {
+        if (IsCullFaceRedundant(mode)) return false;
+        RecordCullFace(mode);
         return true;
     }
 
-    bool ShouldCallDepthFunc(uint32_t func) {
+    bool IsDepthFuncRedundant(uint32_t func) {
         ++batchCalls;
         if (depthFunc == func) {
             ++batchHits;
-            return false;
+            return true;
         }
+        return false;
+    }
+    void RecordDepthFunc(uint32_t func) noexcept {
         depthFunc = func;
+    }
+    bool ShouldCallDepthFunc(uint32_t func) {
+        if (IsDepthFuncRedundant(func)) return false;
+        RecordDepthFunc(func);
         return true;
     }
 
-    bool ShouldCallFrontFace(uint32_t mode) {
+    bool IsFrontFaceRedundant(uint32_t mode) {
         ++batchCalls;
         if (frontFace == mode) {
             ++batchHits;
-            return false;
+            return true;
         }
+        return false;
+    }
+    void RecordFrontFace(uint32_t mode) noexcept {
         frontFace = mode;
+    }
+    bool ShouldCallFrontFace(uint32_t mode) {
+        if (IsFrontFaceRedundant(mode)) return false;
+        RecordFrontFace(mode);
         return true;
     }
 
-    bool ShouldCallColorMask(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    bool IsColorMaskRedundant(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
         ++batchCalls;
         const int8_t packed = static_cast<int8_t>((r ? 1 : 0) | (g ? 2 : 0) | (b ? 4 : 0) | (a ? 8 : 0));
         if (colorMask == packed) {
             ++batchHits;
-            return false;
+            return true;
         }
-        colorMask = packed;
+        return false;
+    }
+    void RecordColorMask(uint8_t r, uint8_t g, uint8_t b, uint8_t a) noexcept {
+        colorMask = static_cast<int8_t>((r ? 1 : 0) | (g ? 2 : 0) | (b ? 4 : 0) | (a ? 8 : 0));
+    }
+    bool ShouldCallColorMask(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        if (IsColorMaskRedundant(r, g, b, a)) return false;
+        RecordColorMask(r, g, b, a);
         return true;
     }
 
-    bool ShouldCallDepthMask(uint8_t flag) {
+    bool IsDepthMaskRedundant(uint8_t flag) {
         ++batchCalls;
         const int8_t v = (flag != 0) ? 1 : 0;
         if (depthMask == v) {
             ++batchHits;
-            return false;
+            return true;
         }
-        depthMask = v;
+        return false;
+    }
+    void RecordDepthMask(uint8_t flag) noexcept {
+        depthMask = (flag != 0) ? 1 : 0;
+    }
+    bool ShouldCallDepthMask(uint8_t flag) {
+        if (IsDepthMaskRedundant(flag)) return false;
+        RecordDepthMask(flag);
         return true;
     }
 
-    bool ShouldCallViewport(int32_t x, int32_t y, int32_t w, int32_t h) {
+    bool IsStencilFuncRedundant(uint32_t func, int32_t ref, uint32_t mask) {
         ++batchCalls;
-        if (w < 0 || h < 0) {
-            vpValid = false;
+        if (stencilFuncValid && stencilFunc == func && stencilRef == ref && stencilFuncMask == mask) {
+            ++batchHits;
             return true;
         }
+        return false;
+    }
+    void RecordStencilFunc(uint32_t func, int32_t ref, uint32_t mask) noexcept {
+        stencilFuncValid = true;
+        stencilFunc      = func;
+        stencilRef       = ref;
+        stencilFuncMask  = mask;
+    }
+    bool ShouldCallStencilFunc(uint32_t func, int32_t ref, uint32_t mask) {
+        if (IsStencilFuncRedundant(func, ref, mask)) return false;
+        RecordStencilFunc(func, ref, mask);
+        return true;
+    }
+
+    bool IsStencilMaskRedundant(uint32_t mask) {
+        ++batchCalls;
+        if (stencilWriteMaskValid && stencilWriteMask == mask) {
+            ++batchHits;
+            return true;
+        }
+        return false;
+    }
+    void RecordStencilMask(uint32_t mask) noexcept {
+        stencilWriteMaskValid = true;
+        stencilWriteMask      = mask;
+    }
+    bool ShouldCallStencilMask(uint32_t mask) {
+        if (IsStencilMaskRedundant(mask)) return false;
+        RecordStencilMask(mask);
+        return true;
+    }
+
+    bool IsStencilOpRedundant(uint32_t fail, uint32_t zfail, uint32_t zpass) {
+        ++batchCalls;
+        if (stencilOpValid && stencilOpFail == fail && stencilOpZfail == zfail && stencilOpZpass == zpass) {
+            ++batchHits;
+            return true;
+        }
+        return false;
+    }
+    void RecordStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) noexcept {
+        stencilOpValid = true;
+        stencilOpFail  = fail;
+        stencilOpZfail = zfail;
+        stencilOpZpass = zpass;
+    }
+    bool ShouldCallStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) {
+        if (IsStencilOpRedundant(fail, zfail, zpass)) return false;
+        RecordStencilOp(fail, zfail, zpass);
+        return true;
+    }
+
+    bool IsPolygonOffsetRedundant(float factor, float units) {
+        ++batchCalls;
+        if (!std::isfinite(factor) || !std::isfinite(units)) {
+            return false;
+        }
+        if (polyOffValid && polyOffFactor == factor && polyOffUnits == units) {
+            ++batchHits;
+            return true;
+        }
+        return false;
+    }
+    void RecordPolygonOffset(float factor, float units) noexcept {
+        if (!std::isfinite(factor) || !std::isfinite(units)) {
+            polyOffValid = false;
+            return;
+        }
+        polyOffValid  = true;
+        polyOffFactor = factor;
+        polyOffUnits  = units;
+    }
+    bool ShouldCallPolygonOffset(float factor, float units) {
+        if (IsPolygonOffsetRedundant(factor, units)) return false;
+        RecordPolygonOffset(factor, units);
+        return true;
+    }
+
+    bool IsViewportRedundant(int32_t x, int32_t y, int32_t w, int32_t h) {
+        ++batchCalls;
+        if (w < 0 || h < 0) return false;
         if (vpValid && vp[0] == x && vp[1] == y && vp[2] == w && vp[3] == h) {
             ++batchHits;
-            return false;
+            return true;
+        }
+        return false;
+    }
+    void RecordViewport(int32_t x, int32_t y, int32_t w, int32_t h) noexcept {
+        if (w < 0 || h < 0) {
+            vpValid = false;
+            return;
         }
         vpValid = true;
         vp[0] = x; vp[1] = y; vp[2] = w; vp[3] = h;
+    }
+    bool ShouldCallViewport(int32_t x, int32_t y, int32_t w, int32_t h) {
+        if (IsViewportRedundant(x, y, w, h)) return false;
+        RecordViewport(x, y, w, h);
         return true;
     }
 
-    bool ShouldCallScissor(int32_t x, int32_t y, int32_t w, int32_t h) {
+    bool IsScissorRedundant(int32_t x, int32_t y, int32_t w, int32_t h) {
         ++batchCalls;
-        if (w < 0 || h < 0) {
-            scValid = false;
-            return true;
-        }
+        if (w < 0 || h < 0) return false;
         if (scValid && sc[0] == x && sc[1] == y && sc[2] == w && sc[3] == h) {
             ++batchHits;
-            return false;
+            return true;
+        }
+        return false;
+    }
+    void RecordScissor(int32_t x, int32_t y, int32_t w, int32_t h) noexcept {
+        if (w < 0 || h < 0) {
+            scValid = false;
+            return;
         }
         scValid = true;
         sc[0] = x; sc[1] = y; sc[2] = w; sc[3] = h;
+    }
+    bool ShouldCallScissor(int32_t x, int32_t y, int32_t w, int32_t h) {
+        if (IsScissorRedundant(x, y, w, h)) return false;
+        RecordScissor(x, y, w, h);
         return true;
     }
 
-    bool ShouldCallEnableDisable(uint32_t cap, bool enable) {
+    bool IsEnableDisableRedundant(uint32_t cap, bool enable) {
         ++batchCalls;
         const int idx = CapToIndex(cap);
         if (idx >= 0) {
             const int8_t v = enable ? 1 : 0;
             if (caps[idx] == v) {
                 ++batchHits;
-                return false;
+                return true;
             }
-            caps[idx] = v;
-            return true;
         }
+        return false;
+    }
+    void RecordEnableDisable(uint32_t cap, bool enable) noexcept {
+        const int idx = CapToIndex(cap);
+        if (idx >= 0) {
+            caps[idx] = enable ? 1 : 0;
+        }
+    }
+    bool ShouldCallEnableDisable(uint32_t cap, bool enable) {
+        if (IsEnableDisableRedundant(cap, enable)) return false;
+        RecordEnableDisable(cap, enable);
         return true;
     }
 
