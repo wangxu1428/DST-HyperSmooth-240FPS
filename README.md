@@ -77,3 +77,16 @@
   - 原生 DLL：`tools/build_native.ps1`（Zig `x86_64-windows-gnu`, `-std=c++20 -O3`，纯 UCRT 零外部运行库依赖）+ `python tools/test_redteam_client.py`
   - 着色器包：`python tools/build_shaders.py`（74/74 原版与模组 `.ksh` 二进制逐字节校验 + 实机 OpenGL 编译验证）
   - Lua 回归：`python tools/test_client_lua_v24.py`（真实 64 位 DST Lua 5.1 虚拟机 18/18 全链路自动化测试）
+
+---
+
+## 技术溯源、独立演进与开源授权 / Provenance & Licensing
+
+本项目公开留存完整的**技术来源文献映射**、**Git 独立演进记录与实机验证套件**，以及**第三方代码/依赖库/素材授权台账**：
+
+- **技术来源与独立开发演进白皮书**：[`docs/PROVENANCE_AND_ARCHITECTURE.md`](docs/PROVENANCE_AND_ARCHITECTURE.md)（[English Version](docs/PROVENANCE_AND_ARCHITECTURE_EN.md)）
+  - 完整列出原生世界空间正交 ShadowMask FBO（SIGGRAPH 1978/2005 PCSS + SPIE 1993 蓝噪声）、平面水面倒影、Dual-Kawase/Karis 泛光、ACES/CDL/TPDF、AZDO 合批环、PCHIP 流体骨骼等每一模块对应的公开论文、教材、规范及架构演进决策（ADR），且 v2.9.x 原生投影/倒影零 Lua 实体克隆。
+- **第三方依赖、开源适配与素材授权台账**：[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) & [`LICENSE`](LICENSE)
+  - 静态链接库：`libdeflate v1.23`（MIT）、`mimalloc v2.1.7`（MIT）；
+  - MIT 开源项目致谢与引用边界：`DST-BCAS-Studio`（Copyright 2026 Nanmianyi / 楠眠已，MIT License，含独立版自动共存礼让）、`DST-KeyBind-UI`（rtk0c / liolok，MIT License）；
+  - 仓库分发的全部 `.ksh` / `.tex` / `.xml` / 蓝噪声表均由仓内源码脚本 100% 确定性生成，不打包分发任何科雷官方受版权保护资源。

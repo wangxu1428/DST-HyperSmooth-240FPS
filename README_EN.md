@@ -55,3 +55,16 @@
 
 - Lockless passthrough of all 6 `System32\dinput8.dll` exports; process-gated strictly to `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe`; W^X `PAGE_EXECUTE_READ` trampolines, 58/58 fail-closed AOBs, and null-string `glShaderSource` driver crash protection.
 - Build from source with Zig (`x86_64-windows-gnu`, `-std=c++20 -O3`) via `tools/build_native.ps1`, rebuild Klei `.ksh` shaders via `tools/build_shaders.py`, and run full verification with `tools/test_redteam_client.py` + `tools/test_client_lua_v24.py` (18/18 DST Lua 5.1 VM tests).
+
+---
+
+## Technical Provenance, Architecture Evolution & Licensing
+
+This repository maintains an explicit three-pillar provenance and licensing record:
+
+- **Technical Sources & Independent Development Trail**: [`docs/PROVENANCE_AND_ARCHITECTURE_EN.md`](docs/PROVENANCE_AND_ARCHITECTURE_EN.md) ([简体中文](docs/PROVENANCE_AND_ARCHITECTURE.md))
+  - Maps every native rendering, post-processing, batching, and animation module (`world_shadow_engine.h`, `water_reflection_engine.h`, `blue_noise_64.h`, `sprite_batcher.h`, `ui_batcher.h`, `skeletal_fluid.h`, `build_shaders.py`, etc.) to its peer-reviewed papers, textbooks, public talks, and Khronos/Microsoft specifications, alongside our public Git timeline, Architecture Decision Records (ADRs), and 700 KB+ automated CPU/GPU test suites (zero Lua entity/part cloning for shadows or reflections).
+- **Third-Party Licensing & Asset Provenance Ledger**: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) & [`LICENSE`](LICENSE)
+  - Statically linked libraries: `libdeflate v1.23` (MIT), `mimalloc v2.1.7` (MIT);
+  - MIT open-source attributions & scope boundaries: `DST-BCAS-Studio` (Copyright 2026 Nanmianyi, MIT License, with automatic runtime coexistence yield via `IsExternalBcasActive()`), `DST-KeyBind-UI` (rtk0c / liolok, MIT License);
+  - Every distributed `.ksh`, `.tex`, `.xml`, and blue-noise lookup table is deterministically generated from source scripts inside this repository, with zero redistribution of Klei Entertainment game assets.

@@ -22,10 +22,16 @@ SOFTWARE.
 
 ---
 
-Third-Party Notices:
-- Compiled binary releases statically link libdeflate v1.23 (Copyright 2016 Eric Biggers),
-  licensed under the MIT License (https://github.com/ebiggers/libdeflate).
+Third-Party Notices (see THIRD_PARTY_NOTICES.md for full scope & asset ledger):
+- libdeflate v1.23 (Copyright 2016 Eric Biggers; Copyright 2024 Google LLC),
+  licensed under the MIT License (third_party/libdeflate-1.23/COPYING, https://github.com/ebiggers/libdeflate).
+- mimalloc v2.1.7 (Copyright (c) 2018-2021 Microsoft Corporation, Daan Leijen),
+  licensed under the MIT License (third_party/mimalloc-2.1.7/LICENSE, https://github.com/microsoft/mimalloc).
 - Bilateral Adaptive Sharpening (YCoCg BCAS), asymmetric ink deconvolution, AURA anti-overshoot,
-  cinematic ACES grading, and identity-LUT ColourCube scaling are adapted from DST-BCAS-Studio
+  cinematic ACES grading, identity-LUT ColourCube scaling, and the legacy v2.8.0 Contract v17
+  Bloom-channel shadow fallback are adapted from DST-BCAS-Studio
   (Copyright 2026 Nanmianyi / 楠眠已, https://github.com/Nanmianyi/DST-BCAS-Studio),
+  licensed under the MIT License.
+- Interactive click-to-record keybind UI interaction design in workshop_mod/dst_smooth_highfps/keybind.lua
+  is inspired by DST-KeyBind-UI (rtk0c / liolok, https://github.com/liolok/DST-KeyBind-UI),
   licensed under the MIT License.
