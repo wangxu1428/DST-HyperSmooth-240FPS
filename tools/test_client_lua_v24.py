@@ -56,7 +56,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.9.6", "Expected modinfo version 2.9.6, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.9.6.1", "Expected modinfo version 2.9.6.1, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do
@@ -90,7 +90,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env_en)
     fn_info()
-    assert(bare_env_en.version == "2.9.6", "Expected EN modinfo version 2.9.6, got " .. tostring(bare_env_en.version))
+    assert(bare_env_en.version == "2.9.6.1", "Expected EN modinfo version 2.9.6.1, got " .. tostring(bare_env_en.version))
     assert(type(bare_env_en.name) == "string" and bare_env_en.name ~= bare_env.name,
            "Expected localized EN modinfo name to differ from ZH")
     assert(type(bare_env_en.description) == "string" and bare_env_en.description ~= bare_env.description,

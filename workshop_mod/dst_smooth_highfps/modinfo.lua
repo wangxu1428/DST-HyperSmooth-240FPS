@@ -55,7 +55,7 @@ Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Over
    - 1-click "Presets" gallery panel (Vanilla Pure / Eye-Care HD / Cinematic Storybook / Crisp Daylight / Cozy Firelight / Misty Canopy — 100% original HyperShade looks, editable & 1-click Undo); Vanilla Pure strictly keeps stock 0.25x BloomSampler & Magiluminescence brightness with zero added visual effects.
 ]])
 author = "Hakimi Tech Lab"
-version = "2.9.6"
+version = "2.9.6.1"
 
 api_version = 10
 dst_compatible = true
