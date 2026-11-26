@@ -2103,18 +2103,23 @@ local function RegisterDynamicRpcQosMasks()
     local fnSetMasks = rawget(GLOBAL, "HyperSmooth_SetRpcChannelMasks")
     if type(fnSetMasks) ~= "function" then return end
 
+    -- Strictly causal-safe, entity-free, handshake-independent Client->Server RPC whitelist:
+    --   * AddSkillXP, SetSkillActivatedState, SetClientAuthoritativeSetting MUST stay on Ch0
+    --     because PostActivateHandshake(CTS_LOADED) requires strict FIFO delivery after them
+    --     (otherwise ValidateCharacterData sees skillxp=0 on cave migration and resets skill tree to 0).
+    --   * ClosePopup, RecievePopupMessage, OpenGift, SetWriteableText, OnScrapbookDataTaught
+    --     stay on Ch0 because they mutate live player StateGraphs or pass live entity references.
     local srv_non_combat_names = {
-        "SetWriteableText", "ToggleController", "OpenGift", "ClosePopup",
-        "RecievePopupMessage", "GetChatHistory", "SetSkillActivatedState",
-        "AddSkillXP", "OnScrapbookDataTaught", "SetClientAuthoritativeSetting",
+        "ToggleController", "GetChatHistory",
     }
-    -- Strictly entity-free ClientRPC whitelist (ShowPopup / RecievePopupMessage
-    -- intentionally stay on Ch0 because SGwilson passes live target entities to ShowPopUp!)
+    -- Strictly entity-free, handshake-independent Server->Client broadcast whitelist
+    -- (ShowPopup/RecievePopupMessage carry live entities; SetSkillActivatedState/AddSkillXP
+    --  must stay strictly FIFO-ordered with CLIENT_RPC.PostActivateHandshake on Ch0!)
     local cli_non_entity_names = {
         "LearnRecipe", "LearnFoodStats",
         "LearnPlantStage", "LearnFertilizerStage", "TakeOversizedPicture",
         "RecieveChatHistory", "LearnBuilderRecipe", "UpdateAccomplishment",
-        "UpdateCountAccomplishment", "SetSkillActivatedState", "AddSkillXP",
+        "UpdateCountAccomplishment",
     }
 
     local srv_tbl = rawget(GLOBAL, "RPC")
@@ -4911,6 +4916,62 @@ if HS_CFG.SKIP_TOP_MODS_QUERY and TheSim and getmetatable then
 end
 
 --------------------------------------------------------------------------------
+-- 2B. Unconditional SimReset / DoRestart / Shutdown Teardown & ShadeType Reuse
+--     Ensures VolLight (ShadeRenderer texHandles) and VFX hosts cleanly disarm
+--     before UnloadPrefabs tears down mod assets (prevents C++ dangling-tex AV).
+--------------------------------------------------------------------------------
+pcall(function()
+    local function RunPreResetTeardown(instanceparameters)
+        local ok_vl, vl = pcall(function() return HS_VOLLIGHT end)
+        if ok_vl and type(vl) == "table" then
+            if type(vl.GetPersistentShadeIds) == "function" then
+                local ok_ids, sids = pcall(vl.GetPersistentShadeIds)
+                if ok_ids and type(sids) == "table" then
+                    if instanceparameters == nil then
+                        instanceparameters = {}
+                    end
+                    instanceparameters._hakimi_shade_types = sids
+                    local s = rawget(GLOBAL, "Settings")
+                    if type(s) == "table" then
+                        s._hakimi_shade_types = sids
+                    end
+                end
+            end
+            if type(vl.Shutdown) == "function" then
+                pcall(vl.Shutdown)
+            end
+        end
+        local ok_vfx, vfx = pcall(function() return HS_VFX end)
+        if ok_vfx and type(vfx) == "table" and type(vfx.Shutdown) == "function" then
+            pcall(vfx.Shutdown)
+        end
+        return instanceparameters
+    end
+
+    local orig_SimReset = rawget(GLOBAL, "SimReset")
+    if type(orig_SimReset) == "function" then
+        rawset(GLOBAL, "SimReset", function(instanceparameters, ...)
+            local ip = RunPreResetTeardown(instanceparameters)
+            return orig_SimReset(ip, ...)
+        end)
+    end
+    local orig_DoRestart = rawget(GLOBAL, "DoRestart")
+    if type(orig_DoRestart) == "function" then
+        rawset(GLOBAL, "DoRestart", function(...)
+            RunPreResetTeardown(nil)
+            return orig_DoRestart(...)
+        end)
+    end
+    local orig_Shutdown = rawget(GLOBAL, "Shutdown")
+    if type(orig_Shutdown) == "function" then
+        rawset(GLOBAL, "Shutdown", function(...)
+            RunPreResetTeardown(nil)
+            return orig_Shutdown(...)
+        end)
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- 3. Pure-Client Zero-Reload Cave <-> Surface Acceleration (Cross-SimReset!)
 --    v2.4.1 FIX: Hook SimReset() to persist _hakimi_kept_worlds AND
 --    _hakimi_kept_chars inside instanceparameters across TheSim:Reset()!
@@ -5325,10 +5386,14 @@ do
         local ct_target = nil
         local ct_need_reset = true
         local ct_clock = 0.0
+        local ct_frame_idx = 0
+        local ct_last_move_frame = 0
         local ct_last_t = 0.0
         local ct_snap_t = 0.0
         local ct_period = 1.0 / 30.0
         local ct_fast_streak = 0
+        local ct_discrete_streak = 0
+        local ct_continuous_bypass = false
         local ct_prev_x, ct_prev_y, ct_prev_z = 0.0, 0.0, 0.0
         local ct_raw_x, ct_raw_y, ct_raw_z = 0.0, 0.0, 0.0
 
@@ -5337,6 +5402,10 @@ do
             self.Snap = function(cam, ...)
                 ct_target = nil
                 ct_need_reset = true
+                ct_last_move_frame = 0
+                ct_fast_streak = 0
+                ct_discrete_streak = 0
+                ct_continuous_bypass = false
                 if HS_HITFEEL ~= nil then
                     HS_HITFEEL.punch_t = 99.0
                 end
@@ -5348,28 +5417,33 @@ do
             if dt == nil or dt <= 0 or dt > 0.25 or cam.paused then
                 ct_target = nil
                 ct_need_reset = true
+                ct_last_move_frame = 0
+                ct_fast_streak = 0
+                ct_discrete_streak = 0
+                ct_continuous_bypass = false
                 return old_Update(cam, dt, dontupdatepos)
             end
 
             ct_clock = ct_clock + dt
+            ct_frame_idx = ct_frame_idx + 1
             local dx, dy, dz = 0.0, 0.0, 0.0
+            local fnCamSmooth = rawget(GLOBAL, "HyperSmooth_SmoothCameraTarget")
+            local has_native_cam_smooth = (type(fnCamSmooth) == "function")
             local cam240_active = current_skeletal_tween
                 and not dontupdatepos
                 and not cam.cutscene
                 and cam.target ~= nil
                 and cam.target == GLOBAL.ThePlayer
                 and cam.target.Transform ~= nil
-                and cam.target.components ~= nil
-                and cam.target.components.locomotor == nil
+                and (has_native_cam_smooth or (cam.target.components ~= nil and cam.target.components.locomotor == nil))
 
             if cam240_active then
                 local rx, ry, rz = cam.target.Transform:GetWorldPosition()
-                local fnCamSmooth = rawget(GLOBAL, "HyperSmooth_SmoothCameraTarget")
                 if rx == nil then
                     ct_target = nil
                     ct_need_reset = true
                     cam240_active = false
-                elseif type(fnCamSmooth) == "function" then
+                elseif has_native_cam_smooth then
                     -- Unified Main-Thread C++ PLL Snapshot-Timeline Lockstep (0.00px phase error vs Character Sprite!)
                     local need_reset = ct_need_reset or ct_target ~= cam.target or (ct_clock - ct_last_t) > 0.16
                     if need_reset then
@@ -5394,8 +5468,11 @@ do
                     ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
                     ct_snap_t = ct_clock
                     ct_last_t = ct_clock
+                    ct_last_move_frame = 0
                     ct_period = 1.0 / 30.0
                     ct_fast_streak = 0
+                    ct_discrete_streak = 0
+                    ct_continuous_bypass = false
                 else
                     local mx = rx - ct_raw_x
                     local my = ry - ct_raw_y
@@ -5406,18 +5483,34 @@ do
                         ct_prev_x, ct_prev_y, ct_prev_z = rx, ry, rz
                         ct_raw_x, ct_raw_y, ct_raw_z = rx, ry, rz
                         ct_snap_t = ct_clock
+                        ct_last_move_frame = ct_frame_idx
                         ct_fast_streak = 0
+                        ct_discrete_streak = 0
                     elseif move_sq > 1e-6 then
                         local gap = ct_clock - ct_snap_t
                         local prev_a = (ct_period > 1e-4) and math.min(1.0, math.max(0.0, gap / ct_period)) or 1.0
                         local disp_x = ct_prev_x + (ct_raw_x - ct_prev_x) * prev_a
                         local disp_y = ct_prev_y + (ct_raw_y - ct_prev_y) * prev_a
                         local disp_z = ct_prev_z + (ct_raw_z - ct_prev_z) * prev_a
-                        if gap < 0.0075 then
+                        local d_frames = (ct_last_move_frame > 0) and (ct_frame_idx - ct_last_move_frame) or 999
+                        ct_last_move_frame = ct_frame_idx
+                        if d_frames == 1 then
                             ct_fast_streak = math.min(16, ct_fast_streak + 1)
+                            ct_discrete_streak = 0
+                            if ct_fast_streak >= 5 then
+                                ct_continuous_bypass = true
+                            end
                         else
                             ct_fast_streak = 0
-                            if gap >= 0.014 and gap <= 0.12 then
+                            if ct_continuous_bypass then
+                                if gap >= 0.011 and gap <= 0.16 then
+                                    ct_discrete_streak = ct_discrete_streak + 1
+                                end
+                                if ct_discrete_streak >= 3 then
+                                    ct_continuous_bypass = false
+                                    ct_discrete_streak = 0
+                                end
+                            elseif gap >= 0.014 and gap <= 0.12 then
                                 local clamped_gap = math.min(0.095, math.max(0.015, gap))
                                 ct_period = ct_period * 0.70 + clamped_gap * 0.30
                             end
@@ -5427,7 +5520,7 @@ do
                         ct_snap_t = ct_clock
                     end
 
-                    if ct_fast_streak < 6 then
+                    if not ct_continuous_bypass then
                         local elapsed = ct_clock - ct_snap_t
                         local alpha = (ct_period > 1e-4) and math.min(1.0, math.max(0.0, elapsed / ct_period)) or 1.0
                         local sx = ct_prev_x + (ct_raw_x - ct_prev_x) * alpha
@@ -5442,6 +5535,10 @@ do
             else
                 ct_target = nil
                 ct_need_reset = true
+                ct_last_move_frame = 0
+                ct_fast_streak = 0
+                ct_discrete_streak = 0
+                ct_continuous_bypass = false
             end
 
             local orig_pan = cam.pangain
@@ -5890,6 +5987,31 @@ if HS_CFG.SMOOTH_UI_240HZ then
         end
     end)
 
+    local _dbg_tbl = rawget(GLOBAL, "debug")
+    local _dbg_getinfo = (type(_dbg_tbl) == "table" and type(_dbg_tbl.getinfo) == "function") and _dbg_tbl.getinfo or nil
+    local function IsVanillaComponentFn(fn, file_pat)
+        if fn == nil or _dbg_getinfo == nil then
+            return true
+        end
+        local info = _dbg_getinfo(fn, "S")
+        local src = info ~= nil and info.source or nil
+        if type(src) ~= "string" then
+            return true
+        end
+        return src:find(file_pat) ~= nil
+    end
+
+    local deployhelper_custom_mod_detected = false
+
+    local function ProbeDeployHelperClass()
+        local ok_dh, DeployHelper = pcall(GLOBAL.require, "components/deployhelper")
+        if ok_dh and type(DeployHelper) == "table" and type(DeployHelper.OnWallUpdate) == "function" then
+            if not IsVanillaComponentFn(DeployHelper.OnWallUpdate, "components[/\\]deployhelper%.lua") then
+                deployhelper_custom_mod_detected = true
+            end
+        end
+    end
+
     local function InstallDeployHelperDedup()
         local orig_fn = rawget(GLOBAL, "TriggerDeployHelpers")
         if type(orig_fn) ~= "function" or rawget(GLOBAL, "_HS_DEPLOY_WRAPPED") then
@@ -5898,32 +6020,40 @@ if HS_CFG.SMOOTH_UI_240HZ then
         rawset(GLOBAL, "_HS_DEPLOY_WRAPPED", true)
         local last_tick = -1
         local last_x, last_z, last_range = 0, 0, -1
-        local last_recipe, last_placer = nil, nil
+        local last_recipe, last_placer, last_key = nil, nil, nil
         local last_t = -1.0
         rawset(GLOBAL, "TriggerDeployHelpers", function(x, y, z, range, recipe, placerinst, ...)
+            if deployhelper_custom_mod_detected then
+                return orig_fn(x, y, z, range, recipe, placerinst, ...)
+            end
             local sim = rawget(GLOBAL, "TheSim")
             local tick = (sim and type(sim.GetTick) == "function") and sim:GetTick() or nil
             if tick ~= nil and type(x) == "number" and type(z) == "number" then
                 local GetTimeRealSeconds = rawget(GLOBAL, "GetTimeRealSeconds")
                 local now = (type(GetTimeRealSeconds) == "function") and (GetTimeRealSeconds() or 0.0) or 0.0
+                local dkey = (placerinst ~= nil) and placerinst.deployhelper_key or nil
                 if tick == last_tick
                     and range == last_range and recipe == last_recipe and placerinst == last_placer
+                    and dkey == last_key
                     and ((x - last_x) * (x - last_x) + (z - last_z) * (z - last_z)) < 0.0625
-                    and (now - last_t) >= 0.0 and (now - last_t) < 0.020 then
+                    and (now - last_t) >= 0.0 and (now - last_t) < 0.012 then
                     latency_stats.deploy_skip = latency_stats.deploy_skip + 1
                     rawset(GLOBAL, "HS_DEPLOY_SKIP_COUNT", latency_stats.deploy_skip)
                     return
                 end
                 last_tick = tick
                 last_x, last_z, last_range = x, z, range
-                last_recipe, last_placer = recipe, placerinst
+                last_recipe, last_placer, last_key = recipe, placerinst, dkey
                 last_t = now
             end
             return orig_fn(x, y, z, range, recipe, placerinst, ...)
         end)
     end
     InstallDeployHelperDedup()
-    AddSimPostInit(InstallDeployHelperDedup)
+    AddSimPostInit(function()
+        InstallDeployHelperDedup()
+        ProbeDeployHelperClass()
+    end)
 
     -- Geometric Placement (workshop-351325790) High-FPS Adaptive Optimizer:
     -- Keeps main placer cursor at true 240Hz 0ms response while throttling background grid refresh
@@ -6117,27 +6247,14 @@ if HS_CFG.SMOOTH_UI_240HZ then
         end
     end)
 
-    local _dbg_tbl = rawget(GLOBAL, "debug")
-    local _dbg_getinfo = (type(_dbg_tbl) == "table" and type(_dbg_tbl.getinfo) == "function") and _dbg_tbl.getinfo or nil
-    local function IsVanillaComponentFn(fn, file_pat)
-        if fn == nil or _dbg_getinfo == nil then
-            return true
-        end
-        local info = _dbg_getinfo(fn, "S")
-        local src = info ~= nil and info.source or nil
-        if type(src) ~= "string" then
-            return true
-        end
-        return src:find(file_pat) ~= nil
-    end
-
     AddComponentPostInit("deployhelper", function(self)
         if not IsVanillaComponentFn(self.OnWallUpdate, "components[/\\]deployhelper%.lua") then
-            -- Preserve third-party mod custom deployhelper:OnWallUpdate untouched
+            -- Preserve third-party mod custom deployhelper:OnWallUpdate untouched and disable dedup
+            deployhelper_custom_mod_detected = true
             return
         end
         self.OnWallUpdate = function(cmp, dt)
-            local step = (dt and dt > 0 and dt < 0.25) and (dt * 60.0) or 1.0
+            local step = (dt and dt > 0 and dt < 0.25) and (dt * 30.0) or 1.0
             if cmp.delay ~= nil and cmp.delay > step then
                 cmp.delay = cmp.delay - step
             else

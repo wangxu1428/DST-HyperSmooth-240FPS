@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -665,6 +666,7 @@ GlVertexAttribPointer_t      g_origGlVertexAttribPointer = nullptr;
 GlDrawArrays_t               g_origGlDrawArrays = nullptr;
 GlDrawElements_t             g_origGlDrawElements = nullptr;
 GlBindFramebuffer_t          g_origGlBindFramebuffer = nullptr;
+GlDeleteFramebuffers_t       g_origGlDeleteFramebuffers = nullptr;
 GlClear_t                    g_origGlClear = nullptr;
 GlClearColor_t               g_origGlClearColor = nullptr;
 GlGenFramebuffers_t          g_fnGlGenFramebuffers = nullptr;
@@ -785,6 +787,7 @@ AnimRenderCmdCtor_t   g_origAnimRenderCmdCtor = nullptr;
 std::atomic<bool>     g_animCmdCtorHooked{false};
 std::atomic<int64_t> g_lastFrameUs{0};
 std::atomic<LONG> g_inGameplay{0};
+std::atomic<uint32_t> g_worldResetGen{0};
 std::atomic<int64_t> g_vmBaseInterpFrames{0};
 std::atomic<int64_t> g_vmBaseWorldPos{0};
 std::atomic<int64_t> g_vmBaseSpatialQueries{0};
@@ -1812,9 +1815,11 @@ struct ThreadLocalAnimState {
 
     // Unified Main-Thread (or fallback RT) frame clock for WorldPos + Camera + Shadow + Light lockstep
     uint64_t posClockSeq = 0;
+    uint64_t fallbackPosSeq = 0;
     int64_t  posClockQpc = 0;
     double   posClockSec = 0.0;
     double   posClockDt  = 0.005;
+    uint32_t lastWorldResetGen = 0u;
 
     // Frame-aware QPC caching, zero-LOCK batched counters & swarm hitch-proof load guard
     uint32_t lastFrameSeq = 0xFFFFFFFFu;
@@ -1864,9 +1869,21 @@ struct ThreadLocalAnimState {
     //     LightMap, DynamicShadow, and AnimRenderCmd::AnimRenderCmd share bit-identical (seq, nowSec, dtSec)!
     //   - On Render Thread (fallback only): keyed by g_rtSwapSeq (incremented once per SwapBuffers).
     void GetPosClock(uint64_t& outSeq, double& outNowSec, double& outDtSec, bool forceRtClock = false) {
-        const uint64_t curSeq = forceRtClock
-            ? (static_cast<uint64_t>(g_rtSwapSeq.load(std::memory_order_acquire)) + 1ULL)
-            : (static_cast<uint64_t>(g_frameSeq.load(std::memory_order_acquire)) + 1ULL);
+        uint64_t curSeq = 0ULL;
+        if (forceRtClock || !g_frameLimiterHooked.load(std::memory_order_acquire)) {
+            const uint32_t rtSeq = g_rtSwapSeq.load(std::memory_order_acquire);
+            if (rtSeq != 0u) {
+                curSeq = static_cast<uint64_t>(rtSeq) + 1ULL;
+            } else {
+                const int64_t now = NowQpc();
+                if (posClockQpc == 0 || static_cast<double>(now - posClockQpc) * g_qpcInvFreq >= 0.0005) {
+                    ++fallbackPosSeq;
+                }
+                curSeq = fallbackPosSeq ? fallbackPosSeq : 1ULL;
+            }
+        } else {
+            curSeq = static_cast<uint64_t>(g_frameSeq.load(std::memory_order_acquire)) + 1ULL;
+        }
         if (curSeq != posClockSeq || posClockQpc == 0) {
             const int64_t now = NowQpc();
             posClockDt  = (posClockQpc > 0) ? (static_cast<double>(now - posClockQpc) * g_qpcInvFreq) : 0.005;
@@ -1936,7 +1953,22 @@ thread_local std::unique_ptr<ThreadLocalAnimState> g_tlsAnimState;
 
 static inline ThreadLocalAnimState& GetTlsAnimState() {
     if (!g_tlsAnimState) g_tlsAnimState.reset(new ThreadLocalAnimState());
-    return *g_tlsAnimState;
+    ThreadLocalAnimState& tls = *g_tlsAnimState;
+    const uint32_t resetGen = g_worldResetGen.load(std::memory_order_acquire);
+    if (tls.lastWorldResetGen != resetGen) {
+        tls.lastWorldResetGen = resetGen;
+        tls.posTimeline.Clear();
+        for (auto& t : tls.tracks) {
+            t.valid = 0;
+            t.entity_key = 0;
+            t.anim = nullptr;
+        }
+        new (&tls.posePool) hs_skeletal::PoseCrossfadePool();
+        tls.posClockSeq = 0;
+        tls.posClockQpc = 0;
+        tls.fallbackPosSeq = 0;
+    }
+    return tls;
 }
 
 // Unified Main-Thread (with automatic RT fallback) 240FPS PLL Snapshot-Timeline world-position smoother:
@@ -8999,6 +9031,25 @@ static void WINAPI HookGlBindFramebuffer(uint32_t target, uint32_t framebuffer) 
     }
 }
 
+static void WINAPI HookGlDeleteFramebuffers(int32_t n, const uint32_t* framebuffers) {
+    if (tl_spriteBatcher.HasPending()) {
+        FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    }
+    if (n > 0 && framebuffers != nullptr && tl_curBoundFbo != 0u) {
+        for (int32_t i = 0; i < n; ++i) {
+            if (framebuffers[i] != 0u && framebuffers[i] == tl_curBoundFbo) {
+                tl_curBoundFbo = 0u;
+                break;
+            }
+        }
+    }
+    if (g_origGlDeleteFramebuffers) {
+        g_origGlDeleteFramebuffers(n, framebuffers);
+    } else if (g_fnGlDeleteFramebuffers) {
+        g_fnGlDeleteFramebuffers(n, framebuffers);
+    }
+}
+
 static void WINAPI HookGlGetIntegerv(uint32_t pname, int32_t* params) {
     if (!g_fnGlGetIntegerv) return;
     g_fnGlGetIntegerv(pname, params);
@@ -9824,7 +9875,7 @@ static void PrepareRenderPerfHooks(std::vector<PendingCodePatch>& patches, uint8
 }
 
 static void HookLightMapRender(void* lightMap, uint8_t* renderData) {
-    if (!g_origLightMapRender) return;
+    if (!g_origLightMapRender || !lightMap) return;
     static uint32_t s_appliedRebuildGen = 0;
     const uint32_t wantGen = g_lightmapRebuildGen.load(std::memory_order_acquire);
     if (renderData && wantGen != s_appliedRebuildGen) {
@@ -10768,6 +10819,7 @@ static bool IsOurGlHookPointer(void* p) noexcept {
            p == reinterpret_cast<void*>(&HookGlDrawArrays) ||
            p == reinterpret_cast<void*>(&HookGlDrawElements) ||
            p == reinterpret_cast<void*>(&HookGlBindFramebuffer) ||
+           p == reinterpret_cast<void*>(&HookGlDeleteFramebuffers) ||
            p == reinterpret_cast<void*>(&HookGlGetIntegerv) ||
            p == reinterpret_cast<void*>(&HookGlClear) ||
            p == reinterpret_cast<void*>(&HookGlClearColor) ||
@@ -10816,7 +10868,10 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
             case  27: g_fnGlCreateShader                 = reinterpret_cast<GlCreateShader_t>(p); break;
             case  28: g_origGlCullFace                   = reinterpret_cast<GlCullFace_t>(p); break;
             case  29: g_origGlDeleteBuffers              = reinterpret_cast<GlDeleteBuffers_t>(p); break;
-            case  30: g_fnGlDeleteFramebuffers           = reinterpret_cast<GlDeleteFramebuffers_t>(p); break;
+            case  30:
+                g_fnGlDeleteFramebuffers   = reinterpret_cast<GlDeleteFramebuffers_t>(p);
+                g_origGlDeleteFramebuffers = g_fnGlDeleteFramebuffers;
+                break;
             case  31: g_origGlDeleteTextures             = reinterpret_cast<GlDeleteTextures_t>(p); break;
             case  32: g_origGlDeleteProgram              = reinterpret_cast<GlDeleteProgram_t>(p); break;
             case  33: g_fnGlDeleteRenderbuffers          = reinterpret_cast<GlDeleteRenderbuffers_t>(p); break;
@@ -11121,6 +11176,7 @@ static void InstallGlIatHooks() {
             bool okDa = PatchExeIatEntry("libGLESv2.dll",  41, "glDrawArrays",          reinterpret_cast<void*>(&HookGlDrawArrays),          g_origGlDrawArrays);
             bool okDe = PatchExeIatEntry("libGLESv2.dll",  42, "glDrawElements",        reinterpret_cast<void*>(&HookGlDrawElements),        g_origGlDrawElements);
             bool okFb = PatchExeIatEntry("libGLESv2.dll",   5, "glBindFramebuffer",     reinterpret_cast<void*>(&HookGlBindFramebuffer),     g_origGlBindFramebuffer);
+            PatchExeIatEntry("libGLESv2.dll",  30, "glDeleteFramebuffers",  reinterpret_cast<void*>(&HookGlDeleteFramebuffers),  g_origGlDeleteFramebuffers);
             bool okCl = PatchExeIatEntry("libGLESv2.dll",  16, "glClear",               reinterpret_cast<void*>(&HookGlClear),               g_origGlClear);
             PatchExeIatEntry("libGLESv2.dll",  17, "glClearColor",          reinterpret_cast<void*>(&HookGlClearColor),          g_origGlClearColor);
             bool okRp = PatchExeIatEntry("libGLESv2.dll",  93, "glReadPixels",          reinterpret_cast<void*>(&HookGlReadPixels),          g_origGlReadPixels);
@@ -11152,6 +11208,9 @@ static void InstallGlIatHooks() {
         if (wantNativeGl) {
             if (!g_origGlBindFramebuffer) {
                 PatchExeIatEntry("libGLESv2.dll", 5, "glBindFramebuffer", reinterpret_cast<void*>(&HookGlBindFramebuffer), g_origGlBindFramebuffer);
+            }
+            if (!g_origGlDeleteFramebuffers) {
+                PatchExeIatEntry("libGLESv2.dll", 30, "glDeleteFramebuffers", reinterpret_cast<void*>(&HookGlDeleteFramebuffers), g_origGlDeleteFramebuffers);
             }
             if (!g_origGlClear) {
                 PatchExeIatEntry("libGLESv2.dll", 16, "glClear", reinterpret_cast<void*>(&HookGlClear), g_origGlClear);
@@ -13499,6 +13558,7 @@ void HookLuaOpenLibs(void* L) {
     // unconditionally resets Client SimTick back to vanilla 30Hz so 60Hz can NEVER leak,
     // and temporarily unlocks unlimited Texture Streaming upload speed during loading screens!
     g_inGameplay.store(0, std::memory_order_release);
+    g_worldResetGen.fetch_add(1u, std::memory_order_release);
     g_vmBaseInterpFrames.store(InterlockedCompareExchange64(&g_animInterpFrames, 0, 0), std::memory_order_relaxed);
     g_vmBaseWorldPos.store(InterlockedCompareExchange64(&g_worldPosInterpCount, 0, 0), std::memory_order_relaxed);
     g_vmBaseSpatialQueries.store(InterlockedCompareExchange64(&g_clientSpatialQueries, 0, 0), std::memory_order_relaxed);

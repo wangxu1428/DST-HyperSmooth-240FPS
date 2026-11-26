@@ -3460,6 +3460,145 @@ int main() {
             CHECK(bypassedFrames >= 20 && std::fabs(ox - 0.03f * 29.0f) < 1e-4f);
         }
 
+        // Regression 26b: Continuous physics across 60/75/90/120/144/165/240 FPS with +/-1.5ms jitter:
+        // Zero mode flips after latch, <0.01px steady-state lag, 0.000px cam-char phase error!
+        {
+            const int rates[] = { 60, 75, 90, 120, 144, 165, 240 };
+            for (int hz : rates) {
+                hs_world_pos::SmoothTimelineTable tbl;
+                const uintptr_t playerKey = 0x30000300ULL;
+                const uintptr_t camKey    = 0xCAFE000000000007ULL;
+                const double nomDt = 1.0 / static_cast<double>(hz);
+                const int totalFrames = hz * 3;
+                const int settleCheckStart = static_cast<int>(std::ceil(0.14 * hz)) + 6;
+                double prevT = 0.0;
+                bool seenLatch = false;
+                int postLatchFlips = 0;
+                double maxLagPx = 0.0;
+                double maxCamDiffPx = 0.0;
+
+                for (int step = 0; step < totalFrames; ++step) {
+                    const double jit = 0.0015 * std::sin(static_cast<double>(step) * 2.17 + 0.4);
+                    double t = 10.0 + static_cast<double>(step) * nomDt + jit;
+                    if (step > 0 && t <= prevT + 0.0008) t = prevT + 0.0008;
+                    const double dt = (step > 0) ? (t - prevT) : nomDt;
+                    prevT = t;
+
+                    const float rawX = static_cast<float>(static_cast<double>(kSpeed) * (t - 10.0));
+                    float px = 0.0f, py = 0.0f, pz = 0.0f;
+                    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                    hs_world_pos::SmoothStats st{};
+                    const uint64_t seq = static_cast<uint64_t>(step) + 1ULL;
+                    tbl.Evaluate(playerKey, rawX, 0.0f, 0.0f, seq, t, dt, 30, 1u, nullptr, true, px, py, pz, &st);
+                    tbl.Evaluate(camKey,    rawX, 0.0f, 0.0f, seq, t, dt, 30, 1u, nullptr, true, cx, cy, cz, nullptr);
+
+                    if (st.bypassed) {
+                        seenLatch = true;
+                    } else if (seenLatch) {
+                        ++postLatchFlips;
+                    }
+                    if (step >= settleCheckStart) {
+                        maxLagPx = std::max(maxLagPx, std::fabs(static_cast<double>(px - rawX)) * kPxPerTile);
+                        maxCamDiffPx = std::max(maxCamDiffPx, std::fabs(static_cast<double>(px - cx)) * kPxPerTile);
+                    }
+                }
+                if (!seenLatch || postLatchFlips != 0 || maxLagPx > 0.01 || maxCamDiffPx > 1e-4) {
+                    std::printf("  [DIAG T26b] hz=%d latch=%d flips=%d maxLag=%.4fpx maxCamDiff=%.4fpx\n",
+                                hz, seenLatch ? 1 : 0, postLatchFlips, maxLagPx, maxCamDiffPx);
+                }
+                CHECK(seenLatch && postLatchFlips == 0);
+                CHECK(maxLagPx <= 0.01 && maxCamDiffPx <= 1e-4);
+            }
+        }
+
+        // Regression 26c: Discrete 30Hz & 60Hz ticks at 75/120/144/240 FPS + +/-1.5ms jitter:
+        // Zero false bypasses, zero PLL future runaway, 0.000px cam-char phase error!
+        {
+            const int rendRates[] = { 75, 120, 144, 240 };
+            const int tickRates[] = { 30, 60 };
+            for (int rHz : rendRates) {
+                for (int sHz : tickRates) {
+                    hs_world_pos::SmoothTimelineTable tbl;
+                    const uintptr_t playerKey = 0x40000400ULL;
+                    const uintptr_t camKey    = 0xCAFE000000000007ULL;
+                    const double nomDt = 1.0 / static_cast<double>(rHz);
+                    const double dtSnap = 1.0 / static_cast<double>(sHz);
+                    double prevT = 20.0;
+                    double nextSnap = 20.0 + dtSnap;
+                    int snapIdx = 0;
+                    float rawX = 0.0f;
+                    float prevPx = 0.0f;
+                    int falseBypass = 0;
+                    double maxVelErrPx = 0.0;
+                    double maxCamDiffPx = 0.0;
+
+                    for (int step = 0; step < rHz * 3; ++step) {
+                        const double jit = 0.0015 * std::cos(static_cast<double>(step) * 1.91);
+                        double t = 20.0 + static_cast<double>(step) * nomDt + jit;
+                        if (step > 0 && t <= prevT + 0.0008) t = prevT + 0.0008;
+                        const double dt = (step > 0) ? (t - prevT) : nomDt;
+                        prevT = t;
+
+                        while (t >= nextSnap) {
+                            ++snapIdx;
+                            rawX = static_cast<float>(static_cast<double>(snapIdx) * kSpeed * dtSnap);
+                            nextSnap = 20.0 + static_cast<double>(snapIdx + 1) * dtSnap;
+                        }
+                        float px = 0.0f, py = 0.0f, pz = 0.0f;
+                        float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                        hs_world_pos::SmoothStats st{};
+                        const uint64_t seq = static_cast<uint64_t>(step) + 1ULL;
+                        tbl.Evaluate(playerKey, rawX, 0.0f, 0.0f, seq, t, dt, sHz, 1u, nullptr, true, px, py, pz, &st);
+                        tbl.Evaluate(camKey,    rawX, 0.0f, 0.0f, seq, t, dt, sHz, 1u, nullptr, true, cx, cy, cz, nullptr);
+
+                        if (st.bypassed) ++falseBypass;
+                        if (step >= rHz) {
+                            const double idealStepPx = static_cast<double>(kSpeed) * dt * kPxPerTile;
+                            const double actualStepPx = static_cast<double>(px - prevPx) * kPxPerTile;
+                            maxVelErrPx = std::max(maxVelErrPx, std::fabs(actualStepPx - idealStepPx));
+                            maxCamDiffPx = std::max(maxCamDiffPx, std::fabs(static_cast<double>(px - cx)) * kPxPerTile);
+                        }
+                        prevPx = px;
+                    }
+                    if (falseBypass != 0 || maxVelErrPx > 0.65 || maxCamDiffPx > 1e-4) {
+                        std::printf("  [DIAG T26c] rend=%dHz tick=%dHz falseByp=%d maxVelErr=%.4fpx maxCamDiff=%.4fpx\n",
+                                    rHz, sHz, falseBypass, maxVelErrPx, maxCamDiffPx);
+                    }
+                    CHECK(falseBypass == 0);
+                    CHECK(maxVelErrPx <= 0.65);
+                    CHECK(maxCamDiffPx <= 1e-4);
+                }
+            }
+        }
+
+        // Regression 26d: Mid-walk transition from continuous physics -> discrete 30Hz exits bypass cleanly after 3 ticks
+        {
+            hs_world_pos::SmoothTimelineTable tbl;
+            const uintptr_t k = 0x50000500ULL;
+            double t = 30.0;
+            uint64_t seq = 1u;
+            float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+            float rawX = 0.0f;
+            hs_world_pos::SmoothStats st{};
+            for (int f = 0; f < 30; ++f) {
+                t += 1.0 / 120.0;
+                rawX += kSpeed * (1.0f / 120.0f);
+                tbl.Evaluate(k, rawX, 0.0f, 0.0f, seq++, t, 1.0 / 120.0, 30, 1u, nullptr, true, ox, oy, oz, &st);
+            }
+            CHECK(st.bypassed);
+            double nextSnap = t + 1.0 / 30.0;
+            for (int f = 0; f < 40; ++f) {
+                t += 1.0 / 120.0;
+                if (t >= nextSnap) {
+                    rawX += kSpeed * (1.0f / 30.0f);
+                    nextSnap += 1.0 / 30.0;
+                }
+                tbl.Evaluate(k, rawX, 0.0f, 0.0f, seq++, t, 1.0 / 120.0, 30, 1u, nullptr, true, ox, oy, oz, &st);
+                CHECK(std::isfinite(ox));
+            }
+            CHECK(!st.bypassed);
+        }
+
         std::printf("[PASS] 26. Unified Main-Thread PLL Snapshot-Timeline Smoother verified (60/30/15Hz + 5ms jit <0.35px velErr, 0.000px cam-char lockstep, 0 false bypasses, LagComp-ON bypass & stop-settle OK)\n");
     }
 

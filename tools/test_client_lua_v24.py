@@ -710,11 +710,25 @@ AddSimPostInit(function()
             -- Snap() resets tracker cleanly
             cam:Snap()
             assert(math.abs(cam.currentpos.x - 12.0) < 1e-4, "Snap() failed")
-            -- Lag Comp ON (locomotor ~= nil) -> MUST NOT alter targetpos!
+            -- Lag Comp ON (locomotor ~= nil) without native DLL -> pure-Lua fallback bypasses FollowCamera!
             mock_player.components.locomotor = {}
             raw_px = 12.20
             cam:Update(1/240)
-            assert(math.abs(cam.targetpos.x - 12.20) < 1e-4, "Lag Comp ON must bypass FollowCamera 240Hz smoother!")
+            assert(math.abs(cam.targetpos.x - 12.20) < 1e-4, "Lag Comp ON must bypass FollowCamera 240Hz smoother in pure-Lua mode!")
+            -- With native HyperSmooth_SmoothCameraTarget present, FollowCamera MUST lockstep even when locomotor ~= nil!
+            local native_cam_calls = 0
+            fakeG.HyperSmooth_SmoothCameraTarget = function(rx, ry, rz, resetFlag)
+                native_cam_calls = native_cam_calls + 1
+                if resetFlag ~= 0 then
+                    return rx, ry, rz, false
+                end
+                return rx - 0.10, ry, rz, true
+            end
+            cam:Update(1/240) -- Frame 0: initializes native tracker (need_reset -> fnCamSmooth reset=1,0)
+            cam:Update(1/240) -- Frame 1: evaluates native smoother (need_reset=false -> sx = rx - 0.10)
+            assert(native_cam_calls >= 2, "FollowCamera must invoke native HyperSmooth_SmoothCameraTarget even with locomotor ~= nil!")
+            assert(math.abs(cam.targetpos.x - 12.10) < 1e-4, "Native FollowCamera lockstep failed with locomotor ~= nil, got " .. tostring(cam.targetpos.x))
+            fakeG.HyperSmooth_SmoothCameraTarget = nil
             mock_player.components.locomotor = nil
         end
     end
@@ -1808,7 +1822,7 @@ AddSimPostInit(function()
         pl:TestCanBuild()
         assert(tcb_calls == 4, "Next sim tick must invalidate Placer cache!")
 
-        -- 12c) TriggerDeployHelpers same-tick dedup + move/tick/expiry pass-through
+        -- 12c) TriggerDeployHelpers same-tick dedup + move/tick/key/60fps/custom-mod pass-through
         local rec_a = { name = "wall_stone" }
         local pinst = {}
         fakeG12.TriggerDeployHelpers(10, 0, 10, 64, rec_a, pinst)
@@ -1821,6 +1835,41 @@ AddSimPostInit(function()
         mock_tick = mock_tick + 1
         fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst) -- next tick
         assert(deploy_raw_calls == 3, "TriggerDeployHelpers next tick must pass through!")
+        pinst.deployhelper_key = "winona_battery_engineering"
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst) -- deployhelper_key change
+        assert(deploy_raw_calls == 4, "TriggerDeployHelpers deployhelper_key change must invalidate dedup!")
+        mock_time = mock_time + 0.0167 -- 1 frame @ 60Hz (>= 12ms dedup window)
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst)
+        assert(deploy_raw_calls == 5, "TriggerDeployHelpers 60fps >=12ms must pass through!")
+
+        assert(type(comp_hooks["deployhelper"]) == "function", "deployhelper hook missing!")
+        local stopped_vanilla = false
+        local vanilla_dh = {
+            delay = 2,
+            StopHelper = function(s) s.delay = nil; stopped_vanilla = true end,
+            OnWallUpdate = nil,
+        }
+        comp_hooks["deployhelper"](vanilla_dh)
+        vanilla_dh:OnWallUpdate(1/60)
+        vanilla_dh:OnWallUpdate(1/60)
+        vanilla_dh:OnWallUpdate(1/60)
+        assert(not stopped_vanilla and vanilla_dh.delay > 0,
+               "Vanilla deployhelper decayed too fast at 60Hz: delay=" .. tostring(vanilla_dh.delay))
+        vanilla_dh:OnWallUpdate(1/60)
+        assert(stopped_vanilla and vanilla_dh.delay == nil,
+               "Vanilla deployhelper failed to stop after 2 sim ticks!")
+
+        local custom_calls = 0
+        local custom_orig = function() custom_calls = custom_calls + 1 end
+        local custom_dh = { delay = 2, StopHelper = function() end, OnWallUpdate = custom_orig }
+        comp_hooks["deployhelper"](custom_dh)
+        assert(custom_dh.OnWallUpdate == custom_orig, "Third-party deployhelper:OnWallUpdate was overwritten!")
+        custom_dh:OnWallUpdate(1/60)
+        assert(custom_calls == 1, "Third-party deployhelper:OnWallUpdate did not run!")
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst)
+        fakeG12.TriggerDeployHelpers(10.50, 0, 10.50, 64, rec_a, pinst)
+        assert(deploy_raw_calls == 7,
+               "TriggerDeployHelpers must bypass dedup when custom deployhelper mod is detected: raw=" .. deploy_raw_calls)
 
         print("[CLIENT_V24_TEST] 12. MapScreen 240Hz Zoom/Throttle + Placer:TestCanBuild + TriggerDeployHelpers PASS")
     end
@@ -2257,8 +2306,19 @@ AddSimPostInit(function()
         g14.CONTROL_CONTROLLER_ATTACK = 39
         g14.CLIENT_MOD_RPC = {}
         g14.CLIENT_MOD_RPC_HANDLERS = {}
-        g14.RPC = { AttackButton = 4, LeftClick = 1, SetWriteableText = 59, ClosePopup = 62, SetSkillActivatedState = 68, PostActivateHandshake = 70 }
-        g14.CLIENT_RPC = { ShowPopup = 1, RecieveChatHistory = 8, TryToTeachScrapbookData = 15, PostActivateHandshake = 14 }
+        g14.RPC = {
+            AttackButton = 4, LeftClick = 1,
+            ToggleController = 58, SetWriteableText = 59, OpenGift = 60,
+            RecievePopupMessage = 61, ClosePopup = 62, GetChatHistory = 63,
+            AddSkillXP = 67, SetSkillActivatedState = 68,
+            SetClientAuthoritativeSetting = 69, PostActivateHandshake = 70,
+            OnScrapbookDataTaught = 71,
+        }
+        g14.CLIENT_RPC = {
+            ShowPopup = 1, LearnRecipe = 2, RecieveChatHistory = 8,
+            SetSkillActivatedState = 12, AddSkillXP = 13,
+            PostActivateHandshake = 14, TryToTeachScrapbookData = 15,
+        }
         g14.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end
         g14.HyperSmooth_SetFps = function() return true end
         g14.HyperSmooth_SetSkeletal = function() return true end
@@ -2347,12 +2407,12 @@ AddSimPostInit(function()
 
         assert(captured_masks ~= nil, "HyperSmooth_SetRpcChannelMasks was not called")
         assert(captured_masks.s0 == 0, "Combat/handshake bit leaked into srv0: " .. tostring(captured_masks.s0))
-        local exp_s1 = (2 ^ 27) + (2 ^ 30)
+        local exp_s1 = (2 ^ 26) + (2 ^ 31) -- only ToggleController (58) + GetChatHistory (63)
         assert(captured_masks.s1 == exp_s1, "Expected srv1=" .. tostring(exp_s1) .. ", got " .. tostring(captured_masks.s1))
-        assert(captured_masks.s2 == (2 ^ 4), "Expected srv2=16, got " .. tostring(captured_masks.s2))
-        -- ShowPopup (bit 1) intentionally stays causal on Ch0 (SGwilson passes live target entities);
-        -- only entity-free RecieveChatHistory (bit 8) moves off Ch0!
-        local exp_c0 = (2 ^ 8)
+        assert(captured_masks.s2 == 0, "SkillTree/handshake/entity bit leaked into srv2: " .. tostring(captured_masks.s2))
+        -- Only strictly entity-free, handshake-independent ClientRPCs move off Ch0 (LearnRecipe=2, RecieveChatHistory=8);
+        -- ShowPopup, SetSkillActivatedState, AddSkillXP, PostActivateHandshake, TryToTeachScrapbookData MUST stay on Ch0!
+        local exp_c0 = (2 ^ 2) + (2 ^ 8)
         assert(captured_masks.c0 == exp_c0, "Expected cli0=" .. tostring(exp_c0) .. ", got " .. tostring(captured_masks.c0))
 
         -- Non-Chinese fallback verify: Russian LanguageTranslator must default to English (ui_zh=false)
@@ -5153,11 +5213,142 @@ AddSimPostInit(function()
             "Test 26: Cave must evict all surface cloud & canopy shade handles!")
         assert(VL.GetStats().active_rays > 0, "Test 26: Cave sinkhole/fungus must spawn cave light shafts!")
 
-        -- 6) Clean Shutdown -> 0 leaked handles & entities
+        -- 6) Clean Shutdown -> 0 leaked handles & entities, AND disarms ShadeRenderer texHandle to ""!
         VL.Shutdown()
         assert(VL.GetStats().active_rays == 0 and CountKeys(shade_live[1]) == 0 and CountKeys(shade_live[2]) == 0,
             "Test 26: Shutdown leaked ray entities or ShadeRenderer handles!")
+        assert(shade_tex[1] == "" and shade_tex[2] == "",
+            "Test 26: Shutdown must clear ShadeRenderer textures to empty string (texHandle=-1)!")
+        assert(shade_str[1] == 0.0 and shade_str[2] == 0.0,
+            "Test 26: Shutdown must zero ShadeRenderer strengths!")
+        local p_ids = VL.GetPersistentShadeIds()
+        assert(type(p_ids) == "table" and p_ids.cloud == 1 and p_ids.canopy == 2,
+            "Test 26: GetPersistentShadeIds must return persistent ShadeType IDs!")
         print("[CLIENT_V24_TEST] 26. v2.9.5-D Phase 1 Volumetric Lighting (3D Forest/Cave LightRays + ShadeRenderer Cloud/Canopy + strict.lua) PASS")
+    end
+
+    -- 26B. ShadeRenderer Crash-Fix Lifecycle Guard (Main Menu Skip + Persistent ID Reuse + Unconditional SimReset Teardown)
+    do
+        local create_calls = 0
+        local tex_calls = {}
+        local str_calls = {}
+        local sr26b = {
+            Enable = function() end,
+            CreateShadeType = function() create_calls = create_calls + 1; return 10 + create_calls end,
+            SetShadeTexture = function(_, id, tex) tex_calls[#tex_calls + 1] = { id = id, tex = tex } end,
+            SetShadeStrength = function(_, id, s) str_calls[id] = s end,
+            SetShadeEnabled = function() end,
+            SetShadeMaxRotation = function() end, SetShadeRotationSpeed = function() end,
+            SetShadeMaxTranslation = function() end, SetShadeTranslationSpeed = function() end,
+            SetShadeMaxScale = function() end, SetShadeScaleSpeed = function() end,
+            SpawnShade = function() return 1 end,
+            RemoveShade = function() end,
+        }
+        -- (a) Main Menu (TheWorld == nil, ThePlayer == nil): ApplyConfig must NOT allocate ShadeTypes or bind textures!
+        local g_menu = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            TheNet = { IsDedicated = function() return false end },
+            ShadeRenderer = sr26b,
+            resolvefilepath = function(p) return p end,
+        }
+        local env_menu = { GLOBAL = g_menu, AddPlayerPostInit = function() end }
+        local fl_m = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_hs_vollight.lua"))
+        setfenv(fl_m, env_menu)
+        fl_m()
+        env_menu.HS_VOLLIGHT.ApplyConfig(1.0, 1.0, 1.0)
+        assert(create_calls == 0 and #tex_calls == 0,
+            "Test 26B: ApplyConfig in Main Menu (TheWorld == nil) must NOT call CreateShadeType or SetShadeTexture!")
+
+        -- (b) Re-entering world with persisted Settings._hakimi_shade_types reuses IDs with 0 CreateShadeType calls,
+        --     and TheWorld onremove triggers Shutdown -> SetShadeTexture(id, '')!
+        local onremove_cb = nil
+        local s_reuse = { _hakimi_shade_types = { cloud = 7, canopy = 8 } }
+        local g_world = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next, unpack = G.unpack,
+            math = G.math, string = G.string, table = G.table, os = G.os,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error,
+            Settings = s_reuse,
+            TheNet = { IsDedicated = function() return false end },
+            TheWorld = {
+                ListenForEvent = function(_, ev, cb) if ev == "onremove" then onremove_cb = cb end end,
+            },
+            ThePlayer = { IsValid = function() return true end },
+            ShadeRenderer = sr26b,
+            CreateEntity = function()
+                local e = { _ok = true }
+                e.IsValid = function() return e._ok end
+                e.Remove = function() e._ok = false end
+                e.AddTag = function() end
+                e.DoPeriodicTask = function() end
+                e.entity = { SetCanSleep = function() end, CallPrefabConstructionComplete = function() end }
+                return e
+            end,
+            resolvefilepath = function(p) return p end,
+        }
+        local env_w = { GLOBAL = g_world, AddPlayerPostInit = function() end }
+        local fl_w = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_hs_vollight.lua"))
+        setfenv(fl_w, env_w)
+        fl_w()
+        env_w.HS_VOLLIGHT.ApplyConfig(1.0, 1.0, 1.0)
+        assert(create_calls == 0, "Test 26B: Persisted ShadeType IDs must prevent CreateShadeType calls on world re-entry!")
+        assert(onremove_cb ~= nil, "Test 26B: Missing TheWorld onremove listener!")
+        assert(#tex_calls >= 2 and tex_calls[1].id == 7 and tex_calls[1].tex == "images/hs_cloud_shade.tex",
+            "Test 26B: Expected reused cloud ShadeType id=7 to arm texture!")
+        onremove_cb()
+        assert(tex_calls[#tex_calls].id == 8 and tex_calls[#tex_calls - 1].id == 7
+            and tex_calls[#tex_calls].tex == "" and tex_calls[#tex_calls - 1].tex == ""
+            and str_calls[7] == 0.0 and str_calls[8] == 0.0,
+            "Test 26B: TheWorld onremove must disarm both ShadeType textures to '' and zero strengths!")
+
+        -- (c) modmain.lua unconditional SimReset teardown runs even when keep_shard_assets = false!
+        local carried_26b = nil
+        local fakeG_26b = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
+            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            math = G.math, string = G.string, table = G.table,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print,
+            Settings = {},
+            TheNet = { GetIsServer = function() return false end, IsDedicated = function() return false end },
+            TheSim = { GetTick = function() return 1 end, GetStaticTick = function() return 1 end, GetTickTime = function() return 1/30 end, GetPersistentString = function(_, _, cb) cb(false, "") end, SetPersistentString = function() end, GetPosition = function() return 0, 0 end },
+            TheInput = { OnUpdate = function() end, IsKeyDown = function() return false end, AddKeyUpHandler = function() end, AddMouseButtonHandler = function() end },
+            TheFrontEnd = { GetActiveScreen = function() return { name = "HUD" } end },
+            SimReset = function(ip) carried_26b = ip end,
+            require = function() return {} end,
+        }
+        local env_m26b = {
+            GLOBAL = fakeG_26b,
+            MODROOT = "../mods/dst_smooth_highfps/",
+            Asset = function(t, f) return { type = t, file = f } end,
+            GetModConfigData = function(k) return k == "target_fps" and 240 or false end,
+            AddClassPostConstruct = function() end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end,
+            AddSimPostInit = function() end,
+            AddModShadersInit = function() end,
+            AddModShadersSortAndEnable = function() end,
+            AddClientModRPCHandler = function() end,
+        }
+        local fn_m26b = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fn_m26b, env_m26b)
+        fn_m26b()
+        local vl_shut, vfx_shut = 0, 0
+        env_m26b.HS_VOLLIGHT = {
+            GetPersistentShadeIds = function() return { cloud = 3, canopy = 4 } end,
+            Shutdown = function() vl_shut = vl_shut + 1 end,
+        }
+        env_m26b.HS_VFX = {
+            Shutdown = function() vfx_shut = vfx_shut + 1 end,
+        }
+        fakeG_26b.SimReset(nil)
+        assert(vl_shut == 1 and vfx_shut == 1,
+            "Test 26B: SimReset must unconditionally shut down HS_VOLLIGHT & HS_VFX even with keep_shard_assets=false!")
+        assert(carried_26b ~= nil and carried_26b._hakimi_shade_types.cloud == 3 and carried_26b._hakimi_shade_types.canopy == 4,
+            "Test 26B: SimReset must forward _hakimi_shade_types into instanceparameters!")
+        print("[CLIENT_V24_TEST] 26B. ShadeRenderer Crash-Fix Lifecycle Guard (MainMenu Skip + ID Reuse + onremove/SimReset Teardown) PASS")
     end
 
     -- 27. v2.9.5-E Shadow Pipeline Parity (#106..#110 + soft=0.00 + Weather/Season + Moon Blue + Dusk Fire Gate + MinHeight + Flash Lights + HS1 Roundtrip)

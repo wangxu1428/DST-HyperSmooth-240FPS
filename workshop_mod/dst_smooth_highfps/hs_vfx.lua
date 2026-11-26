@@ -1097,6 +1097,20 @@ function HS_VFX.StepTick(dt_override)
     end
 end
 
+local bound_world_vfx = nil
+
+local function BindVfxWorldTeardown()
+    local world = rawget(G, "TheWorld")
+    if world ~= nil and world ~= bound_world_vfx and type(world.ListenForEvent) == "function" then
+        bound_world_vfx = world
+        pcall(world.ListenForEvent, world, "onremove", function()
+            if type(HS_VFX) == "table" and type(HS_VFX.Shutdown) == "function" then
+                pcall(HS_VFX.Shutdown)
+            end
+        end)
+    end
+end
+
 function HS_VFX.Shutdown()
     local function Kill(e)
         if IsValidEnt(e) and type(e.Remove) == "function" then pcall(e.Remove, e) end
@@ -1106,6 +1120,7 @@ function HS_VFX.Shutdown()
     Kill(combat_ent); combat_ent = nil
     Kill(weapon_ent); weapon_ent = nil
     weapon_owner = nil
+    bound_world_vfx = nil
     last_px, last_pz = nil, nil
     swing_burst_t = 0.0
 end
@@ -1135,6 +1150,7 @@ if not IsDedicated() and type(AddPlayerPostInit) == "function" then
             inst:DoTaskInTime(0.2, function()
                 local tp = rawget(G, "ThePlayer")
                 if tp ~= nil and tp == inst then
+                    BindVfxWorldTeardown()
                     if cfg.fire_embers > 0.005 or cfg.ambient_motes > 0.005
                         or cfg.footsteps > 0.005 or (cfg.combat_on and cfg.combat_vfx > 0.005) then
                         EnsureHosts()

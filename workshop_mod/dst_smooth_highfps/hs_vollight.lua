@@ -36,6 +36,10 @@ local function IsDedicated()
     return net ~= nil and type(net.IsDedicated) == "function" and net:IsDedicated() == true
 end
 
+local function IsWorldReady()
+    return rawget(G, "TheWorld") ~= nil and rawget(G, "ThePlayer") ~= nil
+end
+
 local function IsValidEnt(ent)
     if ent == nil then return false end
     if type(ent.IsValid) == "function" then return ent:IsValid() == true end
@@ -102,6 +106,9 @@ local canopy_handles = {} -- [cell_key] = { handle, wx, wz }
 
 local cloud_shade_type = nil
 local canopy_shade_type = nil
+local cloud_tex_bound = false
+local canopy_tex_bound = false
+local bound_world = nil
 local shade_globally_nudged = false
 local fog_envelopes_ready = false
 
@@ -528,19 +535,87 @@ end
 
 -- =============================================================================
 -- Gap 2: Native C++ ShadeRenderer Setup (Cloud Shadows + Forest Canopy Shade)
+--   CRITICAL SAFETY INVARIANT:
+--     1. Klei's Lua_SetShadeEnabled @ 0x14001b1e0 reads arg 1 (shadeTypeId, always
+--        truthy!) instead of arg 2 (enabled bool), and ShadeRenderer::Render calls
+--        RenderDevice::SetTexture(0, texHandle) BEFORE checking 0-quads.
+--     2. Therefore disabling/unloading MUST call SR:SetShadeTexture(id, "") so
+--        C++ texHandle becomes -1 (SetTexture returns safely without NULL deref!).
+--     3. Never allocate/bind ShadeTypes in Main Menu (TheWorld == nil) and reuse
+--        persistent IDs across SimReset via Settings._hakimi_shade_types.
 -- =============================================================================
+local function DisarmShadeType(SR, shade_type, is_cloud)
+    if SR ~= nil and shade_type ~= nil then
+        if type(SR.SetShadeStrength) == "function" then pcall(SR.SetShadeStrength, SR, shade_type, 0.0) end
+        if type(SR.SetShadeEnabled) == "function" then pcall(SR.SetShadeEnabled, SR, shade_type, false) end
+        if type(SR.SetShadeTexture) == "function" then pcall(SR.SetShadeTexture, SR, shade_type, "") end
+    end
+    if is_cloud then
+        cloud_tex_bound = false
+    else
+        canopy_tex_bound = false
+    end
+end
+
+local function ArmCloudTexture(SR)
+    if not IsWorldReady() or SR == nil or cloud_shade_type == nil or cloud_tex_bound then
+        return cloud_tex_bound
+    end
+    if type(SR.SetShadeTexture) == "function" then
+        local ok = pcall(SR.SetShadeTexture, SR, cloud_shade_type, ResPath("images/hs_cloud_shade.tex"))
+        if ok then
+            cloud_tex_bound = true
+        end
+    end
+    return cloud_tex_bound
+end
+
+local function ArmCanopyTexture(SR)
+    if not IsWorldReady() or SR == nil or canopy_shade_type == nil or canopy_tex_bound then
+        return canopy_tex_bound
+    end
+    if type(SR.SetShadeTexture) == "function" then
+        local ok = pcall(SR.SetShadeTexture, SR, canopy_shade_type, "images/tree.tex")
+        if ok then
+            canopy_tex_bound = true
+        end
+    end
+    return canopy_tex_bound
+end
+
+local function BindWorldTeardown()
+    local world = rawget(G, "TheWorld")
+    if world ~= nil and world ~= bound_world and type(world.ListenForEvent) == "function" then
+        bound_world = world
+        pcall(world.ListenForEvent, world, "onremove", function()
+            if type(HS_VOLLIGHT) == "table" and type(HS_VOLLIGHT.Shutdown) == "function" then
+                pcall(HS_VOLLIGHT.Shutdown)
+            end
+        end)
+    end
+end
+
 local function EnsureShadeTypes()
+    if not IsWorldReady() then return nil end
+    BindWorldTeardown()
     local SR = rawget(G, "ShadeRenderer")
     if SR == nil or type(SR.CreateShadeType) ~= "function" then return nil end
 
+    local settings = rawget(G, "Settings")
+    local saved = (type(settings) == "table" and type(settings._hakimi_shade_types) == "table")
+        and settings._hakimi_shade_types or nil
+
     if cloud_shade_type == nil then
-        local ok, id = pcall(SR.CreateShadeType, SR)
-        if ok and id ~= nil then
+        local id = nil
+        if saved ~= nil and type(saved.cloud) == "number" then
+            id = saved.cloud
+        else
+            local ok, created = pcall(SR.CreateShadeType, SR)
+            if ok and created ~= nil then id = created end
+        end
+        if id ~= nil then
             cloud_shade_type = id
             pcall(function()
-                if type(SR.SetShadeTexture) == "function" then
-                    SR:SetShadeTexture(id, ResPath("images/hs_cloud_shade.tex"))
-                end
                 -- Note: Klei ShadeRenderer stores (1.0 / speed) and advances phase by (dt / speed),
                 -- so larger values = SLOWER cycle period in seconds (vanilla canopy uses 5.0s).
                 if type(SR.SetShadeMaxTranslation) == "function" then SR:SetShadeMaxTranslation(id, 18.0) end
@@ -549,28 +624,41 @@ local function EnsureShadeTypes()
                 if type(SR.SetShadeRotationSpeed) == "function" then SR:SetShadeRotationSpeed(id, 90.0) end
                 if type(SR.SetShadeMaxScale) == "function" then SR:SetShadeMaxScale(id, 1.8) end
                 if type(SR.SetShadeScaleSpeed) == "function" then SR:SetShadeScaleSpeed(id, 70.0) end
-                if type(SR.SetShadeStrength) == "function" then SR:SetShadeStrength(id, 0.0) end
-                if type(SR.SetShadeEnabled) == "function" then SR:SetShadeEnabled(id, false) end
+                if cfg.cloud_shade > 0.005 then
+                    ArmCloudTexture(SR)
+                else
+                    DisarmShadeType(SR, id, true)
+                end
             end)
         end
     end
 
     if canopy_shade_type == nil then
-        local ok, id = pcall(SR.CreateShadeType, SR)
-        if ok and id ~= nil then
+        local id = nil
+        if saved ~= nil and type(saved.canopy) == "number" then
+            id = saved.canopy
+        else
+            local ok, created = pcall(SR.CreateShadeType, SR)
+            if ok and created ~= nil then id = created end
+        end
+        if id ~= nil then
             canopy_shade_type = id
             pcall(function()
-                if type(SR.SetShadeTexture) == "function" then
-                    SR:SetShadeTexture(id, "images/tree.tex")
-                end
                 if type(SR.SetShadeMaxRotation) == "function" then SR:SetShadeMaxRotation(id, 14.0) end
                 if type(SR.SetShadeRotationSpeed) == "function" then SR:SetShadeRotationSpeed(id, 6.5) end
                 if type(SR.SetShadeMaxTranslation) == "function" then SR:SetShadeMaxTranslation(id, 0.75) end
                 if type(SR.SetShadeTranslationSpeed) == "function" then SR:SetShadeTranslationSpeed(id, 6.0) end
-                if type(SR.SetShadeStrength) == "function" then SR:SetShadeStrength(id, 0.0) end
-                if type(SR.SetShadeEnabled) == "function" then SR:SetShadeEnabled(id, false) end
+                if cfg.canopy_shade > 0.005 then
+                    ArmCanopyTexture(SR)
+                else
+                    DisarmShadeType(SR, id, false)
+                end
             end)
         end
+    end
+
+    if type(settings) == "table" and (cloud_shade_type ~= nil or canopy_shade_type ~= nil) then
+        settings._hakimi_shade_types = { cloud = cloud_shade_type, canopy = canopy_shade_type }
     end
 
     return SR
@@ -713,7 +801,9 @@ local function StreamSpatialGrids(px, pz, world, is_cave)
             ClearShadeHandles(cloud_handles, cloud_shade_type)
             stats.active_clouds = 0
         end
+        DisarmShadeType(SR, cloud_shade_type, true)
     else
+        ArmCloudTexture(SR)
         local CCELL = 36
         local cpx = math.floor(px / CCELL)
         local cpz = math.floor(pz / CCELL)
@@ -757,7 +847,9 @@ local function StreamSpatialGrids(px, pz, world, is_cave)
             ClearShadeHandles(canopy_handles, canopy_shade_type)
             stats.active_canopy = 0
         end
+        DisarmShadeType(SR, canopy_shade_type, false)
     else
+        ArmCanopyTexture(SR)
         local FCELL = 8
         local cpx = math.floor(px / FCELL)
         local cpz = math.floor(pz / FCELL)
@@ -839,26 +931,39 @@ function HS_VOLLIGHT.ApplyConfig(lightrays, cloud_shade, canopy_shade, edge_fog,
         stats.cloud_str = 0.0
         stats.canopy_str = 0.0
         local SR = rawget(G, "ShadeRenderer")
-        if SR ~= nil and type(SR.SetShadeEnabled) == "function" then
-            if cloud_shade_type ~= nil then pcall(SR.SetShadeEnabled, SR, cloud_shade_type, false) end
-            if canopy_shade_type ~= nil then pcall(SR.SetShadeEnabled, SR, canopy_shade_type, false) end
-        end
+        DisarmShadeType(SR, cloud_shade_type, true)
+        DisarmShadeType(SR, canopy_shade_type, false)
         return
+    end
+
+    if cfg.cloud_shade <= 0.005 then
+        ClearShadeHandles(cloud_handles, cloud_shade_type)
+        stats.active_clouds = 0
+        cur_cloud_str = 0.0
+        stats.cloud_str = 0.0
+        DisarmShadeType(rawget(G, "ShadeRenderer"), cloud_shade_type, true)
+    end
+    if cfg.canopy_shade <= 0.005 then
+        ClearShadeHandles(canopy_handles, canopy_shade_type)
+        stats.active_canopy = 0
+        cur_canopy_str = 0.0
+        stats.canopy_str = 0.0
+        DisarmShadeType(rawget(G, "ShadeRenderer"), canopy_shade_type, false)
     end
 
     if cfg.edge_fog <= 0.005 and cfg.ground_fog <= 0.005 then
         DestroyFogHost()
     end
 
-    if (cfg.cloud_shade > 0.005 or cfg.canopy_shade > 0.005) and not shade_globally_nudged then
-        local SR = EnsureShadeTypes()
-        if SR ~= nil and type(SR.Enable) == "function" then
-            pcall(SR.Enable, SR, true)
-            shade_globally_nudged = true
+    if IsWorldReady() then
+        BindWorldTeardown()
+        if (cfg.cloud_shade > 0.005 or cfg.canopy_shade > 0.005) and not shade_globally_nudged then
+            local SR = EnsureShadeTypes()
+            if SR ~= nil and type(SR.Enable) == "function" then
+                pcall(SR.Enable, SR, true)
+                shade_globally_nudged = true
+            end
         end
-    end
-
-    if rawget(G, "ThePlayer") ~= nil then
         EnsureController()
         stream_timer = 99.0 -- immediate refresh on slider change
     end
@@ -1017,25 +1122,51 @@ function HS_VOLLIGHT.StepUpdate(dt)
     StepVolumetricFog(px, pz, world, wstate, is_cave, dt)
 end
 
+function HS_VOLLIGHT.GetPersistentShadeIds()
+    local c = cloud_shade_type
+    local f = canopy_shade_type
+    if c == nil or f == nil then
+        local settings = rawget(G, "Settings")
+        local saved = (type(settings) == "table" and type(settings._hakimi_shade_types) == "table")
+            and settings._hakimi_shade_types or nil
+        if saved ~= nil then
+            if c == nil and type(saved.cloud) == "number" then c = saved.cloud end
+            if f == nil and type(saved.canopy) == "number" then f = saved.canopy end
+        end
+    end
+    if c ~= nil or f ~= nil then
+        return { cloud = c, canopy = f }
+    end
+    return nil
+end
+
 function HS_VOLLIGHT.Shutdown()
     ClearAllRays()
     ClearShadeHandles(cloud_handles, cloud_shade_type)
     ClearShadeHandles(canopy_handles, canopy_shade_type)
     DestroyFogHost()
+    stats.active_rays = 0
+    stats.non_forest_rays = 0
     stats.active_clouds = 0
     stats.active_canopy = 0
+    stats.ray_alpha = 0.0
+    stats.cloud_str = 0.0
+    stats.canopy_str = 0.0
+    cur_ray_alpha = 0.0
+    cur_cloud_str = 0.0
+    cur_canopy_str = 0.0
     edge_fog_acc = 0.0
     ground_fog_acc = 0.0
     if IsValidEnt(ctrl_ent) and type(ctrl_ent.Remove) == "function" then
         pcall(ctrl_ent.Remove, ctrl_ent)
     end
     ctrl_ent = nil
+    bound_world = nil
+    shade_globally_nudged = false
     last_stream_x, last_stream_z = nil, nil
     local SR = rawget(G, "ShadeRenderer")
-    if SR ~= nil and type(SR.SetShadeEnabled) == "function" then
-        if cloud_shade_type ~= nil then pcall(SR.SetShadeEnabled, SR, cloud_shade_type, false) end
-        if canopy_shade_type ~= nil then pcall(SR.SetShadeEnabled, SR, canopy_shade_type, false) end
-    end
+    DisarmShadeType(SR, cloud_shade_type, true)
+    DisarmShadeType(SR, canopy_shade_type, false)
 end
 
 -- Auto-start controller when local player enters world (surface or cave)
@@ -1045,6 +1176,14 @@ if not IsDedicated() and type(AddPlayerPostInit) == "function" then
             inst:DoTaskInTime(0.25, function()
                 local tp = rawget(G, "ThePlayer")
                 if tp ~= nil and tp == inst then
+                    BindWorldTeardown()
+                    if (cfg.cloud_shade > 0.005 or cfg.canopy_shade > 0.005) and not shade_globally_nudged then
+                        local SR = EnsureShadeTypes()
+                        if SR ~= nil and type(SR.Enable) == "function" then
+                            pcall(SR.Enable, SR, true)
+                            shade_globally_nudged = true
+                        end
+                    end
                     if cfg.lightrays > 0.005 or cfg.cloud_shade > 0.005 or cfg.canopy_shade > 0.005
                         or cfg.edge_fog > 0.005 or cfg.ground_fog > 0.005 then
                         EnsureController()
