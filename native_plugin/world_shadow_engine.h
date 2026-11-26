@@ -945,8 +945,11 @@ public:
             lastFrameBatchDraws_     = curFrameBatchDraws_;
             lastFrameUnbatchedDraws_ = curFrameUnbatchedDraws_;
         }
+        const bool hadShadowActivity = beganWriteThisFrame_ || compositedThisFrame_ || hasPrevMap_;
         ResetFrameFlags();
-        ++frameRecvGen_;
+        if (hadShadowActivity) {
+            ++frameRecvGen_;
+        }
     }
 
 private:
@@ -1059,10 +1062,8 @@ private:
             }
         }
 
-        // Always query live driver RGB + Alpha blend state when glGetIntegerv is available:
-        // glCache only intercepts symmetric glBlendFunc / glBlendEquation, so host / overlay
-        // calls to glBlendFuncSeparate / glBlendEquationSeparate can diverge Alpha from RGB
-        // even while glCache's symmetric RGB slots are populated!
+        // Always query live GL blend equation/func (glCache only tracks symmetric glBlendFunc/Equation,
+        // so separate alpha blend setters can diverge from glCache!).
         if (ops_.glGetIntegerv) {
             int32_t eqRgb = -1, eqAlpha = -1;
             ops_.glGetIntegerv(kGlBlendEquationRgb, &eqRgb);
@@ -1072,14 +1073,6 @@ private:
                 rs.blendEqAlpha = (eqAlpha > 0) ? static_cast<uint32_t>(eqAlpha) : rs.blendEqRgb;
                 rs.blendEqKnown = true;
             }
-        }
-        if (!rs.blendEqKnown && glCacheTrusted && glCache.blendEq != hs_gl_cache::kInvalidId) {
-            rs.blendEqRgb   = glCache.blendEq;
-            rs.blendEqAlpha = glCache.blendEq;
-            rs.blendEqKnown = true;
-        }
-
-        if (ops_.glGetIntegerv) {
             int32_t sRgb = -1, dRgb = -1, sA = -1, dA = -1;
             ops_.glGetIntegerv(kGlBlendSrcRgb, &sRgb);
             ops_.glGetIntegerv(kGlBlendDstRgb, &dRgb);
@@ -1092,15 +1085,6 @@ private:
                 rs.blendDstAlpha = (dA >= 0) ? static_cast<uint32_t>(dA) : rs.blendDstRgb;
                 rs.blendFnKnown  = true;
             }
-        }
-        if (!rs.blendFnKnown && glCacheTrusted &&
-            glCache.blendSrc != hs_gl_cache::kInvalidId &&
-            glCache.blendDst != hs_gl_cache::kInvalidId) {
-            rs.blendSrcRgb   = glCache.blendSrc;
-            rs.blendDstRgb   = glCache.blendDst;
-            rs.blendSrcAlpha = glCache.blendSrc;
-            rs.blendDstAlpha = glCache.blendDst;
-            rs.blendFnKnown  = true;
         }
 
         if (glCacheTrusted && glCache.depthFunc != hs_gl_cache::kInvalidId) {
@@ -1282,16 +1266,18 @@ private:
         ops_.glActiveTexture(kGlTexture0 + saved.activeUnit);
         ops_.glUseProgram(restoreProg);
         RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
+        if (kCompositeTexUnit < hs_gl_cache::kMaxTexUnits) {
+            glCache.boundTex2D[kCompositeTexUnit] = hs_gl_cache::kInvalidId;
+        }
+        if (kBlueNoiseTexUnit < hs_gl_cache::kMaxTexUnits) {
+            glCache.boundTex2D[kBlueNoiseTexUnit] = hs_gl_cache::kInvalidId;
+        }
         if (saved.glCacheTrusted) {
             glCache.curProgram = restoreProg;
             glCache.activeUnit = static_cast<int32_t>(saved.activeUnit);
             glCache.boundArrayBuf = saved.boundArrayBuf;
-            if (kCompositeTexUnit < hs_gl_cache::kMaxTexUnits) {
-                glCache.boundTex2D[kCompositeTexUnit] = hs_gl_cache::kInvalidId;
-            }
-            if (kBlueNoiseTexUnit < hs_gl_cache::kMaxTexUnits) {
-                glCache.boundTex2D[kBlueNoiseTexUnit] = hs_gl_cache::kInvalidId;
-            }
+        } else {
+            glCache.activeUnit = -1;
         }
     }
 
@@ -1441,6 +1427,14 @@ private:
 
         EnsureResourcesGuard guard{ ops_, saved, glCache };
         guard.restoreProg = ResolveHostProgram(saved, glCache);
+        if (ops_.glGetIntegerv) {
+            int32_t maxUnits = 0;
+            ops_.glGetIntegerv(kGlMaxTextureImageUnits, &maxUnits);
+            if (maxUnits > 0 && maxUnits <= static_cast<int32_t>(kCompositeTexUnit)) {
+                failed_ = true;
+                return false;
+            }
+        }
         if (!isNativeGl_ && ops_.glGetIntegerv) {
             int32_t rbo = 0;
             ops_.glGetIntegerv(kGlRenderbufferBinding, &rbo);

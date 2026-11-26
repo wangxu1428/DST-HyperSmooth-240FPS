@@ -377,7 +377,7 @@ local PRESET_TUNE = {
         hitfeel_enabled = 0, hitfeel_hitstop = 1.00, hitfeel_recoil = 1.00, hitfeel_flash = 1.00, hitfeel_campunch = 0.85, hitfeel_vfx = 1.00,
         vfx_fire_embers = 0.00, vfx_ambient_motes = 0.00, vfx_footsteps = 0.00,
         vol_lightrays = 0.00, vol_cloud_shade = 0.00, vol_canopy_shade = 0.00,
-        shadow_weather = 0.00, shadow_moon_blue = 0.00, shadow_dusk_point = 1.00, shadow_min_height = 0.00, shadow_flash_lights = 0,
+        shadow_weather = 0.00, shadow_moon_blue = 0.00, shadow_night = 0, shadow_dusk_point = 1.00, shadow_min_height = 0.00, shadow_flash_lights = 0,
         ocean_pbr = 0.00, ocean_sky_refl = 0.00, ocean_sun_glow = 0.00, ocean_hide_waves = 0, vol_edge_fog = 0.00, vol_ground_fog = 0.00, vol_lightrays_everywhere = 0,
         exposure = 0.00, temp = 0.00, tint = 0.00, contrast = 0.00, lightness = 0.00, gamma = 1.00,
         sat = 1.00, vibrance = 0.00, filmic = 0.00, hl_desat = 0.00, sun_fill = 0.00, original_mix = 0.00,
@@ -530,6 +530,7 @@ HS_VF.orig_SetDistortionFactor = nil
 HS_VF.orig_MapSetOverlayLerp = nil
 HS_VF.vf_cc_src0 = nil
 HS_VF.vf_cc_dst0 = nil
+HS_VF.vf_cc0_is_special = false
 HS_VF.vf_cc_lerp0 = nil
 HS_VF.vf_cc_lerp1 = nil
 HS_VF.vf_distort_last = nil
@@ -537,6 +538,17 @@ HS_VF.vf_snow_map = nil
 HS_VF.vf_snow_last = nil
 HS_VF.vf_sandover_widgets = (type(setmetatable) == "function") and setmetatable({}, { __mode = "k" }) or {}
 HS_VF.IDENTITY_CC_TEX = "images/colour_cubes/identity_colourcube.tex"
+
+local function IsSpecialVisionCc(tex)
+    if type(tex) ~= "string" then return false end
+    local lo = string.lower(tex)
+    return string.find(lo, "mole_vision", 1, true) ~= nil
+        or string.find(lo, "nightvision", 1, true) ~= nil
+        or string.find(lo, "beaver_vision", 1, true) ~= nil
+        or string.find(lo, "ghost_cc", 1, true) ~= nil
+        or string.find(lo, "blackout_cc", 1, true) ~= nil
+        or string.find(lo, "ruins_", 1, true) ~= nil
+end
 
 -- Detect standalone DST-BCAS-Studio Workshop mod so HyperSmooth yields post-process/ColourCube cleanly
 local function IsExternalBcasActive()
@@ -659,7 +671,8 @@ function HS_VF.InstallVanillaFilterHooks()
             if index == 0 then
                 HS_VF.vf_cc_src0 = src
                 HS_VF.vf_cc_dst0 = dest
-                if HS_VF.GetEffectiveVanillaCc() < 0.999 then
+                HS_VF.vf_cc0_is_special = IsSpecialVisionCc(src) or IsSpecialVisionCc(dest)
+                if (not HS_VF.vf_cc0_is_special) and HS_VF.GetEffectiveVanillaCc() < 0.999 then
                     -- Swap src to identity LUT so scaling lerp blends Neutral <-> Current LUT
                     -- instead of resurrecting last season's stale LUT! (BCAS-Studio MIT insight)
                     src = HS_VF.IDENTITY_CC_TEX
@@ -676,7 +689,12 @@ function HS_VF.InstallVanillaFilterHooks()
             if index == 0 then
                 HS_VF.vf_cc_lerp0 = lerp
                 local vcc = HS_VF.GetEffectiveVanillaCc()
-                if vcc < 0.999 and type(lerp) == "number" then
+                if (not HS_VF.vf_cc0_is_special) and vcc < 0.999 and type(lerp) == "number" then
+                    local uv = rawget(GLOBAL, "UniformVariables")
+                    if uv and uv.CC_LERP_PARAMS and type(self.SetUniformVariable) == "function" then
+                        -- Scale ONLY CC0 (ambient/season) while preserving CC1 (insanity) & CC2 (lunacy/Enlightened Crown)
+                        return self:SetUniformVariable(uv.CC_LERP_PARAMS, lerp * vcc, lerp, lerp)
+                    end
                     lerp = lerp * vcc
                 end
             elseif index == 1 then
@@ -712,13 +730,23 @@ function HS_VF.ApplyVanillaFilters()
     local pp = rawget(GLOBAL, "PostProcessor")
     if pp and HS_VF.vanilla_filter_hooked then
         if HS_VF.orig_SetColourCubeData and HS_VF.vf_cc_src0 ~= nil and HS_VF.vf_cc_dst0 ~= nil then
-            local src0 = (HS_VF.GetEffectiveVanillaCc() < 0.999) and HS_VF.IDENTITY_CC_TEX or HS_VF.vf_cc_src0
+            local src0 = ((not HS_VF.vf_cc0_is_special) and HS_VF.GetEffectiveVanillaCc() < 0.999) and HS_VF.IDENTITY_CC_TEX or HS_VF.vf_cc_src0
             pcall(HS_VF.orig_SetColourCubeData, pp, 0, src0, HS_VF.vf_cc_dst0)
         end
         if HS_VF.orig_SetColourCubeLerp then
             if HS_VF.vf_cc_lerp0 ~= nil then
                 local vcc = HS_VF.GetEffectiveVanillaCc()
-                pcall(HS_VF.orig_SetColourCubeLerp, pp, 0, (vcc < 0.999) and (HS_VF.vf_cc_lerp0 * vcc) or HS_VF.vf_cc_lerp0)
+                local l0 = HS_VF.vf_cc_lerp0
+                if (not HS_VF.vf_cc0_is_special) and vcc < 0.999 and type(l0) == "number" then
+                    local uv = rawget(GLOBAL, "UniformVariables")
+                    if uv and uv.CC_LERP_PARAMS and type(pp.SetUniformVariable) == "function" then
+                        pcall(pp.SetUniformVariable, pp, uv.CC_LERP_PARAMS, l0 * vcc, l0, l0)
+                    else
+                        pcall(HS_VF.orig_SetColourCubeLerp, pp, 0, l0 * vcc)
+                    end
+                else
+                    pcall(HS_VF.orig_SetColourCubeLerp, pp, 0, l0)
+                end
             end
             if HS_VF.vf_cc_lerp1 ~= nil then
                 pcall(HS_VF.orig_SetColourCubeLerp, pp, 1, HS_VF.IsSanityColorClean() and 0 or HS_VF.vf_cc_lerp1)
@@ -1171,65 +1199,69 @@ local function ComputeWorldLightingState(allow_night_light, dt_step, smooth_lvl)
 
     -- Temporal fade-in / fade-out slot tracking for Top-3 near-field point lights (zero pop on rank swap or extinguish!)
     local pt_slots = nlc.pt_slots
-    local pt_damp = studio_light_init and has_dt and (not paused)
-    local pt_alpha = pt_damp and (1.0 - math.exp(-dt_step * 6.5)) or 1.0
-    for i = 1, #pt_slots do
-        pt_slots[i].target = 0.0
-    end
-    for i = 1, #pt_cand do
-        local c = pt_cand[i]
-        local matched = nil
-        for j = 1, #pt_slots do
-            if pt_slots[j].ent == c.ent then
-                matched = pt_slots[j]
-                break
+    local pt_out = {}
+    if #pt_cand > 0 or #pt_slots > 0 then
+        local pt_damp = studio_light_init and has_dt and (not paused)
+        local pt_alpha = pt_damp and (1.0 - math.exp(-dt_step * 6.5)) or 1.0
+        for i = 1, #pt_slots do
+            pt_slots[i].target = 0.0
+        end
+        for i = 1, #pt_cand do
+            local c = pt_cand[i]
+            local matched = nil
+            for j = 1, #pt_slots do
+                if pt_slots[j].ent == c.ent then
+                    matched = pt_slots[j]
+                    break
+                end
+            end
+            if matched then
+                matched.wx     = c.wx
+                matched.wz     = c.wz
+                matched.radius = matched.radius + (c.radius - matched.radius) * pt_alpha
+                matched.target = c.raw_str
+                matched.score  = c.score
+            elseif #pt_slots < 6 then
+                pt_slots[#pt_slots + 1] = {
+                    ent    = c.ent,
+                    wx     = c.wx,
+                    wz     = c.wz,
+                    radius = c.radius,
+                    weight = pt_damp and 0.0 or c.raw_str,
+                    target = c.raw_str,
+                    score  = c.score,
+                }
             end
         end
-        if matched then
-            matched.wx     = c.wx
-            matched.wz     = c.wz
-            matched.radius = matched.radius + (c.radius - matched.radius) * pt_alpha
-            matched.target = c.raw_str
-            matched.score  = c.score
-        elseif #pt_slots < 6 then
-            pt_slots[#pt_slots + 1] = {
-                ent    = c.ent,
-                wx     = c.wx,
-                wz     = c.wz,
-                radius = c.radius,
-                weight = pt_damp and 0.0 or c.raw_str,
-                target = c.raw_str,
-                score  = c.score,
-            }
+        local kept_slots = {}
+        for i = 1, #pt_slots do
+            local sl = pt_slots[i]
+            if pt_damp then
+                sl.weight = sl.weight + (sl.target - sl.weight) * pt_alpha
+            else
+                sl.weight = sl.target
+            end
+            if sl.target > 0.001 or sl.weight > 0.01 then
+                kept_slots[#kept_slots + 1] = sl
+            end
         end
-    end
-    local kept_slots = {}
-    for i = 1, #pt_slots do
-        local sl = pt_slots[i]
-        if pt_damp then
-            sl.weight = sl.weight + (sl.target - sl.weight) * pt_alpha
-        else
-            sl.weight = sl.target
+        nlc.pt_slots = kept_slots
+        if #kept_slots > 1 then
+            table.sort(kept_slots, function(a, b)
+                if a.weight ~= b.weight then return a.weight > b.weight end
+                return (a.score or 0) > (b.score or 0)
+            end)
         end
-        if sl.target > 0.001 or sl.weight > 0.01 then
-            kept_slots[#kept_slots + 1] = sl
-        end
-    end
-    nlc.pt_slots = kept_slots
-    table.sort(kept_slots, function(a, b)
-        if a.weight ~= b.weight then return a.weight > b.weight end
-        return (a.score or 0) > (b.score or 0)
-    end)
-    local pt_out = {}
-    for i = 1, math.min(#kept_slots, 3) do
-        local sl = kept_slots[i]
-        if sl.weight > 0.008 then
-            pt_out[#pt_out + 1] = {
-                wx       = sl.wx,
-                wz       = sl.wz,
-                radius   = sl.radius,
-                strength = sl.weight,
-            }
+        for i = 1, math.min(#kept_slots, 3) do
+            local sl = kept_slots[i]
+            if sl.weight > 0.008 then
+                pt_out[#pt_out + 1] = {
+                    wx       = sl.wx,
+                    wz       = sl.wz,
+                    radius   = sl.radius,
+                    strength = sl.weight,
+                }
+            end
         end
     end
     -- v2.9.5-E Transient Flash-Light Shadows (lightning / explosions / spell bursts: instant attack, smooth 1s decay!)
@@ -1435,11 +1467,19 @@ end
 
 -- Zero-allocation independent World/ColourCube/Lighting/3D-Relief/Ocean/Shadow Shader uniform sync:
 -- When all strengths are 0.0 -> bit-for-bit identical vanilla fragment output!
+local hs_native_van_synced = false
+local hs_last_clip_en = nil
+local hs_last_clip_safe = nil
 local function PushHd2dEnvToNative(dt_step, precomputed_lst)
     local fl = GetActiveVisualFlags()
     local tn = GetActiveVisTune()
     local is_van = (current_visual_preset == 0)
+    local skip_van_visual_sync = is_van and (dt_step ~= nil) and hs_native_van_synced
+    if (not is_van) or dt_step == nil then
+        hs_native_van_synced = false
+    end
 
+    if not skip_van_visual_sync then
     local fnHd2d = rawget(GLOBAL, "HyperSmooth_SetHd2d")
     if type(fnHd2d) == "function" then
         local ao_str       = fl.ao and ClampTuneValue("ao_str", tn.ao_str) or 0.0
@@ -1782,12 +1822,17 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
             end
         end
     end
+    if is_van then
+        hs_native_van_synced = true
+    end
+    end -- if not skip_van_visual_sync
 
     -- M2 Safe Dual-Monitor Cursor Lock sync (auto-unlocks on Pause / Console / Chat / Modal Menus!)
     local fnClip = rawget(GLOBAL, "HyperSmooth_SetClipCursor")
     if type(fnClip) == "function" then
+        local clip_en = (HS_CFG.clip_cursor == true)
         local safe_clip = false
-        if HS_CFG.clip_cursor == true then
+        if clip_en then
             local player = rawget(GLOBAL, "ThePlayer")
             local hud = player and player.HUD or nil
             local fe = rawget(GLOBAL, "TheFrontEnd")
@@ -1815,7 +1860,11 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
             end
             safe_clip = (player ~= nil) and (hud ~= nil) and (not paused_now) and (not console_open) and (not modal_open)
         end
-        pcall(fnClip, HS_CFG.clip_cursor == true, safe_clip)
+        if dt_step == nil or hs_last_clip_en ~= clip_en or hs_last_clip_safe ~= safe_clip then
+            hs_last_clip_en = clip_en
+            hs_last_clip_safe = safe_clip
+            pcall(fnClip, clip_en, safe_clip)
+        end
     end
 end
 
@@ -2064,8 +2113,8 @@ local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
--- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.9.5.1)
-local EXPECTED_DLL_VERSION = "2.9.5"
+-- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.9.6.1)
+local EXPECTED_DLL_VERSION = "2.9.6"
 
 local function ParseSemVer(str)
     if type(str) ~= "string" then return nil, nil end
@@ -5935,11 +5984,25 @@ if HS_CFG.SMOOTH_UI_240HZ then
     end)
 
     AddComponentPostInit("placer", function(self)
+        local old_UpdateAxisAlignedHelpers = self.UpdateAxisAlignedHelpers
+        if type(old_UpdateAxisAlignedHelpers) == "function" then
+            self.UpdateAxisAlignedHelpers = function(cmp, ...)
+                cmp._hs_in_axis_helpers = true
+                local ok, err = pcall(old_UpdateAxisAlignedHelpers, cmp, ...)
+                cmp._hs_in_axis_helpers = false
+                if not ok then
+                    GLOBAL.error(err)
+                end
+            end
+        end
         local old_TestCanBuild = self.TestCanBuild
         if type(old_TestCanBuild) ~= "function" then
             return
         end
         self.TestCanBuild = function(cmp, ...)
+            if cmp._hs_in_axis_helpers then
+                return old_TestCanBuild(cmp, ...)
+            end
             local sim = rawget(GLOBAL, "TheSim")
             local tick = (sim and type(sim.GetTick) == "function") and sim:GetTick() or nil
             local inst = cmp.inst

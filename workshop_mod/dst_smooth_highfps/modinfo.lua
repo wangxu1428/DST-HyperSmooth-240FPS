@@ -10,6 +10,13 @@ name = L("HyperShade · 饥荒超帧与视觉引擎（原 HyperSmooth）", "DST 
 description = L([[
 纯客户端 240 帧骨骼/位移/影子/粒子/动态光源/镜头全场景补帧、Native OpenGL 硬件加速（完整兼容 Steam 社区界面）、世界空间独立 ShadowMask FBO 流体阴影与 360° 多光源篝火/提灯动态投影 + 沿岸实景平面水面倒影 + 真·白名单植被风动与穿行拨草、原生崩溃侦探与双屏防甩出鼠标锁、全参数实时画质光影工坊、视觉风格闭环（任意截图吸色拟合自有管线参数 → HS1 分享码）与 HS_EXT_V1 标准 Shader 扩展管线（全自动识别官方中英文语言并支持局内热切换）。
 
+【v2.9.6 紧急热修】
+1. 修复部分显卡环境下贴图槽位越界导致的整屏异常发红（类似强行戴鼹鼠帽），并修复鼹鼠帽/夜视/启迪冠升级月亮滤镜与画质预设冲突串色的问题。
+2. 修复全局帧率偏低回退：默认关闭实验性 DXGI 翻转模式、恢复现代 A 卡（OpenGL 4.5+）走原生 OpenGL、消除原版纯净档位每帧冗余同步与着色彩蛋开销。
+3. 修复复杂高密度场景（如神话青竹洲）动作补帧静默失效问题：动作过渡池扩容至 512、修复单帧毛刺误降级并提升密集场景补帧预算。
+4. 修复耕地水分变化时的画面频闪：自动直通进度驱动的世界叠加动画（如耕地湿度/养分覆盖层）。
+5. 修复基地种植时拉网格对齐辅助导致严重掉帧的问题。
+
 【v2.9.5 全栈演进更新（HyperShade 视觉闭环 + M1 性能 + M2 工具 + M3 水面倒影 + M4 白名单风动 + 多光源动态投影）】
 1. 视觉风格闭环（零外部部件 · 内置原生特征分析）：
    - 玩家只需 Win+Shift+S 截图或复制任意参考图片（ReShade、其他游戏、参考画面），在分享卡片点击「吸取剪贴板截图」或控制台输入 c_hslook()，即可在后台线程自动解码缩放并提取 Oklab 视觉特征，严格映射至 HyperShade 自有可控管线参数白名单，一键生成可复现参数状态、可滑块微调、可一键撤销的 HS1- 分享码（仅基于用户提供图片提取视觉统计特征，不读取/复制任何第三方模组着色器、素材或代码）。
@@ -26,6 +33,13 @@ description = L([[
 ]], [[
 Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Overlay compatibility), World-Space ShadowMask FBO fluid shadows with 360-deg Top-3 campfire/lantern dynamic point shadows, coastal-only true planar water reflections, strict tag-whitelisted GPU foliage wind-sway & player parting wake, zero-heap Crash Detective + safe Dual-Monitor Cursor Lock, real-time Visual & Lighting Studio with 6 built-in curated presets, Visual Closed-Loop (any reference screenshot -> HyperShade owned capability whitelist -> transactional HS1 share code), and the HS_EXT_V1 Shader Extension Platform.
 
+[v2.9.6 Hotfix]
+1. Fixed abnormal red-screen tint (texture unit bounds guard for ShadowMask/WaterRefl) and preserved special vision / upgraded Enlightened Crown lunacy ColourCube filters.
+2. Fixed baseline FPS regression: DXGI flip-present now defaults to off, modern AMD GPUs (OpenGL 4.5+) stay on Native OpenGL, and Preset 0 steady-state per-frame sync overhead is eliminated.
+3. Fixed silent animation interpolation fallback in dense scenes (e.g., Myth Words Bamboo Island): 4x pose crossfade pool (512), spike-clamped sampler, and raised shedding thresholds.
+4. Fixed farm soil moisture overlay flicker by bypassing SetPercent-driven world overlays and settling finished tracks.
+5. Fixed severe FPS drop during base planting grid-helper sweeps in Placer:UpdateAxisAlignedHelpers.
+
 [v2.9.5 Full-Stack Milestone (HyperShade Visual Closed-Loop + Built-In Preset Gallery + M1-M4 + Multi-Light Shadows)]
 1. Visual Closed-Loop (Zero External Tools - Built into dinput8.dll):
    - Copy any screenshot or image file (Win+Shift+S / Ctrl+C / ReShade / other games / reference art) and click "Match Clipboard" (or run c_hslook()) to analyze Oklab tonal/color features on a background thread and fit ONLY HyperShade's owned controllable pipeline parameters into a transactional HS1- share code (reproducible parameter state, editable sliders, 1-click Undo; never reads or copies third-party mod shaders, assets, or code).
@@ -41,7 +55,7 @@ Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Over
    - 1-click "Presets" gallery panel (Vanilla Pure / Eye-Care HD / Cinematic Storybook / Crisp Daylight / Cozy Firelight / Misty Canopy — 100% original HyperShade looks, editable & 1-click Undo); Vanilla Pure strictly keeps stock 0.25x BloomSampler & Magiluminescence brightness with zero added visual effects.
 ]])
 author = "Hakimi Tech Lab"
-version = "2.9.5"
+version = "2.9.6"
 
 api_version = 10
 dst_compatible = true

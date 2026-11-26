@@ -670,6 +670,15 @@ private:
         if (failed_) return false;
         if (ready_) return true;
 
+        if (ops_.glGetIntegerv) {
+            int32_t maxUnits = 0;
+            ops_.glGetIntegerv(hs_world_shadow::kGlMaxTextureImageUnits, &maxUnits);
+            if (maxUnits > 0 && maxUnits <= static_cast<int32_t>(kReflTexUnit)) {
+                failed_ = true;
+                return false;
+            }
+        }
+
         int32_t prevRbo = 0;
         if (ops_.glGetIntegerv) {
             ops_.glGetIntegerv(hs_world_shadow::kGlRenderbufferBinding, &prevRbo);

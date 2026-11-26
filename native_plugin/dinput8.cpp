@@ -590,7 +590,7 @@ size_t g_gameRenderPatchIdx    = static_cast<size_t>(-1);
 size_t g_postProcPatchIdx      = static_cast<size_t>(-1);
 size_t g_vbPoolPatchIdx        = static_cast<size_t>(-1);
 std::atomic<int>  g_cfgRenderBackend{2}; // 0=d3d9, 1=opengl, 2=auto
-std::atomic<int>  g_cfgDxgiFlipPresent{2}; // 0=off, 1=on, 2=auto
+std::atomic<int>  g_cfgDxgiFlipPresent{0}; // 0=off (default), 1=on, 2=auto
 std::atomic<bool> g_nativeGlActive{false};
 std::atomic<bool> g_nativeGlProbed{false};
 std::atomic<bool> g_dxgiFlipProbedOk{false};
@@ -1827,6 +1827,7 @@ struct ThreadLocalAnimState {
     int64_t  frameAnimStartQpc = 0;
     int64_t  frameHookAccumQpc = 0;
     uint32_t qpcCountdown = 0;
+    uint32_t frameSampleIdx = 0;
     uint32_t frameTweenEnts = 0;
     uint32_t frameTweenBones = 0;
     uint32_t frameShedCount = 0;
@@ -1927,6 +1928,7 @@ struct ThreadLocalAnimState {
             frameAnimStartQpc = now;
             frameHookAccumQpc = 0;
             qpcCountdown = 16;
+            frameSampleIdx = 0;
             frameTweenEnts = 0;
             frameTweenBones = 0;
             frameShedCount = 0;
@@ -1936,9 +1938,9 @@ struct ThreadLocalAnimState {
         if (qpcCountdown == 0) {
             qpcCountdown = 16;
             const double workUs = static_cast<double>(frameHookAccumQpc) * g_qpcToUs;
-            if (workUs > 1500.0 || frameTweenEnts >= 480) {
+            if (workUs > 4000.0 || frameTweenEnts >= 1800) {
                 frameShedLevel = 2;
-            } else if (workUs > 850.0 || frameTweenEnts >= 240) {
+            } else if (workUs > 2200.0 || frameTweenEnts >= 900) {
                 frameShedLevel = 1;
             }
         } else {
@@ -2115,10 +2117,10 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     if (g_skeletalTweenEnabled.load(std::memory_order_relaxed) == 0) {
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
-    // UI percentage meters (Health/Hunger/Sanity status_meter SetPercent -> playMode == 2)
-    // step discretely by design; cross-frame interpolation + half-way frame_num swaps cause
-    // visible liquid/icon flicker during continuous hunger/sanity drain or Combined Status updates.
-    if (channel == AnimChannel::UI && playMode == 2) {
+    // Percentage meters & discrete state overlays (SetPercent -> playMode == 2: UI status_meter,
+    // world nutrients_overlay / farm_soil_moisture, crop, rainometer, winterometer) step discretely
+    // by design; cross-frame interpolation + half-way frame_num swaps cause visible flicker.
+    if (playMode == 2) {
         return g_origAnimGetFrame(animPtr, playMode, time);
     }
 
@@ -2315,7 +2317,10 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     float dtSinceTick = static_cast<float>(static_cast<double>(nowQpc - tr.seg_start_qpc) * g_qpcInvFreq);
     float alpha = (tr.tick_period > 1e-4f) ? (dtSinceTick / tr.tick_period) : 1.0f;
     if (!std::isfinite(alpha) || alpha < 0.0f) alpha = 0.0f;
-    if (alpha > 1.0f) alpha = 1.0f;
+    if (alpha >= 1.0f) {
+        alpha = 1.0f;
+        tr.prev_f = tr.curr_f;
+    }
 
     float fNow = tr.prev_f + stepF * alpha;
     if (!std::isfinite(fNow)) {
@@ -2385,22 +2390,30 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > kMaxAnimElements || n1 > kMaxAnimElements) {
         return finalizeFrame(&f0, false);
     }
-    if (n0 == 1u && n1 == 1u &&
-        f0.elements[0].symbol_hash == f1.elements[0].symbol_hash &&
-        f0.elements[0].layer_hash  == f1.elements[0].layer_hash &&
-        f0.elements[0].frame_num   == f1.elements[0].frame_num &&
-        memcmp(f0.elements[0].m, f1.elements[0].m, 12) == 0) {
-        if (channel != AnimChannel::Main || crossfadeSec < 0.005f) {
-            return &f0;
+    if (n0 == n1 && n0 <= 16u) {
+        bool allIdentical = true;
+        for (uint32_t k = 0; k < n0; ++k) {
+            if (f0.elements[k].symbol_hash != f1.elements[k].symbol_hash ||
+                f0.elements[k].layer_hash  != f1.elements[k].layer_hash  ||
+                f0.elements[k].frame_num   != f1.elements[k].frame_num   ||
+                memcmp(f0.elements[k].m, f1.elements[k].m, 12) != 0) {
+                allIdentical = false;
+                break;
+            }
         }
-        hs_skeletal::PoseCrossfadeSlot* pExist = tls.posePool.Find(key);
-        if (!pExist || !pExist->blending) {
-            return &f0;
+        if (allIdentical) {
+            if (channel != AnimChannel::Main || crossfadeSec < 0.005f) {
+                return &f0;
+            }
+            hs_skeletal::PoseCrossfadeSlot* pExist = tls.posePool.Find(key);
+            if (!pExist || !pExist->blending) {
+                return &f0;
+            }
+            return finalizeFrame(&f0, false);
         }
-        return finalizeFrame(&f0, false);
     }
 
-    const int64_t workStartQpc = ((tls.frameTweenEnts & 15u) == 0) ? NowQpc() : 0;
+    const int64_t workStartQpc = ((tls.frameSampleIdx++ & 15u) == 0u) ? NowQpc() : 0;
 
     AnimBufferSlot& bufSlot = tls.NextSlot(channel);
     bufSlot.frame = f0;
@@ -2860,8 +2873,12 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     }
 
     if (workStartQpc != 0) {
-        // Sampled per-16-entity work estimator (avoids per-entity QPC overhead while bounding total hook time)
-        tls.frameHookAccumQpc += (NowQpc() - workStartQpc) * 16;
+        // Sampled per-16-entity work estimator; clamp any single-entity OS-preemption / complex-FX
+        // outlier to <=250us before x16 scaling so one spike cannot falsely trip Level-2 shedding.
+        int64_t deltaQpc = NowQpc() - workStartQpc;
+        const int64_t maxSampleQpc = static_cast<int64_t>(250.0 / g_qpcToUs);
+        if (deltaQpc > maxSampleQpc && maxSampleQpc > 0) deltaQpc = maxSampleQpc;
+        if (deltaQpc > 0) tls.frameHookAccumQpc += deltaQpc * 16;
     }
 
     if (tweenedCount > 0) {
@@ -6803,6 +6820,12 @@ struct WorldProgInfo {
     bool          hasXform         = false;
     float         lastColorAlpha   = 1.0f;
     float         lastParamsY      = 0.0f;
+    float         lastOceanEye[4]   = {};
+    float         lastReflBounds[4] = {};
+    float         lastReflCfg[4]    = {};
+    bool          oceanEyeValid     = false;
+    bool          reflBoundsValid   = false;
+    bool          reflCfgValid      = false;
 };
 
 static thread_local hs_world_shadow::WorldShadowEngine   tl_worldShadow;
@@ -7360,6 +7383,10 @@ static inline void SyncOceanReflUniforms() {
     if (!g_fnGlUniform4fv) return;
     SyncWorldShadowEngine();
     const auto& scfg = GetCachedShadowConfig();
+    auto vec4Differs = [](const float a[4], const float b[4]) noexcept {
+        return fabsf(a[0] - b[0]) > 1e-5f || fabsf(a[1] - b[1]) > 1e-5f ||
+               fabsf(a[2] - b[2]) > 1e-5f || fabsf(a[3] - b[3]) > 1e-5f;
+    };
     if (tl_curWorldProg->locOceanEye >= 0) {
         float eye[4];
         if (tl_waterRefl.HasCamEye()) {
@@ -7376,8 +7403,12 @@ static inline void SyncOceanReflUniforms() {
             eye[2] = 18.0f;
         }
         eye[3] = scfg.windTime;
-        g_fnGlUniform4fv(tl_curWorldProg->locOceanEye, 1, eye);
-        tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locOceanEye);
+        if (!tl_curWorldProg->oceanEyeValid || vec4Differs(tl_curWorldProg->lastOceanEye, eye)) {
+            g_fnGlUniform4fv(tl_curWorldProg->locOceanEye, 1, eye);
+            tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locOceanEye);
+            std::memcpy(tl_curWorldProg->lastOceanEye, eye, sizeof(eye));
+            tl_curWorldProg->oceanEyeValid = true;
+        }
     }
     if (tl_curWorldProg->locReflCfg < 0) return;
     if (!tl_curWorldProg->reflTexUnitBound && tl_curWorldProg->locReflTex >= 0 && g_origGlUniform1i) {
@@ -7389,12 +7420,19 @@ static inline void SyncOceanReflUniforms() {
     tl_waterRefl.BindForOceanSampling(rcfg, tl_spriteBatcher.ActiveUnit(),
                                       GetSyncedGlCache(), IsGlCacheOperational(),
                                       rBounds, rCfg);
-    if (tl_curWorldProg->locReflBounds >= 0) {
+    if (tl_curWorldProg->locReflBounds >= 0 &&
+        (!tl_curWorldProg->reflBoundsValid || vec4Differs(tl_curWorldProg->lastReflBounds, rBounds))) {
         g_fnGlUniform4fv(tl_curWorldProg->locReflBounds, 1, rBounds);
         tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locReflBounds);
+        std::memcpy(tl_curWorldProg->lastReflBounds, rBounds, sizeof(rBounds));
+        tl_curWorldProg->reflBoundsValid = true;
     }
-    g_fnGlUniform4fv(tl_curWorldProg->locReflCfg, 1, rCfg);
-    tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locReflCfg);
+    if (!tl_curWorldProg->reflCfgValid || vec4Differs(tl_curWorldProg->lastReflCfg, rCfg)) {
+        g_fnGlUniform4fv(tl_curWorldProg->locReflCfg, 1, rCfg);
+        tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locReflCfg);
+        std::memcpy(tl_curWorldProg->lastReflCfg, rCfg, sizeof(rCfg));
+        tl_curWorldProg->reflCfgValid = true;
+    }
 }
 
 static inline void EnsureWaterReflBeginWrite(const hs_water_refl::WaterReflConfig& rcfg) {
@@ -9777,9 +9815,11 @@ static void HookGameRender(void* self, void* renderData) {
             g_frameAnimShed.fetch_add(tls.frameShedCount, std::memory_order_relaxed);
             tls.FlushCounters();
             tls.frameHookAccumQpc = 0;
+            tls.frameSampleIdx = 0;
             tls.frameTweenEnts = 0;
             tls.frameTweenBones = 0;
             tls.frameShedCount = 0;
+            tls.frameShedLevel = 0;
         }
     }
 }
@@ -11747,7 +11787,7 @@ static BOOL WINAPI HookMiniDumpWriteDump(HANDLE hProcess, DWORD processId, HANDL
 }
 
 static void InstallDiagnosticsAndUtilityIatHooks() {
-    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.5");
+    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.6");
     g_crashDetective.InstallUnhandledFilter();
     const bool okDump   = PatchExeIatEntry("dbghelp.dll",     0, "MiniDumpWriteDump",     reinterpret_cast<void*>(&HookMiniDumpWriteDump),    g_origMiniDumpWriteDump);
     const bool okSteam  = PatchExeIatEntry("steam_api64.dll", 0, "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&HookSteamApiRunCallbacks), g_origSteamRunCallbacks);
@@ -12022,7 +12062,15 @@ int LuaHyperSmoothSetShadowDyn(void* L) {
     };
     bool changed = false;
     AcquireSRWLockExclusive(&g_hd2dStateLock);
-    for (int i = 0; i < 4; ++i) {
+    const bool shadowsActive =
+        (g_hd2dState.shadowDensity > 0.001f) ||
+        (g_hd2dState.shadProj[3] > 0.5f) ||
+        (g_hd2dState.pointLightCount > 0u) ||
+        (g_hd2dState.oceanPbr[0] > 0.001f) ||
+        (g_hd2dState.oceanPbr[1] > 0.001f) ||
+        (g_hd2dState.oceanPbr[2] > 0.001f);
+    const int startIdx = shadowsActive ? 0 : 1; // Ignore idle windTime clock drift when shadows & ocean PBR are OFF
+    for (int i = startIdx; i < 4; ++i) {
         if (fabsf(g_hd2dState.shadDyn[i] - nShadDyn[i]) > 1e-6f) {
             changed = true;
             break;
@@ -12300,12 +12348,16 @@ int LuaHyperSmoothSetWindField(void* L) {
 
     bool changed = false;
     AcquireSRWLockExclusive(&g_windLock);
-    if (fabsf(g_windState.windTime - ns.windTime) > 1e-4f ||
-        fabsf(g_windState.swayAmp - ns.swayAmp) > 1e-4f ||
-        fabsf(g_windState.wakeAmp - ns.wakeAmp) > 1e-4f ||
-        fabsf(g_windState.playerWx - ns.playerWx) > 1e-3f ||
-        fabsf(g_windState.playerWz - ns.playerWz) > 1e-3f ||
-        g_windState.hasPlayer != ns.hasPlayer) {
+    const bool bothOff =
+        (g_windState.swayAmp <= 0.001f && g_windState.wakeAmp <= 0.001f &&
+         ns.swayAmp <= 0.001f && ns.wakeAmp <= 0.001f);
+    if (!bothOff &&
+        (fabsf(g_windState.windTime - ns.windTime) > 1e-4f ||
+         fabsf(g_windState.swayAmp - ns.swayAmp) > 1e-4f ||
+         fabsf(g_windState.wakeAmp - ns.wakeAmp) > 1e-4f ||
+         fabsf(g_windState.playerWx - ns.playerWx) > 1e-3f ||
+         fabsf(g_windState.playerWz - ns.playerWz) > 1e-3f ||
+         g_windState.hasPlayer != ns.hasPlayer)) {
         g_windState = ns;
         changed = true;
     }
@@ -12986,7 +13038,7 @@ int LuaHyperSmoothGetSpriteBatchStats(void* L) {
 
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.9.5");
+    g_luaPushString(L, "DST-HyperSmooth/2.9.6");
     return 1;
 }
 
@@ -13842,7 +13894,7 @@ void EnsureDefaultIni() {
         "enable_rpc_qos=1\n"
         "enable_async_save=0\n"
         "render_backend=auto\n"
-        "dxgi_flip_present=auto\n"
+        "dxgi_flip_present=off\n"
         "enable_vb_pool=1\n"
         "enable_sprite_batch=1\n"
         "\n"
@@ -14029,8 +14081,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optAsyncSave = ReadIniInt(L"OPTIMIZE", L"enable_async_save", 0) != 0;
     wchar_t optBackendBuf[32] = L"auto";
     GetPrivateProfileStringW(L"OPTIMIZE", L"render_backend", L"auto", optBackendBuf, 32, g_iniPath.c_str());
-    wchar_t optDxgiFlipBuf[32] = L"auto";
-    GetPrivateProfileStringW(L"OPTIMIZE", L"dxgi_flip_present", L"auto", optDxgiFlipBuf, 32, g_iniPath.c_str());
+    wchar_t optDxgiFlipBuf[32] = L"off";
+    GetPrivateProfileStringW(L"OPTIMIZE", L"dxgi_flip_present", L"off", optDxgiFlipBuf, 32, g_iniPath.c_str());
     bool optVbPool = ReadIniInt(L"OPTIMIZE", L"enable_vb_pool", 1) != 0;
     bool optSpriteBatch = ReadIniInt(L"OPTIMIZE", L"enable_sprite_batch", 1) != 0;
     {

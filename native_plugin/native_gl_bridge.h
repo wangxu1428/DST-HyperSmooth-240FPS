@@ -489,11 +489,15 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     }
 
     if (mode == BackendMode::Auto) {
-        // Auto mode strictly restricts Native OpenGL Compat to empirically verified NVIDIA drivers.
-        // AMD Radeon & Intel iGPUs default to battle-tested ANGLE D3D9 (users may still opt in via
-        // `RenderBackend = opengl` in dst_hypersmooth.ini).
+        // Auto mode enables Native OpenGL Compat on verified NVIDIA drivers AND modern AMD Radeon
+        // drivers (OpenGL >= 4.5). Legacy AMD (<4.5) and Intel iGPUs default to ANGLE D3D9
+        // (users may still opt in via `render_backend=opengl` in dst_hypersmooth.ini).
         const bool isNvidia = ContainsAsciiInsensitive(out.vendor.c_str(), "NVIDIA");
-        if (!isNvidia) {
+        const bool isModernAmd =
+            (ContainsAsciiInsensitive(out.vendor.c_str(), "ATI") ||
+             ContainsAsciiInsensitive(out.vendor.c_str(), "AMD")) &&
+            (glMaj > 4 || (glMaj == 4 && glMin >= 5));
+        if (!isNvidia && !isModernAmd) {
             out.reason = "auto_prefer_d3d9_for_gpu_vendor";
             cleanup();
             return out;

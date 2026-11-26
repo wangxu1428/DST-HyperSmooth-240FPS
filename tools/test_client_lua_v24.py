@@ -56,7 +56,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env)
     fn_info()
-    assert(bare_env.version == "2.9.5", "Expected modinfo version 2.9.5, got " .. tostring(bare_env.version))
+    assert(bare_env.version == "2.9.6", "Expected modinfo version 2.9.6, got " .. tostring(bare_env.version))
     assert(bare_env.client_only_mod == true and bare_env.all_clients_require_mod == false, "Wrong mod flags")
     local cfg_map = {}
     for i = 1, #bare_env.configuration_options do
@@ -90,7 +90,7 @@ AddSimPostInit(function()
     }
     setfenv(fn_info, bare_env_en)
     fn_info()
-    assert(bare_env_en.version == "2.9.5", "Expected EN modinfo version 2.9.5, got " .. tostring(bare_env_en.version))
+    assert(bare_env_en.version == "2.9.6", "Expected EN modinfo version 2.9.6, got " .. tostring(bare_env_en.version))
     assert(type(bare_env_en.name) == "string" and bare_env_en.name ~= bare_env.name,
            "Expected localized EN modinfo name to differ from ZH")
     assert(type(bare_env_en.description) == "string" and bare_env_en.description ~= bare_env.description,
@@ -192,7 +192,7 @@ AddSimPostInit(function()
                 return true, 10, mStr, 1.5, 0.3, 2.2, 0.4, 445, 452, 7200
             end,
             HyperSmooth_GetFrameStats = function() return 239.8, 226.4, 4.21, 0.04, 15, native_sim_hz end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             HyperSmooth_SetSimTickRate = function(hz)
                 if hz == 30 or hz == 60 then native_sim_hz = hz; return true end
                 return false
@@ -416,10 +416,10 @@ AddSimPostInit(function()
         -- Verify DLL Version Handshake & Update Banner status detection ("ok" / "outdated" / "missing")
         do
             local st, ver, exp = fakeG.HyperSmooth_GetDllStatus()
-            assert(st == "ok" and ver == "2.9.5" and exp == "2.9.5",
-                   "Expected ok/2.9.5/2.9.5, got " .. tostring(st) .. "/" .. tostring(ver))
+            assert(st == "ok" and ver == "2.9.6" and exp == "2.9.6",
+                   "Expected ok/2.9.6/2.9.6, got " .. tostring(st) .. "/" .. tostring(ver))
             local snap_ok = env.HS_PanelApi.GetSnapshot()
-            assert(snap_ok.dll_status == "ok" and snap_ok.dll_ver == "2.9.5", "Panel snapshot dll_status ok mismatch")
+            assert(snap_ok.dll_status == "ok" and snap_ok.dll_ver == "2.9.6", "Panel snapshot dll_status ok mismatch")
 
             local saved_ver = fakeG.HyperSmooth_Version
             local saved_fps = fakeG.HyperSmooth_SetFps
@@ -1983,7 +1983,7 @@ AddSimPostInit(function()
         g13.debug = mock_debug
         g13.os = mock_os
         g13.table = G.table
-        g13.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end
+        g13.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end
         g13.HyperSmooth_FastJsonEncode = function(val, compliant)
             fast_enc_calls = fast_enc_calls + 1
             if type(val) == "table" and val.__fallback then
@@ -2319,7 +2319,7 @@ AddSimPostInit(function()
             SetSkillActivatedState = 12, AddSkillXP = 13,
             PostActivateHandshake = 14, TryToTeachScrapbookData = 15,
         }
-        g14.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end
+        g14.HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end
         g14.HyperSmooth_SetFps = function() return true end
         g14.HyperSmooth_SetSkeletal = function() return true end
         g14.HyperSmooth_SetWorldInterp = function() return true end
@@ -3668,7 +3668,7 @@ AddSimPostInit(function()
                 },
             }),
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             HyperSmooth_SetWorldStudio = function() return true end,
             HyperSmooth_SetShadowDyn   = function() return true end,
             HyperSmooth_SetShadowConfig = function(...)
@@ -3871,7 +3871,7 @@ AddSimPostInit(function()
                 },
             }),
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             HyperSmooth_SetWorldStudio = function(...) ws_calls_20[#ws_calls_20 + 1] = { ... }; return true end,
             HyperSmooth_SetShadowDyn   = function() return true end,
             HyperSmooth_SetShadowConfig = function(...) sc_calls_20[#sc_calls_20 + 1] = { ... }; return true, false end,
@@ -4111,7 +4111,7 @@ AddSimPostInit(function()
                 },
             }),
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             HyperSmooth_SetWorldStudio = function() return true end,
             HyperSmooth_SetShadowDyn = function() return true end,
             HyperSmooth_SetShadowConfig = function() return true, false end,
@@ -4241,7 +4241,7 @@ AddSimPostInit(function()
                 AddKeyDownHandler = function() end,
                 IsKeyDown = function() return false end,
             },
-            HyperSmooth_Version = function() return "2.9.5" end,
+            HyperSmooth_Version = function() return "2.9.6" end,
             HyperSmooth_SetFps = function() return true end,
             HyperSmooth_SetSkeletal = function() return true end,
             HyperSmooth_SetWorldInterp = function() return true end,
@@ -5423,7 +5423,7 @@ AddSimPostInit(function()
                 },
             }),
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             HyperSmooth_SetWorldStudio = function() return true end,
             HyperSmooth_SetShadowDyn   = function() return true end,
             HyperSmooth_SetShadowConfig = function(...) sc27[#sc27 + 1] = { ... }; return true, false end,
@@ -5747,7 +5747,7 @@ AddSimPostInit(function()
             HyperSmooth_SetPointLights = function() return 0 end,
             HyperSmooth_SetWaterRefl = function() return true, 0 end,
             HyperSmooth_SetFps = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             require = function(p)
                 if p == "widgets/text" then
                     return function()
@@ -6136,7 +6136,7 @@ AddSimPostInit(function()
             HyperSmooth_SetDetailParams = function() return true end,
             HyperSmooth_SetCombatConfig = function() return true end,
             HyperSmooth_SetClipboard = function() return true end,
-            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.5" end,
+            HyperSmooth_Version = function() return "DST-HyperSmooth/2.9.6" end,
             require = function(modname)
                 if modname == "widgets/widget" or modname == "widgets/image" or modname == "widgets/imagebutton"
                     or modname == "widgets/text" or modname == "widgets/textedit" then

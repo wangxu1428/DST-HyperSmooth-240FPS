@@ -379,7 +379,7 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
 //       * Particle / duplicate-symbol layers
 //       * Swarm load shedding (fastOnly)
 // =============================================================================
-static constexpr uint32_t kPosePoolSlots = 128u;
+static constexpr uint32_t kPosePoolSlots = 512u;
 static constexpr uint32_t kMaxPoseBones  = 96u;
 
 struct BoneSnap {
