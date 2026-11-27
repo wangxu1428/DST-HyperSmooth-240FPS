@@ -2,10 +2,10 @@
   <strong>简体中文</strong> | <a href="README_EN.md">English</a>
 </p>
 
-# DST HyperCore Server v1.3.0 — Windows & Linux Dedicated Server Native Engine
+# DST HyperCore Server v1.6.0-beta1 — Windows & Linux Dedicated Server Native Engine
 
 > **《饥荒联机版》服务端旗舰级「原生 C++ 引擎 (`bin64/iphlpapi.dll` / `bin64/libhypercore.so`) + 零分歧纯服务端 Mod」双端全栈优化套件**  
-> **Ceiling-Tier Server-Only Native Engine (Windows + Linux x86_64) + Async Save + FS Neg Cache + FastAStar + 2.5× FastLoad + Opt-In 60Hz SimTick**  
+> **Ceiling-Tier Server-Only Native Engine (Windows + Linux x86_64) + Module 10B Replica Pacing + O(N) ReplicaFastPath + Causal 3-Ch RPC QoS + Server HW Tier + Spike Blackbox**  
 > 👉 **Linux x86_64 专用独立目录**：[`server_hypercore_linux/`](server_hypercore_linux/README.md)（[English Guide](server_hypercore_linux/README_EN.md)） | 客户端分支：[`main`](https://github.com/wangxu1428/DST-HyperSmooth-240FPS) | [Releases 下载](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)
 >
 > - **默认 100% 纯服务端生效**：默认 `30Hz` 模式下客户端零下载、所有原版玩家直接进服。
@@ -15,7 +15,12 @@
 
 ---
 
-## v1.3.0 核心升级与全模块矩阵 / What's New in v1.3.0
+## v1.6.0-beta1 核心升级与全模块矩阵 / What's New in v1.6.0-beta1
+
+### 0. Module 10B 零失步分层副本分帧平滑 + `O(N)` 副本极速引擎 + 硬件档位 & 尖峰黑匣子
+- **Module 10B 零失步分层副本构造限流（Replica Construction Pacing）**：进入 1500+ 实体巨型基地或跳虫洞时，自动按距离分桶平滑下发远距静态建筑，消除 250KB RM3 网络洪峰与客户端瞬时卡顿；世界/网络代理、玩家、Classified、背包物品及 14 格近身威胁 0ms 直达，且父先于子提升杜绝挂件失步；支持 `c_hyperpacing()` 实时调参。
+- **`O(N)` 副本极速路径 & 因果 3 通道 `RakNet::RPC4` QoS**（[replica_fastpath.h](server_hypercore/native_plugin/replica_fastpath.h) / [rpc_qos.h](server_hypercore/native_plugin/rpc_qos.h)）：替代大基地高频遍历扫描并将非关键广播隔离出 Ch0，降低主循环与网络抖动。
+- **三档硬件性能策略 + `C++ FastJson` + 专服尖峰黑匣子（Spike Blackbox）**（[server_hardware_tier.h](server_hypercore/native_plugin/server_hardware_tier.h) / [fast_json.h](server_hypercore/native_plugin/fast_json.h) / [spike_blackbox.h](server_hypercore/native_plugin/spike_blackbox.h)）：支持 `c_hypertier()` 调度、原生 JSON 编解码与专服卡顿快照导出；同步在 [modinfo.lua](server_hypercore/server_mod/modinfo.lua) 声明 `dnh_github` 伴侣托管元数据。
 
 ### 1. 异步原子存档提交队列（Module 8 · `enable_async_save = 1`）与子阶段细分探针
 - **64MB 严格因果 FIFO 异步落盘**（[async_save_commit.h](server_hypercore/native_plugin/async_save_commit.h)）：截获 `WritePersistentFile` 并将快照序列化/压缩后的实际磁盘写入卸载至后台独立 I/O 线程，主模拟线程仅耗时微秒级入队（实测 `enq=11 ok=11 err=0 enqUs=76`）。
@@ -59,7 +64,7 @@
 
 - **26,028 实体「四合一地狱压力档」7 轮消融实测**（`i7-12700KF · 32GB · Windows x64`）：
   - 全栈开启（L1+L2）：平均 Tick **`5,334 → 3,631 µs (-31.9%)`**、P99 Tick **`17,728 → 8,620 µs (-51.4%)`**、最大尖峰 **`386.0ms → 29.3ms (-92.4%)`**、超时帧 **`2 → 0`**、Full-GC 冻服 **`380.4ms → 0ms`**、存档冻屏 **`399.0ms → 215.0ms (-46.1%)`**。
-- **最新全链路自动化测试**：`test_redteam_server.exe` **15/15 PASS**、`test_proxy_passthrough.py` **ALL PASS**、`test_perish_savesafety.py` **7/7 ALL_PASS (`rc=0`)**、`test_sim60_live.py` **3/3 PHASES PASS (`rc=0`)**、`test_linux_elf_verify.py` **ALL PASS (`rc=0`，静态 ELF64 + 57/57 Capstone AOB)**。
+- **最新全链路自动化测试**：`test_redteam_server.exe` **22/22 PASS**、`test_proxy_passthrough.py` **ALL PASS**（297 导出、非服务端零挂钩）、`test_server_lua_v14.py` **8/8 ALL_PASS (`rc=0`)**、`test_linux_elf_verify.py` **ALL PASS (`rc=0`，静态 ELF64 + 66/66 Capstone AOB + 22/22 序言)**。
 
 ---
 
@@ -68,9 +73,9 @@
 ### Windows 专服
 1. **安装服务端 Mod**：Steam 创意工坊订阅 **HyperCore Server**（或复制 `server_hypercore/server_mod/` 到专服 `mods/hypercore_server/`）。
 2. **安装原生插件 (`bin64/iphlpapi.dll`)**：
-   - 下载解压 **`DST_HyperCore_Server_v1.3.0_Release.zip`**，关闭饥荒/专服，双击 **`一键安装与更新.bat`** 自动识别目录并校验 SHA256（卸载选 `2`）；
-   - 或手动将 `bin64/iphlpapi.dll` 与 `bin64/dst_hypercore.ini` 放入专服 **`bin64/`**（与 `dontstarve_dedicated_server_nullrenderer_x64.exe` 同目录）。
+   - 下载解压 **`DST_HyperCore_Server_v1.6.0-beta1_Release.zip`**，关闭饥荒/专服，双击 **`一键安装与更新.bat`** 自动识别目录并校验 SHA256（卸载选 `2`）；
+   - 或手动将 `bin64/iphlpapi.dll` 与 `bin64/dst_hypercore.ini` 放入专服 **`bin64/`**（与 `dontstarve_dedicated_server_nullrenderer_x64.exe` 同目录），亦支持通过 **DNH 伴侣（`dnh_github`）** 自动拉取 `iphlpapi.dll`。
 
 ### Linux x86_64 专服
-- 下载 **`DST_HyperCore_Server_Linux_v1.3.0_Release.zip`**，将 `bin64/libhypercore.so`、`bin64/dst_hypercore.ini` 与 `bin64/linux_start_with_hypercore.sh` 放入 Linux 专服 **`bin64/`**（不要放到 32 位 `bin/` 或 `mods/`），通过 `linux_start_with_hypercore.sh` 或设置 `LD_PRELOAD=<路径>/bin64/libhypercore.so` 启动即可！
+- 下载 **`DST_HyperCore_Server_Linux_v1.6.0-beta1_Release.zip`**，将 `bin64/libhypercore.so`、`bin64/dst_hypercore.ini` 与 `bin64/linux_start_with_hypercore.sh` 放入 Linux 专服 **`bin64/`**（不要放到 32 位 `bin/` 或 `mods/`），通过 `linux_start_with_hypercore.sh` 或设置 `LD_PRELOAD=<路径>/bin64/libhypercore.so` 启动即可！
 - 详细部署、`systemd` / Docker / 翼龙面板模板与构建指南请移步独立文档 👉 **[`server_hypercore_linux/README.md`](server_hypercore_linux/README.md)**。

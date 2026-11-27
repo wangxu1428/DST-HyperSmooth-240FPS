@@ -28,6 +28,7 @@ $ldFiles = @(
     @{ src = "$ld\lib\x86\cpu_features.c";   out = "$obj\ld_cpu.o" },
     @{ src = "$ld\lib\adler32.c";            out = "$obj\ld_adler32.o" },
     @{ src = "$ld\lib\deflate_decompress.c"; out = "$obj\ld_decomp.o" },
+    @{ src = "$ld\lib\zlib_decompress.c";    out = "$obj\ld_zdecomp.o" },
     @{ src = "$ld\lib\deflate_compress.c";   out = "$obj\ld_comp.o" },
     @{ src = "$ld\lib\zlib_compress.c";      out = "$obj\ld_zcomp.o" }
 )
@@ -50,7 +51,7 @@ $thunkObj = "$obj\iphlpapi_thunks.o"
 & $zig cc -target $target -c "$np\iphlpapi_thunks.S" -o $thunkObj
 if ($LASTEXITCODE -ne 0) { throw "Failed assembling iphlpapi_thunks.S" }
 
-Write-Host "[4/4] Compiling & linking iphlpapi.dll (DST HyperCore Server Native Engine v1.3.0)..."
+Write-Host "[4/4] Compiling & linking iphlpapi.dll (DST HyperCore Server Native Engine v1.6.0-beta1)..."
 $mainObj = "$obj\iphlpapi.o"
 & $zig c++ -target $target -std=c++20 -O3 -march=x86_64 -DNDEBUG `
     -Wall -Wextra -Wno-unused-parameter `
@@ -63,7 +64,7 @@ $outDll = "$np\iphlpapi.dll"
 & $zig c++ -target $target -shared -O3 -s `
     -o $outDll `
     $mainObj $thunkObj $miObj `
-    "$obj\ld_utils.o" "$obj\ld_cpu.o" "$obj\ld_adler32.o" "$obj\ld_decomp.o" "$obj\ld_comp.o" "$obj\ld_zcomp.o" `
+    "$obj\ld_utils.o" "$obj\ld_cpu.o" "$obj\ld_adler32.o" "$obj\ld_decomp.o" "$obj\ld_zdecomp.o" "$obj\ld_comp.o" "$obj\ld_zcomp.o" `
     "$np\iphlpapi.def" `
     -lws2_32 -lwinmm -ladvapi32 -lbcrypt -lpsapi
 if ($LASTEXITCODE -ne 0) { throw "Failed linking iphlpapi.dll" }

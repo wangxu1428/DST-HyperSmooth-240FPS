@@ -126,7 +126,7 @@ def verify_cpp_against_real_dst_elf():
         assert cnt == 1, f"{name} matched {cnt} times in real Linux ELF .text (expected 1)!"
         off = tb.index(bs)
         aob_map[name] = elf.text_va + off
-    assert len(aob_map) >= 54, f"Expected >=54 AOBs parsed, got {len(aob_map)}"
+    assert len(aob_map) >= 56, f"Expected >=56 AOBs parsed, got {len(aob_map)}"
     print(f"[PASS] All {len(aob_map)}/{len(aob_map)} kAob* arrays in hypercore_linux.cpp match 1-of-1 in real Linux Build 762172 ELF")
 
     var_to_aob = {}
@@ -178,7 +178,7 @@ def verify_cpp_against_real_dst_elf():
                 f"Expected 7B `48 8D` lea [rip+disp32] at 0x{va:x}+{roff}, got {mnem} {op}"
             )
         hook_count += 1
-    assert hook_count >= 19, f"Expected >=19 InstallHookSysV hooks verified, got {hook_count}"
+    assert hook_count >= 21, f"Expected >=21 InstallHookSysV hooks verified, got {hook_count}"
     print(f"[PASS] Capstone verified {hook_count}/{hook_count} InstallHookSysV prologues (exact boundaries & movabs-safe RelocLea)")
 
     # 3. Verify AStar::Step+0x3CC -> PathVec::_M_realloc_insert decode

@@ -41,6 +41,8 @@ struct LuaApiTable {
     void        (*setfield)(void* L, int idx, const char* k) = nullptr;
     int         (*gc)(void* L, int what, int data) = nullptr;
     int         (*next)(void* L, int idx) = nullptr;
+    void        (*rawset)(void* L, int idx) = nullptr;
+    void        (*rawseti)(void* L, int idx, int n) = nullptr;
 
     bool ReadyForFastDump() const {
         return checkstack && gettop && settop && type && tonumber && toboolean &&
@@ -48,6 +50,11 @@ struct LuaApiTable {
     }
     bool ReadyForRegister() const {
         return pushcclosure && setfield && createtable && pushnumber && pushstring && pushboolean;
+    }
+    bool ReadyForFastJson() const {
+        return checkstack && gettop && settop && pushvalue && type && tonumber && toboolean &&
+               tolstring && topointer && pushnil && pushnumber && pushlstring && pushstring &&
+               pushboolean && createtable && next && rawset && rawseti;
     }
 };
 
@@ -380,7 +387,7 @@ inline Status DumpValue(void* L, const LuaApiTable& api, int idx, GrowBuf& out, 
     }
 }
 
-inline Status DumpRoot(void* L, const LuaApiTable& api, int val_idx, const char* varname, size_t varlen, GrowBuf& out, const char** outReason = nullptr) {
+inline Status DumpRoot(void* L, const LuaApiTable& api, int val_idx, const char* varname, size_t varlen, GrowBuf& out, const char** outReason = nullptr, uint32_t maxNodes = kMaxDumpNodes) {
     out.Clear();
     bool ok = true;
     if (!varname) {
@@ -395,6 +402,7 @@ inline Status DumpRoot(void* L, const LuaApiTable& api, int val_idx, const char*
         return Status::FallbackNeeded;
     }
     DumpCtx ctx;
+    ctx.maxNodes = (maxNodes > 0u) ? maxNodes : kMaxDumpNodes;
     ctx.activeTables.reserve(64);
     Status st = DumpValue(L, api, val_idx, out, ctx, 0);
     if (outReason) {

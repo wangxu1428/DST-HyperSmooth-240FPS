@@ -157,7 +157,9 @@ AddSimPostInit(function()
                 local meat_pct = meat.components.perishable:GetPercent()
                 assert(meat_pct < 0.72 and meat_pct > 0.10, "meat StopPerishing lazy settlement anomalous: " .. tostring(meat_pct))
 
-                -- Verify live Server FastDataDumper fail-reason safety (#06)!
+                -- Verify live Server FastDataDumper fail-reason safety (#06) + v1.4.0 FastJson/EntityScript/c_hyperprof!
+                assert(G.HyperCore_Version() == "DST-HyperCore-Server/1.5.0",
+                       "Expected v1.5.0 HyperCore_Version, got " .. tostring(G.HyperCore_Version()))
                 local cyc = {}
                 cyc.self_ref = cyc
                 local dumped_cyc = G.DataDumper(cyc, nil, true)
@@ -165,6 +167,23 @@ AddSimPostInit(function()
                 local ok_nan = pcall(G.DataDumper, { bad = 0 / 0 }, nil, true)
                 assert(not ok_nan, "NaN DataDumper MUST abort cleanly via error!")
                 print("[SIM60_VERIFY] Stage1B Live FastDataDumper cycle-safe + NaN-guard PASS")
+
+                -- Live C++ FastJson parity & edge fallback check in real Server Lua 5.1 VM
+                assert(type(G.HyperCore_FastJsonEncode) == "function" and type(G.HyperCore_FastJsonDecode) == "function",
+                       "HyperCore FastJson C functions missing!")
+                local je = G.json.encode({ arr = { 1, "hi'x", true }, empty = {} })
+                assert(je:find("hi\\'x", 1, true) ~= nil and je:find('"empty":[]', 1, true) ~= nil, "Live json.encode parity failed: " .. je)
+                local jd, jpos = G.json.decode('{"a":[10,null,30],"ok":false}')
+                assert(type(jd) == "table" and jd.ok == false and jd.a[1] == 10 and jd.a[2] == nil and jd.a[3] == 30 and jpos == 30,
+                       "Live json.decode [10,null,30] parity failed! jpos=" .. tostring(jpos))
+                local dv2, dpos2 = G.json.decode('  {"k":1}', 3)
+                assert(type(dv2) == "table" and dv2.k == 1 and dpos2 == 10, "Live json.decode startPos fallback failed!")
+
+                -- Live zero-alloc PushEvent_Internal + unrolled HasTags + c_hyperprof
+                assert(G.EntityScript._hs_fast_pushevent == true, "EntityScript zero-alloc PushEvent_Internal not installed!")
+                assert(G.BRANCH == "dev" or G.EntityScript._hs_fast_hastags == true, "EntityScript fast HasTags not installed!")
+                assert(type(G.c_hyperprof) == "function", "c_hyperprof console helper missing!")
+                print("[SIM60_VERIFY] Stage1B Live v1.4.0 FastJson + EntityScript + c_hyperprof PASS")
 
                 local p0 = carrot.components.perishable:GetPercent()
                 local t60_sim0 = G.GetTime()
@@ -367,14 +386,18 @@ def main():
         assert "[FASTLOAD] std::vector::_Insert_n Loop B" in dll_log1 and "-> OK" in dll_log1, "FAIL: FastLoad VecFillB missing!"
         assert "[PERF][FSNEG]" in dll_log1 and "active=1" in dll_log1, "FAIL: FSNEG negative cache not active!"
         assert "[SAVE] Async Save Barriers" in dll_log1 and "barriersOk=1" in dll_log1, "FAIL: AsyncSave barriers not OK!"
-        assert "[HOOK] WritePersistentFile AsyncCommit" in dll_log1 and "-> OK" in dll_log1, "FAIL: WritePersistentFile hook missing!"
+        assert "[HOOK] WritePersistentFile VerifiedAtomicCommit" in dll_log1 and "-> OK" in dll_log1, "FAIL: WritePersistentFile hook missing!"
         assert "[HOOK] Simulation::luaUpdate" in dll_log1 and "-> OK" in dll_log1, "FAIL: luaUpdate sub-phase hook missing!"
         assert "[HOOK] cNetworkManager::Update" in dll_log1 and "-> OK" in dll_log1, "FAIL: cNetworkManager::Update sub-phase hook missing!"
         assert "[HOOK] ReplicaManager3::Update" in dll_log1 and "-> OK" in dll_log1, "FAIL: ReplicaManager3::Update sub-phase hook missing!"
-        m_async = re.search(r"AsyncSave\(enq=(\d+) ok=(\d+) bytes=(\d+).*?err=(\d+)", dll_log1)
-        assert m_async and int(m_async.group(1)) > 0 and int(m_async.group(4)) == 0, f"FAIL: AsyncSave unexpected stats in {dll_log1}"
-        m_unz = re.search(r"FastLoad\(unz=(\d+) MB=([0-9.]+) ms=([0-9.]+)\)", dll_log1)
+        m_async = re.search(r"AsyncSave\(enq=(\d+) ok=(\d+) comp=(\d+) bytes=(\d+).*?err=(\d+)", dll_log1)
+        assert m_async and int(m_async.group(2)) > 0 and int(m_async.group(5)) == 0, f"FAIL: AsyncSave unexpected stats in {dll_log1}"
+        m_unz = re.search(r"FastLoad\(unz=(\d+) MB=([0-9.]+) ms=([0-9.]+)(?:\s+uncomp=(\d+)\s+outMB=([0-9.]+))?\)", dll_log1)
         assert m_unz and int(m_unz.group(1)) > 0, "FAIL: Server FastLoad unzReadCurrentFile recorded 0 hits during boot!"
+        assert "[FASTLOAD] zlib::uncompress" in dll_log1 and "-> OK" in dll_log1, "FAIL: Server zlib::uncompress hook missing!"
+        m_fsn = re.search(r"FsNeg\(hits=(\d+) misses=(\d+)\)", dll_log1)
+        assert m_fsn and (int(m_fsn.group(1)) + int(m_fsn.group(2))) > 0, f"FAIL: FsNeg still (0/0) in live server log! m={m_fsn and m_fsn.groups()}"
+        print(f"[SIM60_VERIFY] Live FsNeg verified active: hits={m_fsn.group(1)} misses={m_fsn.group(2)}")
         assert "Synced Server NetworkTickRate -> U=60(1) for 60Hz SimTick" in dll_log1, "FAIL (#04): 60Hz U=60(1) sync missing!"
         assert "Synced Server NetworkTickRate -> U=15(2) for 30Hz SimTick" in dll_log1, "FAIL (#04): 60->30Hz U=15(2) restore missing!"
 

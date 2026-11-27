@@ -2,7 +2,7 @@
   <strong>简体中文</strong> | <a href="README_EN.md">English</a>
 </p>
 
-# DST HyperCore Server — Linux x86_64 部署指南 (`v1.3.0`)
+# DST HyperCore Server — Linux x86_64 部署指南 (`v1.6.0-beta1`)
 
 > 专为《饥荒联机版》Linux 64 位专用服务端（`dontstarve_dedicated_server_nullrenderer_x64`，Build `762172`）打造的原生 `LD_PRELOAD` C++ 加速引擎。  
 > 返回服务端总览：[`../README.md`](../README.md) | 源码所在目录：[`../server_hypercore/native_plugin/linux/`](../server_hypercore/native_plugin/linux/hypercore_linux.cpp) | [Releases 下载](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)
@@ -16,12 +16,13 @@
   - **Module 1**：无锁 `mimalloc v2.1.7`（`MI_OVERRIDE=0`）独立 Lua VM 分配器 + `HyperCore_*` C-API 导出。
   - **Module 2**：压力感知自适应增量 GC + Anti-STW Full-GC 护盾。
   - **Module 3**：4 处原位 W^X `SpatialGrid::Query` 零拷贝查询补丁。
-  - **Module 4**：SIMD `libdeflate v1.23` 压缩 + `FastDataDumper` 序列化 + `FastLoad` 极速读包（`unzReadCurrentFile` / `inflate_fast`）。
+  - **Module 4**：SIMD `libdeflate v1.23` 压缩 + `FastDataDumper` 序列化 + `FastJson` 编解码 + `FastLoad` 极速读包（`unzReadCurrentFile` / `inflate_fast`）。
   - **Module 6**：`O(N log N)` 扁平哈希 + 二叉堆 `FastAStar` 寻路引擎（与 MSVC/POSIX 共享统一头文件）。
   - **Module 7**：POSIX 只读 Mod/数据负向 Stat 缓存 (`PosixFsNegCache`)，拦截 `stat` / `open` / `access` misses。
   - **Module 8**：64MB 有界严格因果 FIFO 异步原子存档队列 (`PosixAsyncSaveQueue`)，采用 `.hc_tmp` + `fsync` + `rename` 配合 POSIX 读写/目录/退出屏障。
+  - **v1.6.0-beta1 同步特性**：零失步分层副本构造限流（Module 10B）、`O(N)` `ReplicaFastPath`、因果 3 通道 RPC QoS、三档硬件策略 (`c_hypertier`) 与专服尖峰黑匣子 (`SpikeBlackbox`)。
 - **平台特性**：Linux 版保持原版 **`30Hz` SimTick**（不开启 60Hz 切频），并受 `glibc 2.17` 兼容约束编译，零 `libstdc++.so.6` / `libgcc_s.so.1` 运行时依赖。
-- **验证境界透明说明**：`libhypercore.so` 已通过 Zig `0.17.1`（`-target x86_64-linux-gnu.2.17`）在 Windows 上零警告交叉编译产出，并通过 [test_linux_elf_verify.py](../server_hypercore/tools/test_linux_elf_verify.py) 对真实 Linux Build `762172` ELF 执行完整静态与跨二进制 Capstone 校验（`GLIBC <= 2.17`、`.dynsym` 严格 19 符号白名单、`57/57` AOB 唯一匹配、`19/19` 函数边界、`4/4` SpatialGrid 补丁校验）；**尚未在真实 Linux 宿主机/容器上实机跑服**，欢迎各路 Linux 服主试用并提交实机日志反馈！
+- **验证境界透明说明**：`libhypercore.so` 已通过 Zig `0.17.1`（`-target x86_64-linux-gnu.2.17`，产物 `724,608 B`）在 Windows 上零警告交叉编译产出，并通过 [test_linux_elf_verify.py](../server_hypercore/tools/test_linux_elf_verify.py) 对真实 Linux Build `762172` ELF 执行完整静态与跨二进制 Capstone 校验（`GLIBC <= 2.17`、`.dynsym` 严格 19 符号白名单、`66/66` AOB 唯一匹配、`22/22` 函数边界、`4/4` SpatialGrid 补丁校验、`linux_start_with_hypercore.sh` 纯 LF 无 `\r`）；**尚未在真实 Linux 宿主机/容器上实机跑服**，欢迎各路 Linux 服主试用并提交实机日志反馈！
 
 ---
 
@@ -33,7 +34,7 @@
 
 | 文件名 | 放置路径 | 说明 |
 | :--- | :--- | :--- |
-| `libhypercore.so` | `<DST_SERVER>/bin64/libhypercore.so` | 从 [GitHub Releases](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases/tag/server-v1.3.0) 的 `DST_HyperCore_Server_Linux_v1.3.0_Release.zip` 获取 |
+| `libhypercore.so` | `<DST_SERVER>/bin64/libhypercore.so` | 从 [GitHub Releases](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases/tag/server-v1.6.0-beta1) 的 `DST_HyperCore_Server_Linux_v1.6.0-beta1_Release.zip` 获取 |
 | `dst_hypercore.ini` | `<DST_SERVER>/bin64/dst_hypercore.ini` | 可选模块开关配置文件（与 Windows 通用） |
 | `linux_start_with_hypercore.sh` | `<DST_SERVER>/bin64/linux_start_with_hypercore.sh` | 开服启动包装脚本，执行 `chmod +x linux_start_with_hypercore.sh` |
 | `hypercore_server` Lua Mod | `<DST_SERVER>/mods/hypercore_server/` | 配套服务端 Mod（亦可通过 Steam 创意工坊订阅并在 `modoverrides.lua` 中启用） |

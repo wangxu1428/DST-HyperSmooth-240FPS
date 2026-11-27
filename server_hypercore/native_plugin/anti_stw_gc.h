@@ -11,6 +11,7 @@ struct Config {
     float gc_busy_min_ms     = 0.4f;
     int   gc_emergency_add_mb = 256;
     int   gc_hard_abs_mb      = 0; // 0 = auto-anchored from post-warmup baseline (max(4x, +1024MB, >=512MB))
+    float gc_excess_ramp_mb   = 32.0f;
     bool  enable_anti_stw_gc  = true;
 };
 
@@ -151,6 +152,10 @@ struct State {
         const float busyMinMs  = is60Hz ? std::min(cfg.gc_busy_min_ms, 0.25f) : cfg.gc_busy_min_ms;
         float budgetMs = idleBaseMs;
 
+        const double lowRamp  = std::max(16.0, static_cast<double>(cfg.gc_excess_ramp_mb));
+        const double highRamp = lowRamp * 3.0;
+        const double spanRamp = std::max(1.0, highRamp - lowRamp);
+
         if (forced_catchup > 0 && cfg.enable_anti_stw_gc) {
             --forced_catchup;
             d.in_catchup_mode = true;
@@ -166,11 +171,11 @@ struct State {
             }
         } else if (spareMs < (is60Hz ? 2.5 : 4.0)) {
             budgetMs = busyMinMs;
-        } else if (excessMb >= 96.0) {
+        } else if (excessMb >= highRamp) {
             const double allowed = std::min<double>(cfg.gc_calm_max_ms, std::max(is60Hz ? 0.6 : 1.0, spareMs * 0.25));
             budgetMs = static_cast<float>(std::min(is60Hz ? 1.5 : 2.5, allowed));
-        } else if (excessMb >= 32.0) {
-            const double frac = (excessMb - 32.0) / 64.0;
+        } else if (excessMb >= lowRamp) {
+            const double frac = (excessMb - lowRamp) / spanRamp;
             const double want = (is60Hz ? 0.45 : 0.85) + frac * (is60Hz ? 0.65 : 1.15);
             const double capBySpare = std::max<double>(busyMinMs, spareMs * 0.20);
             budgetMs = static_cast<float>(std::min(want, capBySpare));

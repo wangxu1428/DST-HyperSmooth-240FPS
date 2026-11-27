@@ -250,6 +250,21 @@ public:
         return n;
     }
 
+    void SetMaxWarmPool(size_t cap) {
+        const size_t clamped = (cap < 8u) ? 8u : ((cap > 1024u) ? 1024u : cap);
+        maxWarmPool_.store(clamped, std::memory_order_relaxed);
+        poolLock_.LockExclusive();
+        while (pool_.size() > clamped) {
+            delete pool_.back();
+            pool_.pop_back();
+        }
+        poolLock_.UnlockExclusive();
+    }
+
+    size_t MaxWarmPool() const noexcept {
+        return maxWarmPool_.load(std::memory_order_relaxed);
+    }
+
 private:
     struct Entry {
         void*      key;   // nullptr = empty, kTombstoneVal = deleted
@@ -265,6 +280,7 @@ private:
     size_t                  used_    = 0;
     uint64_t                nextGen_ = 1; // monotonically incremented ONLY under exclusive mapLock_
     std::vector<StateSlot*> pool_;
+    std::atomic<size_t>     maxWarmPool_{kMaxWarmPool};
 
     static inline size_t HashPtr(void* p) noexcept {
         uint64_t x = reinterpret_cast<uintptr_t>(p);
@@ -348,7 +364,7 @@ private:
             slot->state.ClearFast();
             bool recycled = false;
             poolLock_.LockExclusive();
-            if (pool_.size() < kMaxWarmPool) {
+            if (pool_.size() < maxWarmPool_.load(std::memory_order_relaxed)) {
                 pool_.push_back(slot);
                 recycled = true;
             }

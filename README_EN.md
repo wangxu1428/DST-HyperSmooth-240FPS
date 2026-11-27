@@ -2,7 +2,7 @@
   <a href="README.md">简体中文</a> | <strong>English</strong>
 </p>
 
-# DST HyperCore Server v1.3.0 — Windows & Linux Dedicated Server Native Engine
+# DST HyperCore Server v1.6.0-beta1 — Windows & Linux Dedicated Server Native Engine
 
 > **Ceiling-Tier Server-Only Native C++ Engine (`bin64/iphlpapi.dll` / `bin64/libhypercore.so`) + Zero-Divergence Mod for Don't Starve Together**  
 > Dedicated Linux x86_64 directory 👉 [`server_hypercore_linux/`](server_hypercore_linux/README_EN.md) ([中文指南](server_hypercore_linux/README.md)) | Client Repo: [`main`](https://github.com/wangxu1428/DST-HyperSmooth-240FPS) | [Releases](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)
@@ -14,7 +14,12 @@
 
 ---
 
-## What's New in v1.3.0
+## What's New in v1.6.0-beta1
+
+### 0. Module 10B Zero-Desync Tiered Replica Pacing + `O(N)` ReplicaFastPath + Causal 3-Channel RPC QoS + Hardware Tier & Spike Blackbox
+- **Module 10B Zero-Desync Tiered Replica Construction Pacing**: Spreads 1,500+ entity mega-base and wormhole entry bursts across smooth ticks (nearest-first distance buckets) while bypassing Tier-0 objects (proxies, players, classifieds, parented/inventory items, and `<=14wu` threats) with automatic Parent-Before-Child promotion; runtime tuning via `c_hyperpacing()`.
+- **`O(N)` `ReplicaFastPath` & Causal 3-Channel `RakNet::RPC4` QoS** ([replica_fastpath.h](server_hypercore/native_plugin/replica_fastpath.h) / [rpc_qos.h](server_hypercore/native_plugin/rpc_qos.h)): Eliminates redundant replica RB-tree scans and keeps combat/sync RPCs prioritized on Channel 0.
+- **Server Hardware Tiers + `C++ FastJson` + Server Spike Blackbox** ([server_hardware_tier.h](server_hypercore/native_plugin/server_hardware_tier.h) / [fast_json.h](server_hypercore/native_plugin/fast_json.h) / [spike_blackbox.h](server_hypercore/native_plugin/spike_blackbox.h)): Adds `c_hypertier()`, native JSON codec, spike snapshot JSON export, and `dnh_github` metadata in [modinfo.lua](server_hypercore/server_mod/modinfo.lua).
 
 ### 1. Async Atomic Save-Commit Queue (Module 8 · `enable_async_save = 1`) & Sub-Phase Profiler
 - **Bounded 64MB Strict-FIFO Offload** ([async_save_commit.h](server_hypercore/native_plugin/async_save_commit.h)): Intercepts `WritePersistentFile` and moves blocking disk writes to a dedicated worker thread (`enqUs ~ 76µs` on the main sim thread; observed `enq=11 ok=11 err=0` in live server tests).
@@ -48,7 +53,7 @@
 ## Verified Benchmarks & Suites (`Build 762172`)
 
 - **26,028-Entity Stress Save Ablation** (`i7-12700KF · 32GB · Windows x64`): Mean tick **`5,334 → 3,631 µs (-31.9%)`**, P99 **`17,728 → 8,620 µs (-51.4%)`**, max spike **`386.0ms → 29.3ms (-92.4%)`**, overruns **`2 → 0`**, Full-GC freezes **`380.4ms → 0ms`**, save hitch **`399.0ms → 215.0ms (-46.1%)`**.
-- **Automated Regression Suites**: `test_redteam_server.exe` **15/15 PASS**, `test_proxy_passthrough.py` **ALL PASS** (297 exports, 0 non-server hooks), `test_perish_savesafety.py` **7/7 ALL_PASS (`rc=0`)**, `test_sim60_live.py` **3/3 PHASES PASS (`rc=0`)**, `test_linux_elf_verify.py` **ALL PASS (`rc=0`, static ELF64 + 57/57 Capstone AOB verification)**.
+- **Automated Regression Suites**: `test_redteam_server.exe` **22/22 PASS**, `test_proxy_passthrough.py` **ALL PASS** (297 exports, 0 non-server hooks), `test_server_lua_v14.py` **8/8 ALL_PASS (`rc=0`)**, `test_linux_elf_verify.py` **ALL PASS (`rc=0`, static ELF64 + 66/66 Capstone AOB + 22/22 prologue verification)**.
 
 ---
 
@@ -56,8 +61,8 @@
 
 ### Windows Dedicated Server
 1. Subscribe to **HyperCore Server** on Steam Workshop (or copy `server_hypercore/server_mod/` into `<DST_SERVER>/mods/hypercore_server/`).
-2. Download & extract **`DST_HyperCore_Server_v1.3.0_Release.zip`**, stop DST, and run **`一键安装与更新.bat`** (or copy `bin64/iphlpapi.dll` + `bin64/dst_hypercore.ini` into `<DST_SERVER>/bin64/`).
+2. Download & extract **`DST_HyperCore_Server_v1.6.0-beta1_Release.zip`**, stop DST, and run **`一键安装与更新.bat`** (or copy `bin64/iphlpapi.dll` + `bin64/dst_hypercore.ini` into `<DST_SERVER>/bin64/`; DNH `dnh_github` companion auto-update for `iphlpapi.dll` is also declared in `modinfo.lua`).
 
 ### Linux x86_64 Dedicated Server
-- Grab **`DST_HyperCore_Server_Linux_v1.3.0_Release.zip`**, place `libhypercore.so`, `dst_hypercore.ini`, and `linux_start_with_hypercore.sh` inside `<DST_SERVER>/bin64/` (NOT `bin/` or `mods/`), and launch with `LD_PRELOAD`!
+- Grab **`DST_HyperCore_Server_Linux_v1.6.0-beta1_Release.zip`**, place `libhypercore.so`, `dst_hypercore.ini`, and `linux_start_with_hypercore.sh` inside `<DST_SERVER>/bin64/` (NOT `bin/` or `mods/`), and launch with `LD_PRELOAD`!
 - Full bare-metal, `systemd`, Docker, Pterodactyl & build instructions 👉 **[`server_hypercore_linux/README_EN.md`](server_hypercore_linux/README_EN.md)**.

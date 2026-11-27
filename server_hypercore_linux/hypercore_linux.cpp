@@ -1,5 +1,5 @@
 // =============================================================================
-// DST HyperCore Server — Linux x86_64 Engine (v1.3.0)
+// DST HyperCore Server — Linux x86_64 Engine (v1.5.0)
 // =============================================================================
 // LD_PRELOAD + PIE-aware System V AMD64 native acceleration engine targeting
 // Don't Starve Together Build 762172 (`dontstarve_dedicated_server_nullrenderer_x64`).
@@ -47,8 +47,15 @@
 #include "fast_astar.h"
 #include "fast_astar_manager.h"
 #include "fast_dumper.h"
+#include "fast_json.h"
 #include "libdeflate.h"
 #include "mimalloc.h"
+#include "rpc_qos.h"
+#include "replica_fastpath.h"
+#define KLEI_SAVE_CODEC_NO_STL
+#include "klei_save_codec.h"
+#include "spike_blackbox.h"
+#include "server_hardware_tier.h"
 
 namespace {
 
@@ -162,12 +169,33 @@ struct ServerConfig {
     bool  enable_fast_astar        = true;
     bool  enable_fs_neg_cache      = true;
     bool  enable_async_save        = true;
+    bool  enable_rpc_qos           = true;
+    bool  enable_replica_fastpath  = true;
+    int   replica_construct_budget = -1; // -1=auto (tier-managed: 64/96/128), 0=off, [16..1024]=explicit cap
+    bool  replica_budget_ini_explicit = false;
+    bool  enable_blackbox          = true;
+    int   blackbox_threshold_ms    = 0;
+    int   hardware_tier            = 1;
 };
 
 ServerConfig g_cfg;
+hc_server_tier::HostCaps   g_hostCaps{};
+std::atomic<int>           g_activeServerTier{1};
+std::atomic<int64_t>       g_fsNegTtlNs{15000000000LL};
+std::atomic<uint32_t>      g_fastDumpMaxNodes{fast_dumper::kMaxDumpNodes};
+std::atomic<size_t>        g_fastDumpKeepBytes{fast_dumper::kShrinkKeepBytes};
+std::atomic<int>           g_effectiveDeflateLevel{5};
+std::atomic<uint32_t>      g_effectiveReplicaBudget{96u};
+std::atomic<int>           g_luaReplicaBudgetOverride{-1};
+std::atomic<float>         g_gcSpareTargetMs{28.0f};
+std::atomic<float>         g_gcCalmMaxMs{4.0f};
+std::atomic<float>         g_gcBusyMinMs{0.35f};
+std::atomic<int>           g_gcEmergencyAddMb{256};
+std::atomic<float>         g_gcExcessRampMb{32.0f};
 char g_binDir[1024]  = ".";
 char g_iniPath[1088] = "./dst_hypercore.ini";
 char g_logPath[1088] = "./dst_hypercore_server.log";
+char g_shardTag[64]  = "server";
 pthread_mutex_t g_logMtx = PTHREAD_MUTEX_INITIALIZER;
 bool g_logResetOnce = false;
 
@@ -224,7 +252,7 @@ void InitPathsAndLoadConfig() {
         }
     }
 
-    char shardTag[64] = "server";
+    std::snprintf(g_shardTag, sizeof(g_shardTag), "server");
     if (g_real_open) {
         const int fd = g_real_open("/proc/self/cmdline", O_RDONLY);
         if (fd >= 0) {
@@ -240,14 +268,14 @@ void InitPathsAndLoadConfig() {
                     const size_t alen = std::strlen(arg);
                     if (expectShard && alen > 0 && alen < 48) {
                         size_t j = 0;
-                        for (size_t i = 0; i < alen && j < sizeof(shardTag) - 1; ++i) {
+                        for (size_t i = 0; i < alen && j < sizeof(g_shardTag) - 1; ++i) {
                             const char c = arg[i];
                             if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                                 (c >= '0' && c <= '9') || c == '_' || c == '-') {
-                                shardTag[j++] = c;
+                                g_shardTag[j++] = c;
                             }
                         }
-                        if (j > 0) shardTag[j] = '\0';
+                        if (j > 0) g_shardTag[j] = '\0';
                         break;
                     }
                     expectShard = (std::strcmp(arg, "-shard") == 0);
@@ -258,7 +286,7 @@ void InitPathsAndLoadConfig() {
     }
 
     std::snprintf(g_iniPath, sizeof(g_iniPath), "%s/dst_hypercore.ini", g_binDir);
-    std::snprintf(g_logPath, sizeof(g_logPath), "%s/dst_hypercore_%s.log", g_binDir, shardTag);
+    std::snprintf(g_logPath, sizeof(g_logPath), "%s/dst_hypercore_%s.log", g_binDir, g_shardTag);
 
     FILE* f = g_real_fopen ? g_real_fopen(g_iniPath, "rb") : nullptr;
     if (!f) return;
@@ -295,6 +323,25 @@ void InitPathsAndLoadConfig() {
         else if (std::strcmp(key, "enable_fast_astar") == 0) g_cfg.enable_fast_astar = bv;
         else if (std::strcmp(key, "enable_fs_neg_cache") == 0) g_cfg.enable_fs_neg_cache = bv;
         else if (std::strcmp(key, "enable_async_save") == 0) g_cfg.enable_async_save = bv;
+        else if (std::strcmp(key, "enable_rpc_qos") == 0) g_cfg.enable_rpc_qos = bv;
+        else if (std::strcmp(key, "enable_replica_fastpath") == 0) g_cfg.enable_replica_fastpath = bv;
+        else if (std::strcmp(key, "replica_construct_budget") == 0) {
+            if (hc_server_tier::EqualsAsciiInsensitive(val, "auto")) {
+                g_cfg.replica_construct_budget = -1;
+                g_cfg.replica_budget_ini_explicit = false;
+            } else if (iv < 0) {
+                g_cfg.replica_construct_budget = -1;
+                g_cfg.replica_budget_ini_explicit = false;
+            } else {
+                g_cfg.replica_construct_budget = static_cast<int>(hc_replica::ClampReplicaConstructBudget(iv));
+                g_cfg.replica_budget_ini_explicit = true;
+            }
+        }
+        else if (std::strcmp(key, "enable_blackbox") == 0) g_cfg.enable_blackbox = bv;
+        else if (std::strcmp(key, "blackbox_threshold_ms") == 0) {
+            g_cfg.blackbox_threshold_ms = (iv <= 0) ? 0 : std::clamp(iv, 5, 500);
+        }
+        else if (std::strcmp(key, "hardware_tier") == 0) g_cfg.hardware_tier = static_cast<int>(hc_server_tier::ParseTier(val));
     }
     g_real_fclose(f);
 }
@@ -354,6 +401,12 @@ struct Telemetry {
     std::atomic<uint64_t> unz_hits{0};
     std::atomic<uint64_t> unz_bytes{0};
     std::atomic<uint64_t> unz_us_sum{0};
+    std::atomic<uint64_t> uncomp_calls{0};
+    std::atomic<uint64_t> uncomp_out_bytes{0};
+    std::atomic<uint64_t> uncomp_us_sum{0};
+    std::atomic<uint64_t> fastjson_enc_calls{0};
+    std::atomic<uint64_t> fastjson_dec_calls{0};
+    std::atomic<uint64_t> fastjson_fallbacks{0};
 
     std::atomic<uint64_t> prof_lua_update_calls{0};
     std::atomic<uint64_t> prof_lua_update_us_sum{0};
@@ -394,6 +447,9 @@ struct Telemetry {
         fastdump_calls = 0; fastdump_us_sum = 0; fastdump_bytes_sum = 0; fastdump_fallbacks = 0;
         deflate_calls = 0; deflate_us_sum = 0; deflate_main_calls = 0; deflate_main_us_sum = 0;
         deflate_in_bytes = 0; deflate_out_bytes = 0;
+        unz_hits = 0; unz_bytes = 0; unz_us_sum = 0;
+        uncomp_calls = 0; uncomp_out_bytes = 0; uncomp_us_sum = 0;
+        fastjson_enc_calls = 0; fastjson_dec_calls = 0; fastjson_fallbacks = 0;
         serialize_world_calls = 0; serialize_world_us_sum = 0;
         prof_lua_update_calls = 0; prof_lua_update_us_sum = 0; prof_lua_update_us_max = 0;
         prof_net_update_calls = 0; prof_net_update_us_sum = 0; prof_net_update_us_max = 0;
@@ -403,6 +459,46 @@ struct Telemetry {
 };
 
 Telemetry g_stats;
+
+struct TickSubphaseTls {
+    uint32_t luaUs     = 0;
+    uint32_t gcUs      = 0;
+    uint32_t netUs     = 0;
+    uint32_t replicaUs = 0;
+    uint32_t findEntUs = 0;
+    uint32_t astarUs   = 0;
+    uint32_t saveUs    = 0;
+    uint8_t  gcFull    = 0;
+    int      saveDepth = 0;
+};
+thread_local TickSubphaseTls tl_tickProf{};
+
+struct SaveSubphaseGuard {
+    bool top = false;
+    explicit SaveSubphaseGuard() noexcept : top(tl_tickProf.saveDepth++ == 0) {}
+    void Add(uint64_t us) const noexcept {
+        if (top && us > 0) {
+            tl_tickProf.saveUs += static_cast<uint32_t>(std::min<uint64_t>(us, 60000000ULL));
+        }
+    }
+    ~SaveSubphaseGuard() noexcept { --tl_tickProf.saveDepth; }
+};
+
+inline uint32_t ClampUsU32(uint64_t us) noexcept {
+    return static_cast<uint32_t>(std::min<uint64_t>(us, 60000000ULL));
+}
+
+inline uint64_t NowEpochMs() noexcept {
+    struct timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (ts.tv_sec > 0)
+        ? (static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec / 1000000L))
+        : 0ULL;
+}
+
+pthread_mutex_t g_bbMtx = PTHREAD_MUTEX_INITIALIZER;
+hs_blackbox::Ring<hs_blackbox::ServerEvent> g_serverBlackbox;
+std::atomic<uint32_t> g_blackboxLastThreshMs{33};
 
 inline void AtomicUpdateMax(std::atomic<uint64_t>& target, uint64_t val) noexcept {
     uint64_t prev = target.load(std::memory_order_relaxed);
@@ -415,6 +511,9 @@ inline void AtomicUpdateMax(std::atomic<uint64_t>& target, uint64_t val) noexcep
 uint8_t* g_exeBase    = nullptr;
 uint8_t* g_exeTextBeg = nullptr;
 uint8_t* g_exeTextEnd = nullptr;
+struct ElfSegRange { uint8_t* beg = nullptr; uint8_t* end = nullptr; };
+ElfSegRange g_exeDataSegs[8]{};
+size_t      g_exeDataSegCount = 0;
 size_t   g_pageSize   = 4096;
 
 constexpr size_t kSlabSize = 65536;
@@ -435,6 +534,10 @@ int DlPhdrCallback(struct dl_phdr_info* info, size_t /*size*/, void* /*data*/) {
                 uint8_t* segEnd = segBeg + ph.p_memsz;
                 if (!execBeg || segBeg < execBeg) execBeg = segBeg;
                 if (!execEnd || segEnd > execEnd) execEnd = segEnd;
+            } else if (ph.p_type == PT_LOAD && (ph.p_flags & PF_R) != 0 && ph.p_filesz > 0 && g_exeDataSegCount < 8) {
+                uint8_t* segBeg = g_exeBase + ph.p_vaddr;
+                uint8_t* segEnd = segBeg + ph.p_filesz;
+                g_exeDataSegs[g_exeDataSegCount++] = {segBeg, segEnd};
             }
         }
         g_exeTextBeg = execBeg;
@@ -442,6 +545,26 @@ int DlPhdrCallback(struct dl_phdr_info* info, size_t /*size*/, void* /*data*/) {
         return 1;
     }
     return 0;
+}
+
+const uint8_t* FindUniqueElfDataPtr(const void* target) noexcept {
+    if (!target) return nullptr;
+    const uint8_t* hit = nullptr;
+    for (size_t s = 0; s < g_exeDataSegCount; ++s) {
+        const uint8_t* beg = g_exeDataSegs[s].beg;
+        const uint8_t* end = g_exeDataSegs[s].end;
+        if (!beg || end <= beg) continue;
+        const size_t span = static_cast<size_t>(end - beg);
+        for (size_t off = 0; off + sizeof(void*) <= span; off += sizeof(void*)) {
+            const void* val = nullptr;
+            std::memcpy(&val, beg + off, sizeof(void*));
+            if (val == target) {
+                if (hit) return nullptr; // fail-closed on duplicate
+                hit = beg + off;
+            }
+        }
+    }
+    return hit;
 }
 
 uint8_t* FindUniquePattern(const uint8_t* pat, size_t len) noexcept {
@@ -570,13 +693,21 @@ constexpr uint8_t kAobSimLuaUpd[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41
 constexpr uint8_t kAobSimCollGc[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x8B, 0xBF, 0xD8, 0x00, 0x00, 0x00, 0x31, 0xD2, 0xBE, 0x03, 0x00, 0x00, 0x00 };
 constexpr uint8_t kAobNetMgrUpd[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0xB9, 0x78, 0x06, 0x00, 0x00, 0x48, 0x8D, 0x15, 0x86, 0xA4, 0x23, 0x00, 0x48, 0x8D, 0x35, 0xA4, 0xAE, 0x23, 0x00 };
 constexpr uint8_t kAobRepMgrUpd[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0xB9, 0x73, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x15, 0xFE, 0xC2, 0x1D, 0x00, 0x48, 0x8D, 0x35, 0x27, 0xC3, 0x1D, 0x00 };
+constexpr uint8_t kAobQueryRepLst[] = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0xB9, 0xAB, 0x00, 0x00, 0x00, 0x49, 0x89, 0xFF, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x68, 0x48, 0x89 };
+constexpr uint8_t kAobNetProxyRel[] = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x4C, 0x8D, 0x2D, 0x8F, 0xA2, 0x49, 0x00, 0x41, 0x54, 0x55, 0x48, 0x89, 0xD5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x83, 0xEC, 0x28, 0x48 };
+constexpr uint8_t kAobNetProxyQd[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x15, 0xA9, 0x7A, 0x49, 0x00, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x18, 0x31, 0xC0, 0xB8, 0x01, 0x00, 0x00, 0x00 };
+constexpr uint8_t kAobInvItemId[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0xB8, 0x1E, 0x28, 0x8E, 0x3F, 0xC3, 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00, 0xF3, 0x0F, 0x1E, 0xFA, 0x48, 0x8D, 0x05, 0xCA };
+// NetworkProxy::SetOwner (1-of-1 AOB): verifies client+0x1b8 (playerProxy) & playerProxy+0x18 (Entity*)
+constexpr uint8_t kAobNetProxySetOwner[] = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x4C, 0x8D, 0xA7, 0xC8, 0x01, 0x00, 0x00, 0x55, 0x48, 0x89, 0xF5, 0x53, 0x48, 0x89, 0xFB, 0x4C, 0x89, 0xE7, 0x48, 0x83, 0xEC, 0x20 };
 constexpr uint8_t kAobSimFindEnts[] = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x49, 0x89, 0xFC, 0x48, 0x89, 0xF7, 0x55, 0x48, 0x89, 0xF5 };
 constexpr uint8_t kAobSimFindReg[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x55, 0x41, 0x54, 0x55, 0x48, 0x89, 0xF5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x89, 0xF7, 0x48, 0x83, 0xEC, 0x48 };
 constexpr uint8_t kAobSerializeW[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x48, 0x89, 0xF5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x81, 0xEC, 0xE8, 0x00, 0x00, 0x00 };
 constexpr uint8_t kAobCompress2[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x55, 0x53, 0x48, 0x89, 0xF3, 0x48, 0x83, 0xC4, 0x80, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00 };
+constexpr uint8_t kAobUncompress[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xC4, 0x80, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x78 };
 constexpr uint8_t kAobUnzRead[]     = { 0xF3, 0x0F, 0x1E, 0xFA, 0x48, 0x85, 0xFF, 0x0F, 0x84, 0x11, 0x02, 0x00, 0x00, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55 };
 constexpr uint8_t kAobInflateFast[] = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x41, 0x56, 0x44, 0x89, 0xCA, 0x41, 0x55, 0x41, 0x54 };
 constexpr uint8_t kAobWritePFile[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x45, 0x89, 0xC6, 0x41, 0x55, 0x41, 0x54, 0x49, 0x89, 0xFC, 0x55, 0x53 };
+constexpr uint8_t kAobRpc4Call[]    = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x49, 0x89, 0xF6, 0x41, 0x55, 0x49, 0x89, 0xFD, 0x41, 0x54, 0x49, 0x89, 0xD4, 0x55, 0x53 };
 constexpr uint8_t kAobAStarStep[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x78, 0x44, 0x8B, 0x67, 0x08, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00 };
 constexpr uint8_t kAobAStarDtor0[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x48, 0x8D, 0x05, 0xB3, 0xE0, 0x3D, 0x00, 0x55, 0x48, 0x89, 0xFD, 0x53, 0x4C, 0x8B, 0x67, 0x30 };
 constexpr uint8_t kAobAStarDtor1[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x48, 0x8D, 0x05, 0xD3, 0xDF, 0x3D, 0x00, 0x55, 0x53, 0x4C, 0x8B, 0x67, 0x30, 0x48, 0x89, 0xFB };
@@ -602,6 +733,8 @@ constexpr uint8_t kAobLuaGetField[]    = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0
 constexpr uint8_t kAobLuaCreateTbl[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x83, 0xEC, 0x18, 0x80, 0xBF, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x74, 0x0E, 0x48, 0x8B, 0x47, 0x20, 0x48, 0x8B, 0x48, 0x70, 0x48, 0x39, 0x48, 0x78, 0x73, 0x2C, 0x48, 0x8B, 0x6B, 0x10, 0x48, 0x89, 0xDF, 0xE8, 0x30, 0x98, 0x00, 0x00 };
 constexpr uint8_t kAobLuaSetField[]    = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x55, 0x48, 0x89, 0xD5, 0x53, 0x48, 0x89, 0xFB, 0x48, 0x83, 0xEC, 0x20, 0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0x24, 0x18, 0x31, 0xC0, 0xE8, 0x99, 0xEF, 0xFF, 0xFF };
 constexpr uint8_t kAobLuaNext[]        = { 0xF3, 0x0F, 0x1E, 0xFA, 0x53, 0x48, 0x89, 0xFB, 0xE8, 0x63, 0xE9, 0xFF, 0xFF, 0x48, 0x8B, 0x4B, 0x10 };
+constexpr uint8_t kAobLuaRawSet[]      = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x55, 0x53, 0x48, 0x89, 0xFB, 0xE8, 0x20, 0xEF, 0xFF, 0xFF, 0x4C, 0x8B, 0x63, 0x10, 0x48, 0x89, 0xDF, 0x48, 0x8B, 0x30, 0x48, 0x89, 0xC5, 0x49, 0x8D, 0x54, 0x24, 0xE0 };
+constexpr uint8_t kAobLuaRawSetI[]     = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x41, 0x89, 0xD0, 0x55, 0x53, 0x48, 0x89, 0xFB, 0xE8, 0x9D, 0xEE, 0xFF, 0xFF, 0x4C, 0x8B, 0x63, 0x10, 0x48, 0x89, 0xDF, 0x48, 0x8B, 0x30, 0x44, 0x89, 0xC2 };
 constexpr uint8_t kAobSetGcBudget[]    = { 0xF3, 0x0F, 0x1E, 0xFA, 0xF3, 0x0F, 0x11, 0x05, 0xB8, 0xBC, 0x10, 0x00, 0xC3, 0x0F, 0x1F, 0x00 };
 constexpr uint8_t kAobSimLuaAlloc[]    = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x55, 0x49, 0x89, 0xD5, 0x41, 0x54, 0x49, 0x89, 0xFC, 0x55, 0x48, 0x89, 0xF5 };
 constexpr uint8_t kAobWgLuaAlloc[]     = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x55, 0x41, 0x54, 0x55, 0x48, 0x89, 0xF5, 0x53, 0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xC9 };
@@ -676,28 +809,83 @@ public:
             else if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
             norm[len++] = c;
         }
+        if (len < 6) return false;
         norm[len] = '\0';
 
-        // Never cache world saves or cluster state paths
-        auto hasSub = [&](const char* needle, size_t nlen) {
-            if (len < nlen) return false;
-            for (size_t i = 0; i <= len - nlen; ++i) {
+        auto hasSub = [&](const char* needle, size_t nlen, size_t startAt = 0) {
+            if (len < startAt + nlen) return false;
+            for (size_t i = startAt; i <= len - nlen; ++i) {
                 if (norm[i] == needle[0] && std::memcmp(norm + i, needle, nlen) == 0) return true;
             }
             return false;
         };
-        if (!hasSub("/mods/", 6) && !hasSub("/data/", 6) &&
-            std::strncmp(norm, "mods/", 5) != 0 && std::strncmp(norm, "data/", 5) != 0) {
+
+        // Safe traversal guard: allow at most a single leading "../mods/" or "../data/"
+        size_t scanFrom = 0;
+        bool hasRelParent = false;
+        if (len >= 8 && std::memcmp(norm, "../mods/", 8) == 0) {
+            hasRelParent = true;
+            scanFrom = 3;
+        } else if (len >= 8 && std::memcmp(norm, "../data/", 8) == 0) {
+            hasRelParent = true;
+            scanFrom = 3;
+        }
+        if (hasSub("..", 2, scanFrom)) return false;
+
+        struct RelRoot { const char* pfx; size_t len; };
+        static constexpr RelRoot kRelRoots[] = {
+            { "mods/",         5 },
+            { "data/",         5 },
+            { "scripts/",      8 },
+            { "anim/",         5 },
+            { "images/",       7 },
+            { "shaders/",      8 },
+            { "sound/",        6 },
+            { "fonts/",        6 },
+            { "bigportraits/", 13 },
+            { "minimap/",      8 },
+            { "levels/",       7 },
+            { "databundles/",  12 },
+        };
+        bool hasRelRoot = false;
+        for (const auto& r : kRelRoots) {
+            if (len >= r.len && std::memcmp(norm, r.pfx, r.len) == 0) {
+                hasRelRoot = true;
+                break;
+            }
+        }
+        if (!hasRelParent && !hasRelRoot && !hasSub("/mods/", 6) && !hasSub("/data/", 6)) {
             return false;
         }
-        if (hasSub("/save/", 6) || std::strncmp(norm, "save/", 5) == 0) return false;
+
+        struct ForbiddenTok { const char* tok; size_t len; };
+        static constexpr ForbiddenTok kForbidden[] = {
+            { "klei",         4 },
+            { "save",         4 },
+            { "backup",       6 },
+            { "modoverrides", 12 },
+            { "modsettings",  11 },
+            { "cluster",      7 },
+            { "profile",      7 },
+            { ".tmp",         4 },
+            { "bin64",        5 },
+            { ".log",         4 },
+            { "/log/",        5 },
+            { "_log.",        5 },
+            { "persistent",   10 },
+        };
+        for (const auto& f : kForbidden) {
+            if (hasSub(f.tok, f.len)) return false;
+        }
 
         auto endsExt = [&](const char* ext, size_t elen) {
             return len >= elen && std::memcmp(norm + len - elen, ext, elen) == 0;
         };
         const bool okExt = endsExt(".tex", 4) || endsExt(".xml", 4) || endsExt(".bin", 4) ||
                            endsExt(".zip", 4) || endsExt(".lua", 4) || endsExt(".dyn", 4) ||
-                           endsExt(".ksh", 4) || endsExt(".fsb", 4) || endsExt(".fev", 4);
+                           endsExt(".ksh", 4) || endsExt(".fsb", 4) || endsExt(".fev", 4) ||
+                           endsExt(".png", 4) || endsExt(".scml", 5) || endsExt(".anim", 5) ||
+                           endsExt(".build", 6);
         if (!okExt) return false;
 
         uint64_t h1 = 0xCBF29CE484222325ULL;
@@ -784,12 +972,21 @@ struct AsyncCaptureState {
     const void* data   = nullptr;
     uint32_t    size   = 0;
 };
-thread_local AsyncCaptureState tl_asyncCapture;
+thread_local AsyncCaptureState tl_asyncCapture{};
 
 class PosixAsyncSaveQueue {
 public:
     static constexpr size_t kMaxPendingItems = 1024u;
     static constexpr size_t kMaxQueuedBytes  = 64u * 1024u * 1024u;
+    std::atomic<size_t>     maxQueuedBytes_{kMaxQueuedBytes};
+
+    void SetMaxQueueBytes(size_t maxBytes) noexcept {
+        const size_t q = (maxBytes >= 8u * 1024u * 1024u) ? maxBytes : (8u * 1024u * 1024u);
+        maxQueuedBytes_.store(q, std::memory_order_relaxed);
+    }
+    size_t MaxQueueBytes() const noexcept {
+        return maxQueuedBytes_.load(std::memory_order_relaxed);
+    }
 
     struct Item {
         uint64_t seq = 0;
@@ -798,6 +995,8 @@ public:
         char*    dirPath = nullptr;
         uint8_t* bytes = nullptr;
         size_t   len = 0;
+        bool     compressKlei = false;
+        int      deflateLevel = 5;
         Item*    next = nullptr;
     };
 
@@ -838,29 +1037,154 @@ public:
         out[outLen] = '\0';
     }
 
-    static bool WriteAllAndFsync(const char* tmpPath, const uint8_t* data, size_t len) noexcept {
+    static bool MakeUniqueTmpPath(const char* norm, char* out, size_t cap) noexcept {
+        static std::atomic<uint64_t> s_nonce{0};
+        const uint64_t nonce = s_nonce.fetch_add(1, std::memory_order_relaxed) + 1ULL;
+        const int n = std::snprintf(out, cap, "%s.hc_tmp.%d.%llu",
+                                    norm, static_cast<int>(getpid()),
+                                    static_cast<unsigned long long>(nonce));
+        return (n > 0 && static_cast<size_t>(n) < cap);
+    }
+
+    static bool WriteAllAndFsync(const char* tmpPath, const uint8_t* data, size_t len, int* outErrno = nullptr) noexcept {
+        if (outErrno) *outErrno = 0;
+        if (!g_real_open) {
+            if (outErrno) *outErrno = EIO;
+            return false;
+        }
         const int fd = g_real_open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd < 0) return false;
+        if (fd < 0) {
+            if (outErrno) *outErrno = errno;
+            return false;
+        }
         size_t written = 0;
         bool ok = true;
+        int err = 0;
         while (written < len) {
             const ssize_t w = write(fd, data + written, len - written);
             if (w < 0) {
                 if (errno == EINTR) continue;
+                err = errno;
+                ok = false;
+                break;
+            }
+            if (w == 0) {
+                err = EIO;
                 ok = false;
                 break;
             }
             written += static_cast<size_t>(w);
         }
         if (ok) {
-            (void)fsync(fd);
+            while (fsync(fd) != 0) {
+                if (errno == EINTR) continue;
+                err = errno ? errno : EIO;
+                ok = false;
+                break;
+            }
         }
-        close(fd);
+        if (close(fd) != 0 && ok) {
+            err = errno ? errno : EIO;
+            ok = false;
+        }
+        if (!ok && outErrno) *outErrno = err ? err : EIO;
         return ok;
     }
 
     bool Enqueue(const char* path, const void* data, size_t len) noexcept {
         if (!path || !*path || !data || len == 0 || len > kMaxQueuedBytes) return false;
+        auto* copyBuf = static_cast<uint8_t*>(std::malloc(len));
+        if (!copyBuf) return false;
+        std::memcpy(copyBuf, data, len);
+        if (!EnqueueInternal(path, copyBuf, len, false, 5)) {
+            std::free(copyBuf);
+            return false;
+        }
+        return true;
+    }
+
+    // Transfers ownership of `rawOwnedMallocBuf` ONLY when returning true.
+    bool EnqueueCompress(const char* path, uint8_t* rawOwnedMallocBuf, size_t rawLen, int deflateLevel = 5) noexcept {
+        if (!path || !*path || !rawOwnedMallocBuf || rawLen == 0 || rawLen > maxQueuedBytes_.load(std::memory_order_relaxed)) return false;
+        return EnqueueInternal(path, rawOwnedMallocBuf, rawLen, true, deflateLevel);
+    }
+
+    bool CommitSyncAtomic(const char* path, const void* data, size_t len, int* outErrno = nullptr) noexcept {
+        if (outErrno) *outErrno = 0;
+        if (!path || !*path || !data || len == 0) {
+            if (outErrno) *outErrno = EINVAL;
+            return false;
+        }
+        char norm[2048];
+        NormalizePosixPath(path, norm, sizeof(norm));
+        if (norm[0] == '\0') {
+            if (outErrno) *outErrno = EINVAL;
+            return false;
+        }
+        if (!g_real_rename) {
+            errorCount_.fetch_add(1, std::memory_order_relaxed);
+            if (outErrno) *outErrno = EIO;
+            return false;
+        }
+
+        // Per-path serialization: wait for any queued/in-flight async job OR concurrent sync commit on `norm`.
+        SyncNode node{};
+        node.norm = norm;
+        pthread_mutex_lock(&mtx_);
+        while (HasPathConflictLocked(norm)) {
+            pthread_cond_wait(&drainedCv_, &mtx_);
+        }
+        node.next = syncHead_;
+        syncHead_ = &node;
+        activeSyncCount_.fetch_add(1, std::memory_order_release);
+        pthread_mutex_unlock(&mtx_);
+
+        const int64_t io0 = NowNs();
+        char tmpPath[2160];
+        int err = 0;
+        bool ok = MakeUniqueTmpPath(norm, tmpPath, sizeof(tmpPath));
+        if (!ok) {
+            err = ENAMETOOLONG;
+        } else {
+            ok = WriteAllAndFsync(tmpPath, static_cast<const uint8_t*>(data), len, &err);
+            if (ok) {
+                if (g_real_rename(tmpPath, norm) != 0) {
+                    err = errno ? errno : EIO;
+                    ok = false;
+                }
+            }
+            if (!ok && g_real_unlink) {
+                g_real_unlink(tmpPath);
+            }
+        }
+        const uint64_t ioUs = static_cast<uint64_t>(NsDeltaUs(io0, NowNs()));
+        if (ok) {
+            committedCount_.fetch_add(1, std::memory_order_relaxed);
+            committedBytes_.fetch_add(len, std::memory_order_relaxed);
+            ioUsSum_.fetch_add(ioUs, std::memory_order_relaxed);
+        } else {
+            errorCount_.fetch_add(1, std::memory_order_relaxed);
+            if (outErrno) *outErrno = err ? err : EIO;
+        }
+
+        pthread_mutex_lock(&mtx_);
+        SyncNode** pp = &syncHead_;
+        while (*pp) {
+            if (*pp == &node) {
+                *pp = node.next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        activeSyncCount_.fetch_sub(1, std::memory_order_acq_rel);
+        pthread_cond_broadcast(&drainedCv_);
+        pthread_cond_broadcast(&workCv_);
+        pthread_mutex_unlock(&mtx_);
+        return ok;
+    }
+
+private:
+    bool EnqueueInternal(const char* path, uint8_t* ownedMallocBuf, size_t len, bool compressKlei, int deflateLevel) noexcept {
         const int64_t t0 = NowNs();
         char norm[2048];
         NormalizePosixPath(path, norm, sizeof(norm));
@@ -881,26 +1205,30 @@ public:
         } else {
             it->dirPath = strdup("/");
         }
-        it->bytes = static_cast<uint8_t*>(std::malloc(len));
+        it->bytes        = ownedMallocBuf;
+        it->len          = len;
+        it->compressKlei = compressKlei;
+        it->deflateLevel = deflateLevel;
         if (!it->rawPath || !it->normPath || !it->dirPath || !it->bytes) {
+            it->bytes = nullptr; // caller still owns buffer on false!
             FreeItem(it);
             return false;
         }
-        std::memcpy(it->bytes, data, len);
-        it->len = len;
 
         pthread_mutex_lock(&mtx_);
         if (stopped_) {
             pthread_mutex_unlock(&mtx_);
+            it->bytes = nullptr;
             FreeItem(it);
             return false;
         }
         EnsureWorkerLocked();
-        while ((queuedCount_ >= kMaxPendingItems || queuedBytes_ + len > kMaxQueuedBytes) && !stopped_) {
+        while ((queuedCount_ >= kMaxPendingItems || queuedBytes_ + len > maxQueuedBytes_.load(std::memory_order_relaxed)) && !stopped_) {
             pthread_cond_wait(&drainedCv_, &mtx_);
         }
         if (stopped_) {
             pthread_mutex_unlock(&mtx_);
+            it->bytes = nullptr;
             FreeItem(it);
             return false;
         }
@@ -918,8 +1246,11 @@ public:
         return true;
     }
 
+public:
+
     inline bool HasPendingFast() const noexcept {
-        return hasPending_.load(std::memory_order_acquire);
+        return hasPending_.load(std::memory_order_acquire) ||
+               (activeSyncCount_.load(std::memory_order_acquire) != 0);
     }
 
     void FlushPendingForPath(const char* path) noexcept {
@@ -928,19 +1259,20 @@ public:
         NormalizePosixPath(path, norm, sizeof(norm));
         if (!norm[0]) return;
         pthread_mutex_lock(&mtx_);
+        bool waited = false;
         while (true) {
+            const bool hasSync = HasActiveSyncPathLocked(norm);
             uint64_t maxSeq = 0;
             if (inFlightNorm_ && std::strcmp(inFlightNorm_, norm) == 0) maxSeq = std::max(maxSeq, inFlightSeq_);
             for (const Item* cur = head_; cur; cur = cur->next) {
                 if (std::strcmp(cur->normPath, norm) == 0) maxSeq = std::max(maxSeq, cur->seq);
             }
-            if (maxSeq == 0) break;
-            flushCount_.fetch_add(1, std::memory_order_relaxed);
-            while ((inFlightSeq_ > 0 && inFlightSeq_ <= maxSeq) ||
-                   (head_ != nullptr && head_->seq <= maxSeq)) {
-                pthread_cond_wait(&drainedCv_, &mtx_);
+            if (!hasSync && maxSeq == 0) break;
+            if (!waited) {
+                flushCount_.fetch_add(1, std::memory_order_relaxed);
+                waited = true;
             }
-            break;
+            pthread_cond_wait(&drainedCv_, &mtx_);
         }
         pthread_mutex_unlock(&mtx_);
     }
@@ -958,19 +1290,23 @@ public:
             return false;
         };
         pthread_mutex_lock(&mtx_);
+        bool waited = false;
         while (true) {
+            bool hasSyncUnderDir = false;
+            for (const SyncNode* sn = syncHead_; sn; sn = sn->next) {
+                if (matchesDir(sn->norm, nullptr)) { hasSyncUnderDir = true; break; }
+            }
             uint64_t maxSeq = 0;
             if (inFlightSeq_ > 0 && matchesDir(inFlightNorm_, inFlightDir_)) maxSeq = std::max(maxSeq, inFlightSeq_);
             for (const Item* cur = head_; cur; cur = cur->next) {
                 if (matchesDir(cur->normPath, cur->dirPath)) maxSeq = std::max(maxSeq, cur->seq);
             }
-            if (maxSeq == 0) break;
-            flushCount_.fetch_add(1, std::memory_order_relaxed);
-            while ((inFlightSeq_ > 0 && inFlightSeq_ <= maxSeq) ||
-                   (head_ != nullptr && head_->seq <= maxSeq)) {
-                pthread_cond_wait(&drainedCv_, &mtx_);
+            if (!hasSyncUnderDir && maxSeq == 0) break;
+            if (!waited) {
+                flushCount_.fetch_add(1, std::memory_order_relaxed);
+                waited = true;
             }
-            break;
+            pthread_cond_wait(&drainedCv_, &mtx_);
         }
         pthread_mutex_unlock(&mtx_);
     }
@@ -978,10 +1314,10 @@ public:
     void FlushAll() noexcept {
         if (!HasPendingFast()) return;
         pthread_mutex_lock(&mtx_);
-        if (head_ != nullptr || inFlightSeq_ != 0) {
+        if (head_ != nullptr || inFlightSeq_ != 0 || syncHead_ != nullptr) {
             flushCount_.fetch_add(1, std::memory_order_relaxed);
         }
-        while (head_ != nullptr || inFlightSeq_ != 0) {
+        while (head_ != nullptr || inFlightSeq_ != 0 || syncHead_ != nullptr) {
             pthread_cond_wait(&drainedCv_, &mtx_);
         }
         pthread_mutex_unlock(&mtx_);
@@ -989,7 +1325,7 @@ public:
 
     void ShutdownAndFlush() noexcept {
         pthread_mutex_lock(&mtx_);
-        while (head_ != nullptr || inFlightSeq_ != 0) {
+        while (head_ != nullptr || inFlightSeq_ != 0 || syncHead_ != nullptr) {
             pthread_cond_wait(&drainedCv_, &mtx_);
         }
         stopped_ = true;
@@ -1004,6 +1340,8 @@ public:
     uint64_t EnqueuedCount() const noexcept { return enqueuedCount_.load(std::memory_order_relaxed); }
     uint64_t CommittedCount() const noexcept { return committedCount_.load(std::memory_order_relaxed); }
     uint64_t CommittedBytes() const noexcept { return committedBytes_.load(std::memory_order_relaxed); }
+    uint64_t CompressedCount() const noexcept { return compressedCount_.load(std::memory_order_relaxed); }
+    uint64_t CompressUsSum() const noexcept { return compressUsSum_.load(std::memory_order_relaxed); }
     uint64_t FlushCount() const noexcept { return flushCount_.load(std::memory_order_relaxed); }
     uint64_t ErrorCount() const noexcept { return errorCount_.load(std::memory_order_relaxed); }
     uint64_t EnqueueUsSum() const noexcept { return enqueueUsSum_.load(std::memory_order_relaxed); }
@@ -1011,6 +1349,7 @@ public:
 
     void ResetTelemetry() noexcept {
         enqueuedCount_ = 0; committedCount_ = 0; committedBytes_ = 0;
+        compressedCount_ = 0; compressUsSum_ = 0;
         flushCount_ = 0; errorCount_ = 0; enqueueUsSum_ = 0; ioUsSum_ = 0;
     }
 
@@ -1038,13 +1377,22 @@ private:
     }
 
     void RunWorker() noexcept {
+        libdeflate_compressor* workerComp = nullptr;
+        int workerCompLvl = 0;
         while (true) {
             pthread_mutex_lock(&mtx_);
-            while (!head_ && !stopped_) {
-                pthread_cond_wait(&workCv_, &mtx_);
-            }
-            if (!head_ && stopped_) {
-                pthread_mutex_unlock(&mtx_);
+            while (true) {
+                while (!head_ && !stopped_) {
+                    pthread_cond_wait(&workCv_, &mtx_);
+                }
+                if (!head_ && stopped_) {
+                    pthread_mutex_unlock(&mtx_);
+                    goto posix_worker_exit;
+                }
+                if (HasActiveSyncPathLocked(head_->normPath)) {
+                    pthread_cond_wait(&drainedCv_, &mtx_);
+                    continue;
+                }
                 break;
             }
             Item* it = head_;
@@ -1057,23 +1405,49 @@ private:
             inFlightDir_  = it->dirPath;
             pthread_mutex_unlock(&mtx_);
 
+            uint8_t* writePtr = it->bytes;
+            size_t   writeLen = it->len;
+            uint8_t* encBuf   = nullptr;
+            size_t   encLen   = 0;
+            bool     prepOk   = true;
+            if (it->compressKlei) {
+                const int lvl = (it->deflateLevel >= 1 && it->deflateLevel <= 12) ? it->deflateLevel : 5;
+                if (!workerComp || workerCompLvl != lvl) {
+                    if (workerComp) libdeflate_free_compressor(workerComp);
+                    workerComp = libdeflate_alloc_compressor(lvl);
+                    workerCompLvl = lvl;
+                }
+                const int64_t c0 = NowNs();
+                if (klei_save_codec::EncodeKleiZlibBase64Malloc(
+                        it->bytes, it->len, lvl, &encBuf, &encLen, workerComp)) {
+                    compressUsSum_.fetch_add(static_cast<uint64_t>(NsDeltaUs(c0, NowNs())), std::memory_order_relaxed);
+                    compressedCount_.fetch_add(1, std::memory_order_relaxed);
+                    writePtr = encBuf;
+                    writeLen = encLen;
+                } else {
+                    prepOk = false;
+                }
+            }
+
             const int64_t io0 = NowNs();
-            char tmpPath[2100];
-            std::snprintf(tmpPath, sizeof(tmpPath), "%s.hc_tmp", it->normPath);
-            bool ok = WriteAllAndFsync(tmpPath, it->bytes, it->len);
-            if (ok && g_real_rename) {
+            char tmpPath[2160] = {};
+            bool ok = prepOk && g_real_rename != nullptr &&
+                      MakeUniqueTmpPath(it->normPath, tmpPath, sizeof(tmpPath)) &&
+                      WriteAllAndFsync(tmpPath, writePtr, writeLen, nullptr);
+            if (ok) {
                 ok = (g_real_rename(tmpPath, it->normPath) == 0);
             }
-            if (!ok && g_real_unlink) {
+            if (!ok && g_real_unlink && tmpPath[0] != '\0') {
                 g_real_unlink(tmpPath);
             }
             ioUsSum_.fetch_add(static_cast<uint64_t>(NsDeltaUs(io0, NowNs())), std::memory_order_relaxed);
             if (ok) {
                 committedCount_.fetch_add(1, std::memory_order_relaxed);
-                committedBytes_.fetch_add(it->len, std::memory_order_relaxed);
+                committedBytes_.fetch_add(writeLen, std::memory_order_relaxed);
             } else {
                 errorCount_.fetch_add(1, std::memory_order_relaxed);
             }
+            if (encBuf) std::free(encBuf);
 
             pthread_mutex_lock(&mtx_);
             inFlightSeq_  = 0;
@@ -1087,6 +1461,29 @@ private:
 
             FreeItem(it);
         }
+    posix_worker_exit:
+        if (workerComp) libdeflate_free_compressor(workerComp);
+    }
+
+    struct SyncNode {
+        const char* norm = nullptr;
+        SyncNode*   next = nullptr;
+    };
+
+    bool HasActiveSyncPathLocked(const char* norm) const noexcept {
+        for (const SyncNode* sn = syncHead_; sn; sn = sn->next) {
+            if (sn->norm && std::strcmp(sn->norm, norm) == 0) return true;
+        }
+        return false;
+    }
+
+    bool HasPathConflictLocked(const char* norm) const noexcept {
+        if (HasActiveSyncPathLocked(norm)) return true;
+        if (inFlightNorm_ && std::strcmp(inFlightNorm_, norm) == 0) return true;
+        for (const Item* cur = head_; cur; cur = cur->next) {
+            if (cur->normPath && std::strcmp(cur->normPath, norm) == 0) return true;
+        }
+        return false;
     }
 
     pthread_mutex_t mtx_ = PTHREAD_MUTEX_INITIALIZER;
@@ -1097,6 +1494,7 @@ private:
     bool            stopped_ = false;
     Item*           head_ = nullptr;
     Item*           tail_ = nullptr;
+    SyncNode*       syncHead_ = nullptr;
     size_t          queuedCount_ = 0;
     size_t          queuedBytes_ = 0;
     uint64_t        nextSeq_ = 0;
@@ -1105,9 +1503,12 @@ private:
     const char*     inFlightDir_  = nullptr;
 
     std::atomic<bool>     hasPending_{false};
+    std::atomic<uint32_t> activeSyncCount_{0};
     std::atomic<uint64_t> enqueuedCount_{0};
     std::atomic<uint64_t> committedCount_{0};
     std::atomic<uint64_t> committedBytes_{0};
+    std::atomic<uint64_t> compressedCount_{0};
+    std::atomic<uint64_t> compressUsSum_{0};
     std::atomic<uint64_t> flushCount_{0};
     std::atomic<uint64_t> errorCount_{0};
     std::atomic<uint64_t> enqueueUsSum_{0};
@@ -1143,13 +1544,19 @@ using SimLuaUpdate_t    = uint8_t (*)(void* sim, float dt, uint8_t paused);
 using CollectGarbage_t  = void (*)(void* sim);
 using NetMgrUpdate_t    = void (*)(void* mgr, float dt);
 using ReplicaUpdate_t   = void (*)(void* rm);
+using QueryRepList_t    = void (*)(void* conn, void* outConstruct, void* outDestroy);
 using LuaCFuncObj_t     = int (*)(void* selfObj, void* L);
 using Compress2_t       = int (*)(uint8_t* dest, unsigned long* destLen,
                                   const uint8_t* source, unsigned long sourceLen, int level);
+using Uncompress_t      = int (*)(uint8_t* dest, unsigned long* destLen,
+                                  const uint8_t* source, unsigned long sourceLen);
 using UnzRead_t         = int (*)(void* file, void* buf, uint32_t len);
 using InflateFast_t     = void (*)(void* strm, uint32_t start);
 using WritePFile_t      = uint8_t (*)(const char* path, const void* data, int size,
                                       void* cb, uint32_t arg5, void* arg6);
+using Rpc4Call_t        = void (*)(void* thisPtr, const char* uniqueID, void* bitStream,
+                                   int priority, int reliability, uint8_t orderingChannel,
+                                   const void* systemIdentifier, uint8_t broadcast, uint8_t callLocally);
 using AStarStep_t       = uint32_t (*)(void* astar, uint32_t maxSteps);
 using AStarDtor_t       = void (*)(void* astar);
 using PathNodeDtor_t    = void (*)(void* mgr, void* node);
@@ -1170,12 +1577,21 @@ SimLuaUpdate_t   g_origSimLuaUpdate   = nullptr;
 CollectGarbage_t g_origCollectGarbage = nullptr;
 NetMgrUpdate_t   g_origNetMgrUpdate   = nullptr;
 ReplicaUpdate_t  g_origReplicaUpdate  = nullptr;
+QueryRepList_t   g_origQueryRepList   = nullptr;
+hc_replica::ReplicaAbiConfig g_replicaCfg;
+hc_replica::ReplicaFastStats g_replicaStats;
+std::atomic<bool>            g_replicaFastActive{false};
+std::atomic<bool>            g_replicaPreSerPatched{false};
 LuaCFuncObj_t    g_origSimFindEnts    = nullptr;
 LuaCFuncObj_t    g_origSimFindEntsReg = nullptr;
 LuaCFuncObj_t    g_origSerializeWorld = nullptr;
 Compress2_t      g_origCompress2      = nullptr;
+Uncompress_t     g_origUncompress     = nullptr;
 UnzRead_t        g_origUnzRead        = nullptr;
 WritePFile_t     g_origWritePFile     = nullptr;
+Rpc4Call_t       g_origRpc4Call       = nullptr;
+std::atomic<bool> g_rpcQosActive{false};
+hs_rpc_qos::Classifier g_rpcQos;
 AStarStep_t      g_origAStarStep      = nullptr;
 AStarDtor_t      g_origAStarDtor0     = nullptr;
 AStarDtor_t      g_origAStarDtor1     = nullptr;
@@ -1294,6 +1710,7 @@ int Lua_HyperCore_FastDump(void* L) {
         }
         return 0;
     }
+    SaveSubphaseGuard saveGuard;
     const int64_t t0 = NowNs();
     const int nargs = g_lua.gettop(L);
     if (nargs < 1) {
@@ -1307,18 +1724,21 @@ int Lua_HyperCore_FastDump(void* L) {
         varname = g_lua.tolstring(L, 2, &varlen);
     }
     const char* failReason = nullptr;
-    const auto st = fast_dumper::DumpRoot(L, g_lua, 1, varname, varlen, tl_dumpBuf, &failReason);
+    const uint32_t dumpMaxNodes = g_fastDumpMaxNodes.load(std::memory_order_relaxed);
+    const size_t dumpKeepBytes = g_fastDumpKeepBytes.load(std::memory_order_relaxed);
+    const auto st = fast_dumper::DumpRoot(L, g_lua, 1, varname, varlen, tl_dumpBuf, &failReason, dumpMaxNodes);
     const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
 
     if (st == fast_dumper::Status::Ok && !tl_dumpBuf.oom && tl_dumpBuf.data) {
+        saveGuard.Add(us);
         g_stats.fastdump_calls.fetch_add(1, std::memory_order_relaxed);
         g_stats.fastdump_us_sum.fetch_add(us, std::memory_order_relaxed);
         g_stats.fastdump_bytes_sum.fetch_add(tl_dumpBuf.len, std::memory_order_relaxed);
         g_lua.pushlstring(L, tl_dumpBuf.data, tl_dumpBuf.len);
-        tl_dumpBuf.ShrinkIfLarge();
+        tl_dumpBuf.ShrinkIfLarge(dumpKeepBytes);
         return 1;
     }
-    tl_dumpBuf.ShrinkIfLarge();
+    tl_dumpBuf.ShrinkIfLarge(dumpKeepBytes);
     g_stats.fastdump_fallbacks.fetch_add(1, std::memory_order_relaxed);
     g_lua.pushnil(L);
     g_lua.pushstring(L, failReason ? failReason : (st == fast_dumper::Status::CorruptNumber ? "corrupt_number" : "fallback"));
@@ -1330,7 +1750,7 @@ int Lua_HyperCore_GetStats(void* L) {
     double avg = 0, p95 = 0, p99 = 0;
     g_stats.ComputePercentiles(avg, p95, p99);
 
-    g_lua.createtable(L, 0, 52);
+    g_lua.createtable(L, 0, 72);
     auto setNum = [&](const char* k, double v) {
         g_lua.pushnumber(L, v);
         g_lua.setfield(L, -2, k);
@@ -1378,6 +1798,12 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("deflate_main_us_sum",   static_cast<double>(g_stats.deflate_main_us_sum.load()));
     setNum("deflate_in_bytes",      static_cast<double>(g_stats.deflate_in_bytes.load()));
     setNum("deflate_out_bytes",     static_cast<double>(g_stats.deflate_out_bytes.load()));
+    setNum("uncomp_calls",          static_cast<double>(g_stats.uncomp_calls.load()));
+    setNum("uncomp_out_bytes",      static_cast<double>(g_stats.uncomp_out_bytes.load()));
+    setNum("uncomp_us_sum",         static_cast<double>(g_stats.uncomp_us_sum.load()));
+    setNum("fastjson_enc_calls",    static_cast<double>(g_stats.fastjson_enc_calls.load()));
+    setNum("fastjson_dec_calls",    static_cast<double>(g_stats.fastjson_dec_calls.load()));
+    setNum("fastjson_fallbacks",    static_cast<double>(g_stats.fastjson_fallbacks.load()));
     setNum("serialize_world_calls", static_cast<double>(g_stats.serialize_world_calls.load()));
     setNum("serialize_world_us_sum",static_cast<double>(g_stats.serialize_world_us_sum.load()));
     setNum("prof_lua_update_calls", static_cast<double>(g_stats.prof_lua_update_calls.load()));
@@ -1394,11 +1820,16 @@ int Lua_HyperCore_GetStats(void* L) {
     setNum("async_save_enqueued",   static_cast<double>(GetAsyncSave().EnqueuedCount()));
     setNum("async_save_committed",  static_cast<double>(GetAsyncSave().CommittedCount()));
     setNum("async_save_bytes",      static_cast<double>(GetAsyncSave().CommittedBytes()));
+    setNum("async_save_compressed", static_cast<double>(GetAsyncSave().CompressedCount()));
+    setNum("async_save_compress_us_sum", static_cast<double>(GetAsyncSave().CompressUsSum()));
     setNum("async_save_flushes",    static_cast<double>(GetAsyncSave().FlushCount()));
     setNum("async_save_fallbacks",  static_cast<double>(g_stats.async_save_fallbacks.load()));
     setNum("async_save_errors",     static_cast<double>(GetAsyncSave().ErrorCount()));
     setNum("async_save_enqueue_us_sum", static_cast<double>(GetAsyncSave().EnqueueUsSum()));
     setNum("async_save_io_us_sum",  static_cast<double>(GetAsyncSave().IoUsSum()));
+    setNum("rpc_qos_imm",           static_cast<double>(g_rpcQos.ImmCount()));
+    setNum("rpc_qos_off_ch0",       static_cast<double>(g_rpcQos.OffCh0Count()));
+    setNum("rpc_qos_total",         static_cast<double>(g_rpcQos.TotalCalls()));
 
     setBool("opt_mimalloc",         g_cfg.enable_mimalloc);
     setBool("opt_spatial_zerocopy", g_cfg.enable_spatial_zerocopy && g_stats.spatial_zerocopy_sites.load() > 0);
@@ -1409,7 +1840,22 @@ int Lua_HyperCore_GetStats(void* L) {
     setBool("opt_fast_astar",       g_cfg.enable_fast_astar && g_astarReady);
     setBool("opt_fs_neg_cache",     g_cfg.enable_fs_neg_cache && g_fsNegCacheActive.load(std::memory_order_relaxed));
     setBool("opt_async_save",       g_cfg.enable_async_save && g_asyncSaveActive.load(std::memory_order_relaxed));
+    setBool("opt_rpc_qos",          g_cfg.enable_rpc_qos && g_rpcQosActive.load(std::memory_order_relaxed));
+    setBool("opt_replica_fastpath", g_cfg.enable_replica_fastpath && g_replicaFastActive.load(std::memory_order_relaxed));
+    setNum("replica_construct_budget",       static_cast<double>(g_effectiveReplicaBudget.load(std::memory_order_relaxed)));
+    setBool("replica_proximity_active",      g_replicaCfg.proximityValid);
+    setNum("replica_qrl_calls",              static_cast<double>(g_replicaStats.qrl_calls.load()));
+    setNum("replica_constructed_total",      static_cast<double>(g_replicaStats.constructed_total.load()));
+    setNum("replica_destroyed_total",        static_cast<double>(g_replicaStats.destroyed_total.load()));
+    setNum("replica_paced_deferred_total",   static_cast<double>(g_replicaStats.paced_deferred_total.load()));
+    setNum("replica_paced_burst_ticks",      static_cast<double>(g_replicaStats.paced_burst_ticks.load()));
+    setNum("replica_paced_parent_promotes",  static_cast<double>(g_replicaStats.paced_parent_promotes.load()));
+    setNum("replica_paced_near_bypasses",    static_cast<double>(g_replicaStats.paced_near_bypasses.load()));
     setNum("sim_tick_rate",         30.0);
+    setNum("hardware_tier",         static_cast<double>(g_activeServerTier.load(std::memory_order_relaxed)));
+    setNum("hw_cores",              static_cast<double>(g_hostCaps.logicalCores));
+    setNum("hw_ram_mb",             static_cast<double>(g_hostCaps.totalRamMb));
+    setNum("hw_ideal_core",         -1.0);
     return 1;
 }
 
@@ -1419,9 +1865,224 @@ int Lua_HyperCore_ResetStats(void* /*L*/) {
     return 0;
 }
 
+int Lua_HyperCore_SetRpcChannelMasks(void* L) {
+    if (!g_lua.tonumber || !g_lua.pushboolean) return 0;
+    const int nargs = g_lua.gettop ? g_lua.gettop(L) : 4;
+    const uint32_t srv0 = static_cast<uint32_t>(static_cast<int64_t>(g_lua.tonumber(L, 1)));
+    const uint32_t srv1 = static_cast<uint32_t>(static_cast<int64_t>(g_lua.tonumber(L, 2)));
+    const uint32_t srv2 = static_cast<uint32_t>(static_cast<int64_t>(g_lua.tonumber(L, 3)));
+    const uint32_t cli0 = static_cast<uint32_t>(static_cast<int64_t>(g_lua.tonumber(L, 4)));
+    const uint32_t cli1 = (nargs >= 5)
+        ? static_cast<uint32_t>(static_cast<int64_t>(g_lua.tonumber(L, 5)))
+        : 0u;
+    const uint64_t srvLo = static_cast<uint64_t>(srv0) | (static_cast<uint64_t>(srv1) << 32);
+    const uint64_t srvHi = static_cast<uint64_t>(srv2);
+    const uint64_t cliLo = static_cast<uint64_t>(cli0) | (static_cast<uint64_t>(cli1) << 32);
+    g_rpcQos.SetMasks(srvLo, srvHi, cliLo, 0ULL);
+    g_lua.pushboolean(L, 1);
+    return 1;
+}
+
 int Lua_HyperCore_Version(void* L) {
     if (!g_lua.pushstring) return 0;
-    g_lua.pushstring(L, "DST-HyperCore-Server/1.3.0 (Linux x86_64)");
+    g_lua.pushstring(L, "DST-HyperCore-Server/1.6.0 (Linux x86_64)");
+    return 1;
+}
+
+uint32_t ResolveEffectiveReplicaBudget(uint32_t tierBudget) noexcept {
+    const int luaOv = g_luaReplicaBudgetOverride.load(std::memory_order_acquire);
+    if (luaOv >= 0) {
+        return hc_replica::ClampReplicaConstructBudget(luaOv);
+    }
+    if (g_cfg.replica_budget_ini_explicit) {
+        return hc_replica::ClampReplicaConstructBudget(g_cfg.replica_construct_budget);
+    }
+    return hc_replica::ClampReplicaConstructBudget(static_cast<int>(tierBudget));
+}
+
+void ApplyServerHardwareTierLive(int rawTier) noexcept {
+    const auto tier = hc_server_tier::NormalizeTier(rawTier);
+    const auto b    = hc_server_tier::ComputeServerTierBudget(tier, g_hostCaps);
+    g_activeServerTier.store(static_cast<int>(tier), std::memory_order_release);
+
+    if (g_cfg.enable_mimalloc) {
+        mi_option_set(mi_option_purge_delay, b.miPurgeDelayMs);
+        mi_option_set(mi_option_eager_commit, b.miEagerCommit ? 1 : 0);
+        mi_option_set(mi_option_purge_decommits, b.miPurgeDecommits ? 1 : 0);
+    }
+    GetAStarMgr().SetMaxWarmPool(b.astarWarmPoolCap);
+    GetAsyncSave().SetMaxQueueBytes(b.asyncSaveMaxQueueBytes);
+    g_fsNegTtlNs.store(static_cast<int64_t>(b.fsNegTtlSec) * 1000000000LL, std::memory_order_relaxed);
+    g_fastDumpMaxNodes.store(b.fastDumpMaxNodes, std::memory_order_relaxed);
+    g_fastDumpKeepBytes.store(b.fastDumpKeepBytes, std::memory_order_relaxed);
+    g_effectiveDeflateLevel.store(b.libdeflateLevel, std::memory_order_relaxed);
+    const uint32_t effRepBudget = ResolveEffectiveReplicaBudget(b.replicaConstructBudget);
+    g_effectiveReplicaBudget.store(effRepBudget, std::memory_order_relaxed);
+    g_gcSpareTargetMs.store(b.gcSpareTargetMs, std::memory_order_relaxed);
+    g_gcCalmMaxMs.store(b.gcCalmMaxMs, std::memory_order_relaxed);
+    g_gcBusyMinMs.store(b.gcBusyMinMs, std::memory_order_relaxed);
+    g_gcEmergencyAddMb.store(b.gcEmergencyAddMb, std::memory_order_relaxed);
+    g_gcExcessRampMb.store(b.gcExcessRampMb, std::memory_order_relaxed);
+
+    LogMsg("[TIER] Linux Server Hardware Tier=%s(%d) | shard=%s cores=%u ram=%lluMB | miPurge=%dms eager=%d decommit=%d | deflate=L%d dump=%u/%zuMB asyncQ=%zuMB astarPool=%zu fsNeg=%llus repPace=%u | gc(emerg=%dMB busy=%.2fms calm=%.1fms ramp=%.0fMB)",
+           hc_server_tier::TierName(tier), static_cast<int>(tier),
+           g_shardTag, g_hostCaps.logicalCores,
+           static_cast<unsigned long long>(g_hostCaps.totalRamMb),
+           b.miPurgeDelayMs, b.miEagerCommit ? 1 : 0, b.miPurgeDecommits ? 1 : 0,
+           b.libdeflateLevel, b.fastDumpMaxNodes, b.fastDumpKeepBytes / (1024u * 1024u),
+           b.asyncSaveMaxQueueBytes / (1024u * 1024u), b.astarWarmPoolCap,
+           static_cast<unsigned long long>(b.fsNegTtlSec), effRepBudget,
+           b.gcEmergencyAddMb, b.gcBusyMinMs, b.gcCalmMaxMs, b.gcExcessRampMb);
+}
+
+int Lua_HyperCore_SetReplicaPacing(void* L) {
+    if (!g_lua.gettop || !g_lua.tonumber || !g_lua.pushboolean || !g_lua.pushnumber) return 0;
+    int req = -1;
+    if (g_lua.gettop(L) >= 1) {
+        const int t = g_lua.type ? g_lua.type(L, 1) : HC_LUA_TNUMBER;
+        if (t == HC_LUA_TSTRING && g_lua.tolstring) {
+            size_t len = 0;
+            const char* s = g_lua.tolstring(L, 1, &len);
+            if (s && hc_server_tier::EqualsAsciiInsensitive(s, "auto")) {
+                req = -1;
+            } else if (s && (hc_server_tier::EqualsAsciiInsensitive(s, "off") ||
+                             hc_server_tier::EqualsAsciiInsensitive(s, "false"))) {
+                req = 0;
+            } else if (s) {
+                req = std::atoi(s);
+            }
+        } else {
+            req = static_cast<int>(g_lua.tonumber(L, 1));
+        }
+    }
+    if (req < 0) {
+        g_luaReplicaBudgetOverride.store(-1, std::memory_order_release);
+    } else {
+        g_luaReplicaBudgetOverride.store(static_cast<int>(hc_replica::ClampReplicaConstructBudget(req)),
+                                         std::memory_order_release);
+    }
+    const auto tier = hc_server_tier::NormalizeTier(g_activeServerTier.load(std::memory_order_acquire));
+    const auto b    = hc_server_tier::ComputeServerTierBudget(tier, g_hostCaps);
+    const uint32_t eff = ResolveEffectiveReplicaBudget(b.replicaConstructBudget);
+    g_effectiveReplicaBudget.store(eff, std::memory_order_relaxed);
+    LogMsg("[REPLICA] Runtime pacing budget -> %u (req=%d, iniOverride=%d, tier=%s)",
+           eff, req, g_cfg.replica_budget_ini_explicit ? 1 : 0, hc_server_tier::TierName(tier));
+    g_lua.pushboolean(L, 1);
+    g_lua.pushnumber(L, static_cast<double>(eff));
+    return 2;
+}
+
+int Lua_HyperCore_SetHardwareTier(void* L) {
+    if (!g_lua.gettop || !g_lua.tonumber || !g_lua.pushboolean || !g_lua.pushnumber) return 0;
+    int reqTier = 1;
+    if (g_lua.gettop(L) >= 1) {
+        const int t = g_lua.type ? g_lua.type(L, 1) : HC_LUA_TNUMBER;
+        if (t == HC_LUA_TSTRING && g_lua.tolstring) {
+            size_t len = 0;
+            const char* s = g_lua.tolstring(L, 1, &len);
+            reqTier = static_cast<int>(hc_server_tier::ParseTier(s));
+        } else {
+            reqTier = static_cast<int>(g_lua.tonumber(L, 1));
+        }
+    }
+    const auto applied = hc_server_tier::NormalizeTier(reqTier);
+    ApplyServerHardwareTierLive(static_cast<int>(applied));
+    g_lua.pushboolean(L, 1);
+    g_lua.pushnumber(L, static_cast<double>(applied));
+    return 2;
+}
+
+int Lua_HyperCore_GetHardwareInfo(void* L) {
+    if (!g_lua.ReadyForRegister()) return 0;
+    const auto tier = hc_server_tier::NormalizeTier(g_activeServerTier.load(std::memory_order_acquire));
+    const auto b    = hc_server_tier::ComputeServerTierBudget(tier, g_hostCaps);
+
+    g_lua.createtable(L, 0, 24);
+    auto setNum = [&](const char* k, double v) {
+        g_lua.pushnumber(L, v);
+        g_lua.setfield(L, -2, k);
+    };
+    auto setBool = [&](const char* k, bool v) {
+        g_lua.pushboolean(L, v ? 1 : 0);
+        g_lua.setfield(L, -2, k);
+    };
+    auto setStr = [&](const char* k, const char* v) {
+        g_lua.pushstring(L, v ? v : "");
+        g_lua.setfield(L, -2, k);
+    };
+
+    setNum("tier",              static_cast<double>(tier));
+    setStr("tier_name",         hc_server_tier::TierName(tier));
+    setStr("shard",             g_shardTag);
+    setNum("cores",             static_cast<double>(g_hostCaps.logicalCores));
+    setNum("perf_cores",        static_cast<double>(g_hostCaps.perfCoreCount));
+    setNum("ideal_core",        -1.0);
+    setNum("ram_mb",            static_cast<double>(g_hostCaps.totalRamMb));
+    setBool("eco_qos_disabled", false);
+    setNum("mi_purge_ms",       static_cast<double>(b.miPurgeDelayMs));
+    setNum("deflate_level",     static_cast<double>(g_effectiveDeflateLevel.load(std::memory_order_relaxed)));
+    setNum("fastdump_nodes",    static_cast<double>(g_fastDumpMaxNodes.load(std::memory_order_relaxed)));
+    setNum("fastdump_keep_mb",  static_cast<double>(g_fastDumpKeepBytes.load(std::memory_order_relaxed) / (1024u * 1024u)));
+    setNum("async_queue_mb",    static_cast<double>(GetAsyncSave().MaxQueueBytes() / (1024u * 1024u)));
+    setNum("astar_pool",        static_cast<double>(GetAStarMgr().MaxWarmPool()));
+    setNum("fs_neg_ttl_s",      static_cast<double>(b.fsNegTtlSec));
+    setNum("gc_emerg_mb",       static_cast<double>(g_gcEmergencyAddMb.load(std::memory_order_relaxed)));
+    setNum("gc_busy_ms",        static_cast<double>(g_gcBusyMinMs.load(std::memory_order_relaxed)));
+    setNum("gc_calm_ms",        static_cast<double>(g_gcCalmMaxMs.load(std::memory_order_relaxed)));
+    setNum("gc_ramp_mb",        static_cast<double>(g_gcExcessRampMb.load(std::memory_order_relaxed)));
+    setNum("replica_construct_budget", static_cast<double>(g_effectiveReplicaBudget.load(std::memory_order_relaxed)));
+    setBool("replica_budget_explicit", g_cfg.replica_budget_ini_explicit || (g_luaReplicaBudgetOverride.load(std::memory_order_relaxed) >= 0));
+    setBool("prewarm_ran",      false);
+    return 1;
+}
+
+int Lua_HyperCore_FastJsonEncode(void* L) {
+    if (!g_lua.ReadyForFastJson()) {
+        if (g_lua.pushnil) { g_lua.pushnil(L); return 1; }
+        return 0;
+    }
+    const int nargs = g_lua.gettop(L);
+    if (nargs < 1) {
+        g_lua.pushnil(L);
+        return 1;
+    }
+    const bool compliant = (nargs >= 2 && g_lua.type(L, 2) == HC_LUA_TBOOLEAN)
+        ? (g_lua.toboolean(L, 2) != 0) : false;
+    fast_json::JsonOutBuf out;
+    if (fast_json::EncodeRoot(L, g_lua, 1, out, compliant) == fast_dumper::Status::Ok &&
+        !out.oom && out.data) {
+        g_stats.fastjson_enc_calls.fetch_add(1, std::memory_order_relaxed);
+        g_lua.pushlstring(L, out.data, out.len);
+        return 1;
+    }
+    g_stats.fastjson_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    g_lua.pushnil(L);
+    return 1;
+}
+
+int Lua_HyperCore_FastJsonDecode(void* L) {
+    if (!g_lua.ReadyForFastJson()) {
+        if (g_lua.pushboolean) { g_lua.pushboolean(L, 0); return 1; }
+        return 0;
+    }
+    const int baseTop = g_lua.gettop(L);
+    if (baseTop < 1 || g_lua.type(L, 1) != HC_LUA_TSTRING) {
+        g_stats.fastjson_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        g_lua.pushboolean(L, 0);
+        return 1;
+    }
+    size_t slen = 0;
+    const char* s = g_lua.tolstring(L, 1, &slen);
+    size_t nextPos = 1;
+    g_lua.pushboolean(L, 1);
+    if (fast_json::DecodeRoot(L, g_lua, s, slen, &nextPos) == fast_dumper::Status::Ok) {
+        g_stats.fastjson_dec_calls.fetch_add(1, std::memory_order_relaxed);
+        g_lua.pushnumber(L, static_cast<double>(nextPos));
+        return 3;
+    }
+    g_lua.settop(L, baseTop);
+    g_stats.fastjson_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    g_lua.pushboolean(L, 0);
     return 1;
 }
 
@@ -1439,6 +2100,83 @@ int Lua_HyperCore_SetSimTickRate(void* L) {
     return 1;
 }
 
+static int Lua_HyperCore_GetBlackbox(void* L) {
+    if (!g_lua.pushnumber || !g_lua.pushstring) return 0;
+    int limit = 20;
+    if (g_lua.tonumber && (!g_lua.gettop || g_lua.gettop(L) >= 1)) {
+        const int req = static_cast<int>(g_lua.tonumber(L, 1));
+        if (req > 0) limit = std::clamp(req, 1, static_cast<int>(hs_blackbox::kCap));
+    }
+    hs_blackbox::ServerEvent evs[hs_blackbox::kCap]{};
+    uint64_t total = 0;
+    pthread_mutex_lock(&g_bbMtx);
+    const size_t n = g_serverBlackbox.SnapshotLatest(evs, static_cast<size_t>(limit), total);
+    pthread_mutex_unlock(&g_bbMtx);
+
+    const uint32_t threshMs = g_blackboxLastThreshMs.load(std::memory_order_relaxed);
+    constexpr size_t kJsonCap = 32768;
+    char* jsonBuf = static_cast<char*>(std::malloc(kJsonCap));
+    size_t written = 0;
+    if (jsonBuf) {
+        hs_blackbox::FormatServerJson(jsonBuf, kJsonCap, evs, n, total, threshMs, &written);
+        g_lua.pushnumber(L, static_cast<double>(total));
+        g_lua.pushnumber(L, static_cast<double>(written));
+        g_lua.pushstring(L, jsonBuf);
+        std::free(jsonBuf);
+    } else {
+        char emptyBuf[128]{};
+        std::snprintf(emptyBuf, sizeof(emptyBuf),
+                      "{\"role\":\"server\",\"total\":%llu,\"count\":0,\"threshold_ms\":%u,\"events\":[]}",
+                      static_cast<unsigned long long>(total), static_cast<unsigned>(threshMs));
+        g_lua.pushnumber(L, static_cast<double>(total));
+        g_lua.pushnumber(L, 0.0);
+        g_lua.pushstring(L, emptyBuf);
+    }
+    return 3;
+}
+
+static int Lua_HyperCore_ClearBlackbox(void* L) {
+    pthread_mutex_lock(&g_bbMtx);
+    g_serverBlackbox.Clear();
+    pthread_mutex_unlock(&g_bbMtx);
+    if (g_lua.pushboolean) {
+        g_lua.pushboolean(L, 1);
+        return 1;
+    }
+    return 0;
+}
+
+static int Lua_HyperCore_ExportBlackbox(void* L) {
+    if (!g_lua.pushboolean || !g_lua.pushstring) return 0;
+    char outPath[1280]{};
+    std::snprintf(outPath, sizeof(outPath), "%s/dst_hypercore_blackbox_%s.json", g_binDir, g_shardTag);
+
+    hs_blackbox::ServerEvent evs[hs_blackbox::kCap]{};
+    uint64_t total = 0;
+    pthread_mutex_lock(&g_bbMtx);
+    const size_t n = g_serverBlackbox.SnapshotLatest(evs, hs_blackbox::kCap, total);
+    pthread_mutex_unlock(&g_bbMtx);
+
+    const uint32_t threshMs = g_blackboxLastThreshMs.load(std::memory_order_relaxed);
+    constexpr size_t kJsonCap = 32768;
+    char* jsonBuf = static_cast<char*>(std::malloc(kJsonCap));
+    bool ok = false;
+    if (jsonBuf) {
+        size_t written = 0;
+        const size_t jsonLen = hs_blackbox::FormatServerJson(jsonBuf, kJsonCap, evs, n, total, threshMs, &written);
+        if (jsonLen > 0 && g_real_fopen && g_real_fwrite && g_real_fclose) {
+            if (FILE* f = g_real_fopen(outPath, "wb")) {
+                ok = (g_real_fwrite(jsonBuf, 1, jsonLen, f) == jsonLen);
+                g_real_fclose(f);
+            }
+        }
+        std::free(jsonBuf);
+    }
+    g_lua.pushboolean(L, ok ? 1 : 0);
+    g_lua.pushstring(L, outPath);
+    return 2;
+}
+
 void RegisterHyperCoreLuaGlobals(void* L) {
     if (!L || !g_lua.pushcclosure || !g_lua.setfield) return;
     auto regFn = [&](const char* name, int (*fn)(void*)) {
@@ -1446,20 +2184,41 @@ void RegisterHyperCoreLuaGlobals(void* L) {
         g_lua.setfield(L, HC_LUA_GLOBALSINDEX, name);
     };
     const bool regFastDump = g_lua.ReadyForFastDump();
+    const bool regFastJson = g_lua.ReadyForFastJson();
     const bool regStats    = g_lua.ReadyForRegister();
     const bool regVersion  = (g_lua.pushstring != nullptr);
     const bool regGetSim   = (g_lua.pushnumber != nullptr);
     const bool regSetSim   = (g_lua.gettop != nullptr && g_lua.tonumber != nullptr && g_lua.pushboolean != nullptr);
+    const bool regBlackbox = (g_lua.pushnumber != nullptr && g_lua.pushstring != nullptr);
 
     if (regFastDump) regFn("HyperCore_FastDump",       &Lua_HyperCore_FastDump);
+    if (regFastJson) {
+        regFn("HyperCore_FastJsonEncode",              &Lua_HyperCore_FastJsonEncode);
+        regFn("HyperCore_FastJsonDecode",              &Lua_HyperCore_FastJsonDecode);
+    }
     if (regStats)    regFn("HyperCore_GetStats",       &Lua_HyperCore_GetStats);
     regFn("HyperCore_ResetStats",                      &Lua_HyperCore_ResetStats);
     if (regVersion)  regFn("HyperCore_Version",        &Lua_HyperCore_Version);
     if (regGetSim)   regFn("HyperCore_GetSimTickRate", &Lua_HyperCore_GetSimTickRate);
-    if (regSetSim)   regFn("HyperCore_SetSimTickRate", &Lua_HyperCore_SetSimTickRate);
+    if (regSetSim) {
+        regFn("HyperCore_SetSimTickRate", &Lua_HyperCore_SetSimTickRate);
+        regFn("HyperCore_SetRpcChannelMasks", &Lua_HyperCore_SetRpcChannelMasks);
+        if (g_lua.pushnumber) {
+            regFn("HyperCore_SetHardwareTier", &Lua_HyperCore_SetHardwareTier);
+            regFn("HyperCore_SetReplicaPacing", &Lua_HyperCore_SetReplicaPacing);
+        }
+    }
+    if (regStats) {
+        regFn("HyperCore_GetHardwareInfo", &Lua_HyperCore_GetHardwareInfo);
+    }
+    if (regBlackbox) {
+        regFn("HyperCore_GetBlackbox",    &Lua_HyperCore_GetBlackbox);
+        regFn("HyperCore_ExportBlackbox", &Lua_HyperCore_ExportBlackbox);
+    }
+    regFn("HyperCore_ClearBlackbox", &Lua_HyperCore_ClearBlackbox);
 
-    LogMsg("[LUA] Registered HyperCore Linux APIs into Lua VM %p (fastDump=%d stats=%d ver=%d sim=30Hz)",
-           L, regFastDump ? 1 : 0, regStats ? 1 : 0, regVersion ? 1 : 0);
+    LogMsg("[LUA] Registered HyperCore Linux APIs into Lua VM %p (fastDump=%d fastJson=%d stats=%d ver=%d sim=30Hz)",
+           L, regFastDump ? 1 : 0, regFastJson ? 1 : 0, regStats ? 1 : 0, regVersion ? 1 : 0);
 }
 
 void HookLuaOpenLibs(void* L) {
@@ -1492,6 +2251,7 @@ int HookLuaGc(void* L, int what, int data) {
         const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
         g_stats.gc_us_sum.fetch_add(us, std::memory_order_relaxed);
         g_stats.cur_tick_gc_us += us;
+        tl_tickProf.gcUs += ClampUsU32(us);
         return 0;
     }
     return g_origLuaGc(L, what, data);
@@ -1506,6 +2266,7 @@ void HookCollectGarbage(void* sim) {
         const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
         g_stats.gc_us_sum.fetch_add(us, std::memory_order_relaxed);
         g_stats.cur_tick_gc_us += us;
+        tl_tickProf.gcUs += ClampUsU32(us);
         AtomicUpdateMax(g_stats.gc_us_max, us);
         return;
     }
@@ -1527,10 +2288,11 @@ void HookCollectGarbage(void* sim) {
     g_stats.gc_last_kb.store(curKb, std::memory_order_relaxed);
 
     anti_stw_gc::Config pcfg{};
-    pcfg.gc_spare_target_ms  = g_cfg.gc_spare_target_ms;
-    pcfg.gc_calm_max_ms      = g_cfg.gc_calm_max_ms;
-    pcfg.gc_busy_min_ms      = g_cfg.gc_busy_min_ms;
-    pcfg.gc_emergency_add_mb = g_cfg.gc_emergency_add_mb;
+    pcfg.gc_spare_target_ms  = g_gcSpareTargetMs.load(std::memory_order_relaxed);
+    pcfg.gc_calm_max_ms      = g_gcCalmMaxMs.load(std::memory_order_relaxed);
+    pcfg.gc_busy_min_ms      = g_gcBusyMinMs.load(std::memory_order_relaxed);
+    pcfg.gc_emergency_add_mb = g_gcEmergencyAddMb.load(std::memory_order_relaxed);
+    pcfg.gc_excess_ramp_mb   = g_gcExcessRampMb.load(std::memory_order_relaxed);
     pcfg.enable_anti_stw_gc  = g_cfg.enable_anti_stw_gc;
 
     auto& gcState = GetGcPolicyState();
@@ -1542,6 +2304,7 @@ void HookCollectGarbage(void* sim) {
     if (dec.run_hard_full_gc) {
         g_lua.gc(L, 2 /*LUA_GCCOLLECT*/, 0);
         g_stats.gc_full_count.fetch_add(1, std::memory_order_relaxed);
+        tl_tickProf.gcFull = 1;
         const int32_t postKb = g_lua.gc(L, 3 /*LUA_GCCOUNT*/, 0);
         gcState.OnHardFullGcCompleted(postKb);
         *pThresholdKb = std::max<int32_t>(postKb * 2, postKb + g_cfg.gc_emergency_add_mb * 1024);
@@ -1559,6 +2322,7 @@ void HookCollectGarbage(void* sim) {
     const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
     g_stats.gc_us_sum.fetch_add(us, std::memory_order_relaxed);
     g_stats.cur_tick_gc_us += us;
+    tl_tickProf.gcUs += ClampUsU32(us);
     AtomicUpdateMax(g_stats.gc_us_max, us);
 }
 
@@ -1582,11 +2346,12 @@ int HookCompress2(uint8_t* dest, unsigned long* destLen,
             pthread_equal(pthread_self(), g_mainSimThread.load(std::memory_order_relaxed)) != 0) {
             g_stats.deflate_main_calls.fetch_add(1, std::memory_order_relaxed);
             g_stats.deflate_main_us_sum.fetch_add(us, std::memory_order_relaxed);
+            if (tl_tickProf.saveDepth == 0) tl_tickProf.saveUs += ClampUsU32(us);
         }
     };
 
     if (g_cfg.enable_libdeflate && dest && destLen && source && *destLen > 0) {
-        const int targetLevel = g_cfg.libdeflate_level;
+        const int targetLevel = g_effectiveDeflateLevel.load(std::memory_order_relaxed);
         if (!tl_deflate.comp || tl_deflate.level != targetLevel) {
             if (tl_deflate.comp) libdeflate_free_compressor(tl_deflate.comp);
             tl_deflate.comp = libdeflate_alloc_compressor(targetLevel);
@@ -1607,6 +2372,31 @@ int HookCompress2(uint8_t* dest, unsigned long* destLen,
     if (rc == 0 && destLen) g_stats.deflate_out_bytes.fetch_add(*destLen, std::memory_order_relaxed);
     recordTiming(static_cast<uint64_t>(NsDeltaUs(t0, NowNs())));
     return rc;
+}
+
+int HookUncompress(uint8_t* dest, unsigned long* destLen, const uint8_t* source, unsigned long sourceLen) {
+    if (g_cfg.enable_libdeflate && dest && destLen && source && sourceLen > 0 && *destLen > 0) {
+        struct TlsZDecompCtx {
+            libdeflate_decompressor* d = nullptr;
+            ~TlsZDecompCtx() { if (d) libdeflate_free_decompressor(d); }
+        };
+        static thread_local TlsZDecompCtx tl_zdec;
+        if (!tl_zdec.d) tl_zdec.d = libdeflate_alloc_decompressor();
+        if (tl_zdec.d) {
+            const int64_t t0 = NowNs();
+            size_t actualOut = 0;
+            if (libdeflate_zlib_decompress(tl_zdec.d, source, static_cast<size_t>(sourceLen),
+                                           dest, static_cast<size_t>(*destLen), &actualOut) == LIBDEFLATE_SUCCESS) {
+                const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
+                *destLen = static_cast<unsigned long>(actualOut);
+                g_stats.uncomp_calls.fetch_add(1, std::memory_order_relaxed);
+                g_stats.uncomp_out_bytes.fetch_add(actualOut, std::memory_order_relaxed);
+                g_stats.uncomp_us_sum.fetch_add(us, std::memory_order_relaxed);
+                return 0; // Z_OK
+            }
+        }
+    }
+    return g_origUncompress ? g_origUncompress(dest, destLen, source, sourceLen) : -3;
 }
 
 // --- Module 4C: Linux LP64 FastLoad (unzReadCurrentFile + 64-bit inflate_fast) ---
@@ -1991,8 +2781,10 @@ uint32_t HookAStarStep(void* astar, uint32_t maxSteps) {
     const double us = NsDeltaUs(t0, NowNs());
 
     *reinterpret_cast<float*>(ab + 0x60) += static_cast<float>(us * 1e-6);
+    const uint64_t u64 = static_cast<uint64_t>(us);
     g_stats.astar_steps.fetch_add(steps, std::memory_order_relaxed);
-    g_stats.astar_us_sum.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+    g_stats.astar_us_sum.fetch_add(u64, std::memory_order_relaxed);
+    tl_tickProf.astarUs += ClampUsU32(u64);
 
     if (outStatus != 0) {
         *reinterpret_cast<int32_t*>(ab + 0x08) = outStatus;
@@ -2029,8 +2821,8 @@ void LogTelemetrySummary(const char* tag) {
     LogMsg("[%s] ticks=%llu | tick_us(avg=%.0f p95=%.0f p99=%.0f max=%llu overruns=%llu) | "
            "GC(us/t=%.0f max=%llu full=%llu stwBlk=%llu kb=%d) | FindEnts(calls=%llu us/t=%.0f zcSites=%llu) | "
            "AStar(inits=%llu steps=%llu us=%llu ok=%llu fail=%llu) | "
-           "FastDump(calls=%llu ms=%.1f MB=%.2f fb=%llu) | Ser(calls=%llu ms=%.1f) | "
-           "Deflate(calls=%llu main=%llu ms=%.1f in=%.2fMB out=%.2fMB) | FastLoad(unz=%llu MB=%.1f ms=%.1f)",
+           "FastDump(calls=%llu ms=%.1f MB=%.2f fb=%llu) | FastJson(enc=%llu dec=%llu fb=%llu) | Ser(calls=%llu ms=%.1f) | "
+           "Deflate(calls=%llu main=%llu ms=%.1f in=%.2fMB out=%.2fMB) | FastLoad(unz=%llu MB=%.1f ms=%.1f uncomp=%llu outMB=%.1f)",
            tag, static_cast<unsigned long long>(ticks), avg, p95, p99,
            static_cast<unsigned long long>(g_stats.tick_us_max.load()),
            static_cast<unsigned long long>(g_stats.tick_overrun_count.load()),
@@ -2051,6 +2843,9 @@ void LogTelemetrySummary(const char* tag) {
            g_stats.fastdump_us_sum.load() / 1000.0,
            g_stats.fastdump_bytes_sum.load() / (1024.0 * 1024.0),
            static_cast<unsigned long long>(g_stats.fastdump_fallbacks.load()),
+           static_cast<unsigned long long>(g_stats.fastjson_enc_calls.load()),
+           static_cast<unsigned long long>(g_stats.fastjson_dec_calls.load()),
+           static_cast<unsigned long long>(g_stats.fastjson_fallbacks.load()),
            static_cast<unsigned long long>(g_stats.serialize_world_calls.load()),
            g_stats.serialize_world_us_sum.load() / 1000.0,
            static_cast<unsigned long long>(g_stats.deflate_calls.load()),
@@ -2060,15 +2855,20 @@ void LogTelemetrySummary(const char* tag) {
            g_stats.deflate_out_bytes.load() / (1024.0 * 1024.0),
            static_cast<unsigned long long>(g_stats.unz_hits.load()),
            g_stats.unz_bytes.load() / (1024.0 * 1024.0),
-           g_stats.unz_us_sum.load() / 1000.0);
+           g_stats.unz_us_sum.load() / 1000.0,
+           static_cast<unsigned long long>(g_stats.uncomp_calls.load()),
+           g_stats.uncomp_out_bytes.load() / (1024.0 * 1024.0));
 
     const uint64_t luaC = g_stats.prof_lua_update_calls.load();
     const uint64_t netC = g_stats.prof_net_update_calls.load();
     const uint64_t repC = g_stats.prof_replica_update_calls.load();
+    const uint64_t qrlC = g_replicaStats.qrl_calls.load();
     auto& asq = GetAsyncSave();
     LogMsg("[%s-SUB] luaUpdate(c=%llu avg=%.0fus max=%llu) | netUpdate(c=%llu avg=%.0fus max=%llu) | "
-           "repUpdate(c=%llu avg=%.0fus max=%llu) | FsNeg(hits=%llu misses=%llu) | "
-           "AsyncSave(enq=%llu ok=%llu bytes=%llu flush=%llu fb=%llu err=%llu enqUs=%llu ioMs=%.1f)",
+           "repUpdate(c=%llu avg=%.0fus max=%llu) | RepFast(on=%d qrlC=%llu qrlAvg=%.0fus qrlMax=%llu hits=%llu fb=%llu con=%llu dst=%llu cmp=%llu preClr=%llu zSkip=%llu paceB=%u prox=%d def=%llu brst=%llu pPro=%llu nByp=%llu) | "
+           "FsNeg(hits=%llu misses=%llu) | "
+           "AsyncSave(enq=%llu ok=%llu comp=%llu bytes=%llu flush=%llu fb=%llu err=%llu enqUs=%llu compMs=%.1f ioMs=%.1f) | "
+           "RpcQoS(imm=%lld offCh0=%lld tot=%lld)",
            tag,
            static_cast<unsigned long long>(luaC),
            luaC ? static_cast<double>(g_stats.prof_lua_update_us_sum.load()) / luaC : 0.0,
@@ -2079,16 +2879,38 @@ void LogTelemetrySummary(const char* tag) {
            static_cast<unsigned long long>(repC),
            repC ? static_cast<double>(g_stats.prof_replica_update_us_sum.load()) / repC : 0.0,
            static_cast<unsigned long long>(g_stats.prof_replica_update_us_max.load()),
+           g_replicaFastActive.load(std::memory_order_relaxed) ? 1 : 0,
+           static_cast<unsigned long long>(qrlC),
+           qrlC ? static_cast<double>(g_replicaStats.qrl_us_sum.load()) / qrlC : 0.0,
+           static_cast<unsigned long long>(g_replicaStats.qrl_us_max.load()),
+           static_cast<unsigned long long>(g_replicaStats.fast_proxy_hits.load()),
+           static_cast<unsigned long long>(g_replicaStats.slow_rel_fallbacks.load() + g_replicaStats.non_proxy_fallbacks.load()),
+           static_cast<unsigned long long>(g_replicaStats.constructed_total.load()),
+           static_cast<unsigned long long>(g_replicaStats.destroyed_total.load()),
+           static_cast<unsigned long long>(g_replicaStats.bulk_conn_compacts.load()),
+           static_cast<unsigned long long>(g_replicaStats.preser_cleared.load()),
+           static_cast<unsigned long long>(g_replicaStats.preser_zero_conn_skips.load()),
+           g_effectiveReplicaBudget.load(std::memory_order_relaxed),
+           g_replicaCfg.proximityValid ? 1 : 0,
+           static_cast<unsigned long long>(g_replicaStats.paced_deferred_total.load()),
+           static_cast<unsigned long long>(g_replicaStats.paced_burst_ticks.load()),
+           static_cast<unsigned long long>(g_replicaStats.paced_parent_promotes.load()),
+           static_cast<unsigned long long>(g_replicaStats.paced_near_bypasses.load()),
            static_cast<unsigned long long>(g_stats.fs_neg_hits.load()),
            static_cast<unsigned long long>(g_stats.fs_neg_misses.load()),
            static_cast<unsigned long long>(asq.EnqueuedCount()),
            static_cast<unsigned long long>(asq.CommittedCount()),
+           static_cast<unsigned long long>(asq.CompressedCount()),
            static_cast<unsigned long long>(asq.CommittedBytes()),
            static_cast<unsigned long long>(asq.FlushCount()),
            static_cast<unsigned long long>(g_stats.async_save_fallbacks.load()),
            static_cast<unsigned long long>(asq.ErrorCount()),
            static_cast<unsigned long long>(asq.EnqueueUsSum()),
-           asq.IoUsSum() / 1000.0);
+           asq.CompressUsSum() / 1000.0,
+           asq.IoUsSum() / 1000.0,
+           static_cast<long long>(g_rpcQos.ImmCount()),
+           static_cast<long long>(g_rpcQos.OffCh0Count()),
+           static_cast<long long>(g_rpcQos.TotalCalls()));
 }
 
 uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
@@ -2100,6 +2922,7 @@ uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
         g_simStartedForGc.store(true, std::memory_order_release);
     }
     g_stats.cur_tick_gc_us = 0;
+    tl_tickProf = {};
     const int64_t t0 = NowNs();
     const uint8_t ret = g_origSimUpdate(sim, dt, flag);
     const uint64_t totalUs = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
@@ -2110,9 +2933,37 @@ uint8_t HookSimUpdate(void* sim, float dt, uint8_t flag) {
 
     const uint64_t ticks = g_stats.ticks_total.fetch_add(1, std::memory_order_relaxed) + 1;
     g_stats.tick_us_sum.fetch_add(totalUs, std::memory_order_relaxed);
-    if (totalUs > 33333ULL) g_stats.tick_overrun_count.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t simHz = 30u;
+    const uint64_t budgetLimitUs = (simHz == 60u) ? 16667ULL : 33333ULL;
+    if (totalUs > budgetLimitUs) g_stats.tick_overrun_count.fetch_add(1, std::memory_order_relaxed);
     AtomicUpdateMax(g_stats.tick_us_max, totalUs);
     g_stats.PushTickSample(static_cast<uint32_t>(std::min<uint64_t>(totalUs, UINT32_MAX)));
+
+    const uint64_t bbThreshUs = (g_cfg.blackbox_threshold_ms > 0)
+        ? (static_cast<uint64_t>(g_cfg.blackbox_threshold_ms) * 1000ULL)
+        : budgetLimitUs;
+    g_blackboxLastThreshMs.store(static_cast<uint32_t>((bbThreshUs + 500ULL) / 1000ULL), std::memory_order_relaxed);
+    if (g_cfg.enable_blackbox && totalUs > bbThreshUs) {
+        hs_blackbox::ServerEvent ev{};
+        ev.epochMs   = NowEpochMs();
+        ev.tickSeq   = ticks;
+        ev.totalUs   = ClampUsU32(totalUs);
+        ev.budgetUs  = static_cast<uint32_t>(budgetLimitUs);
+        ev.luaUs     = tl_tickProf.luaUs;
+        ev.gcUs      = (tl_tickProf.gcUs > 0) ? tl_tickProf.gcUs : ClampUsU32(gcUs);
+        ev.netUs     = tl_tickProf.netUs;
+        ev.replicaUs = tl_tickProf.replicaUs;
+        ev.findEntUs = tl_tickProf.findEntUs;
+        ev.astarUs   = tl_tickProf.astarUs;
+        ev.saveUs    = tl_tickProf.saveUs;
+        ev.gcKb      = g_stats.gc_last_kb.load(std::memory_order_relaxed);
+        ev.gcFull    = tl_tickProf.gcFull;
+        ev.simHz     = static_cast<uint8_t>(simHz);
+        hs_blackbox::ComputeServerDerived(ev);
+        pthread_mutex_lock(&g_bbMtx);
+        g_serverBlackbox.Push(ev);
+        pthread_mutex_unlock(&g_bbMtx);
+    }
 
     if (g_cfg.enable_profiler && g_cfg.log_interval_ticks > 0 &&
         (ticks % static_cast<uint64_t>(g_cfg.log_interval_ticks) == 0)) {
@@ -2128,6 +2979,7 @@ uint8_t HookSimLuaUpdate(void* sim, float dt, uint8_t paused) {
     g_stats.prof_lua_update_calls.fetch_add(1, std::memory_order_relaxed);
     g_stats.prof_lua_update_us_sum.fetch_add(us, std::memory_order_relaxed);
     AtomicUpdateMax(g_stats.prof_lua_update_us_max, us);
+    tl_tickProf.luaUs += ClampUsU32(us);
     return rc;
 }
 
@@ -2138,38 +2990,76 @@ void HookNetMgrUpdate(void* mgr, float dt) {
     g_stats.prof_net_update_calls.fetch_add(1, std::memory_order_relaxed);
     g_stats.prof_net_update_us_sum.fetch_add(us, std::memory_order_relaxed);
     AtomicUpdateMax(g_stats.prof_net_update_us_max, us);
+    tl_tickProf.netUs += ClampUsU32(us);
 }
 
 void HookReplicaMgr3Update(void* rm) {
     const int64_t t0 = NowNs();
+    const bool preSerPatched = g_replicaPreSerPatched.load(std::memory_order_acquire) && (rm != nullptr);
+    const uint32_t snapBefore = preSerPatched
+        ? *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(rm) + 0x8a0)
+        : 0u;
     g_origReplicaUpdate(rm);
+    if (preSerPatched) {
+        const uint32_t snapAfter = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(rm) + 0x8a0);
+        if (snapAfter != snapBefore) {
+            hc_replica::ClearSerializedPreFlags(rm, g_replicaCfg, &g_replicaStats);
+        }
+    }
     const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
     g_stats.prof_replica_update_calls.fetch_add(1, std::memory_order_relaxed);
     g_stats.prof_replica_update_us_sum.fetch_add(us, std::memory_order_relaxed);
     AtomicUpdateMax(g_stats.prof_replica_update_us_max, us);
+    tl_tickProf.replicaUs += ClampUsU32(us);
+}
+
+void HookQueryReplicaList(void* conn, void* outConstruct, void* outDestroy) {
+    const int64_t t0 = NowNs();
+    if (g_replicaFastActive.load(std::memory_order_acquire) && g_replicaCfg.IsValid()) {
+        hc_replica::ReplicaAbiConfig runCfg = g_replicaCfg;
+        runCfg.maxConstructPerTick = g_effectiveReplicaBudget.load(std::memory_order_relaxed);
+        hc_replica::FastQueryReplicaList(
+            conn,
+            static_cast<hc_replica::DsListPtr*>(outConstruct),
+            static_cast<hc_replica::DsListPtr*>(outDestroy),
+            runCfg,
+            &g_replicaStats);
+    } else if (g_origQueryRepList) {
+        g_origQueryRepList(conn, outConstruct, outDestroy);
+    }
+    const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
+    g_replicaStats.qrl_us_sum.fetch_add(us, std::memory_order_relaxed);
+    AtomicUpdateMax(g_replicaStats.qrl_us_max, us);
 }
 
 int HookSimFindEntities(void* selfObj, void* L) {
     const int64_t t0 = NowNs();
     const int rc = g_origSimFindEnts(selfObj, L);
+    const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
     g_stats.find_entities_calls.fetch_add(1, std::memory_order_relaxed);
-    g_stats.find_entities_us_sum.fetch_add(static_cast<uint64_t>(NsDeltaUs(t0, NowNs())), std::memory_order_relaxed);
+    g_stats.find_entities_us_sum.fetch_add(us, std::memory_order_relaxed);
+    tl_tickProf.findEntUs += ClampUsU32(us);
     return rc;
 }
 
 int HookSimFindEntitiesReg(void* selfObj, void* L) {
     const int64_t t0 = NowNs();
     const int rc = g_origSimFindEntsReg(selfObj, L);
+    const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
     g_stats.find_entities_calls.fetch_add(1, std::memory_order_relaxed);
-    g_stats.find_entities_us_sum.fetch_add(static_cast<uint64_t>(NsDeltaUs(t0, NowNs())), std::memory_order_relaxed);
+    g_stats.find_entities_us_sum.fetch_add(us, std::memory_order_relaxed);
+    tl_tickProf.findEntUs += ClampUsU32(us);
     return rc;
 }
 
 int HookSerializeWorldSession(void* selfObj, void* L) {
+    SaveSubphaseGuard saveGuard;
     const int64_t t0 = NowNs();
     const int rc = g_origSerializeWorld(selfObj, L);
+    const uint64_t us = static_cast<uint64_t>(NsDeltaUs(t0, NowNs()));
     g_stats.serialize_world_calls.fetch_add(1, std::memory_order_relaxed);
-    g_stats.serialize_world_us_sum.fetch_add(static_cast<uint64_t>(NsDeltaUs(t0, NowNs())), std::memory_order_relaxed);
+    g_stats.serialize_world_us_sum.fetch_add(us, std::memory_order_relaxed);
+    saveGuard.Add(us);
     return rc;
 }
 
@@ -2266,28 +3156,7 @@ int ApplySpatialGridZeroCopyPatches() noexcept {
     return patched;
 }
 
-// --- Module 8: WritePersistentFile Interceptor & Shutdown Drain ---
-uint8_t HookWritePersistentFile(const char* path, const void* data, int size,
-                                void* cb, uint32_t arg5, void* arg6) {
-    struct CaptureGuard {
-        AsyncCaptureState prev;
-        CaptureGuard(const char* p, const void* d, uint32_t sz, bool enable) noexcept : prev(tl_asyncCapture) {
-            if (enable) {
-                tl_asyncCapture.active = true;
-                tl_asyncCapture.path   = p;
-                tl_asyncCapture.data   = d;
-                tl_asyncCapture.size   = sz;
-            }
-        }
-        ~CaptureGuard() noexcept { tl_asyncCapture = prev; }
-    };
-    const bool enable = g_cfg.enable_async_save &&
-                        g_asyncSaveActive.load(std::memory_order_acquire) &&
-                        path != nullptr && data != nullptr && size > 0;
-    CaptureGuard guard(path, data, enable ? static_cast<uint32_t>(size) : 0u, enable);
-    return g_origWritePFile(path, data, size, cb, arg5, arg6);
-}
-
+// --- Module 8 & 9: EncodePersistentString / WritePersistentFile / RPC4::Call ---
 bool CanCaptureAsyncFopen(const char* path) noexcept {
     if (!path || path[0] == '\0' || !g_real_stat) return false;
     const size_t len = std::strlen(path);
@@ -2308,6 +3177,55 @@ bool CanCaptureAsyncFopen(const char* path) noexcept {
         if (S_ISDIR(tst.st_mode) || (tst.st_mode & S_IWUSR) == 0) return false;
     }
     return true;
+}
+
+void HookRpc4Call(void* thisPtr, const char* uniqueID, void* bitStream,
+                  int priority, int reliability, uint8_t orderingChannel,
+                  const void* systemIdentifier, uint8_t broadcast, uint8_t callLocally) {
+    if (!g_origRpc4Call) return;
+    if (g_cfg.enable_rpc_qos &&
+        g_rpcQosActive.load(std::memory_order_acquire) &&
+        bitStream != nullptr) {
+        const uint8_t* bs = static_cast<const uint8_t*>(bitStream);
+        uint32_t bsBits = 0;
+        const uint8_t* bsData = nullptr;
+        std::memcpy(&bsBits, bs + 0x00, sizeof(bsBits));
+        std::memcpy(&bsData, bs + 0x10, sizeof(bsData));
+        const auto cls = g_rpcQos.Classify(uniqueID, bsData, bsBits, priority, reliability, orderingChannel);
+        priority = cls.priority;
+        orderingChannel = cls.orderingChannel;
+    }
+    g_origRpc4Call(thisPtr, uniqueID, bitStream, priority, reliability, orderingChannel,
+                   systemIdentifier, broadcast, callLocally);
+}
+
+uint8_t HookWritePersistentFile(const char* path, const void* data, int size,
+                                void* cb, uint32_t arg5, void* arg6) {
+    struct CaptureGuard {
+        AsyncCaptureState prev;
+        CaptureGuard(bool enable, const char* p, const void* d, uint32_t sz) noexcept
+            : prev(tl_asyncCapture) {
+            if (enable) {
+                tl_asyncCapture.active = true;
+                tl_asyncCapture.path   = p;
+                tl_asyncCapture.data   = d;
+                tl_asyncCapture.size   = sz;
+            }
+        }
+        ~CaptureGuard() noexcept { tl_asyncCapture = prev; }
+    };
+
+    if (!g_origWritePFile) return 0;
+
+    // EncodePersistentString is never substituted with placeholder tokens: data is ALWAYS complete,
+    // independently decodable save bytes (and already SIMD-accelerated via libdeflate compress2 hook).
+    // CommonFopenShim commits it atomically with per-path serialization, unique temp file, and verified
+    // write + fsync + close + rename BEFORE reporting success to DST!
+    const bool enablePlain = g_cfg.enable_async_save &&
+                             g_asyncSaveActive.load(std::memory_order_acquire) &&
+                             path != nullptr && data != nullptr && size > 0;
+    CaptureGuard guard(enablePlain, path, data, enablePlain ? static_cast<uint32_t>(size) : 0u);
+    return g_origWritePFile(path, data, size, cb, arg5, arg6);
 }
 
 void FlushSavesAndLogOnShutdown() noexcept {
@@ -2342,13 +3260,16 @@ void HyperCoreLinuxInit() {
     g_isServerProcess.store(true, std::memory_order_release);
     ShimGuard guard;
     InitPathsAndLoadConfig();
-    LogMsg("=== DST HyperCore Server Linux Engine v1.3.0 Boot (PID=%d) ===", static_cast<int>(getpid()));
+    g_hostCaps = hc_server_tier::ProbeHostCaps();
+    ApplyServerHardwareTierLive(g_cfg.hardware_tier);
+    LogMsg("=== DST HyperCore Server Linux Engine v1.6.0 Boot (PID=%d) ===", static_cast<int>(getpid()));
     LogMsg("Config: profiler=%d mimalloc=%d spatial_zc=%d adaptive_gc=%d libdeflate=%d(L%d) "
-           "fastload=%d fast_dumper=%d fast_astar=%d fs_neg=%d async_save=%d",
+           "fastload=%d fast_dumper=%d fast_astar=%d fs_neg=%d async_save=%d rpc_qos=%d rep_fast=%d(pace=%u)",
            g_cfg.enable_profiler?1:0, g_cfg.enable_mimalloc?1:0, g_cfg.enable_spatial_zerocopy?1:0,
            g_cfg.enable_adaptive_gc?1:0, g_cfg.enable_libdeflate?1:0, g_cfg.libdeflate_level,
            g_cfg.enable_fastload?1:0, g_cfg.enable_fast_dumper?1:0, g_cfg.enable_fast_astar?1:0,
-           g_cfg.enable_fs_neg_cache?1:0, g_cfg.enable_async_save?1:0);
+           g_cfg.enable_fs_neg_cache?1:0, g_cfg.enable_async_save?1:0, g_cfg.enable_rpc_qos?1:0,
+           g_cfg.enable_replica_fastpath?1:0, g_effectiveReplicaBudget.load(std::memory_order_relaxed));
 
     dl_iterate_phdr(DlPhdrCallback, nullptr);
     if (!g_exeTextBeg || !g_exeTextEnd) {
@@ -2378,8 +3299,11 @@ void HyperCoreLinuxInit() {
     g_lua.setfield     = reinterpret_cast<decltype(g_lua.setfield)>(FindUniqueAob(kAobLuaSetField));
     g_lua.gc           = reinterpret_cast<decltype(g_lua.gc)>(FindUniqueAob(kAobLuaGc));
     g_lua.next         = reinterpret_cast<decltype(g_lua.next)>(FindUniqueAob(kAobLuaNext));
-    LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d",
-           g_lua.ReadyForRegister() ? 1 : 0, g_lua.ReadyForFastDump() ? 1 : 0);
+    g_lua.rawset       = reinterpret_cast<decltype(g_lua.rawset)>(FindUniqueAob(kAobLuaRawSet));
+    g_lua.rawseti      = reinterpret_cast<decltype(g_lua.rawseti)>(FindUniqueAob(kAobLuaRawSetI));
+    LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d ReadyForFastJson=%d",
+           g_lua.ReadyForRegister() ? 1 : 0, g_lua.ReadyForFastDump() ? 1 : 0,
+           g_lua.ReadyForFastJson() ? 1 : 0);
 
     // 2. Materialize immortal singletons BEFORE installing hooks
     (void)GetFsNegCache();
@@ -2443,6 +3367,123 @@ void HyperCoreLinuxInit() {
         const bool ok = InstallHookSysV(pRepUpd, reinterpret_cast<void*>(&HookReplicaMgr3Update), 18,
                                         reinterpret_cast<void**>(&g_origReplicaUpdate), &rel, 1);
         LogMsg("[HOOK] ReplicaManager3::Update @ %p -> %s", pRepUpd, ok ? "OK" : "FAIL");
+
+        if (ok && g_cfg.enable_replica_fastpath) {
+            auto decodeRel32Call = [](const uint8_t* site) -> uint8_t* {
+                if (!site || site[0] != 0xE8) return nullptr;
+                int32_t disp = 0;
+                std::memcpy(&disp, site + 1, 4);
+                return const_cast<uint8_t*>(site + 5 + static_cast<int64_t>(disp));
+            };
+            uint8_t* pQrl   = FindUniqueAob(kAobQueryRepLst);
+            uint8_t* pRel   = FindUniqueAob(kAobNetProxyRel);
+            uint8_t* pQdB   = FindUniqueAob(kAobNetProxyQd);
+            uint8_t* pInvId = FindUniqueAob(kAobInvItemId);
+            bool cfgOk = false;
+            if (pQrl && pRel && pQdB && pInvId &&
+                pQrl[0x59] == 0x48 && pQrl[0x5a] == 0x8B && pQrl[0x5b] == 0x3D &&
+                pQrl[0x6b] == 0xE8 && pQrl[0x1a1] == 0xE8) {
+                int32_t dispNet = 0;
+                std::memcpy(&dispNet, pQrl + 0x5c, 4);
+                auto** ppNetMgr = reinterpret_cast<void**>(pQrl + 0x59 + 7 + static_cast<int64_t>(dispNet));
+                uint8_t* pGetCli  = decodeRel32Call(pQrl + 0x6b);
+                uint8_t* pPush    = decodeRel32Call(pQrl + 0x1a1);
+                uint8_t* pHostNew = (pPush && pPush[0x58] == 0xE8) ? decodeRel32Call(pPush + 0x58) : nullptr;
+                uint8_t* pHostDel = (pPush && pPush[0x8d] == 0xE8) ? decodeRel32Call(pPush + 0x8d) : nullptr;
+
+                // Verify NetworkProxy::QueryDestruction secondary thunk at pQdB + 0x80 (`endbr64; sub rdi, 0x20; jmp rel32`)
+                uint8_t* pQdThunk = pQdB + 0x80;
+                bool thunkOk = (pQdThunk[0] == 0xF3 && pQdThunk[1] == 0x0F && pQdThunk[2] == 0x1E && pQdThunk[3] == 0xFA &&
+                                pQdThunk[4] == 0x48 && pQdThunk[5] == 0x83 && pQdThunk[6] == 0xEF && pQdThunk[7] == 0x20 &&
+                                pQdThunk[8] == 0xE9);
+                if (thunkOk) {
+                    int32_t jdisp = 0;
+                    std::memcpy(&jdisp, pQdThunk + 9, 4);
+                    thunkOk = (pQdThunk + 13 + static_cast<int64_t>(jdisp) == pQdB);
+                }
+                const uint8_t* qdSlot    = thunkOk ? FindUniqueElfDataPtr(pQdThunk) : nullptr;
+                const uint8_t* invIdSlot = FindUniqueElfDataPtr(pInvId);
+                if (ppNetMgr && pGetCli && pHostNew && pHostDel && qdSlot && invIdSlot) {
+                    hc_replica::ReplicaAbiConfig cfg{};
+                    cfg.ppNetMgr          = ppNetMgr;
+                    cfg.fnGetClientByGuid = reinterpret_cast<hc_replica::GetClientByGuidFn_t>(pGetCli);
+                    cfg.fnIsRelevant      = reinterpret_cast<hc_replica::IsRelevantFn_t>(pRel);
+                    cfg.fnHostNew         = reinterpret_cast<hc_replica::HostNewFn_t>(pHostNew);
+                    cfg.fnHostDelete      = reinterpret_cast<hc_replica::HostDeleteFn_t>(pHostDel);
+                    cfg.networkProxyVtbl  = qdSlot - 0x50;
+                    cfg.invItemCompVtbl   = invIdSlot - 0x38;
+                    // Verified Linux x86_64 GCC Itanium ABI Build 762172 offsets
+                    cfg.offNetMgrIsClient     = 0x2d0;
+                    cfg.offNetMgrReplicaMgr   = 0x250;
+                    cfg.offClientReady        = 0x329;
+                    cfg.offClientBlocked      = 0x32a;
+                    cfg.offEntDestroyed       = 0x1f4;
+                    cfg.offEntHidden1c4       = 0x1ac;
+                    cfg.offEntHidden1c8       = 0x1b0;
+                    cfg.offEntParent1         = 0x088;
+                    cfg.offEntParent2         = 0x0a8;
+                    cfg.offEntCompBegin       = 0x0d0;
+                    cfg.offEntCompEnd         = 0x0d8;
+                    cfg.vtblOffQueryConstruct = 0x048;
+                    cfg.vtblOffQueryDestruct  = 0x050;
+                    cfg.vtblOffIsDestroyed    = 0x140;
+
+                    // Fail-closed proximity offset verification on Linux Build 762172 ELF:
+                    //   1) kAobNetProxySetOwner: mov rdi, [ppNetMgr]; mov rdi, [rax+0x1b8]; mov rax, [rbx+0x18]
+                    //   2) kAobSpatialAnchorFindEnts: movzx ebx,[r13+0x1f4]; subss xmm1,[r13+0x1e8]; subss xmm2,[r13+0x1f0]
+                    uint8_t* pSetOwner = FindUniqueAob(kAobNetProxySetOwner);
+                    uint8_t* pFindEnts = FindUniqueAob(kAobSpatialAnchorFindEnts);
+                    if (pSetOwner && pFindEnts &&
+                        pSetOwner[0xcc] == 0x48 && pSetOwner[0xcd] == 0x8B && pSetOwner[0xce] == 0x3D) {
+                        int32_t dispNetOwn = 0;
+                        std::memcpy(&dispNetOwn, pSetOwner + 0xcf, 4);
+                        auto** ppNetOwn = reinterpret_cast<void**>(pSetOwner + 0xcc + 7 + static_cast<int64_t>(dispNetOwn));
+                        const bool plyOk = (ppNetOwn == ppNetMgr) &&
+                            pSetOwner[0xf9]  == 0x48 && pSetOwner[0xfa]  == 0x8B && pSetOwner[0xfb]  == 0xB8 &&
+                            pSetOwner[0xfc]  == 0xB8 && pSetOwner[0xfd]  == 0x01 && pSetOwner[0xfe]  == 0x00 && pSetOwner[0xff] == 0x00 &&
+                            pSetOwner[0x111] == 0x48 && pSetOwner[0x112] == 0x8B && pSetOwner[0x113] == 0x43 && pSetOwner[0x114] == 0x18;
+                        const bool posOk =
+                            pFindEnts[0x58] == 0x41 && pFindEnts[0x59] == 0x0F && pFindEnts[0x5a] == 0xB6 && pFindEnts[0x5b] == 0x9D &&
+                            pFindEnts[0x5c] == 0xF4 && pFindEnts[0x5d] == 0x01 && pFindEnts[0x5e] == 0x00 && pFindEnts[0x5f] == 0x00 &&
+                            pFindEnts[0x73] == 0xF3 && pFindEnts[0x74] == 0x41 && pFindEnts[0x75] == 0x0F && pFindEnts[0x76] == 0x5C &&
+                            pFindEnts[0x77] == 0x8D && pFindEnts[0x78] == 0xE8 && pFindEnts[0x79] == 0x01 && pFindEnts[0x7a] == 0x00 && pFindEnts[0x7b] == 0x00 &&
+                            pFindEnts[0x8b] == 0xF3 && pFindEnts[0x8c] == 0x41 && pFindEnts[0x8d] == 0x0F && pFindEnts[0x8e] == 0x5C &&
+                            pFindEnts[0x8f] == 0x95 && pFindEnts[0x90] == 0xF0 && pFindEnts[0x91] == 0x01 && pFindEnts[0x92] == 0x00 && pFindEnts[0x93] == 0x00;
+                        if (plyOk && posOk) {
+                            cfg.proximityValid       = true;
+                            cfg.offClientPlayerProxy = 0x1b8;
+                            cfg.offEntPosX           = 0x1e8;
+                            cfg.offEntPosZ           = 0x1f0;
+                        }
+                    }
+                    g_replicaCfg = cfg;
+                    cfgOk = g_replicaCfg.IsValid();
+                }
+            }
+            if (cfgOk && pQrl) {
+                const bool okQrl = InstallHookSysV(pQrl, reinterpret_cast<void*>(&HookQueryReplicaList), 16,
+                                                   reinterpret_cast<void**>(&g_origQueryRepList));
+                g_replicaFastActive.store(okQrl, std::memory_order_release);
+                LogMsg("[HOOK] cNetworkConnection::QueryReplicaList FastPath @ %p -> %s (proxyVtbl=%p invVtbl=%p prox=%d paceBudget=%u)",
+                       pQrl, okQrl ? "OK" : "FAIL", g_replicaCfg.networkProxyVtbl, g_replicaCfg.invItemCompVtbl,
+                       g_replicaCfg.proximityValid ? 1 : 0, g_effectiveReplicaBudget.load(std::memory_order_relaxed));
+
+                // Patch Linux PreSerialize 17k-entity full-world scan (`test r15d, r15d; je +26h` -> `jmp +26h`)
+                if (okQrl &&
+                    pRepUpd[0x1d1] == 0x45 && pRepUpd[0x1d2] == 0x85 && pRepUpd[0x1d3] == 0xFF &&
+                    pRepUpd[0x1d4] == 0x74 && pRepUpd[0x1d5] == 0x26) {
+                    const uint8_t jmpByte = 0xEB;
+                    if (PatchTextBytesWX(pRepUpd + 0x1d4, &jmpByte, 1)) {
+                        g_replicaPreSerPatched.store(true, std::memory_order_release);
+                        LogMsg("[PERF][REPLICA] Patched Linux PreSerialize full-world scan @ %p -> Zero-Scan active",
+                               pRepUpd + 0x1d4);
+                    }
+                }
+            } else {
+                LogMsg("[WARN][REPLICA] Linux FastPath symbol verification incomplete (pQrl=%p pRel=%p pQdB=%p pInvId=%p)",
+                       pQrl, pRel, pQdB, pInvId);
+            }
+        }
     }
     if (uint8_t* pFe = FindUniqueAob(kAobSimFindEnts)) {
         InstallHookSysV(pFe, reinterpret_cast<void*>(&HookSimFindEntities), 15,
@@ -2467,6 +3508,11 @@ void HyperCoreLinuxInit() {
             const bool ok = InstallHookSysV(pCmp, reinterpret_cast<void*>(&HookCompress2), 15,
                                             reinterpret_cast<void**>(&g_origCompress2));
             LogMsg("[HOOK] zlib::compress2 (LP64) @ %p -> %s", pCmp, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pUncomp = FindUniqueAob(kAobUncompress)) {
+            const bool ok = InstallHookSysV(pUncomp, reinterpret_cast<void*>(&HookUncompress), 21,
+                                            reinterpret_cast<void**>(&g_origUncompress));
+            LogMsg("[FASTLOAD] zlib::uncompress (LP64) @ %p -> %s", pUncomp, ok ? "OK" : "FAIL");
         }
     }
     if (g_cfg.enable_fastload) {
@@ -2523,14 +3569,24 @@ void HyperCoreLinuxInit() {
         LogMsg("[HOOK] Pathfinder FastAStar O(N log N) -> %s", g_astarReady ? "OK" : "FAIL");
     }
 
-    // 8. Module 7 & Module 8: FS Neg Cache + WritePersistentFile Async Commit
+    // 8. Module 7 & Module 8: FS Neg Cache + WritePersistentFile Verified Atomic Commit
     g_fsNegCacheActive.store(g_cfg.enable_fs_neg_cache, std::memory_order_release);
     if (g_cfg.enable_async_save) {
         if (uint8_t* pWpf = FindUniqueAob(kAobWritePFile)) {
             const bool ok = InstallHookSysV(pWpf, reinterpret_cast<void*>(&HookWritePersistentFile), 15,
                                             reinterpret_cast<void**>(&g_origWritePFile));
             g_asyncSaveActive.store(ok, std::memory_order_release);
-            LogMsg("[HOOK] WritePersistentFile AsyncCommit @ %p -> %s", pWpf, ok ? "OK" : "FAIL");
+            LogMsg("[HOOK] WritePersistentFile VerifiedAtomicCommit @ %p -> %s", pWpf, ok ? "OK" : "FAIL");
+        }
+    }
+
+    // 9. Module 9: Causal 3-Channel RakNet::RPC4 QoS Classifier
+    if (g_cfg.enable_rpc_qos) {
+        if (uint8_t* pRpc = FindUniqueAob(kAobRpc4Call)) {
+            const bool ok = InstallHookSysV(pRpc, reinterpret_cast<void*>(&HookRpc4Call), 16,
+                                            reinterpret_cast<void**>(&g_origRpc4Call));
+            g_rpcQosActive.store(ok, std::memory_order_release);
+            LogMsg("[HOOK] RakNet::RPC4::Call CausalQoS @ %p -> %s", pRpc, ok ? "OK" : "FAIL");
         }
     }
 
@@ -2561,10 +3617,27 @@ static FILE* CommonFopenShim(FopenFn_t realFn, const char* path, const char* mod
     if (tl_asyncCapture.active && path && mode && std::strcmp(mode, "wb") == 0 &&
         tl_asyncCapture.path && std::strcmp(path, tl_asyncCapture.path) == 0 &&
         g_asyncSaveActive.load(std::memory_order_acquire)) {
-        GetFsNegCache().InvalidateAll();
-        if (CanCaptureAsyncFopen(path) &&
-            GetAsyncSave().Enqueue(path, tl_asyncCapture.data, tl_asyncCapture.size)) {
-            return GetAsyncSentinelFp();
+        const void* capData = tl_asyncCapture.data;
+        const uint32_t capSize = tl_asyncCapture.size;
+        tl_asyncCapture.active = false;
+        if (CanCaptureAsyncFopen(path) && capData && capSize > 0) {
+            int savedErr = 0;
+            const int64_t tCommit0 = NowNs();
+            // Synchronous verified atomic commit (per-path lock + unique temp file +
+            // verified write/fsync/close + rename): NEVER fabricate save success!
+            if (GetAsyncSave().CommitSyncAtomic(path, capData, capSize, &savedErr)) {
+                const uint64_t commitUs = static_cast<uint64_t>(NsDeltaUs(tCommit0, NowNs()));
+                if (g_hasMainSimThread.load(std::memory_order_acquire) &&
+                    pthread_equal(pthread_self(), g_mainSimThread.load(std::memory_order_relaxed)) != 0 &&
+                    tl_tickProf.saveDepth == 0) {
+                    tl_tickProf.saveUs += ClampUsU32(commitUs);
+                }
+                GetFsNegCache().InvalidateAll();
+                return GetAsyncSentinelFp();
+            }
+            g_stats.async_save_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            errno = savedErr ? savedErr : EIO;
+            return nullptr;
         }
         g_stats.async_save_fallbacks.fetch_add(1, std::memory_order_relaxed);
         GetAsyncSave().FlushPendingForPath(path);
@@ -2585,7 +3658,7 @@ static FILE* CommonFopenShim(FopenFn_t realFn, const char* path, const char* mod
                 const int savedErr = errno;
                 if (!fp && (savedErr == ENOENT || savedErr == ENOTDIR)) {
                     g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
-                    GetFsNegCache().Insert(h1, h2, now, 15LL * 1000000000LL);
+                    GetFsNegCache().Insert(h1, h2, now, g_fsNegTtlNs.load(std::memory_order_relaxed));
                 }
                 errno = savedErr;
                 return fp;
@@ -2673,7 +3746,7 @@ static int CommonXstatShim(XstatFn_t realFn, int ver, const char* path, void* bu
             const int savedErr = errno;
             if (rc != 0 && (savedErr == ENOENT || savedErr == ENOTDIR)) {
                 g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
-                GetFsNegCache().Insert(h1, h2, now, 15LL * 1000000000LL);
+                GetFsNegCache().Insert(h1, h2, now, g_fsNegTtlNs.load(std::memory_order_relaxed));
             }
             errno = savedErr;
             return rc;
@@ -2712,7 +3785,7 @@ static int CommonStatShim(StatFn_t realFn, const char* path, void* buf) {
             const int savedErr = errno;
             if (rc != 0 && (savedErr == ENOENT || savedErr == ENOTDIR)) {
                 g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
-                GetFsNegCache().Insert(h1, h2, now, 15LL * 1000000000LL);
+                GetFsNegCache().Insert(h1, h2, now, g_fsNegTtlNs.load(std::memory_order_relaxed));
             }
             errno = savedErr;
             return rc;
@@ -2751,7 +3824,7 @@ HC_EXPORT int access(const char* pathname, int mode) {
             const int savedErr = errno;
             if (rc != 0 && (savedErr == ENOENT || savedErr == ENOTDIR)) {
                 g_stats.fs_neg_misses.fetch_add(1, std::memory_order_relaxed);
-                GetFsNegCache().Insert(h1, h2, now, 15LL * 1000000000LL);
+                GetFsNegCache().Insert(h1, h2, now, g_fsNegTtlNs.load(std::memory_order_relaxed));
             }
             errno = savedErr;
             return rc;

@@ -1,42 +1,43 @@
-name = "HyperCore Server (服务端深度性能优化引擎)"
-description = [[
-《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.3.0 巨型基地全链路提速版 · 5/5 空间网格零拷贝 & O(N log N) 原生寻路引擎）。
-单装本 Mod 即可生效全部 Lua 级手术优化；配合开源原生引擎插件 bin64/iphlpapi.dll（可前往 GitHub Release 下载）更可解锁无锁 mimalloc 内存池、5/5 空间网格零拷贝、O(N log N) 极速寻路引擎、压力驱动自适应 GC、C++ 原生极速存档序列化与 SIMD 压缩！
+local is_zh = (locale == "zh" or locale == "zhr" or locale == "zht")
+local function L(zh, en)
+    if is_zh then
+        return zh
+    end
+    return en
+end
 
-【v1.3.0 新特性 · 巨型基地全链路引擎升级（零玩法分歧 · 零存档变更）】
-- 5/5 全覆盖 SpatialGrid::Query 零拷贝加速：在原有 FindEntities 缓存标签路径基础上，完整补齐其余 4 处高频只读空间查询（FindEntities_DirectTag、FindEntities_Registered、LightWatcher 光照强度与 RGB 查询），彻底消除巨型基地每帧数万次 MSVCR90 malloc + memcpy + free 堆复制风暴！
-- O(N log N) 原生 FastAStar 寻路引擎（bin64/iphlpapi.dll 默认启用）：将原版 PathFinder 每步全表 std::sort + 双链表线性扫 + 逐节点 new/delete（O(S^2 log S)）替换为平坦开放寻址哈希表 + 二叉最小堆 + 连续内存池，100% 复用原版邻居/地形/围墙/船只/道路判定函数与启发函数，巨型围墙基地与猎犬/Boss 绕障寻路大幅提速且路径结果与原版等价！
-- 控制台 c_hyperstats() 同步升级：实时展示 SpatialGrid 实体/光照查询总数、FastAStar 寻路次数/步数/总耗时/回退次数。
+name = L("HyperCore 服务端深度性能优化引擎", "HyperCore Server Performance Engine")
+description = L([[
+《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.6.0-beta1 测试版热更新 · 零失步分层副本分帧平滑 + O(N) 副本极速引擎 + 因果 3 通道 RPC QoS）。
+单装本 Mod 即可生效全部 Lua 级手术优化（零分配 PushEvent_Internal、HasTags 展开、C++ FastJson 加速与 c_hyperprof() 热点采样）；配合开源原生引擎插件 bin64/iphlpapi.dll（或 Linux x86_64 libhypercore.so）更可解锁无锁 mimalloc 内存池、5/5 空间网格零拷贝、O(N log N) 极速寻路引擎、压力驱动自适应 GC、C++ 原生极速存档序列化、因果 3 通道 RPC QoS、验证原子存盘与巨型基地副本分帧平滑！
 
-【v1.2.1 P0 存档安全热修】
-- 彻底根治旧版 v1.2.0 开启「白名单惰性腐烂精确积分 (opt_lazy_perishable)」时，在存档保存阶段对已过期休眠食物写入负值 perishremainingtime 导致重载世界时在 POPULATING 期中途销毁实体并触发 inventoryitem_replica.lua:225 (classified 为 nil) 专服无法启动的严重隐患！
-- 全面改为 100% 零副作用只读 GetPercent() 与零副作用 OnSave()（过期实体统一以安全正值 0.01 落盘，真正腐烂推迟至存盘后异步结算），为全部休眠/唤醒/容器事件加装 GLOBAL.POPULATING 防护锁，并在 Perishable:OnLoad 内置向后兼容自愈——无需手动修改存档文件，更新本版即可直接无损救活受 v1.2.0 影响的旧存档！
+【v1.6.0-beta1 测试版热更新（零玩法分歧 · 零失步 · 零存档变更）】
+- Module 10B 零失步分层副本构造限流（Replica Construction Pacing）：进入 1500+ 实体巨型基地或跳虫洞时，自动将远距离静态建筑平滑分散至多帧下发，彻底消除 250KB 单帧网络洪峰与客户端 700ms 瞬间卡顿！
+- 严格 Tier-0 零延迟直通：世界/网络代理、玩家与归属实体、Classified 界面、父子/背包物品、以及玩家 14 格内近身威胁 0ms 直达，并自动父先于子提升（Parent-Before-Child Promotion）杜绝挂件失步。
+- 控制台新增 c_hyperpacing() 实时调参，c_hyperstats() 新增副本加速与分帧统计，并声明 DNH 伴侣（dnh_github）热更新元数据。
 
-【v1.2.0 新特性 · 双端自协商真 60Hz 逻辑刻 & 0ms 零停顿网络发包】
-- 新增可选开关「60Hz 极速逻辑刻模式」（默认关闭保持 100% 纯原版 30Hz 兼容，客户端无需安装任何文件）；
-- 服主开启后（需配套 bin64/iphlpapi.dll），服务端逻辑判定、物理步进与 4/4 子系统时钟全面升级至真 60Hz（16.7ms/刻，保持 1.000x 原版真实游戏倍速），自动同步网络快照频率至 U=60(1)（尊重 cluster.ini 手动配置）、启用 120Hz 高精度内核稳帧消除 0/2 拍频抖动，并自动通过世界网络标签/RPC 握手通知 HyperSmooth v2.4.0+ 客户端无缝切入 60Hz 协同模式！
-- 原生插件内置 RakNet 事件驱动零停顿唤醒（30Hz/60Hz 均默认生效），彻底消除服务端状态快照在 WaitOnEvent(10) 中白等 0~10ms 的网络空转（零轮询、0% 空闲 CPU）！
+【既有核心特性 · 零分歧默认开启】
+1. 5/5 SpatialGrid 空间网格全零拷贝 + O(N log N) FastAStar 寻路引擎 + mimalloc 无锁 Lua 堆 + RakNet 0ms 事件唤醒 + 因果 3 通道 RPC QoS + 原子存盘防护。
+2. 鱼人村 RetargetFn 无过滤风暴修复 + 生物错峰苏醒 + 安全白名单惰性腐烂精确积分 + 60Hz 双端可选协同逻辑刻。
+3. 控制台 c_hyperstats() 实时查看 Tick P95/P99、GC、SpatialGrid、FastAStar、FastDump、FastJson、RepFast、FSNeg、AsyncSave 与 RpcQoS 指标。
+]], [[
+Dedicated & Host-Server Deep Performance Optimization Suite for Don't Starve Together (v1.6.0-beta1 Beta Hotfix: Zero-Desync Tiered Replica Construction Pacing + O(N) Replica Fast-Path + Causal 3-Channel RPC QoS).
+Install this mod alone for all Lua-level surgical optimizations (zero-alloc PushEvent_Internal pool, unrolled HasTags, FastJson bridge, c_hyperprof() profiler); pair with open-source native companion bin64/iphlpapi.dll (Windows) or libhypercore.so (Linux x86_64) to unlock lockless mimalloc Lua heap, 5/5 SpatialGrid zero-copy, O(N log N) FastAStar pathfinding, pressure-driven adaptive GC, causal 3-channel RPC QoS, verified atomic save commits, and mega-base replica burst pacing!
 
-【v1.1.0+ 架构与安全加固】
-- FastDataDumper 防环检测 + 256MB 安全上限 + 区域无关浮点格式化，彻底免疫异常 Mod 嵌套环表与逗号小数区域环境。
-- SpatialGrid 无限大/NaN 半径原版等价回退 + 独立 AOB Fail-Closed 校验 + W^X 跳板只读固化 + Windows x64 SEH 栈展开表完备。
-- 多分片（Master / Caves）独立日志隔离 + 端口独占防劫持 + 鱼人索敌保留第三方 Mod 兼容 + 野牛软上限精确排除玩家驯化与带鞍牛。
+[v1.6.0-beta1 Beta Hotfix (Zero Gameplay Divergence, Zero Desync, Zero Save Lock-in)]
+- Module 10B Zero-Desync Tiered Replica Construction Pacing: spreads 1,500+ entity mega-base and wormhole entry bursts across smooth ticks (nearest-first buckets) to eliminate 250KB RM3 burst spikes and 700ms client stalls.
+- Strict Tier-0 0-Tick Bypass: World/Net proxies, players, classifieds, parented/inventory items, and <=14wu nearby threats construct immediately with automatic Parent-Before-Child Promotion (zero child-before-parent desync).
+- Added c_hyperpacing() console control, RepFast pacing telemetry in c_hyperstats(), and DNH companion (dnh_github) metadata.
 
-【核心特性 · 零分歧默认开启】
-1. 鱼人村 RetargetFn 无过滤全扫 Bug 手术修复：保留 100% 原版战斗逻辑与第三方 Mod 兼容，前置标签过滤，彻底消除鱼人王 / 沃特鱼人军团对树木、箱子、冬季盛宴糖果的无效全扫卡顿。
-2. 实体群体错峰苏醒调度：平滑分散大基地加载瞬间的集中唤醒尖峰。
-3. 安全白名单惰性腐烂积分：对休眠地面与关闭容器内的普通易腐食物启用精确温湿度积分（自动跳过全部自定义 onperishfn 物品、热食、光源与温控场），ShowMe/Insight 查询实时精确，存档绝不写入 paused=true，随时卸载 100% 恢复原版！
-4. C++ 原生极速存档桥接：配合 bin64/iphlpapi.dll 时自动切换 C++ FastDataDumper（155 MB/s，实测存档主线程冻结降低 46%），异常自动回退原版，100% 原版存档格式零锁死。
-5. 控制台性能透视：服务端控制台输入 c_hyperstats() 一键查看 Tick 均值/P95/P99、GC、空间检索与存档耗时。
-
-【可选治理策略 · 默认关闭，按需开启】
-- 休眠地面杂物安全自动堆叠：仅合并远离玩家且持续休眠的同种基础可堆叠杂物，永不删除任何物品。
-- 野生牛群生态软承载上限：超过上限后仅暂停野牛自然繁殖，永不删除已有牛群，自动排除已驯化/正在驯化/带鞍的玩家牛。
-
-注意：默认 30Hz 模式下 100% 纯服务端生效，客户端无需下载；随时取消勾选即可无损退回原版，零存档残留！
-]]
+[Core Features]
+1. 5/5 SpatialGrid zero-copy queries, O(N log N) FastAStar, mimalloc Lua allocator, 0ms RakNet event wakeup, Causal 3-Channel RPC QoS, Verified Atomic Save-Commit.
+2. Merm RetargetFn tag pre-filter fix, staggered entity wake, safe whitelist lazy perishable integration, optional 60Hz synced SimTick mode.
+3. Run c_hyperstats() in server console to inspect Tick P95/P99, GC, SpatialGrid, FastAStar, FastDump, FastJson, RepFast, FSNeg, AsyncSave, and RpcQoS telemetry.
+]])
 author = "Hakimi Tech Lab"
-version = "1.3.0.1"
+version = "1.6.0-beta1"
+dnh_github = "wangxu1428/DST-HyperSmooth-240FPS"
+dnh_github_asset = "iphlpapi.dll"
 forumthread = ""
 api_version = 10
 
@@ -52,77 +53,113 @@ server_filter_tags = { "optimization", "performance", "hypercore", "优化" }
 icon_atlas = "modicon.xml"
 icon = "modicon.tex"
 
+-- NOTE: Klei executes modinfo.lua in a bare sandbox (no ipairs/pairs/string/table/tostring globals).
 configuration_options = {
     {
         name = "opt_fast_dumper",
-        label = "[零分歧] C++ 极速存档序列化桥接",
-        hover = "配合 bin64/iphlpapi.dll 启用 C++ 原生 FastDataDumper 加速每日存档（100% 原版存档格式，异常自动回退原版）",
+        label = L("[零分歧] C++ 极速存档序列化桥接", "[Zero-Div] C++ FastDataDumper Bridge"),
+        hover = L("配合原生引擎插件启用 C++ FastDataDumper 加速每日存档（100% 原版格式，异常自动回退原版）",
+                  "Accelerates daily save serialization via native FastDataDumper when iphlpapi.dll/libhypercore.so is installed (100% vanilla save format)"),
         options = {
-            { description = "启用 (推荐)", data = true },
-            { description = "禁用", data = false },
+            { description = L("启用 (推荐)", "Enabled (Recommended)"), data = true },
+            { description = L("禁用", "Disabled"), data = false },
         },
         default = true,
     },
     {
         name = "opt_merm_retarget",
-        label = "[零分歧] 鱼人村索敌无过滤风暴修复",
-        hover = "修复原版 merm.lua 未传标签导致鱼人王/沃特鱼人军团每秒全扫地上杂物与树木的 Bug（战斗逻辑 100% 一致）",
+        label = L("[零分歧] 鱼人村索敌无过滤风暴修复", "[Zero-Div] Merm Retarget Tag-Filter Fix"),
+        hover = L("修复原版 merm.lua 未传标签导致鱼人王/沃特鱼人军团每秒全扫地上杂物与树木的 Bug（战斗逻辑 100% 一致）",
+                  "Fixes vanilla merm.lua un-filtered entity scans that scan trees/items on Merm King/Wurt servers (100% identical combat behavior)"),
         options = {
-            { description = "启用 (推荐)", data = true },
-            { description = "禁用", data = false },
+            { description = L("启用 (推荐)", "Enabled (Recommended)"), data = true },
+            { description = L("禁用", "Disabled"), data = false },
         },
         default = true,
     },
     {
         name = "opt_staggered_wake",
-        label = "[零分歧] 密集生物错峰苏醒调度",
-        hover = "将加载瞬间同时苏醒的密集生物大脑分散在 0.0~0.5 秒内平滑启动，消除瞬间卡顿尖峰",
+        label = L("[零分歧] 密集生物错峰苏醒调度", "[Zero-Div] Staggered Entity Wakeup"),
+        hover = L("将加载瞬间同时苏醒的密集生物大脑分散在 0.0~0.5 秒内平滑启动，消除瞬间卡顿尖峰",
+                  "Spreads simultaneous brain wakeups across 0.0-0.5s during world/sector load to smooth out tick spikes"),
         options = {
-            { description = "启用 (推荐)", data = true },
-            { description = "禁用", data = false },
+            { description = L("启用 (推荐)", "Enabled (Recommended)"), data = true },
+            { description = L("禁用", "Disabled"), data = false },
         },
         default = true,
     },
     {
         name = "opt_lazy_perishable",
-        label = "[零分歧] 白名单惰性腐烂精确积分",
-        hover = "对休眠与关闭容器内的安全白名单易腐食物按温湿度精确积分（跳过特殊腐烂物品；绝不锁死存档，卸载零残留）",
+        label = L("[零分歧] 白名单惰性腐烂精确积分", "[Zero-Div] Whitelist Lazy Perishable"),
+        hover = L("对休眠与关闭容器内的安全白名单易腐食物按温湿度精确积分（跳过特殊腐烂物品；绝不锁死存档，卸载零残留）",
+                  "Pauses vanilla per-tick perish timers on dormant/closed whitelisted foods and integrates accurately via read-only temperature math (safe to uninstall anytime)"),
         options = {
-            { description = "启用 (推荐)", data = true },
-            { description = "禁用", data = false },
+            { description = L("启用 (推荐)", "Enabled (Recommended)"), data = true },
+            { description = L("禁用", "Disabled"), data = false },
         },
         default = true,
     },
     {
         name = "opt_offline_autostack",
-        label = "[可选治理] 休眠地面杂物安全堆叠",
-        hover = "仅在远离玩家且持续休眠后，自动合并地面同种基础散落物（木头/石头/草/树枝等），永不删除任何物品",
+        label = L("[可选治理] 休眠地面杂物安全堆叠", "[Optional] Dormant Ground Auto-Stack"),
+        hover = L("仅在远离玩家且持续休眠后，自动合并地面同种基础散落物（木头/石头/草/树枝等），永不删除任何物品",
+                  "Safely merges matching basic ground stackables when far from players and dormant; never deletes any item"),
         options = {
-            { description = "关闭 (原版默认)", data = false },
-            { description = "开启 (仅安全合并)", data = true },
+            { description = L("关闭 (原版默认)", "Disabled (Vanilla Default)"), data = false },
+            { description = L("开启 (仅安全合并)", "Enabled (Safe Merge Only)"), data = true },
         },
         default = false,
     },
     {
         name = "opt_wild_beefalo_cap",
-        label = "[可选治理] 野生牛群生态软上限",
-        hover = "全图野生牛群达到上限后仅暂停自然发情繁殖，绝不删除已有牛群，也不影响玩家驯化牛",
+        label = L("[可选治理] 野生牛群生态软上限", "[Optional] Wild Beefalo Soft Cap"),
+        hover = L("全图野生牛群达到上限后仅暂停自然发情繁殖，绝不删除已有牛群，也不影响玩家驯化牛",
+                  "Pauses natural wild beefalo reproduction once the global wild cap is reached; never deletes existing or domesticated/saddled beefalo"),
         options = {
-            { description = "关闭 (原版默认)", data = 0 },
-            { description = "40 头野牛", data = 40 },
-            { description = "60 头野牛", data = 60 },
-            { description = "100 头野牛", data = 100 },
+            { description = L("关闭 (原版默认)", "Disabled (Vanilla Default)"), data = 0 },
+            { description = L("40 头野牛", "40 Wild Beefalo"), data = 40 },
+            { description = L("60 头野牛", "60 Wild Beefalo"), data = 60 },
+            { description = L("100 头野牛", "100 Wild Beefalo"), data = 100 },
         },
         default = 0,
     },
     {
         name = "opt_sim_60hz",
-        label = "[实验 · 双端高刷] 60Hz 真逻辑刻模式",
-        hover = "需配套 bin64/iphlpapi.dll（自动同步 U=60(1) 网络快照，无需手改 cluster.ini）。开启后逻辑刻由 30Hz 翻倍至 60Hz 并自动与 HyperSmooth v2.4.0+ 客户端握手生效（普通玩家服请保持关闭）",
+        label = L("[实验 · 双端高刷] 60Hz 真逻辑刻模式", "[Experimental] True 60Hz Server SimTick"),
+        hover = L("需配套原生插件（自动同步 U=60(1) 网络快照，无需手改 cluster.ini）。开启后逻辑刻由 30Hz 翻倍至 60Hz 并与 HyperSmooth 客户端协同（普通服请保持关闭）",
+                  "Requires native plugin (auto-syncs U=60(1) snapshots). Doubles server simulation clock from 30Hz to true 60Hz and handshakes with HyperSmooth clients (keep OFF for standard servers)"),
         options = {
-            { description = "关闭 (原版 30Hz · 推荐)", data = false },
-            { description = "开启 (60Hz 双端高刷实验模式)", data = true },
+            { description = L("关闭 (原版 30Hz · 推荐)", "Disabled (Vanilla 30Hz · Recommended)"), data = false },
+            { description = L("开启 (60Hz 双端高刷实验模式)", "Enabled (60Hz Synced Experimental)"), data = true },
         },
         default = false,
+    },
+    {
+        name = "hardware_tier",
+        label = L("[原生引擎] 服务端硬件性能档位", "[Native] Server Hardware Liberation Tier"),
+        hover = L("需配合原生插件 iphlpapi.dll / libhypercore.so：按服务器配置调节内存/GC/存盘/压缩预算，高端解放档还会关闭 Win11 EcoQoS 并为地面与洞穴分别分配独立物理大核",
+                  "Requires native plugin (iphlpapi.dll / libhypercore.so): scales mimalloc retention, GC budget, FastDump/AsyncSave limits, Win11 EcoQoS bypass, and Master/Caves physical P-core hints"),
+        options = {
+            { description = L("0 · 省电低配 (低内存保守)", "0 · Low Spec (Conservative)"), data = 0 },
+            { description = L("1 · 均衡标准 (推荐默认)", "1 · Balanced (Recommended)"), data = 1 },
+            { description = L("2 · 高端全解放 (大内存高核全开)", "2 · Unleashed (Full Hardware)"), data = 2 },
+        },
+        default = 1,
+    },
+    {
+        name = "opt_replica_pacing",
+        label = L("[原生引擎 · 零分歧] 巨型基地副本分帧平滑", "[Native · Zero-Div] Mega-Base Replica Construction Pacing"),
+        hover = L("需配合原生插件：进入巨型基地或跳虫洞时将远端静态建筑分散在多帧平滑下发，消除客户端瞬间卡顿；周围 14 格内威胁/玩家/背包容器/父实体永远 0 延迟直达",
+                  "Requires native plugin: spreads mega-base / wormhole entry bursts across smooth ticks (nearest-first) while keeping <=14wu nearby threats, players, classifieds, inventory/parented entities, and needed parents at 0-tick latency"),
+        options = {
+            { description = L("自动 (跟随硬件档位 · 推荐)", "Auto (Follow Hardware Tier · Recommended)"), data = -1 },
+            { description = L("关闭 (原版单帧全发)", "Off (Vanilla Single-Tick Burst)"), data = 0 },
+            { description = L("64 实体/刻 (极度平滑)", "64 entities/tick (Ultra Smooth)"), data = 64 },
+            { description = L("96 实体/刻 (均衡推荐)", "96 entities/tick (Balanced)"), data = 96 },
+            { description = L("128 实体/刻 (高吞吐)", "128 entities/tick (High Throughput)"), data = 128 },
+            { description = L("192 实体/刻 (宽松限流)", "192 entities/tick (Relaxed)"), data = 192 },
+            { description = L("256 实体/刻 (轻度限流)", "256 entities/tick (Light)"), data = 256 },
+        },
+        default = -1,
     },
 }

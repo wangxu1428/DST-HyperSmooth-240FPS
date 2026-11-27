@@ -64,11 +64,45 @@ inline bool IsCacheableReadOnlyAssetPath(const wchar_t* rawPath, uint64_t* outH1
     if (len < 6) return false;
     buf[len] = L'\0';
 
+    // Path traversal guard: allow at most a single leading "..\\mods\\" or "..\\data\\" segment.
+    size_t scanFrom = 0;
+    bool hasRelParentAnchor = false;
+    if (len >= 8 && std::wmemcmp(buf, L"..\\mods\\", 8) == 0) {
+        hasRelParentAnchor = true;
+        scanFrom = 3;
+    } else if (len >= 8 && std::wmemcmp(buf, L"..\\data\\", 8) == 0) {
+        hasRelParentAnchor = true;
+        scanFrom = 3;
+    }
+    if (ContainsSubstr(buf + scanFrom, len - scanFrom, L"..", 2)) return false;
+
+    struct RelPrefix { const wchar_t* pfx; size_t len; };
+    static constexpr RelPrefix kRelAssetRoots[] = {
+        { L"mods\\",         5 },
+        { L"data\\",         5 },
+        { L"scripts\\",      8 },
+        { L"anim\\",         5 },
+        { L"images\\",       7 },
+        { L"shaders\\",      8 },
+        { L"sound\\",        6 },
+        { L"fonts\\",        6 },
+        { L"bigportraits\\", 13 },
+        { L"minimap\\",      8 },
+        { L"levels\\",       7 },
+        { L"databundles\\",  12 },
+    };
+    bool hasRelAssetRoot = false;
+    for (const auto& r : kRelAssetRoots) {
+        if (len >= r.len && std::wmemcmp(buf, r.pfx, r.len) == 0) {
+            hasRelAssetRoot = true;
+            break;
+        }
+    }
     const bool hasRootAnchor =
+        hasRelParentAnchor ||
+        hasRelAssetRoot ||
         ContainsSubstr(buf, len, L"\\mods\\", 6) ||
-        ContainsSubstr(buf, len, L"\\data\\", 6) ||
-        (len >= 5 && std::wmemcmp(buf, L"mods\\", 5) == 0) ||
-        (len >= 5 && std::wmemcmp(buf, L"data\\", 5) == 0);
+        ContainsSubstr(buf, len, L"\\data\\", 6);
     if (!hasRootAnchor) return false;
 
     struct Forbidden { const wchar_t* tok; size_t len; };
@@ -82,7 +116,10 @@ inline bool IsCacheableReadOnlyAssetPath(const wchar_t* rawPath, uint64_t* outH1
         { L"profile",      7 },
         { L".tmp",         4 },
         { L"bin64",        5 },
-        { L"log",          3 },
+        { L".log",         4 },
+        { L"\\log\\",       5 },
+        { L"_log.",        5 },
+        { L"persistent",   10 },
     };
     for (const auto& f : kForbidden) {
         if (ContainsSubstr(buf, len, f.tok, f.len)) return false;
@@ -134,6 +171,22 @@ inline bool IsCacheableReadOnlyAssetPath(const wchar_t* rawPath, uint64_t* outH1
         if (outH2) *outH2 = h2;
     }
     return true;
+}
+
+inline bool IsCacheableReadOnlyAssetPathA(const char* rawPath,
+                                          uint64_t* outH1 = nullptr,
+                                          uint64_t* outH2 = nullptr) noexcept {
+    if (!rawPath || !rawPath[0]) return false;
+    wchar_t wbuf[520];
+    size_t i = 0;
+    for (; rawPath[i] != '\0'; ++i) {
+        if (i >= 519) return false;
+        const unsigned char c = static_cast<unsigned char>(rawPath[i]);
+        if (c < 0x20 || c >= 0x80) return false; // non-ASCII / control chars bypass fail-closed
+        wbuf[i] = static_cast<wchar_t>(c);
+    }
+    wbuf[i] = L'\0';
+    return IsCacheableReadOnlyAssetPath(wbuf, outH1, outH2);
 }
 
 class NegativeStatCache {

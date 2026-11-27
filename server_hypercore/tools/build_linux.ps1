@@ -29,6 +29,7 @@ $ldFiles = @(
     @{ src = "$ld\lib\x86\cpu_features.c";   out = "$obj\ld_cpu.o" },
     @{ src = "$ld\lib\adler32.c";            out = "$obj\ld_adler32.o" },
     @{ src = "$ld\lib\deflate_decompress.c"; out = "$obj\ld_decomp.o" },
+    @{ src = "$ld\lib\zlib_decompress.c";    out = "$obj\ld_zdecomp.o" },
     @{ src = "$ld\lib\deflate_compress.c";   out = "$obj\ld_comp.o" },
     @{ src = "$ld\lib\zlib_compress.c";      out = "$obj\ld_zcomp.o" }
 )
@@ -42,7 +43,7 @@ $miObj = "$obj\mimalloc_static.o"
 & $zig cc @commonC "-I$mi\include" "-DMI_STATIC_LIB=1" "-DMI_SKIP_COLLECT_ON_EXIT=1" "-DMI_OVERRIDE=0" -c "$mi\src\static.c" -o $miObj
 if ($LASTEXITCODE -ne 0) { throw "Failed compiling mimalloc static.c" }
 
-Write-Host "[3/3] Cross-compiling & linking libhypercore.so (DST HyperCore Server Linux Engine v1.3.0)..."
+Write-Host "[3/3] Cross-compiling & linking libhypercore.so (DST HyperCore Server Linux Engine v1.6.0-beta1)..."
 $mainObj = "$obj\hypercore_linux.o"
 & $zig c++ -target $target -std=c++20 -O3 -march=x86_64 -fPIC -fvisibility=hidden -DNDEBUG `
     -Wall -Wextra -Wno-unused-parameter `
@@ -59,7 +60,7 @@ $mapFile = $lnxDir.Replace('\', '/') + "/exports.map"
     "-Wl,-Bsymbolic" `
     -o $outSo `
     $mainObj $miObj `
-    "$obj\ld_utils.o" "$obj\ld_cpu.o" "$obj\ld_adler32.o" "$obj\ld_decomp.o" "$obj\ld_comp.o" "$obj\ld_zcomp.o" `
+    "$obj\ld_utils.o" "$obj\ld_cpu.o" "$obj\ld_adler32.o" "$obj\ld_decomp.o" "$obj\ld_zdecomp.o" "$obj\ld_comp.o" "$obj\ld_zcomp.o" `
     -lpthread -ldl -lm
 if ($LASTEXITCODE -ne 0) { throw "Failed linking libhypercore.so" }
 
