@@ -132,6 +132,142 @@ inline constexpr const char* kReflBatchFs =
     "\tgl_FragColor = vec4(rgb, clamp(fade * smoothstep(0.28, 0.65, a), 0.0, 1.0));\n"
     "}\n";
 
+inline constexpr const char* kReflBatchFs16 =
+    "#if defined(GL_ES)\n"
+    "precision highp float;\n"
+    "#endif\n"
+    "uniform sampler2D HS_BATCH_TEX0;\n"
+    "uniform sampler2D HS_BATCH_TEX1;\n"
+    "uniform sampler2D HS_BATCH_TEX2;\n"
+    "uniform sampler2D HS_BATCH_TEX3;\n"
+    "uniform sampler2D HS_BATCH_TEX4;\n"
+    "uniform sampler2D HS_BATCH_TEX5;\n"
+    "uniform sampler2D HS_BATCH_TEX6;\n"
+    "uniform sampler2D HS_BATCH_TEX7;\n"
+    "uniform sampler2D HS_BATCH_TEX8;\n"
+    "uniform sampler2D HS_BATCH_TEX9;\n"
+    "uniform sampler2D HS_BATCH_TEX10;\n"
+    "uniform sampler2D HS_BATCH_TEX11;\n"
+    "uniform sampler2D HS_BATCH_TEX12;\n"
+    "uniform sampler2D HS_BATCH_TEX13;\n"
+    "uniform sampler2D HS_BATCH_TEX14;\n"
+    "uniform sampler2D HS_BATCH_TEX15;\n"
+    "varying vec3 v_tc;\n"
+    "varying vec4 v_cmult;\n"
+    "varying vec4 v_cadd;\n"
+    "void main() {\n"
+    "\tfloat s = v_tc.z;\n"
+    "\tvec4 c;\n"
+    "\tif (s < 7.5) {\n"
+    "\t\tif (s < 3.5) {\n"
+    "\t\t\tif (s < 1.5)      c = (s < 0.5) ? texture2D(HS_BATCH_TEX0, v_tc.xy) : texture2D(HS_BATCH_TEX1, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 2.5) ? texture2D(HS_BATCH_TEX2, v_tc.xy) : texture2D(HS_BATCH_TEX3, v_tc.xy);\n"
+    "\t\t} else {\n"
+    "\t\t\tif (s < 5.5)      c = (s < 4.5) ? texture2D(HS_BATCH_TEX4, v_tc.xy) : texture2D(HS_BATCH_TEX5, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 6.5) ? texture2D(HS_BATCH_TEX6, v_tc.xy) : texture2D(HS_BATCH_TEX7, v_tc.xy);\n"
+    "\t\t}\n"
+    "\t} else {\n"
+    "\t\tif (s < 11.5) {\n"
+    "\t\t\tif (s < 9.5)      c = (s < 8.5) ? texture2D(HS_BATCH_TEX8, v_tc.xy) : texture2D(HS_BATCH_TEX9, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 10.5) ? texture2D(HS_BATCH_TEX10, v_tc.xy) : texture2D(HS_BATCH_TEX11, v_tc.xy);\n"
+    "\t\t} else {\n"
+    "\t\t\tif (s < 13.5)     c = (s < 12.5) ? texture2D(HS_BATCH_TEX12, v_tc.xy) : texture2D(HS_BATCH_TEX13, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 14.5) ? texture2D(HS_BATCH_TEX14, v_tc.xy) : texture2D(HS_BATCH_TEX15, v_tc.xy);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\tfloat a = c.a * v_cmult.a;\n"
+    "\tif (a < 0.28) {\n"
+    "\t\tdiscard;\n"
+    "\t}\n"
+    "\tvec3 premul = c.rgb * v_cmult.rgb + c.a * v_cadd.rgb;\n"
+    "\tvec3 rgb = clamp(premul / max(a, 0.001), vec3(0.0), vec3(1.25));\n"
+    "\tfloat h = v_cadd.w;\n"
+    "\tfloat fade = smoothstep(0.02, 0.16, h) * (1.0 - smoothstep(1.40, 7.80, h));\n"
+    "\tgl_FragColor = vec4(rgb, clamp(fade * smoothstep(0.28, 0.65, a), 0.0, 1.0));\n"
+    "}\n";
+
+inline constexpr const char* kReflBatchGpuVs =
+    "#version 430 compatibility\n"
+    "#extension GL_ARB_bindless_texture : require\n"
+    "struct HsGpuInst { vec4 m0; vec4 m1; vec4 m2; vec4 cmult; vec4 cadd; vec4 meta; vec4 meta2; uvec2 tex0; uvec2 tex1; uvec2 tex2; uvec2 flags; };\n"
+    "layout(std430, binding = 0) readonly buffer HsGpuInstBuf { HsGpuInst hs_gpu_insts[]; };\n"
+    "uniform vec4 u_reflBounds;\n"
+    "uniform vec4 u_reflEye;\n"
+    "uniform vec4 u_reflBack;\n"
+    "attribute vec4 POS2D_UV;\n"
+    "attribute vec4 HS_BATCH_WPOS;\n"
+    "varying vec2 v_tc;\n"
+    "varying vec4 v_cmult;\n"
+    "varying vec4 v_cadd;\n"
+    "flat out uvec2 v_btex;\n"
+    "void main() {\n"
+    "\tint hs_iid = int(HS_BATCH_WPOS.x + 0.5);\n"
+    "\tHsGpuInst hs_ins = hs_gpu_insts[hs_iid];\n"
+    "\tif (hs_ins.cadd.w < 0.5) {\n"
+    "\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+    "\t\tv_tc = vec2(0.0);\n"
+    "\t\tv_cmult = vec4(0.0);\n"
+    "\t\tv_cadd = vec4(0.0);\n"
+    "\t\tv_btex = uvec2(0u, 0u);\n"
+    "\t\treturn;\n"
+    "\t}\n"
+    "\tvec2 hs_p = POS2D_UV.xy;\n"
+    "\tfloat hs_dx = hs_ins.m0.x * hs_p.x + hs_ins.m1.x * hs_p.y;\n"
+    "\tfloat hs_dy = hs_ins.m0.y * hs_p.x + hs_ins.m1.y * hs_p.y;\n"
+    "\tfloat hs_dz = hs_ins.m0.z * hs_p.x + hs_ins.m1.z * hs_p.y;\n"
+    "\tfloat hs_wx = hs_dx + hs_ins.m2.x;\n"
+    "\tfloat hs_wy = hs_dy + hs_ins.m2.y;\n"
+    "\tfloat hs_wz = hs_dz + hs_ins.m2.z;\n"
+    "\tif (hs_ins.meta2.z > 0.5 && hs_dy > 0.06) {\n"
+    "\t\tfloat hs_ho;\n"
+    "\t\tif (hs_ins.meta2.z < 1.5) {\n"
+    "\t\t\ths_ho = hs_ins.meta2.x * smoothstep(0.08, 1.35, hs_dy)\n"
+    "\t\t\t      + hs_ins.meta2.y * smoothstep(0.06, 1.10, hs_dy);\n"
+    "\t\t} else {\n"
+    "\t\t\tfloat hs_b2 = smoothstep(1.00, 3.80, hs_dy);\n"
+    "\t\t\tfloat hs_hc = min(hs_dy, 8.0);\n"
+    "\t\t\ths_ho = hs_ins.meta2.x * (hs_b2 * hs_b2) * (0.18 + 0.025 * hs_hc);\n"
+    "\t\t}\n"
+    "\t\ths_wx += hs_ins.meta.w * hs_ho;\n"
+    "\t\ths_wz += hs_ins.meta2.w * hs_ho;\n"
+    "\t}\n"
+    "\tfloat hs_si = floor(POS2D_UV.z * 0.5);\n"
+    "\tv_tc = vec2(POS2D_UV.z - 2.0 * hs_si, POS2D_UV.w);\n"
+    "\tv_btex = (hs_si < 0.5) ? hs_ins.tex0 : ((hs_si < 1.5) ? hs_ins.tex1 : hs_ins.tex2);\n"
+    "\tfloat hs_h = clamp(hs_wy, 0.0, 8.5);\n"
+    "\tfloat hs_eyeY = max(u_reflEye.y, 6.0);\n"
+    "\tfloat hs_ls = clamp(u_reflBounds.w, 0.50, 1.60);\n"
+    "\tfloat hs_s = hs_eyeY / max(hs_eyeY + hs_h * hs_ls, 1.0);\n"
+    "\tvec2 hs_rxz = mix(u_reflEye.xz, vec2(hs_wx, hs_wz), hs_s);\n"
+    "\tvec2 hs_ndc = (hs_rxz - u_reflBounds.xy) * u_reflBounds.z;\n"
+    "\tvec3 hs_pref = vec3(hs_wx, -hs_h, hs_wz);\n"
+    "\tfloat hs_vd = dot(u_reflEye.xyz - hs_pref, u_reflBack.xyz);\n"
+    "\tfloat hs_z = clamp((hs_vd - 4.0) / 140.0, 0.0, 1.0) * 1.98 - 0.99;\n"
+    "\tv_cmult = hs_ins.cmult;\n"
+    "\tv_cadd  = vec4(hs_ins.cadd.rgb, hs_h);\n"
+    "\tgl_Position = vec4(hs_ndc.x, hs_ndc.y, hs_z, 1.0);\n"
+    "}\n";
+
+inline constexpr const char* kReflBatchGpuFs =
+    "#version 430 compatibility\n"
+    "#extension GL_ARB_bindless_texture : require\n"
+    "varying vec2 v_tc;\n"
+    "varying vec4 v_cmult;\n"
+    "varying vec4 v_cadd;\n"
+    "flat in uvec2 v_btex;\n"
+    "void main() {\n"
+    "\tvec4 c = texture2D(sampler2D(v_btex), v_tc);\n"
+    "\tfloat a = c.a * v_cmult.a;\n"
+    "\tif (a < 0.28) {\n"
+    "\t\tdiscard;\n"
+    "\t}\n"
+    "\tvec3 premul = c.rgb * v_cmult.rgb + c.a * v_cadd.rgb;\n"
+    "\tvec3 rgb = clamp(premul / max(a, 0.001), vec3(0.0), vec3(1.25));\n"
+    "\tfloat h = v_cadd.w;\n"
+    "\tfloat fade = smoothstep(0.02, 0.16, h) * (1.0 - smoothstep(1.40, 7.80, h));\n"
+    "\tgl_FragColor = vec4(rgb, clamp(fade * smoothstep(0.28, 0.65, a), 0.0, 1.0));\n"
+    "}\n";
+
 class WaterReflectionEngine {
 public:
     WaterReflectionEngine() = default;
@@ -224,6 +360,7 @@ public:
             tex_[0] = tex_[1] = 0;
             depthRbo_[0] = depthRbo_[1] = 0;
             progBatch_ = 0;
+            progBatchGpu_ = 0;
         }
         ready_ = false;
         failed_ = false;
@@ -313,15 +450,17 @@ public:
         }
         RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
 
-        beganWriteThisFrame_   = true;
-        batchUniUploadedFrame_ = false;
+        beganWriteThisFrame_      = true;
+        batchUniUploadedFrame_    = false;
+        batchGpuUniUploadedFrame_ = false;
         return true;
     }
 
     void MirrorBatchedSprites(uint32_t indexCount,
                               const WaterReflConfig& cfg,
                               const hs_world_shadow::ShadowPassState& saved,
-                              hs_gl_cache::ThreadState& glCache) noexcept {
+                              hs_gl_cache::ThreadState& glCache,
+                              uintptr_t indexByteOffset = 0u) noexcept {
         if (!ready_ || !beganWriteThisFrame_ || indexCount == 0u || !ops_.IsComplete()) return;
         if (!cfg.IsEnabled() || !IsInsideWorldPass(saved.dstFbo)) return;
 
@@ -343,7 +482,54 @@ public:
         }
 
         ops_.glDrawElements(hs_world_shadow::kGlTriangles, static_cast<int32_t>(indexCount),
-                            hs_world_shadow::kGlUnsignedShort, nullptr);
+                            hs_world_shadow::kGlUnsignedShort, reinterpret_cast<const void*>(indexByteOffset));
+        ++curFrameDraws_;
+        wroteAnyThisFrame_ = true;
+
+        ops_.glUseProgram(restoreProg);
+        ops_.glBindFramebuffer(hs_world_shadow::kGlFramebuffer, saved.dstFbo);
+        ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
+        if (saved.glCacheTrusted) {
+            glCache.curProgram = restoreProg;
+        }
+    }
+
+    void MirrorBatchedSpritesGpu(uint32_t ssboId,
+                                 uint32_t indexCount,
+                                 int32_t baseVertex,
+                                 uintptr_t indexByteOffset,
+                                 const WaterReflConfig& cfg,
+                                 const hs_world_shadow::ShadowPassState& saved,
+                                 hs_gl_cache::ThreadState& glCache) noexcept {
+        if (!ready_ || !beganWriteThisFrame_ || !isNativeGl_ || progBatchGpu_ == 0u ||
+            indexCount == 0u || ssboId == 0u || !ops_.IsComplete() ||
+            !ops_.glBindBufferBase || !ops_.glDrawElementsBaseVertex) {
+            return;
+        }
+        if (!cfg.IsEnabled() || !IsInsideWorldPass(saved.dstFbo)) return;
+
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted);
+        const uint32_t restoreProg = ResolveHostProgram(saved, glCache);
+
+        ops_.glBindFramebuffer(hs_world_shadow::kGlFramebuffer, fbo_[writeSlot_]);
+        ops_.glViewport(0, 0, static_cast<int32_t>(kReflRes), static_cast<int32_t>(kReflRes));
+        ApplyReflWriteRasterState();
+
+        ops_.glUseProgram(progBatchGpu_);
+        ops_.glBindBufferBase(hs_world_shadow::kGlShaderStorageBuffer, hs_world_shadow::kGpuInstBinding, ssboId);
+        if (!batchGpuUniUploadedFrame_) {
+            const float eyeU[4]  = { effEyeX_, effEyeY_, effEyeZ_, 0.0f };
+            const float backU[4] = { effBackX_, effBackY_, effBackZ_, 0.0f };
+            if (locBatchGpuBounds_ >= 0) ops_.glUniform4fv(locBatchGpuBounds_, 1, writeBounds_);
+            if (locBatchGpuEye_ >= 0)    ops_.glUniform4fv(locBatchGpuEye_, 1, eyeU);
+            if (locBatchGpuBack_ >= 0)   ops_.glUniform4fv(locBatchGpuBack_, 1, backU);
+            batchGpuUniUploadedFrame_ = true;
+        }
+
+        ops_.glDrawElementsBaseVertex(hs_world_shadow::kGlTriangles, static_cast<int32_t>(indexCount),
+                                      hs_world_shadow::kGlUnsignedShort,
+                                      reinterpret_cast<const void*>(indexByteOffset), baseVertex);
         ++curFrameDraws_;
         wroteAnyThisFrame_ = true;
 
@@ -416,10 +602,11 @@ public:
 
 private:
     void ResetFrameFlags() noexcept {
-        sawOceanThisFrame_      = false;
-        beganWriteThisFrame_    = false;
-        wroteAnyThisFrame_      = false;
-        batchUniUploadedFrame_  = false;
+        sawOceanThisFrame_        = false;
+        beganWriteThisFrame_      = false;
+        wroteAnyThisFrame_        = false;
+        batchUniUploadedFrame_    = false;
+        batchGpuUniUploadedFrame_ = false;
         boundForOceanThisFrame_ = false;
         curFrameDraws_          = 0u;
     }
@@ -596,7 +783,7 @@ private:
         const uint32_t sh = ops_.glCreateShader(type);
         if (sh == 0u) return 0u;
         std::string src;
-        if (isNativeGl_) {
+        if (isNativeGl_ && std::strncmp(rawSrc, "#version", 8) != 0) {
             src.reserve(std::strlen(rawSrc) + 16u);
             src.append("#version 100\n");
             src.append(rawSrc);
@@ -624,9 +811,9 @@ private:
         return sh;
     }
 
-    uint32_t BuildBatchProgram() noexcept {
-        const uint32_t vs = CompileShader(hs_world_shadow::kGlVertexShader, kReflBatchVs, "ReflBatch.VS");
-        const uint32_t fs = CompileShader(hs_world_shadow::kGlFragmentShader, kReflBatchFs, "ReflBatch.FS");
+    uint32_t BuildProgramPair(const char* vsSrc, const char* fsSrc, const char* tag, bool bindColAttribs) noexcept {
+        const uint32_t vs = CompileShader(hs_world_shadow::kGlVertexShader, vsSrc, tag);
+        const uint32_t fs = CompileShader(hs_world_shadow::kGlFragmentShader, fsSrc, tag);
         if (vs == 0u || fs == 0u) {
             if (vs) ops_.glDeleteShader(vs);
             if (fs) ops_.glDeleteShader(fs);
@@ -641,8 +828,10 @@ private:
         ops_.glAttachShader(prog, vs);
         ops_.glAttachShader(prog, fs);
         ops_.glBindAttribLocation(prog, 0u, "POS2D_UV");
-        ops_.glBindAttribLocation(prog, 5u, "HS_BATCH_CMULT");
-        ops_.glBindAttribLocation(prog, 6u, "HS_BATCH_CADD");
+        if (bindColAttribs) {
+            ops_.glBindAttribLocation(prog, 5u, "HS_BATCH_CMULT");
+            ops_.glBindAttribLocation(prog, 6u, "HS_BATCH_CADD");
+        }
         ops_.glBindAttribLocation(prog, 7u, "HS_BATCH_WPOS");
         ops_.glLinkProgram(prog);
         ops_.glDeleteShader(vs);
@@ -656,7 +845,7 @@ private:
                 int32_t logLen = 0;
                 ops_.glGetProgramInfoLog(prog, sizeof(logBuf) - 1, &logLen, logBuf);
                 char msg[640]{};
-                std::snprintf(msg, sizeof(msg), "[REFL][ERR] Link failed (ReflBatch): %s", logBuf);
+                std::snprintf(msg, sizeof(msg), "[REFL][ERR] Link failed (%s): %s", tag, logBuf);
                 ops_.logFn(msg);
             }
             ops_.glDeleteProgram(prog);
@@ -665,19 +854,28 @@ private:
         return prog;
     }
 
+    uint32_t BuildBatchProgram(bool use16BatchSlots) noexcept {
+        return BuildProgramPair(kReflBatchVs, use16BatchSlots ? kReflBatchFs16 : kReflBatchFs, "ReflBatch", true);
+    }
+
+    uint32_t BuildGpuBatchProgram() noexcept {
+        return BuildProgramPair(kReflBatchGpuVs, kReflBatchGpuFs, "ReflBatchGpu", false);
+    }
+
     bool EnsureResources(const hs_world_shadow::ShadowPassState& saved,
                          hs_gl_cache::ThreadState& glCache) noexcept {
         if (failed_) return false;
         if (ready_) return true;
 
+        int32_t maxUnits = 0;
         if (ops_.glGetIntegerv) {
-            int32_t maxUnits = 0;
             ops_.glGetIntegerv(hs_world_shadow::kGlMaxTextureImageUnits, &maxUnits);
             if (maxUnits > 0 && maxUnits <= static_cast<int32_t>(kReflTexUnit)) {
                 failed_ = true;
                 return false;
             }
         }
+        const bool use16BatchSlots = isNativeGl_ && (maxUnits >= 24);
 
         int32_t prevRbo = 0;
         if (ops_.glGetIntegerv) {
@@ -717,7 +915,7 @@ private:
         } guard{ ops_, saved, glCache, restoreProg, (prevRbo > 0) ? static_cast<uint32_t>(prevRbo) : 0u };
 
         if (progBatch_ == 0u) {
-            progBatch_ = BuildBatchProgram();
+            progBatch_ = BuildBatchProgram(use16BatchSlots);
             if (progBatch_ == 0u) {
                 guard.Restore();
                 DestroyResources();
@@ -729,13 +927,23 @@ private:
             locBatchBack_   = ops_.glGetUniformLocation(progBatch_, "u_reflBack");
             guard.touchedProg = true;
             ops_.glUseProgram(progBatch_);
-            for (uint32_t s = 0; s < hs_world_shadow::kMaxBatchTexSlots; ++s) {
+            const uint32_t slotCnt = use16BatchSlots
+                ? hs_world_shadow::kMaxBatchTexSlots : hs_world_shadow::kLegacyBatchTexSlots;
+            for (uint32_t s = 0; s < slotCnt; ++s) {
                 char uName[24]{};
                 std::snprintf(uName, sizeof(uName), "HS_BATCH_TEX%u", s);
                 const int32_t loc = ops_.glGetUniformLocation(progBatch_, uName);
                 if (loc >= 0) {
-                    ops_.glUniform1i(loc, static_cast<int32_t>(hs_world_shadow::kBatchTexUnitBase + s));
+                    ops_.glUniform1i(loc, static_cast<int32_t>(hs_world_shadow::BatchSlotToTexUnit(s)));
                 }
+            }
+        }
+        if (progBatchGpu_ == 0u && isNativeGl_ && ops_.glBindBufferBase && ops_.glDrawElementsBaseVertex) {
+            progBatchGpu_ = BuildGpuBatchProgram();
+            if (progBatchGpu_ != 0u) {
+                locBatchGpuBounds_ = ops_.glGetUniformLocation(progBatchGpu_, "u_reflBounds");
+                locBatchGpuEye_    = ops_.glGetUniformLocation(progBatchGpu_, "u_reflEye");
+                locBatchGpuBack_   = ops_.glGetUniformLocation(progBatchGpu_, "u_reflBack");
             }
         }
 
@@ -822,6 +1030,10 @@ private:
             ops_.glDeleteProgram(progBatch_);
             progBatch_ = 0;
         }
+        if (progBatchGpu_) {
+            ops_.glDeleteProgram(progBatchGpu_);
+            progBatchGpu_ = 0;
+        }
         ready_ = false;
     }
 
@@ -841,6 +1053,11 @@ private:
     int32_t  locBatchBounds_ = -1;
     int32_t  locBatchEye_    = -1;
     int32_t  locBatchBack_   = -1;
+
+    uint32_t progBatchGpu_      = 0u;
+    int32_t  locBatchGpuBounds_ = -1;
+    int32_t  locBatchGpuEye_    = -1;
+    int32_t  locBatchGpuBack_   = -1;
 
     uint32_t worldFbo_   = 0u;
     int32_t  worldVp_[4] = { 0, 0, 1280, 720 };
@@ -865,7 +1082,8 @@ private:
     bool     sawOceanThisFrame_      = false;
     bool     beganWriteThisFrame_    = false;
     bool     wroteAnyThisFrame_      = false;
-    bool     batchUniUploadedFrame_  = false;
+    bool     batchUniUploadedFrame_    = false;
+    bool     batchGpuUniUploadedFrame_ = false;
     bool     boundForOceanThisFrame_ = false;
     uint32_t curFrameDraws_          = 0u;
     uint32_t lastFrameDraws_         = 0u;

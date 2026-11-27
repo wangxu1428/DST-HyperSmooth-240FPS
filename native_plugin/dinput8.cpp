@@ -63,11 +63,17 @@
 #include "world_shadow_engine.h"
 #include "crash_detective.h"
 #include "water_reflection_engine.h"
+#include "hardware_tier.h"
+#include "elastic_pool.h"
 #include "foliage_field.h"
 #include "world_pos_smooth.h"
 #include "skeletal_fluid.h"
+#include "skeletal_mt_pool.h"
 #include "combat_impact.h"
 #include "look_matcher.h"
+#include "gpu_clarity_engine.h"
+#include "pbo_tex_ring.h"
+#include "klei_render_fastpath.h"
 
 namespace {
 
@@ -157,9 +163,11 @@ using GlFrontFace_t = void (WINAPI*)(uint32_t mode);
 using GlScissor_t = void (WINAPI*)(int32_t x, int32_t y, int32_t width, int32_t height);
 using GlViewport_t = void (WINAPI*)(int32_t x, int32_t y, int32_t width, int32_t height);
 using GlUniform1f_t = void (WINAPI*)(int32_t location, float x);
+using GlUniform1fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* v);
 using GlUniform1i_t = void (WINAPI*)(int32_t location, int32_t x);
 using GlUniform2fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* v);
 using GlUniform3fv_t = void (WINAPI*)(int32_t location, int32_t count, const float* v);
+using GlUniformMatrix2fv_t = void (WINAPI*)(int32_t location, int32_t count, uint8_t transpose, const float* value);
 using GlUniformMatrix3fv_t = void (WINAPI*)(int32_t location, int32_t count, uint8_t transpose, const float* value);
 using GlUniformMatrix4fv_t = void (WINAPI*)(int32_t location, int32_t count, uint8_t transpose, const float* value);
 using GlBindAttribLocation_t = void (WINAPI*)(uint32_t program, uint32_t index, const char* name);
@@ -182,6 +190,25 @@ using GlBlitFramebuffer_t = void (WINAPI*)(int32_t srcX0, int32_t srcY0, int32_t
 using GlFenceSync_t = void* (WINAPI*)(uint32_t condition, uint32_t flags);
 using GlClientWaitSync_t = uint32_t (WINAPI*)(void* sync, uint32_t flags, uint64_t timeout);
 using GlDeleteSync_t = void (WINAPI*)(void* sync);
+using GlBufferStorage_t = void (WINAPI*)(uint32_t target, ptrdiff_t size, const void* data, uint32_t flags);
+using GlTexStorage2D_t = void (WINAPI*)(uint32_t target, int32_t levels, uint32_t internalformat, int32_t width, int32_t height);
+using GlDrawElementsBaseVertex_t = void (WINAPI*)(uint32_t mode, int32_t count, uint32_t type, const void* indices, int32_t basevertex);
+using GlBindBufferBase_t = void (WINAPI*)(uint32_t target, uint32_t index, uint32_t buffer);
+using GlGetTextureHandleArb_t = uint64_t (WINAPI*)(uint32_t texture);
+using GlMakeTextureHandleResidentArb_t = void (WINAPI*)(uint64_t handle);
+using GlMakeTextureHandleNonResidentArb_t = void (WINAPI*)(uint64_t handle);
+using GlDispatchCompute_t = void (WINAPI*)(uint32_t num_groups_x, uint32_t num_groups_y, uint32_t num_groups_z);
+using GlMemoryBarrier_t = void (WINAPI*)(uint32_t barriers);
+using GlBindImageTexture_t = void (WINAPI*)(uint32_t unit, uint32_t texture, int32_t level, uint8_t layered, int32_t layer, uint32_t access, uint32_t format);
+using GlIsEnabled_t = uint8_t (WINAPI*)(uint32_t cap);
+using GlUniform4f_t = void (WINAPI*)(int32_t location, float v0, float v1, float v2, float v3);
+using GlGenQueries_t = void (WINAPI*)(int32_t n, uint32_t* ids);
+using GlDeleteQueries_t = void (WINAPI*)(int32_t n, const uint32_t* ids);
+using GlBeginQuery_t = void (WINAPI*)(uint32_t target, uint32_t id);
+using GlEndQuery_t = void (WINAPI*)(uint32_t target);
+using GlGetQueryObjectiv_t = void (WINAPI*)(uint32_t id, uint32_t pname, int32_t* params);
+using GlGetQueryObjectui64v_t = void (WINAPI*)(uint32_t id, uint32_t pname, uint64_t* params);
+using GlQueryCounter_t = void (WINAPI*)(uint32_t id, uint32_t target);
 using GlGenRenderbuffers_t = void (WINAPI*)(int32_t n, uint32_t* renderbuffers);
 using GlDeleteRenderbuffers_t = void (WINAPI*)(int32_t n, const uint32_t* renderbuffers);
 using GlBindRenderbuffer_t = void (WINAPI*)(uint32_t target, uint32_t renderbuffer);
@@ -237,6 +264,25 @@ using ParticleMgrUpdate_t = void (*)(void* mgr, float dt);
 using ParticleRenderCmdCtor_t = void* (*)(void* cmd, void* renderNode, void* mtx);
 using TransformGetWorldMatrix_t = const float* (*)(void* transform);
 using LightMapRender_t = void (*)(void* lightMap, uint8_t* renderData);
+
+struct LuaDebug51 {
+    int         event;
+    const char* name;
+    const char* namewhat;
+    const char* what;
+    const char* source;
+    int         currentline;
+    int         nups;
+    int         linedefined;
+    int         lastlinedefined;
+    char        short_src[60];
+    int         i_ci;
+};
+using LuaHook_t     = void (*)(void* L, LuaDebug51* ar);
+using LuaSethook_t  = int (*)(void* L, LuaHook_t func, int mask, int count);
+using LuaGethook_t  = LuaHook_t (*)(void* L);
+using LuaGetstack_t = int (*)(void* L, int level, LuaDebug51* ar);
+using LuaGetinfo_t  = int (*)(void* L, const char* what, LuaDebug51* ar);
 
 constexpr int kLuaGlobalsIndex = -10002;
 constexpr DWORD kCreateWaitableTimerHighRes = 0x00000002; // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Win10 1803+)
@@ -302,6 +348,18 @@ std::atomic<uint32_t> g_displayRefreshHz{0};
 std::atomic<int>  g_visualAnisoLevel{1};
 std::atomic<bool> g_visualFullresLightmap{false};
 std::atomic<float> g_visualMipLodBias{0.0f}; // Player-First default: 0.0f (100% vanilla)
+std::atomic<uint32_t> g_visualTexParamGen{1};
+std::atomic<bool> g_visualHdrLightmap{false};
+std::atomic<bool> g_visualHdrLightmapActive{false};
+std::atomic<bool> g_visualHdrLightmapFailed{false};
+std::atomic<int>  g_visualClarityGrade{0}; // 0=Vanilla, 1=Clarity(1080p), 2=UltraHD(1x Compute), 3=BluRay(2x Virtual-4K Compute)
+std::atomic<float> g_visualClarityStrength{1.0f};
+std::atomic<bool> g_gpuClaritySupported{false};
+std::atomic<bool> g_gpuClarityActive{false};
+std::atomic<uint32_t> g_gpuClarityGpuUs{0};
+std::atomic<uint32_t> g_gpuClarityVramKb{0};
+std::atomic<int>      g_gpuClarityEffGrade{0};
+std::atomic<uint64_t> g_gpuClarityAdaptSteps{0ULL};
 std::atomic<uint32_t> g_d3d9ExLatGen{1};
 std::atomic<bool> g_angleSamplerHooked{false};
 std::atomic<bool> g_d3d9ExActive{false};
@@ -327,6 +385,29 @@ LightMapRender_t          g_origLightMapRender = nullptr;
 std::atomic<bool>         g_lightPos240Hooked{false};
 std::atomic<bool>         g_lightmapHotSwapHooked{false};
 std::atomic<uint32_t>     g_lightmapRebuildGen{0};
+std::atomic<bool>         g_lightmapAdaptiveHalf{false};
+std::atomic<bool>         g_worldShadowFastRecv1Tap{false};
+
+// [v4.0 Phase 4] Klei Renderer CPU Fast-Path (Flat L1 Uniform Plan + Zero-Lock Effect/VB/IBO Cache)
+std::atomic<uint64_t>                 g_kleiRenderCacheEpoch{1ULL};
+std::atomic<uint32_t>                 g_kleiFastOpsGen{0u};
+std::atomic<bool>                     g_kleiEpochHooksReady{false};
+std::atomic<bool>                     g_kleiApplyUniHooked{false};
+std::atomic<bool>                     g_kleiDrawPrimHooked{false};
+std::atomic<bool>                     g_kleiDrawIdxHooked{false};
+hs_klei_fastpath::ApplyShaderUniforms_t g_origApplyShaderUniforms = nullptr;
+hs_klei_fastpath::DrawPrimitives_t      g_origDrawPrimitives      = nullptr;
+hs_klei_fastpath::DrawIndexed_t         g_origDrawIndexed         = nullptr;
+hs_klei_fastpath::KleiRendererHelpers   g_kleiRendererHelpers{};
+size_t                                g_kleiApplyUniPatchIdx = static_cast<size_t>(-1);
+size_t                                g_kleiDrawPrimPatchIdx = static_cast<size_t>(-1);
+size_t                                g_kleiDrawIdxPatchIdx  = static_cast<size_t>(-1);
+std::atomic<uint64_t>                 g_kFastUniHits{0ULL};
+std::atomic<uint64_t>                 g_kFastUniSkips{0ULL};
+std::atomic<uint64_t>                 g_kFastUniFallbacks{0ULL};
+std::atomic<uint64_t>                 g_kFastDrawHits{0ULL};
+std::atomic<uint64_t>                 g_kFastDrawMisses{0ULL};
+std::atomic<uint64_t>                 g_kFastLocksSaved{0ULL};
 volatile LONG64           g_lightPos240Count = 0;
 GlTexParameteri_t g_origGlTexParameteri = nullptr;
 GlTexParameterf_t g_fnGlTexParameterf   = nullptr;
@@ -444,6 +525,7 @@ std::atomic<uint32_t> g_hd2dStateGen{1};
 std::atomic<bool>     g_optHd2dWorldShaders{true};
 std::atomic<float>    g_hd2dMasterStr{0.0f};
 std::atomic<uint32_t> g_hd2dShadersInjected{0};
+std::atomic<uint32_t> g_ccAntiAnisoShadersPatched{0};
 std::atomic<uint32_t> g_hd2dProgsLinked{0};
 std::atomic<uint32_t> g_hd2dAnimVsInjected{0};
 std::atomic<uint32_t> g_hd2dShadowBloomInjected{0};
@@ -454,6 +536,9 @@ std::atomic<uint32_t> g_worldShadowRes{0};
 std::atomic<uint32_t> g_worldShadowDraws{0};
 std::atomic<uint32_t> g_worldShadowBatchDraws{0};
 std::atomic<uint32_t> g_worldShadowUnbatchedDraws{0};
+std::atomic<uint32_t> g_worldShadowDeferredBatches{0};
+std::atomic<uint64_t> g_worldShadowReuseSkips{0ULL};
+std::atomic<uint32_t> g_worldShadowCoalescedDraws{0};
 std::atomic<uint32_t> g_wsOpsGen{1};
 Hd2dProgSlot          g_hd2dProgs[kMaxHd2dProgs]{};
 // Multi-context overflow map when two distinct non-shared EGL contexts use the same program ID
@@ -479,6 +564,12 @@ volatile LONG64       g_uiVertsBatched = 0;
 volatile LONG64       g_uiBypassDraws  = 0;
 volatile LONG64       g_uiProgSkips    = 0;
 volatile LONG64       g_uiReadbacks    = 0;
+volatile LONG64       g_uiFlReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Count)] = {};
+static thread_local bool     tl_wallLuaActive      = false;
+static thread_local uint32_t tl_wallSpatialCalls   = 0u;
+static thread_local uint32_t tl_wallSpatialEnts    = 0u;
+static thread_local int64_t  tl_wallSpatialQpc     = 0;
+static thread_local float    tl_wallSpatialMaxR    = 0.0f;
 GlUseProgram_t        g_origGlUseProgram = nullptr;
 GlDeleteProgram_t     g_origGlDeleteProgram = nullptr;
 GlGetUniformLocation_t g_fnGlGetUniformLocation = nullptr;
@@ -591,6 +682,32 @@ size_t g_postProcPatchIdx      = static_cast<size_t>(-1);
 size_t g_vbPoolPatchIdx        = static_cast<size_t>(-1);
 std::atomic<int>  g_cfgRenderBackend{2}; // 0=d3d9, 1=opengl, 2=auto
 std::atomic<int>  g_cfgDxgiFlipPresent{0}; // 0=off (default), 1=on, 2=auto
+hs_hw_tier::HardwareCaps g_hwCaps{};
+std::atomic<int>         g_cfgHardwareTier{1}; // 0=low, 1=balanced, 2=unleashed
+std::atomic<bool>        g_optBoostPriority{true};
+std::atomic<size_t>      g_tierShadowCacheBytes{64u * 1024u * 1024u};
+std::atomic<bool>        g_tierPersistentRing{true};
+std::atomic<double>      g_tierAnimShedL1Us{2200.0};
+std::atomic<double>      g_tierAnimShedL2Us{4000.0};
+std::atomic<uint32_t>    g_tierAnimShedL1Ents{900u};
+std::atomic<uint32_t>    g_tierAnimShedL2Ents{1800u};
+std::atomic<double>      g_tierTexSliceUs{1200.0};
+std::atomic<int>         g_tierGcHeadroomMinKb{262144};
+std::atomic<int>         g_tierGcHeadroomMaxKb{0x320000};
+std::atomic<int>         g_tierGcMaxDefer{1};
+std::atomic<float>       g_tierGcBusyCapShortSec{0.00030f};
+std::atomic<bool>        g_tierPrewarmMods{false};
+std::atomic<bool>        g_sbPersistentRingActive{false};
+std::atomic<size_t>      g_sbShadowCacheUsedBytes{0};
+std::atomic<uint8_t>     g_elasticPressureLevel{0u};
+std::atomic<uint32_t>    g_elasticMaxSkeletalWorkers{1u};
+std::atomic<uint32_t>    g_elasticGpuRingVerts{65536u};
+std::atomic<uint32_t>    g_elasticGpuRingIndices{131072u};
+std::atomic<uint32_t>    g_elasticGpuRingInsts{8192u};
+std::atomic<bool>        g_elasticGpuDriven{false};
+std::atomic<bool>        g_sbGpuDrivenActive{false};
+std::atomic<uint32_t>    g_sbBindlessCount{0u};
+std::atomic<uint64_t>    g_sbGpuDrivenDraws{0ULL};
 std::atomic<bool> g_nativeGlActive{false};
 std::atomic<bool> g_nativeGlProbed{false};
 std::atomic<bool> g_dxgiFlipProbedOk{false};
@@ -652,10 +769,12 @@ GlFrontFace_t                g_origGlFrontFace = nullptr;
 GlScissor_t                  g_origGlScissor = nullptr;
 GlViewport_t                 g_origGlViewport = nullptr;
 GlUniform1f_t                g_origGlUniform1f = nullptr;
+GlUniform1fv_t               g_origGlUniform1fv = nullptr;
 GlUniform1i_t                g_origGlUniform1i = nullptr;
 GlUniform2fv_t               g_origGlUniform2fv = nullptr;
 GlUniform3fv_t               g_origGlUniform3fv = nullptr;
 GlUniform4fv_t               g_origGlUniform4fv = nullptr;
+GlUniformMatrix2fv_t         g_origGlUniformMatrix2fv = nullptr;
 GlUniformMatrix3fv_t         g_origGlUniformMatrix3fv = nullptr;
 GlUniformMatrix4fv_t         g_origGlUniformMatrix4fv = nullptr;
 GlBindAttribLocation_t       g_fnGlBindAttribLocation = nullptr;
@@ -672,14 +791,21 @@ GlClearColor_t               g_origGlClearColor = nullptr;
 GlGenFramebuffers_t          g_fnGlGenFramebuffers = nullptr;
 GlDeleteFramebuffers_t       g_fnGlDeleteFramebuffers = nullptr;
 GlFramebufferTexture2D_t     g_fnGlFramebufferTexture2D = nullptr;
+GlFramebufferTexture2D_t     g_origGlFramebufferTexture2D = nullptr;
 GlCheckFramebufferStatus_t   g_fnGlCheckFramebufferStatus = nullptr;
+GlCheckFramebufferStatus_t   g_origGlCheckFramebufferStatus = nullptr;
 GlGenRenderbuffers_t         g_fnGlGenRenderbuffers = nullptr;
 GlDeleteRenderbuffers_t      g_fnGlDeleteRenderbuffers = nullptr;
+GlDeleteRenderbuffers_t      g_origGlDeleteRenderbuffers = nullptr;
 GlBindRenderbuffer_t         g_fnGlBindRenderbuffer = nullptr;
 GlRenderbufferStorage_t      g_fnGlRenderbufferStorage = nullptr;
+GlRenderbufferStorage_t      g_origGlRenderbufferStorage = nullptr;
 GlFramebufferRenderbuffer_t  g_fnGlFramebufferRenderbuffer = nullptr;
+GlFramebufferRenderbuffer_t  g_origGlFramebufferRenderbuffer = nullptr;
 GlGenTextures_t              g_fnGlGenTextures = nullptr;
+GlGenTextures_t              g_origGlGenTextures = nullptr;
 GlGetError_t                 g_fnGlGetError = nullptr;
+GlGetError_t                 g_origGlGetError = nullptr;
 GlGetShaderInfoLog_t         g_fnGlGetShaderInfoLog = nullptr;
 GlGetProgramInfoLog_t        g_fnGlGetProgramInfoLog = nullptr;
 GlReadPixels_t               g_origGlReadPixels = nullptr;
@@ -688,6 +814,24 @@ GlBlitFramebuffer_t          g_fnGlBlitFramebuffer = nullptr;
 GlFenceSync_t                g_fnGlFenceSync = nullptr;
 GlClientWaitSync_t           g_fnGlClientWaitSync = nullptr;
 GlDeleteSync_t               g_fnGlDeleteSync = nullptr;
+GlBufferStorage_t            g_fnGlBufferStorage = nullptr;
+GlTexStorage2D_t                    g_fnGlTexStorage2D = nullptr;
+GlDrawElementsBaseVertex_t          g_fnGlDrawElementsBaseVertex = nullptr;
+GlBindBufferBase_t                  g_fnGlBindBufferBase = nullptr;
+GlGetTextureHandleArb_t             g_fnGlGetTextureHandleARB = nullptr;
+GlMakeTextureHandleResidentArb_t    g_fnGlMakeTextureHandleResidentARB = nullptr;
+GlMakeTextureHandleNonResidentArb_t g_fnGlMakeTextureHandleNonResidentARB = nullptr;
+GlDispatchCompute_t          g_fnGlDispatchCompute = nullptr;
+GlMemoryBarrier_t            g_fnGlMemoryBarrier = nullptr;
+GlBindImageTexture_t         g_fnGlBindImageTexture = nullptr;
+GlIsEnabled_t                g_fnGlIsEnabled = nullptr;
+GlUniform4f_t                g_fnGlUniform4f = nullptr;
+GlGenQueries_t               g_fnGlGenQueries = nullptr;
+GlDeleteQueries_t            g_fnGlDeleteQueries = nullptr;
+GlBeginQuery_t               g_fnGlBeginQuery = nullptr;
+GlEndQuery_t                 g_fnGlEndQuery = nullptr;
+GlGetQueryObjectiv_t         g_fnGlGetQueryObjectiv = nullptr;
+GlGetQueryObjectui64v_t      g_fnGlGetQueryObjectui64v = nullptr;
 hs_look_match::LookMatchManager g_lookMatcher;
 GlFinish_t                   g_origGlFinish = nullptr;
 GlStencilFunc_t              g_origGlStencilFunc = nullptr;
@@ -707,6 +851,49 @@ std::atomic<float>    g_emaPostProcUs{0.0f};
 std::atomic<float>    g_emaFrameBusyUs{0.0f};
 std::atomic<float>    g_emaGpuDrainUs{0.0f};
 std::atomic<float>    g_emaSwapUs{0.0f};
+std::atomic<float>    g_emaWxLmUs{0.0f};
+std::atomic<float>    g_emaWxShReplayUs{0.0f};
+std::atomic<float>    g_emaWxShUnbUs{0.0f};
+std::atomic<float>    g_emaWxSbTryUs{0.0f};
+std::atomic<float>    g_emaWxSbFlushUs{0.0f};
+std::atomic<float>    g_emaWxSbResUs{0.0f};
+std::atomic<float>    g_emaWxSbInFlUs{0.0f};
+std::atomic<float>    g_emaWxSbWaitUs{0.0f};
+std::atomic<float>    g_emaWxSbUpUs{0.0f};
+std::atomic<float>    g_emaWxSbDrwUs{0.0f};
+std::atomic<uint64_t> g_sbDiagModeSwitches{0ULL};
+std::atomic<uint64_t> g_sbDiagLatchFrames{0ULL};
+std::atomic<uint64_t> g_sbDiagDenyHits{0ULL};
+std::atomic<uint64_t> g_sbDiagDenyMutated{0ULL};
+std::atomic<uint64_t> g_sbDiagDenyNullAlloc{0ULL};
+std::atomic<uint64_t> g_sbDiagDenyHandleZero{0ULL};
+std::atomic<uint64_t> g_sbDiagRingOvf{0ULL};
+std::atomic<uint64_t> g_sbDiagFallbackRing{0ULL};
+std::atomic<uint64_t> g_sbDiagShadowFetch{0ULL};
+std::atomic<uint32_t> g_sbDiagPeakVerts{0u};
+std::atomic<uint32_t> g_sbDiagPeakIndices{0u};
+std::atomic<uint32_t> g_sbDiagPeakInsts{0u};
+std::atomic<bool>     g_sbDiagLatched{false};
+std::atomic<bool>     g_pboTexActive{false};
+std::atomic<uint64_t> g_pboTexUploads{0ULL};
+std::atomic<uint64_t> g_pboTexBytes{0ULL};
+std::atomic<uint64_t> g_pboTexOverflows{0ULL};
+std::atomic<uint64_t> g_pboTexTimeouts{0ULL};
+std::atomic<uint64_t> g_pboTexSlotSkips{0ULL};
+std::atomic<uint64_t> g_glErrSkipped{0ULL};
+std::atomic<uint64_t> g_fboChkSkipped{0ULL};
+std::atomic<uint64_t> g_sbStencilBypassDraws{0ULL};
+std::atomic<uint32_t> g_hd2dProgLayoutGen{1u};
+std::atomic<bool>     g_fboCompleteCacheHooksReady{false};
+std::atomic<uint64_t> g_texPoolHits{0ULL};
+std::atomic<uint64_t> g_texPoolRefills{0ULL};
+std::atomic<uint32_t> g_texPoolAvail{0u};
+std::atomic<uint32_t> g_lastNativeGpuUs{0u};
+std::atomic<float>    g_emaWxUnbDrawUs{0.0f};
+std::atomic<uint32_t> g_lastWxShUnbCnt{0u};
+std::atomic<uint32_t> g_lastWxUnbDrawCnt{0u};
+std::atomic<uint32_t> g_lastWxUnbTopProg{0u};
+std::atomic<uint32_t> g_lastWxUnbTopCnt{0u};
 std::atomic<float>    g_processVramMb{0.0f};
 std::atomic<float>    g_processVramBudgetMb{0.0f};
 std::atomic<float>    g_peakVramMb{0.0f};
@@ -737,6 +924,18 @@ LuaPushBoolean_t g_luaPushBoolean = nullptr;
 LuaPushString_t g_luaPushString = nullptr;
 LuaToNumber_t g_luaToNumber = nullptr;
 LuaToBoolean_t g_luaToBoolean = nullptr;
+LuaSethook_t  g_luaSetHook   = nullptr;
+LuaGethook_t  g_luaGetHook   = nullptr;
+LuaGetstack_t g_luaGetStack  = nullptr;
+LuaGetinfo_t  g_luaGetInfo   = nullptr;
+int32_t       g_simLuaStateOffset = -1;
+static thread_local int64_t tl_wluaHookT0Qpc     = 0;
+static thread_local bool    tl_wluaStackCaptured = false;
+static thread_local char    tl_wluaStackBuf[512] = {};
+static thread_local int64_t tl_luaHookT0Qpc      = 0;
+static thread_local bool    tl_luaStackCaptured  = false;
+static thread_local char    tl_luaStackBuf[512]  = {};
+static std::atomic<uint32_t> s_luaSpikeLogs{0u};
 
 // v2.4.0 Hermetic mimalloc Client Lua Heap pointers
 LuaNewState_t g_origClientLuaNewState = nullptr;
@@ -793,6 +992,7 @@ std::atomic<int64_t> g_vmBaseWorldPos{0};
 std::atomic<int64_t> g_vmBaseSpatialQueries{0};
 std::wstring g_binDir;
 std::wstring g_iniPath;
+std::atomic<uint64_t> g_selfIniWriteTime{0};
 std::wstring g_logPath;
 
 volatile LONG64 g_libdeflateHits = 0;
@@ -822,6 +1022,8 @@ volatile LONG64 g_texUploadSlices = 0;
 
 // Lock-free per-frame subsystem timing & Hitch breakdown telemetry (0 game-thread I/O)
 std::atomic<uint32_t> g_lastAnimHookUs{0};
+std::atomic<uint32_t> g_lastAnimMtUs{0};
+std::atomic<uint32_t> g_lastAnimInlUs{0};
 std::atomic<uint32_t> g_lastAnimEnts{0};
 std::atomic<uint32_t> g_lastAnimBones{0};
 std::atomic<uint32_t> g_lastAnimShed{0};
@@ -843,6 +1045,8 @@ std::atomic<uint32_t> g_frameSwapUs{0};
 std::atomic<uint32_t> g_frameWorldUs{0};
 std::atomic<uint32_t> g_framePostUs{0};
 std::atomic<uint32_t> g_frameAnimUs{0};
+std::atomic<uint32_t> g_frameAnimMtUs{0};
+std::atomic<uint32_t> g_frameAnimInlUs{0};
 std::atomic<uint32_t> g_frameAnimEnts{0};
 std::atomic<uint32_t> g_frameAnimBones{0};
 std::atomic<uint32_t> g_frameAnimShed{0};
@@ -865,9 +1069,13 @@ std::atomic<uint32_t> g_frameUiDrawUs{0};
 std::atomic<uint32_t> g_frameSoundUs{0};
 std::atomic<uint32_t> g_frameSteamUs{0};
 std::atomic<uint32_t> g_frameMsgUs{0};
+std::atomic<uint64_t> g_xrayVbPoolUs{0};
+std::atomic<uint64_t> g_xrayVbPoolCalls{0};
 std::atomic<float>    g_emaLuaUs{0.0f};
 std::atomic<float>    g_emaNetUs{0.0f};
 std::atomic<float>    g_emaAnimUs{0.0f};
+std::atomic<float>    g_emaAnimMtUs{0.0f};
+std::atomic<float>    g_emaAnimInlUs{0.0f};
 std::atomic<float>    g_emaGcUs{0.0f};
 std::atomic<float>    g_emaRenderThreadUs{0.0f};
 std::atomic<float>    g_emaWallLuaUs{0.0f};
@@ -877,6 +1085,23 @@ std::atomic<float>    g_emaEntPostUs{0.0f};
 std::atomic<float>    g_emaCacheRndUs{0.0f};
 std::atomic<float>    g_emaUiDrawUs{0.0f};
 std::atomic<float>    g_emaSoundUs{0.0f};
+
+static inline void RecordPeakFrameAnimStats(uint32_t totalUs, uint32_t mtUs, uint32_t inlUs,
+                                            uint32_t ents, uint32_t bones, uint32_t shed) noexcept {
+    const uint32_t key = (totalUs > 0u) ? totalUs : ((ents > 0u || bones > 0u || shed > 0u) ? 1u : 0u);
+    if (key == 0u) return;
+    uint32_t prev = g_frameAnimUs.load(std::memory_order_relaxed);
+    while (key >= prev) {
+        if (g_frameAnimUs.compare_exchange_weak(prev, totalUs, std::memory_order_relaxed)) {
+            g_frameAnimMtUs.store(mtUs, std::memory_order_relaxed);
+            g_frameAnimInlUs.store(inlUs, std::memory_order_relaxed);
+            g_frameAnimEnts.store(ents, std::memory_order_relaxed);
+            g_frameAnimBones.store(bones, std::memory_order_relaxed);
+            g_frameAnimShed.store(shed, std::memory_order_relaxed);
+            break;
+        }
+    }
+}
 
 // Tear-free Hitch & Severe-Stall telemetry snapshot (protected by lightweight SRWLOCK only on >25ms frames & 10s flush)
 struct HitchSnapshot {
@@ -911,6 +1136,8 @@ struct HitchSnapshot {
     uint32_t slowPktUs    = 0;
     uint32_t slowPktMeta  = 0;
     uint32_t animUs       = 0;
+    uint32_t animMtUs     = 0;
+    uint32_t animInlUs    = 0;
     uint32_t animEnts     = 0;
     uint32_t animBones    = 0;
     uint32_t animShed     = 0;
@@ -1203,6 +1430,104 @@ void LogMsg(const char* fmt, ...) {
     ReleaseSRWLockExclusive(&g_logLock);
 }
 
+uint64_t GetFileModTime(const std::wstring& path);
+
+static void ApplyElasticPoolPlan(bool forceLog = false) {
+    const int clampedTier = std::clamp(g_cfgHardwareTier.load(std::memory_order_acquire), 0, 2);
+    hs_elastic_pool::ElasticHostSnapshot snap{};
+    snap.tier               = static_cast<hs_hw_tier::HardwareTier>(clampedTier);
+    snap.logicalCores       = g_hwCaps.logicalCores;
+    snap.totalRamMb         = g_hwCaps.totalRamMb;
+    const uint64_t liveAvail = hs_elastic_pool::QueryLiveAvailRamMb();
+    snap.availRamMb         = (liveAvail > 0ULL) ? liveAvail : g_hwCaps.availRamMb;
+    snap.vramUsedMb         = g_processVramMb.load(std::memory_order_relaxed);
+    snap.vramBudgetMb       = g_processVramBudgetMb.load(std::memory_order_relaxed);
+    snap.isNativeGl         = g_nativeGlActive.load(std::memory_order_acquire);
+    snap.hasBufferStorage   = g_hwCaps.hasBufferStorage;
+    snap.hasSsbo            = g_hwCaps.hasSsbo;
+    snap.hasBindlessTexture = g_hwCaps.hasBindlessTexture;
+    snap.hasBaseVertex      = g_hwCaps.hasBaseVertex;
+    snap.lastAnimEnts       = g_lastAnimEnts.load(std::memory_order_relaxed);
+
+    const auto ep = hs_elastic_pool::ComputeElasticPlan(snap);
+    const uint8_t  prevPres = g_elasticPressureLevel.exchange(ep.pressureLevel, std::memory_order_relaxed);
+    const uint32_t prevWork = g_elasticMaxSkeletalWorkers.exchange(ep.maxSkeletalWorkers, std::memory_order_relaxed);
+    const uint32_t prevRingV = g_elasticGpuRingVerts.exchange(ep.gpuRingMaxVertsPerFrame, std::memory_order_relaxed);
+    const uint32_t prevRingI = g_elasticGpuRingIndices.exchange(ep.gpuRingMaxIndicesPerFrame, std::memory_order_relaxed);
+    const uint32_t prevRingS = g_elasticGpuRingInsts.exchange(ep.gpuRingMaxInstsPerFrame, std::memory_order_relaxed);
+    const bool     prevGpuDrv = g_elasticGpuDriven.exchange(ep.enableGpuDrivenBindless, std::memory_order_relaxed);
+    const size_t   prevShadow = g_tierShadowCacheBytes.exchange(ep.spriteShadowCacheBytes, std::memory_order_relaxed);
+    const int      prevGcMax  = g_tierGcHeadroomMaxKb.exchange(ep.gcHeadroomMaxKb, std::memory_order_relaxed);
+    g_tierGcHeadroomMinKb.store(ep.gcHeadroomMinKb, std::memory_order_relaxed);
+
+    const bool changed = (prevPres != ep.pressureLevel) ||
+                         (prevWork != ep.maxSkeletalWorkers) ||
+                         (prevRingV != ep.gpuRingMaxVertsPerFrame) ||
+                         (prevRingI != ep.gpuRingMaxIndicesPerFrame) ||
+                         (prevRingS != ep.gpuRingMaxInstsPerFrame) ||
+                         (prevGpuDrv != ep.enableGpuDrivenBindless) ||
+                         (prevShadow != ep.spriteShadowCacheBytes) ||
+                         (prevGcMax != ep.gcHeadroomMaxKb);
+    if (changed || forceLog) {
+        g_vbPool.SetLimits(ep.vbPoolMaxBytes, ep.vbPoolMaxCount, ep.vbPoolIdleEvictFrames);
+        LogMsg("[ELASTIC_POOL] tier=%s press=%u workers=%u/%u ramAvail=%lluMB vram=%.0f/%.0fMB vbPool=%zuMB shadowCache=%zuMB gcMax=%dMB ring=(v=%u,i=%u,s=%u) gpuDriven=%d",
+               hs_hw_tier::TierName(snap.tier),
+               static_cast<unsigned>(ep.pressureLevel),
+               ep.maxSkeletalWorkers, snap.logicalCores,
+               static_cast<unsigned long long>(snap.availRamMb),
+               static_cast<double>(snap.vramUsedMb), static_cast<double>(snap.vramBudgetMb),
+               ep.vbPoolMaxBytes / (1024u * 1024u),
+               ep.spriteShadowCacheBytes / (1024u * 1024u),
+               ep.gcHeadroomMaxKb / 1024,
+               ep.gpuRingMaxVertsPerFrame, ep.gpuRingMaxIndicesPerFrame, ep.gpuRingMaxInstsPerFrame,
+               ep.enableGpuDrivenBindless ? 1 : 0);
+    }
+}
+
+static void ApplyHardwareTierLive(int rawTier, bool writeIni = false) {
+    const int clamped = std::clamp(rawTier, 0, 2);
+    const auto tier = static_cast<hs_hw_tier::HardwareTier>(clamped);
+    const auto b = hs_hw_tier::ComputeTierBudget(tier, g_hwCaps);
+    const int prev = g_cfgHardwareTier.exchange(clamped, std::memory_order_release);
+
+    g_tierShadowCacheBytes.store(b.spriteShadowCacheBytes, std::memory_order_relaxed);
+    g_tierPersistentRing.store(b.persistentSpriteRing, std::memory_order_relaxed);
+    g_tierAnimShedL1Us.store(b.animShedL1Us, std::memory_order_relaxed);
+    g_tierAnimShedL2Us.store(b.animShedL2Us, std::memory_order_relaxed);
+    g_tierAnimShedL1Ents.store(b.animShedL1Ents, std::memory_order_relaxed);
+    g_tierAnimShedL2Ents.store(b.animShedL2Ents, std::memory_order_relaxed);
+    g_tierTexSliceUs.store(b.texSliceBudgetUs, std::memory_order_relaxed);
+    g_tierGcHeadroomMinKb.store(b.gcHeadroomMinKb, std::memory_order_relaxed);
+    g_tierGcHeadroomMaxKb.store(b.gcHeadroomMaxKb, std::memory_order_relaxed);
+    g_tierGcMaxDefer.store(b.gcMaxDeferStreak, std::memory_order_relaxed);
+    g_tierGcBusyCapShortSec.store(b.gcBusyCapShortSec, std::memory_order_relaxed);
+    g_tierPrewarmMods.store(b.prewarmMods, std::memory_order_relaxed);
+
+    g_vbPool.SetLimits(b.vbPoolMaxBytes, b.vbPoolMaxCount, b.vbPoolIdleEvictFrames);
+    const bool ecoApplied = hs_hw_tier::ApplyWin11EcoQosDisable(b.disableEcoQos);
+    if (g_optBoostPriority.load(std::memory_order_relaxed)) {
+        SetPriorityClass(GetCurrentProcess(),
+                         b.highPriority ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS);
+    }
+    if (writeIni && !g_iniPath.empty()) {
+        WritePrivateProfileStringW(L"OPTIMIZE", L"hardware_tier",
+                                   hs_hw_tier::TierNameW(tier), g_iniPath.c_str());
+        g_selfIniWriteTime.store(GetFileModTime(g_iniPath), std::memory_order_release);
+    }
+    if (prev != clamped || !writeIni) {
+        LogMsg("[HW_TIER] tier=%s cores=%u ram=%lluMB vbPool=%zuMB shadowCache=%zuMB animShed=(%.0fus/%u, %.0fus/%u) texSlice=%.0fus ecoQosOff=%d(ok=%d) persistentRing=%d",
+               hs_hw_tier::TierName(tier), g_hwCaps.logicalCores,
+               static_cast<unsigned long long>(g_hwCaps.totalRamMb),
+               b.vbPoolMaxBytes / (1024u * 1024u),
+               b.spriteShadowCacheBytes / (1024u * 1024u),
+               b.animShedL1Us, b.animShedL1Ents,
+               b.animShedL2Us, b.animShedL2Ents,
+               b.texSliceBudgetUs, b.disableEcoQos ? 1 : 0, ecoApplied ? 1 : 0,
+               b.persistentSpriteRing ? 1 : 0);
+    }
+    ApplyElasticPoolPlan(prev != clamped || !writeIni);
+}
+
 // Lock-free System32\dinput8.dll loader: eliminates InitOnceExecuteOnce <-> Loader Lock AB-BA deadlock
 HMODULE LoadRealDInput8LockFree() {
     HMODULE h = g_realDInput8.load(std::memory_order_acquire);
@@ -1257,6 +1582,19 @@ bool GetTextSection(uint8_t*& outStart, size_t& outSize) {
     return false;
 }
 
+static bool GetExeImageBounds(uint8_t*& outBase, size_t& outSize) {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    if (!exe) return false;
+    auto* base = reinterpret_cast<uint8_t*>(exe);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    outBase = base;
+    outSize = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
+    return outSize > 0;
+}
+
 // Strict fail-closed unique AOB scanner: returns match ONLY if exactly 1 occurrence exists.
 uint8_t* FindPatternInText(uint8_t* start, size_t size, const uint8_t* sig, size_t sigLen) {
     if (!start || sigLen == 0 || size < sigLen) return nullptr;
@@ -1290,6 +1628,25 @@ uint8_t* FindMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig
 
 static uint8_t* FindUniqueMaskedPatternInText(uint8_t* start, size_t size, const uint8_t* sig, const char* mask, size_t sigLen) {
     return FindMaskedPatternInText(start, size, sig, mask, sigLen);
+}
+
+// Strict fail-closed unique int16_t AOB scanner (-1 = wildcard): returns match ONLY if exactly 1 occurrence exists.
+static uint8_t* FindUniqueInt16PatternInText(uint8_t* start, size_t size, const int16_t* sig, size_t sigLen) {
+    if (!start || !sig || sigLen == 0 || size < sigLen) return nullptr;
+    uint8_t* hit = nullptr;
+    const int16_t first = sig[0];
+    for (size_t off = 0; off <= size - sigLen; ++off) {
+        if (first >= 0 && start[off] != static_cast<uint8_t>(first)) continue;
+        bool ok = true;
+        for (size_t j = 1; j < sigLen; ++j) {
+            if (sig[j] >= 0 && start[off + j] != static_cast<uint8_t>(sig[j])) { ok = false; break; }
+        }
+        if (ok) {
+            if (hit) return nullptr; // ambiguous (>1 match) -> fail-closed
+            hit = start + off;
+        }
+    }
+    return hit;
 }
 
 uint8_t* ResolveRel32Call(uint8_t* callInstr) {
@@ -1826,9 +2183,11 @@ struct ThreadLocalAnimState {
     int64_t  cachedQpc = 0;
     int64_t  frameAnimStartQpc = 0;
     int64_t  frameHookAccumQpc = 0;
+    int64_t  frameShedWorkQpc  = 0;
     uint32_t qpcCountdown = 0;
     uint32_t frameSampleIdx = 0;
     uint32_t frameTweenEnts = 0;
+    uint32_t frameInlineMainEnts = 0;
     uint32_t frameTweenBones = 0;
     uint32_t frameShedCount = 0;
     uint8_t  frameShedLevel = 0; // 0=full quality, 1=fast linear only, 2=pos240-only skeletal shed
@@ -1844,9 +2203,11 @@ struct ThreadLocalAnimState {
     int64_t  batchShedFrames = 0;
     int64_t  batchDeJitterHits = 0;
 
+    AnimBufferSlot* mtOutSlot = nullptr;
     ThreadLocalAnimState() : tracks(kTrackSlots) {}
 
     AnimBufferSlot& NextSlot(AnimChannel ch) {
+        if (mtOutSlot != nullptr) return *mtOutSlot;
         if (ch == AnimChannel::Main) return mainSlots[(mainRing++) & 1u];
         if (ch == AnimChannel::Overlay) return overlaySlots[(overlayRing++) & 7u];
         return uiSlots[(uiRing++) & 1u];
@@ -1911,25 +2272,31 @@ struct ThreadLocalAnimState {
             const int64_t now = NowQpc();
             if (frameAnimStartQpc != 0 &&
                 (frameHookAccumQpc > 0 || frameTweenEnts > 0 || frameTweenBones > 0 || frameShedCount > 0)) {
-                const uint32_t hookUs = static_cast<uint32_t>(
-                    std::clamp(static_cast<double>(frameHookAccumQpc) * g_qpcToUs, 0.0, 500000.0));
-                g_lastAnimHookUs.store(hookUs, std::memory_order_relaxed);
-                g_lastAnimEnts.store(frameTweenEnts, std::memory_order_relaxed);
-                g_lastAnimBones.store(frameTweenBones, std::memory_order_relaxed);
-                g_lastAnimShed.store(frameShedCount, std::memory_order_relaxed);
-                g_frameAnimUs.fetch_add(hookUs, std::memory_order_relaxed);
-                g_frameAnimEnts.fetch_add(frameTweenEnts, std::memory_order_relaxed);
-                g_frameAnimBones.fetch_add(frameTweenBones, std::memory_order_relaxed);
-                g_frameAnimShed.fetch_add(frameShedCount, std::memory_order_relaxed);
+                // Only publish fallback frame-rollover anim stats when HookGameRender is NOT active
+                // (e.g. Main Menu); in live gameplay HookGameRender owns world MT+inline telemetry so
+                // 26-widget UI passes never clobber world entity counts or double-count anim time!
+                if (g_lastWorldRenderUs.load(std::memory_order_relaxed) == 0u) {
+                    const uint32_t hookUs = static_cast<uint32_t>(
+                        std::clamp(static_cast<double>(frameHookAccumQpc) * g_qpcToUs, 0.0, 500000.0));
+                    g_lastAnimHookUs.store(hookUs, std::memory_order_relaxed);
+                    g_lastAnimMtUs.store(0u, std::memory_order_relaxed);
+                    g_lastAnimInlUs.store(hookUs, std::memory_order_relaxed);
+                    g_lastAnimEnts.store(frameTweenEnts, std::memory_order_relaxed);
+                    g_lastAnimBones.store(frameTweenBones, std::memory_order_relaxed);
+                    g_lastAnimShed.store(frameShedCount, std::memory_order_relaxed);
+                    RecordPeakFrameAnimStats(hookUs, 0u, hookUs, frameTweenEnts, frameTweenBones, frameShedCount);
+                }
             }
             FlushCounters();
             lastFrameSeq = curSeq;
             cachedQpc = now;
             frameAnimStartQpc = now;
             frameHookAccumQpc = 0;
+            frameShedWorkQpc  = 0;
             qpcCountdown = 16;
             frameSampleIdx = 0;
             frameTweenEnts = 0;
+            frameInlineMainEnts = 0;
             frameTweenBones = 0;
             frameShedCount = 0;
             frameShedLevel = 0;
@@ -1937,10 +2304,14 @@ struct ThreadLocalAnimState {
         }
         if (qpcCountdown == 0) {
             qpcCountdown = 16;
-            const double workUs = static_cast<double>(frameHookAccumQpc) * g_qpcToUs;
-            if (workUs > 4000.0 || frameTweenEnts >= 1800) {
+            const double workUs = static_cast<double>(frameShedWorkQpc) * g_qpcToUs;
+            const double l1Us = g_tierAnimShedL1Us.load(std::memory_order_relaxed);
+            const double l2Us = g_tierAnimShedL2Us.load(std::memory_order_relaxed);
+            const uint32_t l1Ents = g_tierAnimShedL1Ents.load(std::memory_order_relaxed);
+            const uint32_t l2Ents = g_tierAnimShedL2Ents.load(std::memory_order_relaxed);
+            if (workUs > l2Us || frameTweenEnts >= l2Ents) {
                 frameShedLevel = 2;
-            } else if (workUs > 2200.0 || frameTweenEnts >= 900) {
+            } else if (workUs > l1Us || frameTweenEnts >= l1Ents) {
                 frameShedLevel = 1;
             }
         } else {
@@ -2037,6 +2408,20 @@ static inline bool IsGridPlacerAnim(uint32_t layer, uint32_t orientMode, const v
     return (sym0 == 0x006719C9u || sym0 == 0x7DE50C20u || sym0 == 0x98AD297Fu);
 }
 
+static inline bool IsStormScrollOverlayAnim(const Animation* anim) noexcept {
+    if (anim == nullptr || anim->num_frames == 0u || anim->frames == nullptr) return false;
+    const AnimFrame& f0 = anim->frames[0];
+    if (f0.num_elements < 2u || f0.elements == nullptr) return false;
+    if (f0.elements[0].layer_hash != 0xE97E2A8Du) return false;
+    const uint32_t sh0 = f0.elements[0].symbol_hash;
+    // Full-screen scrolling tiled storm sheets (verified unique across all DST anim zips):
+    //   sand_over.zip      `dust_loop` (sym=0x95B3FF72, layer=0xE97E2A8D, 8 tiles)
+    //   moonstorm_over.zip `dust_loop` (sym=0xFB87AC44, layer=0xE97E2A8D, 8 tiles)
+    // Tiles move 33..110px/frame (> 48px dup-particle cap), tearing into wave seams if partially
+    // interpolated -> pass through untouched to vanilla discrete frames.
+    return (sh0 == 0x95B3FF72u || sh0 == 0xFB87AC44u);
+}
+
 static void InterpolateAnimCmdWorldPos(uint8_t* cmd, const void* animPtr, uintptr_t key,
                                        ThreadLocalAnimState& tls, int64_t nowQpc, bool forceRtClock = false) {
     if (!cmd || key == 0) return;
@@ -2061,6 +2446,11 @@ static void InterpolateAnimCmdWorldPos(uint8_t* cmd, const void* animPtr, uintpt
         key, tls, nowQpc, true, animPtr, forceRtClock);
 }
 
+static hs_skeletal_mt::SkeletalMtPool<ThreadLocalAnimState, AnimBufferSlot>& GetMtSkeletalPool() {
+    static auto* s_pool = new hs_skeletal_mt::SkeletalMtPool<ThreadLocalAnimState, AnimBufferSlot>();
+    return *s_pool;
+}
+
 static void* HookAnimRenderCmdCtor(void* cmdMem, void* animNode, void* worldMtx) {
     void* cmd = g_origAnimRenderCmdCtor ? g_origAnimRenderCmdCtor(cmdMem, animNode, worldMtx) : cmdMem;
     if (cmd && animNode) {
@@ -2069,14 +2459,43 @@ static void* HookAnimRenderCmdCtor(void* cmdMem, void* animNode, void* worldMtx)
         const float rawX = *reinterpret_cast<const float*>(bytes + 0x24);
         const float rawY = *reinterpret_cast<const float*>(bytes + 0x34);
         const float rawZ = *reinterpret_cast<const float*>(bytes + 0x44);
-        if (g_worldPosInterpEnabled.load(std::memory_order_relaxed) != 0 &&
-            g_skeletalTweenEnabled.load(std::memory_order_relaxed) != 0) {
-            const void* animPtr = *reinterpret_cast<const void* const*>(bytes + 0xB0);
+        const void* animPtr = *reinterpret_cast<const void* const*>(bytes + 0xB0);
+        const bool skelOn = (g_skeletalTweenEnabled.load(std::memory_order_relaxed) != 0);
+        if (g_worldPosInterpEnabled.load(std::memory_order_relaxed) != 0 && skelOn) {
             ThreadLocalAnimState& tls = GetTlsAnimState();
             InterpolateAnimCmdWorldPos(bytes, animPtr, entityKey, tls, 0, false);
         }
         if (g_combatImpact.ActiveImpulseCount() > 0u) {
             g_combatImpact.BindAndApplyOnMainThread(bytes, entityKey, rawX, rawY, rawZ, NowQpc(), g_qpcInvFreq);
+        }
+        // Stage eligible world entities for multi-core parallel 240Hz skeletal pre-interpolation
+        // (verified @ 0x1400f4f05: animPtr=+0xB0, playMode=+0xC0, time=+0xC4; immutable after Ctor!)
+        if (skelOn && animPtr != nullptr && g_altRenderCheckVerified && g_hwCaps.logicalCores >= 4u) {
+            const uint32_t layer  = *reinterpret_cast<const uint32_t*>(bytes + 0x60);
+            const uint32_t orient = *reinterpret_cast<const uint32_t*>(bytes + 0x64);
+            const int32_t playMode = *reinterpret_cast<const int32_t*>(bytes + 0xC0);
+            if ((playMode == 0 || playMode == 1) && !IsGridPlacerAnim(layer, orient, animPtr)) {
+                bool isAltRender = false;
+                const auto* buildPtr = *reinterpret_cast<const uint8_t* const*>(bytes + g_cmdBuildOffset);
+                if (buildPtr && *reinterpret_cast<const void* const*>(buildPtr + g_buildAltOffset) != nullptr) {
+                    isAltRender = true;
+                }
+                const auto* anim = static_cast<const Animation*>(animPtr);
+                if (!isAltRender && anim->num_frames > 1u && anim->frames != nullptr && !IsStormScrollOverlayAnim(anim)) {
+                    const float time = *reinterpret_cast<const float*>(bytes + 0xC4);
+                    const auto* wm   = reinterpret_cast<const float*>(bytes + 0x18);
+                    hs_skeletal_mt::MtAnimJob job{};
+                    job.cmdPtr    = cmd;
+                    job.entityKey = entityKey;
+                    job.animPtr   = animPtr;
+                    job.playMode  = playMode;
+                    job.time      = time;
+                    job.axisX[0]  = wm[0];
+                    job.axisX[1]  = wm[4];
+                    job.axisX[2]  = wm[8];
+                    GetMtSkeletalPool().StageJob(job);
+                }
+            }
         }
     }
     return cmd;
@@ -2106,33 +2525,41 @@ static const float* HookLightGetWorldMatrix(void* transform) {
 
 static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, float time, uintptr_t key,
                                       AnimChannel channel, ThreadLocalAnimState* optTls = nullptr,
-                                      int64_t optNowQpc = 0, const float* curAxisX = nullptr) {
+                                      int64_t optNowQpc = 0, const float* curAxisX = nullptr,
+                                      bool isWorker = false) {
     // Always refresh parent key BEFORE any early return (prevents stale overlay keys on 1-frame / disabled entities)
-    if (channel == AnimChannel::Main && key != 0) {
+    if (!isWorker && channel == AnimChannel::Main && key != 0) {
         g_tlsLastParentKey = key;
     }
-    if (!animPtr || !g_origAnimGetFrame) {
+    auto bailOrig = [&]() -> const void* {
+        if (isWorker) return nullptr;
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
+    };
+    if (!animPtr || (!isWorker && !g_origAnimGetFrame)) {
+        return bailOrig();
     }
     if (g_skeletalTweenEnabled.load(std::memory_order_relaxed) == 0) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
     }
     // Percentage meters & discrete state overlays (SetPercent -> playMode == 2: UI status_meter,
     // world nutrients_overlay / farm_soil_moisture, crop, rainometer, winterometer) step discretely
     // by design; cross-frame interpolation + half-way frame_num swaps cause visible flicker.
     if (playMode == 2) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
     }
 
     const auto* anim = static_cast<const Animation*>(animPtr);
     uint32_t nframes = anim->num_frames;
     float fps = anim->framerate;
     if (nframes <= 1 || !anim->frames || !std::isfinite(fps) || !std::isfinite(time) || fps <= 0.0f || fps > 240.0f) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
+    }
+    if (IsStormScrollOverlayAnim(anim)) {
+        return bailOrig();
     }
 
     if (key == 0) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
     }
 
     ThreadLocalAnimState& tls = optTls ? *optTls : GetTlsAnimState();
@@ -2141,7 +2568,11 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         ? (std::clamp(g_animCrossfadeMs.load(std::memory_order_relaxed), 0.0f, 120.0f) * 0.001f)
         : 0.0f;
     const float splineStr = std::clamp(g_animSplineStrength.load(std::memory_order_relaxed), 0.0f, 1.0f);
-    const bool fastOnly = (tls.frameShedLevel >= 1 && channel != AnimChannel::UI);
+    const bool mtInlineMiss = (!isWorker && channel == AnimChannel::Main && GetMtSkeletalPool().IsActive());
+    const double inlineWorkUs = mtInlineMiss ? (static_cast<double>(tls.frameShedWorkQpc) * g_qpcToUs) : 0.0;
+    const bool fastOnly = ((tls.frameShedLevel >= 1) ||
+                           (mtInlineMiss && (inlineWorkUs >= 900.0 || tls.frameInlineMainEnts >= 128u))) &&
+                          (channel != AnimChannel::UI);
 
     // Compute continuous floating-point frame coordinate (works for 30fps, 40fps,
     // SetDeltaTimeMultiplier speed scaling, looping, one-shot, and percentage animations).
@@ -2159,10 +2590,10 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         float c = (time < 0.0f) ? 0.0f : ((time > 1.0f) ? 1.0f : time);
         curF = c * (nf - 1.0f);
     } else {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
     }
     if (!std::isfinite(curF)) {
-        return g_origAnimGetFrame(animPtr, playMode, time);
+        return bailOrig();
     }
 
     // 4-probe open-addressing lookup with LRU eviction (0% hash-collision eviction in megabases)
@@ -2191,10 +2622,13 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         return &anim->frames[fi];
     };
 
+    bool simTimeChanged = false;
+
     // A1 Cross-Clip Pose Crossfade finalize wrapper:
     //   - Applied on EVERY normal return so crossfades never flicker when frac hits 0.0/1.0!
     //   - Copies read-only anim->frames[] into a writable AnimBufferSlot before blending.
-    //   - Records final blended pose so rapid chained clip switches stay C0-continuous!
+    //   - Records pose on every SimTick, clip switch, or active crossfade frame (DST clip switches
+    //     only occur on SimTicks; skipping redundant mid-tick copies saves ~80% pose bandwidth!).
     auto finalizeFrame = [&](const AnimFrame* outFrame, bool isWritable) -> const void* {
         if (!outFrame) return nullptr;
         if (channel != AnimChannel::Main || crossfadeSec < 0.005f) return outFrame;
@@ -2224,13 +2658,24 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                 ++tls.batchCrossfadeFrames;
             }
         }
-        hs_skeletal::PoseCrossfadePool::RecordPose(*pslot, *finalOut, nowQpc, curAxisX);
+        if (pslot->blending || simTimeChanged || pslot->last_count == 0u || !isWritable) {
+            hs_skeletal::PoseCrossfadePool::RecordPoseSmart(*pslot, *finalOut, isWritable, nowQpc, curAxisX);
+        } else {
+            pslot->seen_qpc = nowQpc;
+            if (curAxisX) {
+                pslot->last_axis_x[0] = curAxisX[0];
+                pslot->last_axis_x[1] = curAxisX[1];
+                pslot->last_axis_x[2] = curAxisX[2];
+                pslot->has_axis_x = 1;
+            }
+        }
         return finalOut;
     };
 
     const uint32_t curSimGen = g_clientSimTickGen.load(std::memory_order_relaxed);
     const int curSimHz = g_clientSimTickRate.load(std::memory_order_relaxed);
     if (!wasSameEntity || tr.anim != animPtr) {
+        simTimeChanged = true;
         tr.entity_key = key;
         tr.anim = animPtr;
         tr.last_time = time;
@@ -2260,6 +2705,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     }
 
     if (time != tr.last_time) {
+        simTimeChanged = true;
         float oldF = tr.curr_f;
         float df = curF - oldF;
         float elapsed = static_cast<float>(static_cast<double>(nowQpc - tr.tick_qpc) * g_qpcInvFreq);
@@ -2350,9 +2796,15 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     }
     tr.last_rendered_f = fNow;
 
-    // Level-2 Swarm Hitch Guard: under extreme 500+ entity storms, gracefully shed excess skeletal
-    // bone blending for this frame while keeping 100% 240FPS world-position interpolation active!
-    if (tls.frameShedLevel >= 2 && channel != AnimChannel::UI) {
+    // Level-2 Swarm Hitch Guard + MT Inline-Miss Burst Cap:
+    //   1) Under extreme 500+ entity storms, gracefully shed excess skeletal bone blending while
+    //      keeping 100% 240FPS world-position interpolation active.
+    //   2) When SkeletalMtPool is active, single-threaded RenderThread inline misses are capped at
+    //      1.5ms or 256 entities/frame so sudden walking/turning arrival bursts return exact vanilla
+    //      pose in 0.000ms on that 1st frame instead of stalling 8ms single-threaded, while
+    //      HookAnimRenderCmdCtor stages them for 12-worker parallel tweening on the very next frame!
+    if ((tls.frameShedLevel >= 2 && channel != AnimChannel::UI) ||
+        (mtInlineMiss && (inlineWorkUs >= 1500.0 || tls.frameInlineMainEnts >= 256u))) {
         ++tls.frameShedCount;
         ++tls.batchShedFrames;
         return discreteFrame();
@@ -2390,15 +2842,44 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     if (n0 == 0 || !f0.elements || n1 == 0 || !f1.elements || n0 > kMaxAnimElements || n1 > kMaxAnimElements) {
         return finalizeFrame(&f0, false);
     }
-    if (n0 == n1 && n0 <= 16u) {
+    if (n0 == n1) {
         bool allIdentical = true;
+        bool indexAlignedUnique = (n0 <= 128u);
+        uint32_t seenLKey[256];
+        uint8_t  seenLOcc[256];
+        if (indexAlignedUnique) {
+            memset(seenLOcc, 0, sizeof(seenLOcc));
+        }
         for (uint32_t k = 0; k < n0; ++k) {
-            if (f0.elements[k].symbol_hash != f1.elements[k].symbol_hash ||
-                f0.elements[k].layer_hash  != f1.elements[k].layer_hash  ||
-                f0.elements[k].frame_num   != f1.elements[k].frame_num   ||
-                memcmp(f0.elements[k].m, f1.elements[k].m, 12) != 0) {
+            const AnimElement& e0 = f0.elements[k];
+            const AnimElement& e1 = f1.elements[k];
+            if (e0.symbol_hash != e1.symbol_hash || e0.layer_hash != e1.layer_hash) {
                 allIdentical = false;
+                indexAlignedUnique = false;
                 break;
+            }
+            if (allIdentical && (e0.frame_num != e1.frame_num || memcmp(e0.m, e1.m, 12) != 0)) {
+                allIdentical = false;
+            }
+            if (indexAlignedUnique) {
+                const uint32_t lh = e0.layer_hash;
+                const uint32_t base = (lh * 2654435761u) & 255u;
+                bool placed = false;
+                for (uint32_t p = 0; p < 8u; ++p) {
+                    const uint32_t s = (base + p) & 255u;
+                    if (!seenLOcc[s]) {
+                        seenLOcc[s] = 1u;
+                        seenLKey[s] = lh;
+                        placed = true;
+                        break;
+                    }
+                    if (seenLKey[s] == lh) {
+                        indexAlignedUnique = false; // duplicate layer_hash -> use full matcher
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) indexAlignedUnique = false;
             }
         }
         if (allIdentical) {
@@ -2411,9 +2892,151 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
             }
             return finalizeFrame(&f0, false);
         }
+
+        // Bit-Exact O(N) Index-Aligned Unique-Layer Fast Path:
+        //   When f0 and f1 share identical 1-to-1 element order and all layer_hash are unique,
+        //   every bone uniquely matches index-for-index with isParticleLayer == false, skipping
+        //   all 6 stack hash-table memsets & 4 hash builds while preserving 100% 4-key PCHIP splines!
+        if (indexAlignedUnique) {
+            const int64_t workStartQpc = !isWorker ? NowQpc() : 0;
+            AnimBufferSlot& bufSlot = tls.NextSlot(channel);
+            bufSlot.frame = f0;
+            bufSlot.frame.elements = bufSlot.elems;
+            memcpy(bufSlot.elems, f0.elements, n0 * sizeof(AnimElement));
+
+            const bool useSplineFast = (splineStr > 0.001f && !fastOnly && nframes >= 3u);
+            const AnimFrame* fM1 = nullptr;
+            const AnimFrame* fP2 = nullptr;
+            bool m1Aligned = false, p2Aligned = false;
+            constexpr uint32_t kFastHashSize = 128;
+            constexpr uint32_t kFastHashMask = kFastHashSize - 1;
+            int16_t headM1[kFastHashSize], nextM1[kMaxAnimElements];
+            int16_t headP2[kFastHashSize], nextP2[kMaxAnimElements];
+
+            if (useSplineFast) {
+                const uint32_t idxM1 = isWrappingSeg ? ((idx0 + nframes - 1u) % nframes) : ((idx0 > 0u) ? (idx0 - 1u) : idx0);
+                const uint32_t idxP2 = isWrappingSeg ? ((idx1 + 1u) % nframes) : ((idx1 + 1u < nframes) ? (idx1 + 1u) : idx1);
+                if (idxM1 != idx0 && idxM1 != idx1) {
+                    const AnimFrame& cand = anim->frames[idxM1];
+                    if (cand.elements && cand.num_elements > 0u && cand.num_elements <= kMaxAnimElements) {
+                        fM1 = &cand;
+                        if (cand.num_elements == n0) {
+                            m1Aligned = true;
+                            for (uint32_t k = 0; k < n0; ++k) {
+                                if (cand.elements[k].layer_hash != f0.elements[k].layer_hash ||
+                                    cand.elements[k].symbol_hash != f0.elements[k].symbol_hash) {
+                                    m1Aligned = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!m1Aligned) {
+                            memset(headM1, -1, sizeof(headM1));
+                            for (int32_t k = static_cast<int32_t>(cand.num_elements) - 1; k >= 0; --k) {
+                                const uint32_t h = ((cand.elements[k].layer_hash * 2654435761u) ^ cand.elements[k].symbol_hash) & kFastHashMask;
+                                nextM1[k] = headM1[h];
+                                headM1[h] = static_cast<int16_t>(k);
+                            }
+                        }
+                    }
+                }
+                if (idxP2 != idx1 && idxP2 != idx0) {
+                    const AnimFrame& cand = anim->frames[idxP2];
+                    if (cand.elements && cand.num_elements > 0u && cand.num_elements <= kMaxAnimElements) {
+                        fP2 = &cand;
+                        if (cand.num_elements == n0) {
+                            p2Aligned = true;
+                            for (uint32_t k = 0; k < n0; ++k) {
+                                if (cand.elements[k].layer_hash != f0.elements[k].layer_hash ||
+                                    cand.elements[k].symbol_hash != f0.elements[k].symbol_hash) {
+                                    p2Aligned = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!p2Aligned) {
+                            memset(headP2, -1, sizeof(headP2));
+                            for (int32_t k = static_cast<int32_t>(cand.num_elements) - 1; k >= 0; --k) {
+                                const uint32_t h = ((cand.elements[k].layer_hash * 2654435761u) ^ cand.elements[k].symbol_hash) & kFastHashMask;
+                                nextP2[k] = headP2[h];
+                                headP2[h] = static_cast<int16_t>(k);
+                            }
+                        }
+                    }
+                }
+            }
+
+            auto findFastNbrM = [&](const AnimFrame* fn, bool aligned, const int16_t* heads, const int16_t* nexts,
+                                    uint32_t idx, uint32_t lhash, uint32_t shash) -> const uint16_t* {
+                if (!fn) return nullptr;
+                if (aligned) return fn->elements[idx].m;
+                const uint32_t h = ((lhash * 2654435761u) ^ shash) & kFastHashMask;
+                int32_t hit = -1;
+                for (int16_t k = heads[h]; k >= 0; k = nexts[k]) {
+                    const AnimElement& ek = fn->elements[k];
+                    if (ek.symbol_hash == shash && ek.layer_hash == lhash) {
+                        if (hit >= 0) return nullptr;
+                        hit = k;
+                    }
+                }
+                return (hit >= 0) ? fn->elements[hit].m : nullptr;
+            };
+
+            uint32_t tweenedCount = 0;
+            uint32_t pass2Count = 0;
+            uint32_t splineCount = 0;
+            for (uint32_t i = 0; i < n0; ++i) {
+                const AnimElement& e0 = f0.elements[i];
+                const AnimElement& e1 = f1.elements[i];
+                const bool isPass2 = (e1.frame_num != e0.frame_num);
+                if (isPass2 && fastOnly) continue;
+                if (!isPass2 && std::memcmp(e0.m, e1.m, 12) == 0) {
+                    ++tweenedCount;
+                    continue;
+                }
+                bool okTween = false;
+                if (useSplineFast && (fM1 || fP2)) {
+                    const uint16_t* mM1 = findFastNbrM(fM1, m1Aligned, headM1, nextM1, i, e0.layer_hash, e0.symbol_hash);
+                    const uint16_t* mP2 = findFastNbrM(fP2, p2Aligned, headP2, nextP2, i, e0.layer_hash, e0.symbol_hash);
+                    bool usedSpl = false;
+                    okTween = hs_skeletal::TweenElementMatrixSpline(
+                        mM1, e0.m, e1.m, mP2, frac, splineStr, bufSlot.elems[i].m, fastOnly, &usedSpl);
+                    if (okTween && usedSpl) ++splineCount;
+                } else {
+                    okTween = TweenElementMatrix(e0.m, e1.m, frac, bufSlot.elems[i].m, fastOnly);
+                }
+                if (okTween) {
+                    ++tweenedCount;
+                    if (isPass2) {
+                        ++pass2Count;
+                        if (frac >= 0.5f) {
+                            bufSlot.elems[i].frame_num = e1.frame_num;
+                        }
+                    }
+                }
+            }
+            if (workStartQpc != 0) {
+                const int64_t deltaQpc = NowQpc() - workStartQpc;
+                if (deltaQpc > 0) {
+                    tls.frameHookAccumQpc += deltaQpc;
+                    const int64_t maxSampleQpc = static_cast<int64_t>(250.0 / g_qpcToUs);
+                    tls.frameShedWorkQpc += (maxSampleQpc > 0 && deltaQpc > maxSampleQpc) ? maxSampleQpc : deltaQpc;
+                }
+            }
+            if (tweenedCount > 0) {
+                ++tls.frameTweenEnts;
+                if (mtInlineMiss) ++tls.frameInlineMainEnts;
+                tls.frameTweenBones += tweenedCount;
+                ++tls.batchInterpFrames;
+                tls.batchElemsTweened += static_cast<int64_t>(tweenedCount);
+                if (pass2Count > 0) tls.batchPass2Swaps += static_cast<int64_t>(pass2Count);
+                if (splineCount > 0) tls.batchSplineBones += static_cast<int64_t>(splineCount);
+            }
+            return finalizeFrame(&bufSlot.frame, true);
+        }
     }
 
-    const int64_t workStartQpc = ((tls.frameSampleIdx++ & 15u) == 0u) ? NowQpc() : 0;
+    const int64_t workStartQpc = !isWorker ? NowQpc() : 0;
 
     AnimBufferSlot& bufSlot = tls.NextSlot(channel);
     bufSlot.frame = f0;
@@ -2443,19 +3066,29 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     uint8_t uniqueRigid[kMaxAnimElements];
     uint64_t usedF1[kMaxAnimElements / 64] = { 0 }; // 512 bits (matches kMaxAnimElements)
 
+    uint8_t l0BktCnt[kHashSize];
+    uint8_t l1BktCnt[kHashSize];
     memset(headLS, -1, sizeof(headLS));
     memset(f0BucketCnt, 0, sizeof(f0BucketCnt));
+    memset(l0BktCnt, 0, sizeof(l0BktCnt));
+    memset(l1BktCnt, 0, sizeof(l1BktCnt));
     memset(matchedF1, -1, n0 * sizeof(int16_t));
     memset(f0Processed, 0, n0 * sizeof(uint8_t));
     memset(uniqueRigid, 0, n0 * sizeof(uint8_t));
 
     for (uint32_t k = 0; k < n0; ++k) {
-        const uint32_t h = ((f0.elements[k].layer_hash * 2654435761u) ^ f0.elements[k].symbol_hash) & kHashMask;
+        const uint32_t lh = f0.elements[k].layer_hash;
+        const uint32_t lb = (lh * 2654435761u) & kHashMask;
+        if (l0BktCnt[lb] < 255) ++l0BktCnt[lb];
+        const uint32_t h = ((lh * 2654435761u) ^ f0.elements[k].symbol_hash) & kHashMask;
         if (f0BucketCnt[h] < 255) ++f0BucketCnt[h];
     }
     // Reverse-insert f1 so bucket chains traverse in strict ascending index order (0, 1, 2, ...)
     for (int32_t j = static_cast<int32_t>(n1) - 1; j >= 0; --j) {
-        const uint32_t h = ((f1.elements[j].layer_hash * 2654435761u) ^ f1.elements[j].symbol_hash) & kHashMask;
+        const uint32_t lh = f1.elements[j].layer_hash;
+        const uint32_t lb = (lh * 2654435761u) & kHashMask;
+        if (l1BktCnt[lb] < 255) ++l1BktCnt[lb];
+        const uint32_t h = ((lh * 2654435761u) ^ f1.elements[j].symbol_hash) & kHashMask;
         nextLS[j] = headLS[h];
         headLS[h] = static_cast<int16_t>(j);
     }
@@ -2469,11 +3102,19 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     auto elemDet = [](const uint16_t m[6]) -> float {
         return HalfToFloat(m[0]) * HalfToFloat(m[3]) - HalfToFloat(m[1]) * HalfToFloat(m[2]);
     };
-    // Distinguishes dynamic particle layers (e.g. autumn `tree_leaf_fx` where leaves duplicate or
-    // spawn/despawn across frames) from rigid composite character rig layers (e.g. player `arm_carry`
-    // holding 6 distinct 1-to-1 limb/weapon symbols: arm_upper, arm_lower, hand, swap_object).
-    // Only dynamic particle layers receive the 48px jump cap; rigid character limbs retain full 420px!
+    // O(1) fast-path + memoized exact particle-layer detector (mathematically 100% identical to full scan!):
+    //   - 90%+ of unique bones live on 1-element layers -> l0BktCnt[lb] <= 1 && l1BktCnt[lb] <= 1 -> O(1) false!
+    //   - Multi-element layers are computed AT MOST ONCE per distinct layer_hash and cached in stack memo table.
+    uint32_t partCacheKey[16];
+    uint8_t  partCacheVal[16];
+    uint32_t partCacheCnt = 0u;
     auto isParticleLayer = [&](uint32_t lhash) -> bool {
+        const uint32_t lb = (lhash * 2654435761u) & kHashMask;
+        if (l0BktCnt[lb] <= 1u && l1BktCnt[lb] <= 1u) return false;
+        for (uint32_t c = 0; c < partCacheCnt; ++c) {
+            if (partCacheKey[c] == lhash) return partCacheVal[c] != 0u;
+        }
+        bool res = false;
         uint32_t c0 = 0, c1 = 0;
         for (uint32_t k = 0; k < n0; ++k) {
             if (f0.elements[k].layer_hash == lhash) ++c0;
@@ -2481,23 +3122,36 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         for (uint32_t j = 0; j < n1; ++j) {
             if (f1.elements[j].layer_hash == lhash) ++c1;
         }
-        if (c0 <= 1 && c1 <= 1) return false;
-        if (c0 != c1) return true; // particle spawn/despawn on this layer -> cap 48px
-        for (uint32_t k = 0; k < n0; ++k) {
-            if (f0.elements[k].layer_hash != lhash) continue;
-            const uint32_t sym = f0.elements[k].symbol_hash;
-            uint32_t m0 = 0, m1 = 0;
-            for (uint32_t a = 0; a < n0; ++a) {
-                if (f0.elements[a].layer_hash == lhash && f0.elements[a].symbol_hash == sym) ++m0;
+        if (c0 <= 1 && c1 <= 1) {
+            res = false;
+        } else if (c0 != c1) {
+            res = true; // particle spawn/despawn on this layer -> cap 48px
+        } else {
+            for (uint32_t k = 0; k < n0; ++k) {
+                if (f0.elements[k].layer_hash != lhash) continue;
+                const uint32_t sym = f0.elements[k].symbol_hash;
+                uint32_t m0 = 0, m1 = 0;
+                for (uint32_t a = 0; a < n0; ++a) {
+                    if (f0.elements[a].layer_hash == lhash && f0.elements[a].symbol_hash == sym) ++m0;
+                }
+                if (m0 != 1) { res = true; break; } // duplicate symbol on layer -> particle layer
+                for (uint32_t b = 0; b < n1; ++b) {
+                    if (f1.elements[b].layer_hash == lhash && f1.elements[b].symbol_hash == sym) ++m1;
+                }
+                if (m1 != 1) { res = true; break; } // symbol churn (vanished/replaced) -> particle layer
             }
-            if (m0 != 1) return true; // duplicate symbol on layer -> particle layer
-            for (uint32_t b = 0; b < n1; ++b) {
-                if (f1.elements[b].layer_hash == lhash && f1.elements[b].symbol_hash == sym) ++m1;
-            }
-            if (m1 != 1) return true; // symbol churn (vanished/replaced) -> particle layer
         }
-        return false; // strict 1-to-1 symbol bijection -> rigid composite limb layer!
+        if (partCacheCnt < 16u) {
+            partCacheKey[partCacheCnt] = lhash;
+            partCacheVal[partCacheCnt] = res ? 1u : 0u;
+            ++partCacheCnt;
+        }
+        return res;
     };
+
+    const bool useSpline = (splineStr > 0.001f && !fastOnly && nframes >= 3u);
+    uint32_t matchedCount = 0u;
+    bool anyUniqueRigidMoving = false;
 
     for (uint32_t i = 0; i < n0; ++i) {
         if (f0Processed[i]) continue;
@@ -2529,14 +3183,26 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         if (cnt0LS == 1 && cnt1LS == 1) {
             // Fast O(1) unique (layer, symbol) 1-to-1 bone match
             const AnimElement& e1 = f1.elements[firstJ];
+            const bool exactMat = (std::memcmp(e0.m, e1.m, 12) == 0);
+            if (exactMat) {
+                matchedF1[i] = static_cast<int16_t>(firstJ);
+                markUsedF1(static_cast<uint32_t>(firstJ));
+                ++matchedCount;
+                f0Processed[i] = 1;
+                continue;
+            }
             const float dx = HalfToFloat(e1.m[4]) - HalfToFloat(e0.m[4]);
             const float dy = HalfToFloat(e1.m[5]) - HalfToFloat(e0.m[5]);
             const float d2 = dx * dx + dy * dy;
-            const bool partLayer = isParticleLayer(lhash);
+            const bool partLayer = (d2 > kDupMaxDistSq || useSpline) ? isParticleLayer(lhash) : false;
             if (d2 <= kDupMaxDistSq || !partLayer) {
                 matchedF1[i] = static_cast<int16_t>(firstJ);
                 markUsedF1(static_cast<uint32_t>(firstJ));
-                if (!partLayer) uniqueRigid[i] = 1;
+                ++matchedCount;
+                if (!partLayer && useSpline) {
+                    uniqueRigid[i] = 1;
+                    anyUniqueRigidMoving = true;
+                }
             }
             f0Processed[i] = 1;
             continue;
@@ -2722,6 +3388,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                     const uint16_t fj = b1[locMatch[a]];
                     matchedF1[b0[a]] = static_cast<int16_t>(fj);
                     markUsedF1(fj);
+                    ++matchedCount;
                 }
             }
         } else {
@@ -2748,6 +3415,7 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
                 if (bestJ >= 0) {
                     matchedF1[k] = static_cast<int16_t>(bestJ);
                     markUsedF1(static_cast<uint32_t>(bestJ));
+                    ++matchedCount;
                 }
             }
         }
@@ -2755,48 +3423,49 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
 
     // Pass 2: Cross-Layer Orbit Handoff (e.g. Enlightened Crown `hat_alterguardian_equipped`
     // activate_loop where orbiting crown shards step ~1.9px while crossing between front & back
-    // layers). Only considers still-unmatched elements with exact same symbol_hash, consistent
-    // determinant sign, and tight <=20px proximity (zero false matches on fireflies/ripples).
-    constexpr float kCrossLayerMaxDistSq = 20.0f * 20.0f;
-    for (;;) {
-        float bestD2 = kCrossLayerMaxDistSq + 1.0f;
-        int32_t bestI = -1, bestJ = -1;
-        for (uint32_t i = 0; i < n0; ++i) {
-            if (matchedF1[i] >= 0) continue;
-            const AnimElement& e0 = f0.elements[i];
-            const float x0i = HalfToFloat(e0.m[4]), y0i = HalfToFloat(e0.m[5]);
-            const float d0i = elemDet(e0.m);
-            for (uint32_t j = 0; j < n1; ++j) {
-                if (isUsedF1(j)) continue;
-                const AnimElement& e1 = f1.elements[j];
-                if (e1.symbol_hash != e0.symbol_hash) continue;
-                if (d0i * elemDet(e1.m) < 0.0f) continue;
-                const float dx = HalfToFloat(e1.m[4]) - x0i;
-                const float dy = HalfToFloat(e1.m[5]) - y0i;
-                const float d2 = dx * dx + dy * dy;
-                if (d2 <= kCrossLayerMaxDistSq && d2 < bestD2) {
-                    bestD2 = d2;
-                    bestI = static_cast<int32_t>(i);
-                    bestJ = static_cast<int32_t>(j);
+    // layers). Only runs when unmatched bones remain in both f0 and f1 (O(1) skip for 95%+ entities!).
+    if (matchedCount < n0 && matchedCount < n1) {
+        constexpr float kCrossLayerMaxDistSq = 20.0f * 20.0f;
+        for (;;) {
+            float bestD2 = kCrossLayerMaxDistSq + 1.0f;
+            int32_t bestI = -1, bestJ = -1;
+            for (uint32_t i = 0; i < n0; ++i) {
+                if (matchedF1[i] >= 0) continue;
+                const AnimElement& e0 = f0.elements[i];
+                const float x0i = HalfToFloat(e0.m[4]), y0i = HalfToFloat(e0.m[5]);
+                const float d0i = elemDet(e0.m);
+                for (uint32_t j = 0; j < n1; ++j) {
+                    if (isUsedF1(j)) continue;
+                    const AnimElement& e1 = f1.elements[j];
+                    if (e1.symbol_hash != e0.symbol_hash) continue;
+                    if (d0i * elemDet(e1.m) < 0.0f) continue;
+                    const float dx = HalfToFloat(e1.m[4]) - x0i;
+                    const float dy = HalfToFloat(e1.m[5]) - y0i;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 <= kCrossLayerMaxDistSq && d2 < bestD2) {
+                        bestD2 = d2;
+                        bestI = static_cast<int32_t>(i);
+                        bestJ = static_cast<int32_t>(j);
+                    }
                 }
             }
+            if (bestI < 0) break;
+            matchedF1[bestI] = static_cast<int16_t>(bestJ);
+            markUsedF1(static_cast<uint32_t>(bestJ));
+            ++matchedCount;
         }
-        if (bestI < 0) break;
-        matchedF1[bestI] = static_cast<int16_t>(bestJ);
-        markUsedF1(static_cast<uint32_t>(bestJ));
     }
 
     // A2: Optional 4-keyframe C1 Monotone PCHIP Spline neighbor lookup (fM1, fP2)
-    //     Strictly limited to unique rigid 1-to-1 bones (never particle swarms!) and auto-bypassed
-    //     under swarm load shedding (fastOnly) or splineStr == 0.
-    const bool useSpline = (splineStr > 0.001f && !fastOnly && nframes >= 3u);
+    //     Strictly limited to moving unique rigid 1-to-1 bones (zero wasted hash build on static frames!).
+    const bool buildSplineTables = (useSpline && anyUniqueRigidMoving);
     const AnimFrame* fM1 = nullptr;
     const AnimFrame* fP2 = nullptr;
     int16_t headM1[kHashSize];
     int16_t nextM1[kMaxAnimElements];
     int16_t headP2[kHashSize];
     int16_t nextP2[kMaxAnimElements];
-    if (useSpline) {
+    if (buildSplineTables) {
         const uint32_t idxM1 = isWrappingSeg ? ((idx0 + nframes - 1u) % nframes) : ((idx0 > 0u) ? (idx0 - 1u) : idx0);
         const uint32_t idxP2 = isWrappingSeg ? ((idx1 + 1u) % nframes) : ((idx1 + 1u < nframes) ? (idx1 + 1u) : idx1);
         if (idxM1 != idx0 && idxM1 != idx1) {
@@ -2850,8 +3519,13 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
         const AnimElement& e1 = f1.elements[mj];
         const bool isPass2 = (e1.frame_num != e0.frame_num);
         if (isPass2 && fastOnly) continue;
+        // Bit-exact zero-work fast path: bufSlot.elems[i].m ALREADY holds e0.m from memcpy above!
+        if (!isPass2 && std::memcmp(e0.m, e1.m, 12) == 0) {
+            ++tweenedCount;
+            continue;
+        }
         bool okTween = false;
-        if (useSpline && uniqueRigid[i] && (fM1 || fP2)) {
+        if (buildSplineTables && uniqueRigid[i] && (fM1 || fP2)) {
             const uint16_t* mM1 = findUniqueNeighborM(fM1, headM1, nextM1, e0.layer_hash, e0.symbol_hash);
             const uint16_t* mP2 = findUniqueNeighborM(fP2, headP2, nextP2, e0.layer_hash, e0.symbol_hash);
             bool usedSpl = false;
@@ -2873,16 +3547,17 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     }
 
     if (workStartQpc != 0) {
-        // Sampled per-16-entity work estimator; clamp any single-entity OS-preemption / complex-FX
-        // outlier to <=250us before x16 scaling so one spike cannot falsely trip Level-2 shedding.
-        int64_t deltaQpc = NowQpc() - workStartQpc;
-        const int64_t maxSampleQpc = static_cast<int64_t>(250.0 / g_qpcToUs);
-        if (deltaQpc > maxSampleQpc && maxSampleQpc > 0) deltaQpc = maxSampleQpc;
-        if (deltaQpc > 0) tls.frameHookAccumQpc += deltaQpc * 16;
+        const int64_t deltaQpc = NowQpc() - workStartQpc;
+        if (deltaQpc > 0) {
+            tls.frameHookAccumQpc += deltaQpc;
+            const int64_t maxSampleQpc = static_cast<int64_t>(250.0 / g_qpcToUs);
+            tls.frameShedWorkQpc += (maxSampleQpc > 0 && deltaQpc > maxSampleQpc) ? maxSampleQpc : deltaQpc;
+        }
     }
 
     if (tweenedCount > 0) {
         ++tls.frameTweenEnts;
+        if (mtInlineMiss) ++tls.frameInlineMainEnts;
         tls.frameTweenBones += tweenedCount;
         ++tls.batchInterpFrames;
         tls.batchElemsTweened += static_cast<int64_t>(tweenedCount);
@@ -2892,22 +3567,43 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     return finalizeFrame(&bufSlot.frame, true);
 }
 
+static const void* MtEvalSkeletalJob(ThreadLocalAnimState& st, const hs_skeletal_mt::MtAnimJob& job,
+                                     int64_t nowQpc, AnimBufferSlot& outSlot, void*) {
+    st.mtOutSlot = &outSlot;
+    const void* res = InterpGetFrameCore(job.animPtr, job.playMode, job.time, job.entityKey,
+                                         AnimChannel::Main, &st, nowQpc, job.axisX, true);
+    st.mtOutSlot = nullptr;
+    return res;
+}
+
+static void MtResetShardState(ThreadLocalAnimState& st) {
+    for (auto& t : st.tracks) t.valid = 0;
+    st.posePool = hs_skeletal::PoseCrossfadePool();
+}
+
 extern "C" const void* FastInterpGetFrameMain(const void* animPtr, int32_t playMode, float time, const void* animRenderCmd) {
     if (!animRenderCmd) {
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
     }
     auto* cmd = const_cast<uint8_t*>(static_cast<const uint8_t*>(animRenderCmd));
+    const void* persistentAnimNode = *reinterpret_cast<const void* const*>(cmd + 8);
+    if (persistentAnimNode) {
+        g_tlsLastParentKey = reinterpret_cast<uintptr_t>(persistentAnimNode);
+    }
+    // O(1) Multi-Core Pre-Interpolated Lookup (quintuple-verified on cmdPtr, entityKey, animPtr, playMode, time!)
+    if (const void* preFrame = GetMtSkeletalPool().LookupResult(
+            animRenderCmd, animPtr, playMode, time, reinterpret_cast<uintptr_t>(persistentAnimNode))) {
+        return preFrame;
+    }
     const uint32_t cmdLayer  = *reinterpret_cast<const uint32_t*>(cmd + 0x60);
     const uint32_t cmdOrient = *reinterpret_cast<const uint32_t*>(cmd + 0x64);
     if (IsGridPlacerAnim(cmdLayer, cmdOrient, animPtr)) {
         return g_origAnimGetFrame ? g_origAnimGetFrame(animPtr, playMode, time) : nullptr;
     }
-    const void* persistentAnimNode = *reinterpret_cast<const void* const*>(cmd + 8);
     ThreadLocalAnimState& tls = GetTlsAnimState();
     const int64_t nowQpc = tls.GetFrameQpc();
     if (persistentAnimNode) {
         const uintptr_t entityKey = reinterpret_cast<uintptr_t>(persistentAnimNode);
-        g_tlsLastParentKey = entityKey;
         // Fallback only when Main-Thread AnimRenderCmd::AnimRenderCmd hook isn't active.
         // Under normal operation, HookAnimRenderCmdCtor has ALREADY interpolated [cmd+0x18..0x57]
         // on the Main Thread in 0.00px lockstep with FollowCamera, DynamicShadow, and LightMap!
@@ -3224,11 +3920,13 @@ extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
     }
     tl_lastGcQpc = nowQpc;
 
-    auto computeFloor = [](int liveKB) -> int {
-        int floorKB = liveKB + 262144; // +256 MB emergency headroom
+    const int gcMinKb = g_tierGcHeadroomMinKb.load(std::memory_order_relaxed);
+    const int gcMaxKb = g_tierGcHeadroomMaxKb.load(std::memory_order_relaxed);
+    auto computeFloor = [gcMinKb, gcMaxKb](int liveKB) -> int {
+        int floorKB = liveKB + gcMinKb;
         int scaleKB = static_cast<int>(static_cast<double>(liveKB) * 2.5);
         int next = (scaleKB > floorKB) ? scaleKB : floorKB;
-        if (next - liveKB > 0x320000) next = liveKB + 0x320000;
+        if (next - liveKB > gcMaxKb) next = liveKB + gcMaxKb;
         return next;
     };
 
@@ -3249,19 +3947,21 @@ extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
         ranEmergencyFull = true;
     }
 
-    // 2. Real-dt base budget (~8.5% frame-time, [0.35ms, 1.60ms])
+    // 2. Real-dt base budget (~8.5% frame-time, [0.30ms, 0.80ms])
     float budgetSec = actualDt * 0.085f;
-    if (budgetSec < 0.00035f) budgetSec = 0.00035f;
-    if (budgetSec > 0.00160f) budgetSec = 0.00160f;
+    if (budgetSec < 0.00030f) budgetSec = 0.00030f;
+    if (budgetSec > 0.00080f) budgetSec = 0.00080f;
 
     // 3. Heartbeat-Dodging (isolated ticks) + Swarm-Flat Micro-Slicing (sustained FPS dips)
     const LONG curFps = g_currentFps.load(std::memory_order_relaxed);
     const int64_t frameStart = g_frameStartQpc.load(std::memory_order_acquire);
-    if (curFps > 0 && frameStart > 0 && nowQpc >= frameStart) {
-        const double targetUs = 1000000.0 / static_cast<double>(curFps);
+    if (frameStart > 0 && nowQpc >= frameStart) {
+        const double targetUs = (curFps > 0) ? (1000000.0 / static_cast<double>(curFps)) : 6000.0;
         const double workUs = static_cast<double>(nowQpc - frameStart) * g_qpcToUs;
-        if (workUs > targetUs * 0.60) {
-            if (tl_heavyStreak == 0 && tl_gcDeferred == 0) {
+        const uint32_t frameLuaUs = g_frameLuaUs.load(std::memory_order_relaxed);
+        if (workUs > targetUs * 0.55 || frameLuaUs >= 2500u) {
+            const int maxDefer = std::max(1, g_tierGcMaxDefer.load(std::memory_order_relaxed));
+            if (tl_heavyStreak == 0 && tl_gcDeferred < maxDefer) {
                 // Isolated heavy 30Hz/60Hz SimTick frame inside smooth 240Hz -> defer once to idle frame!
                 ++tl_heavyStreak;
                 ++tl_gcDeferred;
@@ -3277,7 +3977,8 @@ extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
             // Run a flat, ultra-smooth micro-slice every frame so frame-time stays level.
             if (tl_heavyStreak < 16) ++tl_heavyStreak;
             tl_gcDeferred = 0;
-            float flatCapSec = (actualDt <= 0.010f) ? 0.00030f : ((actualDt <= 0.018f) ? 0.00045f : 0.00065f);
+            const float busyShort = g_tierGcBusyCapShortSec.load(std::memory_order_relaxed);
+            float flatCapSec = (actualDt <= 0.018f) ? std::min(busyShort, 0.00045f) : 0.00055f;
             if (budgetSec > flatCapSec) budgetSec = flatCapSec;
         } else {
             tl_heavyStreak = 0;
@@ -3312,6 +4013,13 @@ extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
         std::clamp(static_cast<double>(NowQpc() - nowQpc) * g_qpcToUs, 0.0, 60000000.0));
     g_lastGcUs.store(gcUs, std::memory_order_relaxed);
     g_frameGcUs.fetch_add(gcUs, std::memory_order_relaxed);
+    static std::atomic<uint32_t> s_gcSpikeLogs{0u};
+    if (gcUs >= 4000u && s_gcSpikeLogs.load(std::memory_order_relaxed) < 10u &&
+        s_gcSpikeLogs.fetch_add(1u, std::memory_order_relaxed) < 10u) {
+        LogMsg("[DIAG][GC_SPIKE] gc=%.2fms | memKB=%d thresh=%d budgetUs=%.0f done=%d full=%d",
+               static_cast<double>(gcUs) * 0.001, g_lastGcKb.load(std::memory_order_relaxed),
+               *pThresh, static_cast<double>(budgetSec) * 1e6, cycleDone, ranEmergencyFull ? 1 : 0);
+    }
 }
 
 void PrepareSmoothLuaGcHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
@@ -3576,8 +4284,241 @@ extern "C" void HookSetTargetFrameTime(void* frameLimiter, float engineDt) {
     *reinterpret_cast<float*>(static_cast<uint8_t*>(frameLimiter) + 8) = dt;
 }
 
+// Zero-Lock >18ms / >=45ms Dual-Thread (Main + Render) Hitch Stack Sampler
+// Exposes 100% of ghost freezes across BOTH Klei's MainThread and RenderThread!
+static std::atomic<HANDLE>   g_mainThreadHandle{nullptr};
+static std::atomic<DWORD>    g_mainThreadId{0u};
+static std::atomic<HANDLE>   g_renderThreadHandle{nullptr};
+static std::atomic<DWORD>    g_renderThreadId{0u};
+static std::atomic<int64_t>  g_activeWorkStartQpc{0};
+static std::atomic<uint8_t>  g_mainWorkPhase{0u};
+static std::atomic<uint8_t>  g_renderWorkPhase{0u};
+static HANDLE                g_hitchWatchdogThread = nullptr;
+
+static const char* MainWorkPhaseName(uint8_t p) noexcept {
+    switch (p) {
+        case 1u: return "LuaUpdate";
+        case 2u: return "NetUpdate";
+        default: return "MainLoop";
+    }
+}
+
+static const char* RenderWorkPhaseName(uint8_t p) noexcept {
+    switch (p) {
+        case 3u: return "WorldRender";
+        case 4u: return "PostProc";
+        case 5u: return "TexUpload";
+        case 6u: return "Swap";
+        default: return "RenderIdle";
+    }
+}
+
+struct MainWorkPhaseScope {
+    uint8_t prev;
+    explicit MainWorkPhaseScope(uint8_t next) noexcept
+        : prev(g_mainWorkPhase.exchange(next, std::memory_order_relaxed)) {}
+    ~MainWorkPhaseScope() {
+        g_mainWorkPhase.store(prev, std::memory_order_relaxed);
+    }
+};
+
+struct RenderWorkPhaseScope {
+    uint8_t prev;
+    explicit RenderWorkPhaseScope(uint8_t next) noexcept
+        : prev(g_renderWorkPhase.exchange(next, std::memory_order_relaxed)) {}
+    ~RenderWorkPhaseScope() {
+        g_renderWorkPhase.store(prev, std::memory_order_relaxed);
+    }
+};
+
+static inline void RegisterMainThreadForHitchSampler() noexcept {
+    if (g_mainThreadHandle.load(std::memory_order_relaxed) != nullptr) return;
+    g_mainThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    HANDLE dup = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &dup,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                        FALSE, 0) && dup != nullptr) {
+        HANDLE expected = nullptr;
+        if (!g_mainThreadHandle.compare_exchange_strong(expected, dup, std::memory_order_release)) {
+            CloseHandle(dup);
+        }
+    }
+}
+
+static inline void RegisterRenderThreadForHitchSampler() noexcept {
+    if (g_renderThreadHandle.load(std::memory_order_relaxed) != nullptr) return;
+    g_renderThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    HANDLE dup = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &dup,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                        FALSE, 0) && dup != nullptr) {
+        HANDLE expected = nullptr;
+        if (!g_renderThreadHandle.compare_exchange_strong(expected, dup, std::memory_order_release)) {
+            CloseHandle(dup);
+        }
+    }
+}
+
+static bool FormatCodeAddr(uintptr_t addr, char* out, size_t outSz) noexcept {
+    if (addr < 0x10000ULL) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) return false;
+    constexpr DWORD kExecMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & kExecMask) == 0u || (mbi.Protect & PAGE_GUARD) != 0u) {
+        return false;
+    }
+    HMODULE hm = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(addr), &hm) || !hm) {
+        return false;
+    }
+    char path[MAX_PATH]{};
+    const DWORD len = GetModuleFileNameA(hm, path, MAX_PATH);
+    const char* base = (len > 0) ? path : "?";
+    for (const char* p = base; *p; ++p) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    const uintptr_t rva = addr - reinterpret_cast<uintptr_t>(hm);
+    std::snprintf(out, outSz, "%s+0x%llX", base, static_cast<unsigned long long>(rva));
+    return true;
+}
+
+// Ultra-short (<15us) lock-free suspend window: ONLY kernel syscalls (GetThreadContext + ReadProcessMemory).
+// ZERO user-mode locks acquired while target thread is paused -> 100% deadlock-free & AV-free!
+static bool SampleThreadStackRaw(HANDLE hThread, int64_t expectedStartQpc,
+                                 uintptr_t& outRip, uintptr_t outStack[64], SIZE_T& outBytes) noexcept {
+    outRip = 0u;
+    outBytes = 0u;
+    if (!hThread) return false;
+    if (SuspendThread(hThread) == static_cast<DWORD>(-1)) return false;
+    if (g_activeWorkStartQpc.load(std::memory_order_relaxed) == expectedStartQpc) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(hThread, &ctx)) {
+            outRip = static_cast<uintptr_t>(ctx.Rip);
+            if (ctx.Rsp >= 0x10000ULL) {
+                ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(ctx.Rsp),
+                                  outStack, sizeof(uintptr_t) * 64u, &outBytes);
+            }
+        }
+    }
+    ResumeThread(hThread);
+    return outRip != 0u;
+}
+
+static void FormatThreadStackLine(uintptr_t rip, const uintptr_t rawStack[64], SIZE_T gotBytes,
+                                  char* ripBuf, size_t ripBufSz, char* retLine, size_t retLineSz) noexcept {
+    if (rip == 0u) {
+        std::snprintf(ripBuf, ripBufSz, "n/a");
+        if (retLineSz > 0u) retLine[0] = '\0';
+        return;
+    }
+    if (!FormatCodeAddr(rip, ripBuf, ripBufSz)) {
+        std::snprintf(ripBuf, ripBufSz, "0x%llX", static_cast<unsigned long long>(rip));
+    }
+    if (retLineSz > 0u) retLine[0] = '\0';
+    size_t pos = 0u;
+    uint32_t retCnt = 0u;
+    const size_t nSlots = gotBytes / sizeof(uintptr_t);
+    uintptr_t prevAddr = rip;
+    for (size_t i = 0; i < nSlots && retCnt < 6u; ++i) {
+        const uintptr_t cand = rawStack[i];
+        if (cand == 0u || cand == prevAddr) continue;
+        char sym[96]{};
+        if (!FormatCodeAddr(cand, sym, sizeof(sym))) continue;
+        if (std::strncmp(sym, "dinput8.dll+", 12) == 0 && retCnt > 0u) continue;
+        const int n = std::snprintf(retLine + pos, retLineSz - pos,
+                                    "%s%s", (retCnt > 0u) ? " <- " : "", sym);
+        if (n > 0 && pos + static_cast<size_t>(n) < retLineSz) {
+            pos += static_cast<size_t>(n);
+            ++retCnt;
+            prevAddr = cand;
+        }
+    }
+}
+
+static DWORD WINAPI HitchWatchdogProc(LPVOID) {
+    int64_t lastFrameStart = 0;
+    uint8_t lastFrameStage = 0u;
+    int64_t lastLogQpc = 0;
+    uint32_t sampleCount = 0u;
+    while (g_stopFlag.load(std::memory_order_relaxed) == 0) {
+        const bool inGame = (g_inGameplay.load(std::memory_order_acquire) != 0);
+        Sleep(inGame ? 4 : 50);
+        if (!inGame || sampleCount >= 48u) continue;
+        const int64_t sQpc = g_activeWorkStartQpc.load(std::memory_order_acquire);
+        if (sQpc == 0) continue;
+        if (sQpc != lastFrameStart) {
+            lastFrameStart = sQpc;
+            lastFrameStage = 0u;
+        }
+        const int64_t now = NowQpc();
+        if (now <= sQpc) continue;
+        const double elapsedMs = static_cast<double>(now - sQpc) * g_qpcToUs * 0.001;
+        uint8_t wantStage = 0u;
+        if (lastFrameStage == 0u && elapsedMs >= 18.0) {
+            if (lastLogQpc != 0 && static_cast<double>(now - lastLogQpc) * g_qpcToUs < 500000.0) continue;
+            wantStage = 1u;
+        } else if (lastFrameStage == 1u && elapsedMs >= 45.0) {
+            // Re-sample severe >=45ms freezes mid-stall (bypasses 500ms cooldown so RenderThread culprit is never missed!)
+            wantStage = 2u;
+        } else {
+            continue;
+        }
+
+        HANDLE hMain = g_mainThreadHandle.load(std::memory_order_acquire);
+        if (!hMain) continue;
+        lastFrameStage = wantStage;
+
+        const uint8_t mPhase = g_mainWorkPhase.load(std::memory_order_relaxed);
+        const uint8_t rPhase = g_renderWorkPhase.load(std::memory_order_relaxed);
+
+        uintptr_t mainRip = 0u;
+        uintptr_t mainStack[64]{};
+        SIZE_T mainGot = 0u;
+        if (!SampleThreadStackRaw(hMain, sQpc, mainRip, mainStack, mainGot)) continue;
+
+        // Sample RenderThread sequentially AFTER MainThread is already resumed (never pause both at once!)
+        uintptr_t rtRip = 0u;
+        uintptr_t rtStack[64]{};
+        SIZE_T rtGot = 0u;
+        HANDLE hRender = g_renderThreadHandle.load(std::memory_order_acquire);
+        const DWORD mTid = g_mainThreadId.load(std::memory_order_relaxed);
+        const DWORD rTid = g_renderThreadId.load(std::memory_order_relaxed);
+        if (hRender && rTid != 0u && rTid != mTid) {
+            SampleThreadStackRaw(hRender, sQpc, rtRip, rtStack, rtGot);
+        }
+
+        char mainRipBuf[96]{};
+        char mainRetLine[512]{};
+        FormatThreadStackLine(mainRip, mainStack, mainGot, mainRipBuf, sizeof(mainRipBuf), mainRetLine, sizeof(mainRetLine));
+
+        char rtRipBuf[96]{};
+        char rtRetLine[512]{};
+        if (rtRip != 0u) {
+            FormatThreadStackLine(rtRip, rtStack, rtGot, rtRipBuf, sizeof(rtRipBuf), rtRetLine, sizeof(rtRetLine));
+        } else {
+            std::snprintf(rtRipBuf, sizeof(rtRipBuf), (hRender && rTid == mTid) ? "same_tid" : "n/a");
+        }
+
+        lastLogQpc = NowQpc();
+        ++sampleCount;
+        LogMsg("[DIAG][HITCH_STACK] #%u(s%u) elapsed=%.1fms mPhase=%s rPhase=%s | main=%s [%s] | rt=%s [%s]",
+               sampleCount, static_cast<unsigned>(wantStage), elapsedMs,
+               MainWorkPhaseName(mPhase), RenderWorkPhaseName(rPhase),
+               mainRipBuf, mainRetLine, rtRipBuf, rtRetLine);
+    }
+    HANDLE hCloseMain = g_mainThreadHandle.exchange(nullptr, std::memory_order_acq_rel);
+    if (hCloseMain) CloseHandle(hCloseMain);
+    HANDLE hCloseRt = g_renderThreadHandle.exchange(nullptr, std::memory_order_acq_rel);
+    if (hCloseRt) CloseHandle(hCloseRt);
+    return 0;
+}
+
 extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
     thread_local FramePacerTls tls;
+    RegisterMainThreadForHitchSampler();
+    g_activeWorkStartQpc.store(0, std::memory_order_release);
 
     int64_t nowQpc = NowQpc();
     uint32_t frameCpuBusyUs = 0;
@@ -3723,6 +4664,7 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
 
     // Publish exact frame start & sequence for RenderThread/GC/TexStream + 1% Low ring & Hitch breakdown
     g_frameStartQpc.store(nowQpc, std::memory_order_release);
+    g_activeWorkStartQpc.store(nowQpc, std::memory_order_release);
     const uint32_t completedFrameSeq = g_frameSeq.fetch_add(1, std::memory_order_release);
     const uint32_t frameUnzUs       = g_frameUnzUs.exchange(0, std::memory_order_acq_rel);
     const uint32_t frameShaderUs    = g_frameShaderUs.exchange(0, std::memory_order_acq_rel);
@@ -3735,6 +4677,8 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
     const uint32_t frameWorldUs     = g_frameWorldUs.exchange(0, std::memory_order_acq_rel);
     const uint32_t framePostUs      = g_framePostUs.exchange(0, std::memory_order_acq_rel);
     const uint32_t frameAnimUs      = g_frameAnimUs.exchange(0, std::memory_order_acq_rel);
+    const uint32_t frameAnimMtUs    = g_frameAnimMtUs.exchange(0, std::memory_order_acq_rel);
+    const uint32_t frameAnimInlUs   = g_frameAnimInlUs.exchange(0, std::memory_order_acq_rel);
     const uint32_t frameAnimEnts    = g_frameAnimEnts.exchange(0, std::memory_order_acq_rel);
     const uint32_t frameAnimBones   = g_frameAnimBones.exchange(0, std::memory_order_acq_rel);
     const uint32_t frameAnimShed    = g_frameAnimShed.exchange(0, std::memory_order_acq_rel);
@@ -3758,7 +4702,10 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
     const uint32_t frameMsgUs       = g_frameMsgUs.exchange(0, std::memory_order_acq_rel);
     UpdateAtomicEma(g_emaLuaUs,      static_cast<float>(frameLuaUs),      0.04f);
     UpdateAtomicEma(g_emaNetUs,      static_cast<float>(frameNetUs),      0.04f);
-    UpdateAtomicEma(g_emaAnimUs,     static_cast<float>(frameAnimUs),     0.04f);
+    if (g_lastWorldRenderUs.load(std::memory_order_relaxed) == 0u) {
+        UpdateAtomicEma(g_emaAnimUs,    static_cast<float>(frameAnimUs),    0.04f);
+        UpdateAtomicEma(g_emaAnimInlUs, static_cast<float>(frameAnimInlUs), 0.04f);
+    }
     UpdateAtomicEma(g_emaGcUs,       static_cast<float>(frameGcUs),       0.04f);
     UpdateAtomicEma(g_emaWallLuaUs,  static_cast<float>(frameWallLuaUs),  0.04f);
     UpdateAtomicEma(g_emaEntWallUs,  static_cast<float>(frameEntWallUs),  0.04f);
@@ -3842,7 +4789,8 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                         ev.frameSeq   = completedFrameSeq;
                         ev.frameUs    = fUs;
                         ev.cpuBusyUs  = effBusyUs;
-                        ev.gpuDrainUs = frameGpuDrainUs;
+                        ev.gpuDrainUs = (frameGpuDrainUs != 0u) ? frameGpuDrainUs
+                                      : (g_nativeGlActive.load(std::memory_order_relaxed) ? g_lastNativeGpuUs.load(std::memory_order_relaxed) : 0u);
                         ev.swapUs     = frameSwapUs;
                         ev.worldUs    = frameWorldUs;
                         ev.postUs     = framePostUs;
@@ -3884,7 +4832,8 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                     if (fUs >= g_hitchSnap.peakUs) {
                         g_hitchSnap.peakUs     = fUs;
                         g_hitchSnap.busyUs     = effBusyUs;
-                        g_hitchSnap.gpuDrainUs = frameGpuDrainUs;
+                        g_hitchSnap.gpuDrainUs = (frameGpuDrainUs != 0u) ? frameGpuDrainUs
+                                               : (g_nativeGlActive.load(std::memory_order_relaxed) ? g_lastNativeGpuUs.load(std::memory_order_relaxed) : 0u);
                         g_hitchSnap.swapUs     = frameSwapUs;
                         g_hitchSnap.rtUs       = frameRtUs;
                         g_hitchSnap.worldUs    = frameWorldUs;
@@ -3910,6 +4859,8 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                         g_hitchSnap.slowPktUs  = frameSlowPktUs;
                         g_hitchSnap.slowPktMeta = frameSlowPktMeta;
                         g_hitchSnap.animUs     = frameAnimUs;
+                        g_hitchSnap.animMtUs   = frameAnimMtUs;
+                        g_hitchSnap.animInlUs  = frameAnimInlUs;
                         g_hitchSnap.animEnts   = frameAnimEnts;
                         g_hitchSnap.animBones  = frameAnimBones;
                         g_hitchSnap.animShed   = frameAnimShed;
@@ -4356,10 +5307,19 @@ static void HookClientSpatialQuery(void* grid, const float* posXZ, float radius,
     static thread_local uint32_t tl_q = 0;
     static thread_local uint32_t tl_c = 0;
 
+    const bool trackWall = tl_wallLuaActive;
+    const int64_t wallT0 = trackWall ? NowQpc() : 0;
+    uint32_t wallEnts = 0u;
+
     const auto vis = g_clientSpatialVisitor[Slot];
     const auto orig = g_origClientSpatialQuery[Slot];
     if (!g_optFastSpatialQuery.load(std::memory_order_relaxed) || !vis || !grid || !posXZ) {
         if (orig) orig(grid, posXZ, radius, visitor);
+        if (trackWall) {
+            ++tl_wallSpatialCalls;
+            if (radius > tl_wallSpatialMaxR) tl_wallSpatialMaxR = radius;
+            tl_wallSpatialQpc += (NowQpc() - wallT0);
+        }
         return;
     }
 
@@ -4439,12 +5399,19 @@ static void HookClientSpatialQuery(void* grid, const float* posXZ, float radius,
                 void** p = cur->ent_begin;
                 void** e = cur->ent_end;
                 while (p < e) {
+                    if (trackWall) ++wallEnts;
                     if (!vis(visitor, *p)) {
                         tl_c += visited_cells;
                         if (++tl_q >= 256u) {
                             InterlockedAdd64(&g_clientSpatialQueries, tl_q);
                             InterlockedAdd64(&g_clientSpatialCells, tl_c);
                             tl_q = 0; tl_c = 0;
+                        }
+                        if (trackWall) {
+                            ++tl_wallSpatialCalls;
+                            tl_wallSpatialEnts += wallEnts;
+                            if (radius > tl_wallSpatialMaxR) tl_wallSpatialMaxR = radius;
+                            tl_wallSpatialQpc += (NowQpc() - wallT0);
                         }
                         return;
                     }
@@ -4460,6 +5427,12 @@ static void HookClientSpatialQuery(void* grid, const float* posXZ, float radius,
         InterlockedAdd64(&g_clientSpatialQueries, tl_q);
         InterlockedAdd64(&g_clientSpatialCells, tl_c);
         tl_q = 0; tl_c = 0;
+    }
+    if (trackWall) {
+        ++tl_wallSpatialCalls;
+        tl_wallSpatialEnts += wallEnts;
+        if (radius > tl_wallSpatialMaxR) tl_wallSpatialMaxR = radius;
+        tl_wallSpatialQpc += (NowQpc() - wallT0);
     }
 }
 
@@ -4573,6 +5546,14 @@ void PrepareClientSpatialZeroCopyHooks(std::vector<PendingCodePatch>& patches, u
 //     finish smoothly 4ms later on the next frame).
 //   - Loading screens / VM resets / bulk >48 queue: unlimited full speed!
 //------------------------------------------------------------------------------
+static thread_local bool     tl_inAsyncTexJob = false;
+static thread_local int64_t  tl_texJobGlQpc   = 0;
+static thread_local uint32_t tl_texJobGlCalls = 0u;
+static thread_local uint32_t tl_texJobPboHits = 0u;
+static thread_local int32_t  tl_texJobMaxW    = 0;
+static thread_local int32_t  tl_texJobMaxH    = 0;
+static thread_local uint32_t tl_texJobFmt     = 0u;
+
 static void HookProcessAsyncTextureQueue(void* loader) {
     if (!loader || !g_optTexTimeSlice.load(std::memory_order_relaxed)) {
         const int64_t tFallback0 = NowQpc();
@@ -4593,10 +5574,12 @@ static void HookProcessAsyncTextureQueue(void* loader) {
 
     static thread_local uint32_t tl_lastTexSeq = 0xFFFFFFFFu;
     static thread_local uint32_t tl_frameTexUs = 0;
+    static thread_local uint32_t tl_texCooldownFrames = 0;
     const uint32_t curSeq = g_frameSeq.load(std::memory_order_relaxed);
     if (curSeq != tl_lastTexSeq) {
         tl_lastTexSeq = curSeq;
         tl_frameTexUs = 0;
+        if (tl_texCooldownFrames > 0u) --tl_texCooldownFrames;
     }
 
     EnterCriticalSection(cs);
@@ -4608,14 +5591,20 @@ static void HookProcessAsyncTextureQueue(void* loader) {
     }
 
     const size_t initCount = static_cast<size_t>(end - begin);
-    const int64_t lastFrameUs = g_lastFrameUs.load(std::memory_order_relaxed);
-    // Boss-burst protection: Ancient Fuelweaver / crowded combat spikes can dip frame time up to ~149ms and queue >48 textures;
-    // keep 1.2ms budget slicing active unless truly in a bulk loading screen (>150ms or >128 queued textures).
+    // Keep 1.2ms budget slicing active during gameplay unless truly in a bulk loading screen (>256 queued textures).
+    // NEVER disable slicing just because a prior frame hitched (>150ms): that caused 25ms+ cascade texture dumps!
     const bool limitActive = (g_inGameplay.load(std::memory_order_relaxed) != 0) &&
-                             (lastFrameUs > 0 && lastFrameUs < 150000) &&
-                             (initCount <= 128);
-    constexpr double kTexSliceBudgetUs = 1200.0;
+                             (initCount <= 256);
+    const double kTexSliceBudgetUs = g_tierTexSliceUs.load(std::memory_order_relaxed);
+    if (limitActive && initCount > 0 &&
+        (tl_texCooldownFrames > 0u || static_cast<double>(tl_frameTexUs) >= kTexSliceBudgetUs)) {
+        LeaveCriticalSection(cs);
+        InterlockedIncrement64(&g_texUploadSlices);
+        return;
+    }
 
+    RegisterRenderThreadForHitchSampler();
+    RenderWorkPhaseScope phaseScope(5u);
     const int64_t t0 = NowQpc();
     size_t processed = 0;
     bool sliced = false;
@@ -4627,6 +5616,14 @@ static void HookProcessAsyncTextureQueue(void* loader) {
         if (processed >= curCount) break;
 
         void* job = begin[processed];
+        tl_inAsyncTexJob  = true;
+        tl_texJobGlQpc    = 0;
+        tl_texJobGlCalls  = 0u;
+        tl_texJobPboHits  = 0u;
+        tl_texJobMaxW     = 0;
+        tl_texJobMaxH     = 0;
+        tl_texJobFmt      = 0u;
+        const int64_t j0 = NowQpc();
         if (job) {
             auto* vtbl = *reinterpret_cast<void***>(job);
             if (vtbl) {
@@ -4634,11 +5631,32 @@ static void HookProcessAsyncTextureQueue(void* loader) {
                 if (vtbl[2]) reinterpret_cast<void (*)(void*, int)>(vtbl[2])(job, 1); // Deleting dtor (+0x10)
             }
         }
+        tl_inAsyncTexJob = false;
         ++processed;
+
+        const double jUs = static_cast<double>(NowQpc() - j0) * g_qpcToUs;
+        if (jUs >= 4000.0 && limitActive) {
+            // Space out heavy >=4ms mod texture uploads by 2 frames so back-to-back 9ms uploads cannot chain-stutter!
+            tl_texCooldownFrames = 2u;
+        }
+        if (jUs >= 6000.0 && g_inGameplay.load(std::memory_order_relaxed) != 0) {
+            static std::atomic<uint32_t> s_texSpikeLogs{0u};
+            if (s_texSpikeLogs.load(std::memory_order_relaxed) < 8u &&
+                s_texSpikeLogs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+                const double glMs = static_cast<double>(tl_texJobGlQpc) * g_qpcToUs * 0.001;
+                const double jobMs = jUs * 0.001;
+                const double cpuMs = std::max(0.0, jobMs - glMs);
+                LogMsg("[DIAG][TEX_SPIKE] singleJob=%.2fms (gl=%.2fms[%u pbo=%u/%u %dx%d fmt=0x%X] cpu=%.2fms) initQ=%zu proc=%zu frameTex=%.2fms limit=%d",
+                       jobMs, glMs, tl_texJobGlCalls, tl_texJobPboHits, tl_texJobGlCalls,
+                       tl_texJobMaxW, tl_texJobMaxH, tl_texJobFmt, cpuMs,
+                       initCount, processed, static_cast<double>(tl_frameTexUs) * 0.001,
+                       limitActive ? 1 : 0);
+            }
+        }
 
         if (limitActive && processed < curCount) {
             const double elapsedUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
-            if (elapsedUs + static_cast<double>(tl_frameTexUs) >= kTexSliceBudgetUs) {
+            if (jUs >= 4000.0 || (elapsedUs + static_cast<double>(tl_frameTexUs) >= kTexSliceBudgetUs)) {
                 sliced = true;
                 break;
             }
@@ -5089,19 +6107,108 @@ static void ProbeAnisoCapsOnGlThread() {
 
 static void FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason reason = hs_sprite_batch::FlushReason::State);
 
+struct MipTexEntry {
+    uint32_t gen = 0u;
+    int32_t  origMinFilter = 0x2701;
+};
+
+static thread_local const void* tl_mipTexCtx = nullptr;
+static thread_local uint32_t    tl_activeTexUnit = 0u;
+static thread_local uint32_t    tl_boundTex2d[32]{};
+static thread_local std::unordered_map<uint32_t, MipTexEntry> tl_mipTexGen;
+static thread_local uint32_t    tl_mipTexLastGen = 0u;
+static thread_local size_t      tl_mipTexPending = 0u;
+
+static __declspec(noinline) void ResetMipTexTracker(const void* ctx) noexcept {
+    tl_mipTexCtx = ctx;
+    tl_activeTexUnit = 0u;
+    std::fill(std::begin(tl_boundTex2d), std::end(tl_boundTex2d), 0u);
+    tl_mipTexGen.clear();
+    tl_mipTexLastGen = 0u;
+    tl_mipTexPending = 0u;
+}
+
+static const void* CurrentTrackedGlContext() noexcept;
+
+static inline void SyncMipTexTrackerContext() noexcept {
+    const void* curCtx = CurrentTrackedGlContext();
+    if (tl_mipTexCtx != curCtx) {
+        ResetMipTexTracker(curCtx);
+    }
+}
+
+static inline void ApplyCurrentVisualParamsToBoundTex(int32_t origMinFilter, bool updateMinFilter) noexcept {
+    constexpr uint32_t kGlTexture2D               = 0x0DE1u;
+    constexpr uint32_t kGlTextureMinFilter        = 0x2801u;
+    constexpr int32_t  kGlLinearMipmapNearest     = 0x2701;
+    constexpr int32_t  kGlLinearMipmapLinear      = 0x2703;
+    constexpr uint32_t kGlTextureMaxAnisotropyExt = 0x84FEu;
+    constexpr uint32_t kGlTextureLodBias          = 0x8501u;
+
+    const int desiredAf = g_visualAnisoLevel.load(std::memory_order_relaxed);
+    const float desiredBias = g_visualMipLodBias.load(std::memory_order_relaxed);
+
+    if (updateMinFilter && g_origGlTexParameteri) {
+        const int32_t minF = (desiredAf > 1) ? kGlLinearMipmapLinear : origMinFilter;
+        g_origGlTexParameteri(kGlTexture2D, kGlTextureMinFilter, minF);
+        if (desiredAf > 1 && origMinFilter == kGlLinearMipmapNearest) {
+            InterlockedIncrement64(&g_afTrilinearUpgrades);
+        }
+    }
+
+    if (g_fnGlTexParameterf) {
+        if (g_afCapsProbeState.load(std::memory_order_acquire) == 0) {
+            ProbeAnisoCapsOnGlThread();
+        }
+        if (g_afCapsProbeState.load(std::memory_order_acquire) == 1) {
+            const float hwMax = g_hwMaxAniso.load(std::memory_order_relaxed);
+            const float level = (desiredAf > 1) ? std::min(static_cast<float>(desiredAf), hwMax) : 1.0f;
+            g_fnGlTexParameterf(kGlTexture2D, kGlTextureMaxAnisotropyExt, level);
+            if (level > 1.0f) {
+                InterlockedIncrement64(&g_afAppliedHits);
+            }
+        }
+        // Desktop Native OpenGL exposes GL_TEXTURE_LOD_BIAS (0x8501); never emit on ANGLE GLES2.
+        if (g_nativeGlActive.load(std::memory_order_acquire)) {
+            g_fnGlTexParameterf(kGlTexture2D, kGlTextureLodBias, desiredBias);
+            if (fabsf(desiredBias) > 1e-4f) {
+                InterlockedIncrement64(&g_mipBiasAppliedHits);
+            }
+        }
+    }
+}
+
+static inline void CommitLazyBatchBindings() noexcept;
+static inline void ClearLazyBatchBindings() noexcept;
+static inline void FlushDeferredWorldShadowsIfPending();
+static inline bool IsBoundTex2dBindless(uint32_t texId) noexcept;
+
 void WINAPI HookGlTexParameteri(uint32_t target, uint32_t pname, int32_t param) {
     FlushSpriteBatchIfPending();
+    CommitLazyBatchBindings();
     // Strictly target mipmapped GL_TEXTURE_2D (terrain/entity/tree atlases);
     // leaves ColourCube LUTs (POINT), UI sprites (no-mip LINEAR) and FBOs untouched!
     constexpr uint32_t kGlTexture2D = 0x0DE1u;
+    if (target == kGlTexture2D) {
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        if (boundTex != 0u && IsBoundTex2dBindless(boundTex)) {
+            return;
+        }
+    }
     constexpr uint32_t kGlTextureMinFilter = 0x2801u;
+    constexpr uint32_t kGlTextureMaxAnisotropyExt = 0x84FEu;
+    constexpr uint32_t kGlTextureLodBias = 0x8501u;
+    constexpr int32_t  kGlNearest = 0x2600;
+    constexpr int32_t  kGlLinear  = 0x2601;
     constexpr int32_t  kGlLinearMipmapNearest = 0x2701;
     constexpr int32_t  kGlLinearMipmapLinear  = 0x2703;
-    constexpr uint32_t kGlTextureMaxAnisotropyExt = 0x84FEu;
 
     int32_t effectiveParam = param;
     const bool isMipLinear = (target == kGlTexture2D) && (pname == kGlTextureMinFilter) &&
                              (param == kGlLinearMipmapNearest || param == kGlLinearMipmapLinear);
+    const bool isNonMipFilter = (target == kGlTexture2D) && (pname == kGlTextureMinFilter) &&
+                                (param == kGlNearest || param == kGlLinear);
     const int desiredAf = g_visualAnisoLevel.load(std::memory_order_relaxed);
     if (isMipLinear && desiredAf > 1 && param == kGlLinearMipmapNearest) {
         effectiveParam = kGlLinearMipmapLinear;
@@ -5112,16 +6219,34 @@ void WINAPI HookGlTexParameteri(uint32_t target, uint32_t pname, int32_t param) 
         g_origGlTexParameteri(target, pname, effectiveParam);
     }
 
-    if (isMipLinear && g_fnGlTexParameterf) {
-        if (g_afCapsProbeState.load(std::memory_order_acquire) == 0) {
-            ProbeAnisoCapsOnGlThread();
+    if (isMipLinear) {
+        SyncMipTexTrackerContext();
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        const uint32_t curGen = g_visualTexParamGen.load(std::memory_order_acquire);
+        if (boundTex != 0u) {
+            tl_mipTexGen[boundTex] = MipTexEntry{ curGen, param };
         }
-        if (g_afCapsProbeState.load(std::memory_order_acquire) == 1) {
-            const float hwMax = g_hwMaxAniso.load(std::memory_order_relaxed);
-            const float level = (desiredAf > 1) ? std::min(static_cast<float>(desiredAf), hwMax) : 1.0f;
-            g_fnGlTexParameterf(kGlTexture2D, kGlTextureMaxAnisotropyExt, level);
-            if (level > 1.0f) {
-                InterlockedIncrement64(&g_afAppliedHits);
+        ApplyCurrentVisualParamsToBoundTex(param, false);
+    } else if (isNonMipFilter) {
+        SyncMipTexTrackerContext();
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        if (boundTex != 0u) {
+            auto it = tl_mipTexGen.find(boundTex);
+            if (it != tl_mipTexGen.end()) {
+                if (it->second.gen != tl_mipTexLastGen && tl_mipTexPending > 0u) {
+                    --tl_mipTexPending;
+                }
+                tl_mipTexGen.erase(it);
+            }
+        }
+        if (g_fnGlTexParameterf != nullptr) {
+            if (g_afCapsProbeState.load(std::memory_order_acquire) == 1) {
+                g_fnGlTexParameterf(kGlTexture2D, kGlTextureMaxAnisotropyExt, 1.0f);
+            }
+            if (g_nativeGlActive.load(std::memory_order_acquire)) {
+                g_fnGlTexParameterf(kGlTexture2D, kGlTextureLodBias, 0.0f);
             }
         }
     }
@@ -5405,11 +6530,12 @@ static size_t FindPrecisionEndOffset(const std::string& src) {
     if (p == std::string::npos) {
         p = src.find("precision highp float;");
     }
-    if (p == std::string::npos) return 0;
+    if (p == std::string::npos) return hs_sprite_batch::FindDeclInsertOffset(src);
     size_t e = src.find("#endif", p);
-    if (e == std::string::npos) return 0;
+    if (e == std::string::npos) return hs_sprite_batch::FindDeclInsertOffset(src);
     size_t nl = src.find('\n', e);
-    return (nl == std::string::npos) ? (e + 6) : (nl + 1);
+    size_t off = (nl == std::string::npos) ? (e + 6) : (nl + 1);
+    return hs_sprite_batch::SkipExtensionLines(src, off);
 }
 
 static void InsertDerivExtension(std::string& s) {
@@ -5435,11 +6561,17 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
     // VERTEX SHADERS (no gl_FragColor): ANIM_VS (3D relief coords) & ANIM_BLOOM_VS (ground shadow proj)
     // -------------------------------------------------------------------------
     if (src.find("gl_FragColor") == std::string::npos) {
-        // V1. World ANIM vertex shaders (anim, anim_skinned, anim_fade, anim_haunted, anim_holo):
+        // V1. World ANIM vertex shaders (anim, anim_skinned):
+        //     Excludes anim_fade, anim_haunted, anim_fade_haunted, and anim_holo so special
+        //     erosion/hologram/haunted shaders remain 100% vanilla pass-through and never cast
+        //     or mirror world-space shadow/reflection passes.
         //     a) Computes per-entity local relief metres (HS_LOCAL_METRES) with 0% batching loss!
         //     b) v2.9.0 World-Space ShadowMask FBO pass (HS_SHADOW_PASS > 0.5) for anim_skinned & unbatched anim:
         //        height-blended 360-deg side-light billboard reorientation + canopy breeze -> ortho NDC!
-        if (src.find("attribute vec4 POS2D_UV;") != std::string::npos &&
+        if (!hs_sprite_batch::HasDefineLine(src, "FADE_OUT") &&
+            !hs_sprite_batch::HasDefineLine(src, "HOLO") &&
+            !hs_sprite_batch::HasDefineLine(src, "HAUNT") &&
+            src.find("attribute vec4 POS2D_UV;") != std::string::npos &&
             src.find("PS_POS = world_pos.xyz;") != std::string::npos &&
             src.find("HS_LOCAL_METRES") == std::string::npos) {
             std::string s = src;
@@ -5461,11 +6593,19 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 if (posP != std::string::npos) {
                     const bool isBatched = (s.find("HS_BATCH_ACTIVE") != std::string::npos);
                     if (isBatched) {
-                        static constexpr const char* kBatchLocal =
-                            "PS_POS = world_pos.xyz;\n"
-                            "\tif (HS_BATCH_ACTIVE > 0.5) {\n"
-                            "\t\tHS_LOCAL_METRES = vec2(HS_BATCH_CADD.w, max(HS_BATCH_WPOS.y, 0.0));\n"
-                            "\t} else {\n"
+                        const bool hasGpuLocalX = (s.find("hs_gpu_localX") != std::string::npos);
+                        const char* kBatchPrefix = hasGpuLocalX
+                            ? "PS_POS = world_pos.xyz;\n"
+                              "\tif (HS_BATCH_ACTIVE > 1.5) {\n"
+                              "\t\tHS_LOCAL_METRES = vec2(hs_gpu_localX, max(world_pos.y, 0.0));\n"
+                              "\t} else if (HS_BATCH_ACTIVE > 0.5) {\n"
+                              "\t\tHS_LOCAL_METRES = vec2(HS_BATCH_CADD.w, max(HS_BATCH_WPOS.y, 0.0));\n"
+                              "\t} else {\n"
+                            : "PS_POS = world_pos.xyz;\n"
+                              "\tif (HS_BATCH_ACTIVE > 0.5) {\n"
+                              "\t\tHS_LOCAL_METRES = vec2(HS_BATCH_CADD.w, max(HS_BATCH_WPOS.y, 0.0));\n"
+                              "\t} else {\n";
+                        static constexpr const char* kBatchElseTail =
                             "\t\tvec3 hs_r = MatrixW[0].xyz;\n"
                             "\t\ths_r /= max(length(hs_r), 0.0001);\n"
                             "\t\tvec3 hs_d = world_pos.xyz - MatrixW[3].xyz;\n"
@@ -5549,7 +6689,8 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                             "\t\t\tgl_Position = mtxPV * world_pos;\n"
                             "\t\t}\n"
                             "\t}";
-                        s.replace(posP, strlen(kPsPosLine), kBatchLocal);
+                        const std::string batchLocal = std::string(kBatchPrefix) + kBatchElseTail;
+                        s.replace(posP, strlen(kPsPosLine), batchLocal);
                     } else {
                         static constexpr const char* kStdLocal =
                             "PS_POS = world_pos.xyz;\n"
@@ -5668,6 +6809,13 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
             const size_t posAttr = s.find("attribute vec4 POS2D_UV;");
             if (posAttr != std::string::npos) {
                 s.insert(posAttr, "uniform vec4 HS_HD2D_SHAD_PROJ;\nuniform vec4 HS_HD2D_SHAD_DYN;\nvarying float HS_SHAD_H;\n");
+                if (s.find("HS_BATCH_ACTIVE") != std::string::npos) {
+                    const size_t posMain = s.find("void main()");
+                    const size_t posBrace = (posMain != std::string::npos) ? s.find('{', posMain) : std::string::npos;
+                    if (posBrace != std::string::npos) {
+                        s.insert(posBrace + 1, "\n\tHS_SHAD_H = 0.0;");
+                    }
+                }
                 static constexpr const char* kSkinPos = "gl_Position = pvw * vec4(POSITION, 1.0);";
                 const size_t posSk = s.find(kSkinPos);
                 if (posSk != std::string::npos) {
@@ -6022,14 +7170,18 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
         }
     }
 
-    // 3. ANIM (anim, anim_skinned, anim_fade, anim_haunted, anim_fade_haunted, anim_holo;
-    //    strictly excludes BLOOM & UI_CC shaders!):
+    // 3. ANIM (anim, anim_skinned; strictly excludes BLOOM, UI_CC, FADE_OUT, HOLO, and HAUNT shaders!):
+    //    Keeping anim_fade, anim_haunted, anim_fade_haunted, and anim_holo 100% vanilla pass-through
+    //    ensures zero HD-2D alpha sharpening or HS_SHADOW_PASS mutation on hologram/erosion/haunted entities.
     //    a) Ground Contact AO + soft highlight shoulder (HS_HD2D_PARAMS.x)
     //    b) 3D Rounded-Relief Directional Surface Lighting (HS_HD2D_SHADE & HS_HD2D_SHADE2)
     //    c) v2.9.5-A High-DPI Derivative-Adaptive Ink Silhouette Crispness & Internal Linework Clarity (HS_DETAIL_PARAMS.yz)
     static constexpr const char* kAnimAnchor =
         "gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );";
-    if (src.find(kAnimAnchor) != std::string::npos &&
+    if (!hs_sprite_batch::HasDefineLine(src, "FADE_OUT") &&
+        !hs_sprite_batch::HasDefineLine(src, "HOLO") &&
+        !hs_sprite_batch::HasDefineLine(src, "HAUNT") &&
+        src.find(kAnimAnchor) != std::string::npos &&
         src.find("OCEAN_BLEND_PARAMS") != std::string::npos &&
         src.find("UI_CC") != std::string::npos &&
         src.find("#define BLOOM\r") == std::string::npos &&
@@ -6084,7 +7236,6 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\t\tfloat hs_aSafe = max(hs_a, 0.001);\n"
                 "\t\t\tvec3 hs_col = gl_FragColor.rgb / hs_aSafe;\n"
                 "\t\t\tfloat hs_luma = dot(hs_col, vec3(0.299, 0.587, 0.114));\n"
-                "\t\t\tfloat hs_ink = smoothstep(0.05, 0.22, hs_luma);\n"
                 "\t\t\tvec3 hs_res = hs_col;\n"
                 "\t\t\tfloat hs_outA = hs_a;\n"
                 "#ifdef GL_OES_standard_derivatives\n"
@@ -6107,72 +7258,81 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\t\t\t}\n"
                 "\t\t\t}\n"
                 "#endif\n"
-                "\t\t\tif (HS_HD2D_PARAMS.x > 0.001) {\n"
-                "\t\t\t\tfloat hs_s = min(HS_HD2D_PARAMS.x, 1.50);\n"
-                "\t\t\t\tfloat hs_y = max(PS_POS.y, 0.0);\n"
-                "\t\t\t\tfloat hs_ao = mix(1.0 - 0.13 * hs_s, 1.0, smoothstep(0.0, 0.45, hs_y));\n"
-                "\t\t\t\ths_res *= mix(1.0, hs_ao, hs_ink);\n"
-                "\t\t\t\tvec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
-                "\t\t\t\ths_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
-                "\t\t\t}\n"
-                "\t\t\tif (HS_HD2D_SHADE.x > 0.001 && HS_HD2D_SHADE2.w > 0.005) {\n"
-                "\t\t\t\tfloat hs_sl = clamp(HS_HD2D_SHADE.x, 0.0, 1.5) * clamp(HS_HD2D_SHADE2.w, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_warm = clamp(HS_HD2D_SHADE.y, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_con = clamp(HS_HD2D_SHADE.z, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_scool = clamp(HS_HD2D_SHADE.w, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_sdark = clamp(HS_HD2D_SHADE2.x, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_theta = HS_HD2D_SHADE2.y;\n"
-                "\t\t\t\tfloat hs_el = clamp(HS_HD2D_SHADE2.z, 0.08, 1.50);\n"
-                "\t\t\t\tfloat hs_elev_n = clamp(hs_el * 0.63661977, 0.0, 1.0);\n"
-                "\t\t\t\tfloat hs_sun_x = cos(hs_theta);\n"
-                "\t\t\t\tfloat hs_sun_f = sin(hs_theta);\n"
-                "\t\t\t\tfloat hs_lx = HS_LOCAL_METRES.x;\n"
-                "\t\t\t\tfloat hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
-                "\t\t\t\tfloat hs_roof = smoothstep(0.30, 2.30, HS_LOCAL_METRES.y);\n"
-                "\t\t\t\tfloat hs_nup = 0.22 + hs_roof * 0.28;\n"
-                "\t\t\t\tfloat hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
-                "\t\t\t\tvec2 hs_sun2 = normalize(vec2(hs_sun_x, sin(hs_el) * 2.60 + 0.18));\n"
-                "\t\t\t\tfloat hs_diff = max(hs_nx * hs_sun2.x + hs_nup * 1.35 * hs_sun2.y + hs_nfront * 0.50 * hs_sun_f, 0.0);\n"
-                "\t\t\t\tfloat hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
-                "\t\t\t\tfloat hs_back = 1.0 - hs_direct;\n"
-                "\t\t\t\tfloat hs_amp = 0.40 + 1.20 * hs_con;\n"
-                "\t\t\t\tfloat hs_warmth = 1.0 - smoothstep(0.10, 0.85, hs_elev_n);\n"
-                "\t\t\t\tvec3 hs_sun_col = mix(vec3(1.0, 0.96, 0.86), vec3(1.0, 0.70, 0.34), hs_warmth);\n"
-                "\t\t\t\tvec3 hs_lit_hue = mix(vec3(0.86, 0.98, 1.18), vec3(1.14, 1.02, 0.82), hs_warm);\n"
-                "\t\t\t\tvec3 hs_back_hue = mix(vec3(1.14, 1.00, 0.84), vec3(0.84, 0.95, 1.22), hs_scool);\n"
-                "\t\t\t\tfloat hs_dark_amp = 0.40 + 1.20 * hs_sdark;\n"
-                "\t\t\t\tfloat hs_h_mask = smoothstep(0.05, 0.25, max(PS_POS.y, HS_LOCAL_METRES.y));\n"
-                "\t\t\t\tfloat hs_str = hs_sl * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
-                "\t\t\t\tvec3 hs_lit_mul = mix(vec3(1.0), hs_sun_col * hs_lit_hue * (1.0 + 0.16 * hs_amp), hs_direct * hs_str);\n"
-                "\t\t\t\tvec3 hs_shd_mul = mix(vec3(1.0), hs_back_hue * (1.0 - 0.17 * hs_amp * hs_dark_amp), hs_back * hs_str);\n"
-                "\t\t\t\tfloat hs_rim = clamp(-hs_sun_f, 0.0, 1.0) * pow(1.0 - hs_nfront, 1.6) * (0.20 * hs_amp * hs_str);\n"
-                "\t\t\t\ths_res = hs_res * hs_lit_mul * hs_shd_mul + hs_sun_col * hs_lit_hue * hs_rim;\n"
-                "\t\t\t}\n"
-                "\t\t\tif (HS_RECV_TINT.a > 0.001 && HS_RECV_BOUNDS.w > 0.5) {\n"
-                "\t\t\t\tfloat hs_py = max(PS_POS.y, 0.0);\n"
-                "\t\t\t\tvec2 hs_rdir = normalize(HS_HD2D_SHAD_PROJ.xy + vec2(1e-6, 0.0));\n"
-                "\t\t\t\tvec2 hs_rperp = vec2(-hs_rdir.y, hs_rdir.x);\n"
-                "\t\t\t\tvec2 hs_rg = PS_POS.xz + hs_rdir * (hs_py * HS_HD2D_SHAD_PROJ.z);\n"
-                "\t\t\t\tvec2 hs_ruv = (hs_rg - HS_RECV_BOUNDS.xy) * (HS_RECV_BOUNDS.z * 0.5) + 0.5;\n"
-                "\t\t\t\tvec2 hs_redge = abs(hs_ruv * 2.0 - 1.0);\n"
-                "\t\t\t\tfloat hs_rin = 1.0 - smoothstep(0.90, 1.0, max(hs_redge.x, hs_redge.y));\n"
-                "\t\t\t\tif (hs_rin > 0.001) {\n"
-                "\t\t\t\t\tfloat hs_uvs = HS_RECV_BOUNDS.z * 0.5;\n"
-                "\t\t\t\t\tvec2 hs_dp1 = hs_rperp * (((HS_RECV_BOUNDS.w > 1.5) ? 0.62 : 0.28) * hs_uvs);\n"
-                "\t\t\t\t\tvec2 hs_dp2 = (HS_RECV_BOUNDS.w > 1.5) ? (hs_rperp * (0.95 * hs_uvs)) : (hs_rdir * (0.22 * hs_uvs));\n"
-                "\t\t\t\t\tvec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
-                "\t\t\t\t\tvec4 hs_t1 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
-                "\t\t\t\t\tvec4 hs_t2 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
-                "\t\t\t\t\tvec4 hs_t3 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
-                "\t\t\t\t\tvec4 hs_t4 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
-                "\t\t\t\t\tfloat hs_o0 = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\tfloat hs_o1 = hs_t1.r * smoothstep(0.45, 1.15, hs_t1.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\tfloat hs_o2 = hs_t2.r * smoothstep(0.45, 1.15, hs_t2.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\tfloat hs_o3 = hs_t3.r * smoothstep(0.45, 1.15, hs_t3.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\tfloat hs_o4 = hs_t4.r * smoothstep(0.45, 1.15, hs_t4.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\tfloat hs_occ = (HS_RECV_BOUNDS.w > 1.5) ? max(hs_o0, max((hs_o1 + hs_o2) * 0.50, min(hs_o3, hs_o4))) : (hs_o0 * 0.40 + (hs_o1 + hs_o2 + hs_o3 + hs_o4) * 0.15);\n"
-                "\t\t\t\t\tfloat hs_rstr = clamp(hs_occ, 0.0, 1.0) * hs_rin * clamp(HS_RECV_TINT.a, 0.0, 1.0);\n"
-                "\t\t\t\t\ths_res *= mix(vec3(1.0), clamp(HS_RECV_TINT.rgb, vec3(0.0), vec3(1.0)), hs_rstr * hs_ink);\n"
+                "\t\t\tif (hs_effMask > 0.001) {\n"
+                "\t\t\t\tfloat hs_ink = smoothstep(0.05, 0.22, hs_luma);\n"
+                "\t\t\t\tif (HS_HD2D_PARAMS.x > 0.001) {\n"
+                "\t\t\t\t\tfloat hs_s = min(HS_HD2D_PARAMS.x, 1.50);\n"
+                "\t\t\t\t\tfloat hs_y = max(PS_POS.y, 0.0);\n"
+                "\t\t\t\t\tfloat hs_ao = mix(1.0 - 0.13 * hs_s, 1.0, smoothstep(0.0, 0.45, hs_y));\n"
+                "\t\t\t\t\ths_res *= mix(1.0, hs_ao, hs_ink);\n"
+                "\t\t\t\t\tvec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
+                "\t\t\t\t\ths_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
+                "\t\t\t\t}\n"
+                "\t\t\t\tif (HS_HD2D_SHADE.x > 0.001 && HS_HD2D_SHADE2.w > 0.005) {\n"
+                "\t\t\t\t\tfloat hs_sl = clamp(HS_HD2D_SHADE.x, 0.0, 1.5) * clamp(HS_HD2D_SHADE2.w, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_warm = clamp(HS_HD2D_SHADE.y, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_con = clamp(HS_HD2D_SHADE.z, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_scool = clamp(HS_HD2D_SHADE.w, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_sdark = clamp(HS_HD2D_SHADE2.x, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_theta = HS_HD2D_SHADE2.y;\n"
+                "\t\t\t\t\tfloat hs_el = clamp(HS_HD2D_SHADE2.z, 0.08, 1.50);\n"
+                "\t\t\t\t\tfloat hs_elev_n = clamp(hs_el * 0.63661977, 0.0, 1.0);\n"
+                "\t\t\t\t\tfloat hs_sun_x = cos(hs_theta);\n"
+                "\t\t\t\t\tfloat hs_sun_f = sin(hs_theta);\n"
+                "\t\t\t\t\tfloat hs_lx = HS_LOCAL_METRES.x;\n"
+                "\t\t\t\t\tfloat hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
+                "\t\t\t\t\tfloat hs_roof = smoothstep(0.30, 2.30, HS_LOCAL_METRES.y);\n"
+                "\t\t\t\t\tfloat hs_nup = 0.22 + hs_roof * 0.28;\n"
+                "\t\t\t\t\tfloat hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
+                "\t\t\t\t\tvec2 hs_sun2 = normalize(vec2(hs_sun_x, sin(hs_el) * 2.60 + 0.18));\n"
+                "\t\t\t\t\tfloat hs_diff = max(hs_nx * hs_sun2.x + hs_nup * 1.35 * hs_sun2.y + hs_nfront * 0.50 * hs_sun_f, 0.0);\n"
+                "\t\t\t\t\tfloat hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
+                "\t\t\t\t\tfloat hs_back = 1.0 - hs_direct;\n"
+                "\t\t\t\t\tfloat hs_amp = 0.40 + 1.20 * hs_con;\n"
+                "\t\t\t\t\tfloat hs_warmth = 1.0 - smoothstep(0.10, 0.85, hs_elev_n);\n"
+                "\t\t\t\t\tvec3 hs_sun_col = mix(vec3(1.0, 0.96, 0.86), vec3(1.0, 0.70, 0.34), hs_warmth);\n"
+                "\t\t\t\t\tvec3 hs_lit_hue = mix(vec3(0.86, 0.98, 1.18), vec3(1.14, 1.02, 0.82), hs_warm);\n"
+                "\t\t\t\t\tvec3 hs_back_hue = mix(vec3(1.14, 1.00, 0.84), vec3(0.84, 0.95, 1.22), hs_scool);\n"
+                "\t\t\t\t\tfloat hs_dark_amp = 0.40 + 1.20 * hs_sdark;\n"
+                "\t\t\t\t\tfloat hs_h_mask = smoothstep(0.05, 0.25, max(PS_POS.y, HS_LOCAL_METRES.y));\n"
+                "\t\t\t\t\tfloat hs_str = hs_sl * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
+                "\t\t\t\t\tvec3 hs_lit_mul = mix(vec3(1.0), hs_sun_col * hs_lit_hue * (1.0 + 0.16 * hs_amp), hs_direct * hs_str);\n"
+                "\t\t\t\t\tvec3 hs_shd_mul = mix(vec3(1.0), hs_back_hue * (1.0 - 0.17 * hs_amp * hs_dark_amp), hs_back * hs_str);\n"
+                "\t\t\t\t\tfloat hs_rim = clamp(-hs_sun_f, 0.0, 1.0) * pow(1.0 - hs_nfront, 1.6) * (0.20 * hs_amp * hs_str);\n"
+                "\t\t\t\t\ths_res = hs_res * hs_lit_mul * hs_shd_mul + hs_sun_col * hs_lit_hue * hs_rim;\n"
+                "\t\t\t\t}\n"
+                "\t\t\t\tif (HS_RECV_TINT.a > 0.001 && HS_RECV_BOUNDS.w > 0.5) {\n"
+                "\t\t\t\t\tfloat hs_py = max(PS_POS.y, 0.0);\n"
+                "\t\t\t\t\tvec2 hs_rdir = normalize(HS_HD2D_SHAD_PROJ.xy + vec2(1e-6, 0.0));\n"
+                "\t\t\t\t\tvec2 hs_rg = PS_POS.xz + hs_rdir * (hs_py * HS_HD2D_SHAD_PROJ.z);\n"
+                "\t\t\t\t\tvec2 hs_ruv = (hs_rg - HS_RECV_BOUNDS.xy) * (HS_RECV_BOUNDS.z * 0.5) + 0.5;\n"
+                "\t\t\t\t\tvec2 hs_redge = abs(hs_ruv * 2.0 - 1.0);\n"
+                "\t\t\t\t\tfloat hs_rin = 1.0 - smoothstep(0.90, 1.0, max(hs_redge.x, hs_redge.y));\n"
+                "\t\t\t\t\tif (hs_rin > 0.001) {\n"
+                "\t\t\t\t\t\tfloat hs_occ = 0.0;\n"
+                "\t\t\t\t\t\tif (HS_RECV_BOUNDS.w < 0.75) {\n"
+                "\t\t\t\t\t\t\tvec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+                "\t\t\t\t\t\t\ths_occ = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t} else {\n"
+                "\t\t\t\t\t\t\tvec2 hs_rperp = vec2(-hs_rdir.y, hs_rdir.x);\n"
+                "\t\t\t\t\t\t\tfloat hs_uvs = HS_RECV_BOUNDS.z * 0.5;\n"
+                "\t\t\t\t\t\t\tvec2 hs_dp1 = hs_rperp * (((HS_RECV_BOUNDS.w > 1.5) ? 0.62 : 0.28) * hs_uvs);\n"
+                "\t\t\t\t\t\t\tvec2 hs_dp2 = (HS_RECV_BOUNDS.w > 1.5) ? (hs_rperp * (0.95 * hs_uvs)) : (hs_rdir * (0.22 * hs_uvs));\n"
+                "\t\t\t\t\t\t\tvec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t1 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t2 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t3 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t4 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
+                "\t\t\t\t\t\t\tfloat hs_o0 = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tfloat hs_o1 = hs_t1.r * smoothstep(0.45, 1.15, hs_t1.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tfloat hs_o2 = hs_t2.r * smoothstep(0.45, 1.15, hs_t2.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tfloat hs_o3 = hs_t3.r * smoothstep(0.45, 1.15, hs_t3.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tfloat hs_o4 = hs_t4.r * smoothstep(0.45, 1.15, hs_t4.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\ths_occ = (HS_RECV_BOUNDS.w > 1.5) ? max(hs_o0, max((hs_o1 + hs_o2) * 0.50, min(hs_o3, hs_o4))) : (hs_o0 * 0.40 + (hs_o1 + hs_o2 + hs_o3 + hs_o4) * 0.15);\n"
+                "\t\t\t\t\t\t}\n"
+                "\t\t\t\t\t\tfloat hs_rstr = clamp(hs_occ, 0.0, 1.0) * hs_rin * clamp(HS_RECV_TINT.a, 0.0, 1.0);\n"
+                "\t\t\t\t\t\ths_res *= mix(vec3(1.0), clamp(HS_RECV_TINT.rgb, vec3(0.0), vec3(1.0)), hs_rstr * hs_ink);\n"
+                "\t\t\t\t\t}\n"
                 "\t\t\t\t}\n"
                 "\t\t\t}\n"
                 "\t\t\tvec3 hs_origScaled = (hs_a > 0.001) ? (gl_FragColor.rgb * (hs_outA / hs_a)) : vec3(0.0);\n"
@@ -6317,6 +7477,8 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
 static thread_local std::unordered_map<uint32_t, hs_ui_batch::UiShaderTag> tl_uiShaderTags;
 static thread_local std::unordered_map<uint32_t, std::pair<hs_ui_batch::UiShaderTag, hs_ui_batch::UiShaderTag>> tl_uiProgAttached;
 static thread_local std::unordered_map<uint32_t, hs_ui_batch::UiProgInfo> tl_uiProgs;
+static thread_local std::unordered_map<uint32_t, uint8_t> tl_sbGpuShaders;
+static thread_local std::unordered_map<uint32_t, uint8_t> tl_sbGpuProgMask;
 static thread_local std::unordered_map<uint32_t, WorldProgRole> tl_shaderWorldRole;
 static thread_local std::unordered_map<uint32_t, WorldProgRole> tl_progWorldRole;
 static thread_local std::unordered_map<uint32_t, uint8_t>       tl_hauntShaders;
@@ -6325,6 +7487,11 @@ static thread_local std::unordered_map<uint32_t, uint8_t>       tl_hauntProgs;
 static thread_local std::unordered_map<uint32_t, uint8_t>       tl_lookShaderRole;
 static thread_local std::unordered_map<uint32_t, uint8_t>       tl_lookProgRole;
 static thread_local uint8_t                                     tl_curLookProgRole = 0u;
+static thread_local bool                                        tl_bloomLegacyShadowActive = false;
+static thread_local uint32_t                                    tl_sbProgsGen    = 1u;
+static thread_local uint32_t                                    tl_uiProgsGen    = 1u;
+static thread_local uint32_t                                    tl_worldProgsGen = 1u;
+static thread_local uint32_t                                    tl_extProfGen    = 1u;
 // =============================================================================
 // HS_EXT_V1 Per-Plugin Hardware GPU Pass Profiler (0.000ms Pipeline Stall)
 //   - Identifies third-party & core post-process passes by `// @HS_EXT_ID: <id>`
@@ -6338,13 +7505,6 @@ static constexpr uint32_t kExtQueryRing    = 4u;
 static constexpr uint32_t kGlTimeElapsed   = 0x88BFu;
 static constexpr uint32_t kGlQueryResult   = 0x8866u;
 static constexpr uint32_t kGlQueryAvail    = 0x8867u;
-
-using GlGenQueries_t          = void (WINAPI*)(int32_t n, uint32_t* ids);
-using GlDeleteQueries_t       = void (WINAPI*)(int32_t n, const uint32_t* ids);
-using GlBeginQuery_t          = void (WINAPI*)(uint32_t target, uint32_t id);
-using GlEndQuery_t            = void (WINAPI*)(uint32_t target);
-using GlGetQueryObjectiv_t    = void (WINAPI*)(uint32_t id, uint32_t pname, int32_t* params);
-using GlGetQueryObjectui64v_t = void (WINAPI*)(uint32_t id, uint32_t pname, uint64_t* params);
 
 struct ExtProfSlot {
     char                  id[64]{};
@@ -6520,6 +7680,144 @@ struct TlExtProfState {
 };
 
 static thread_local TlExtProfState tl_extProf;
+static thread_local uint32_t       tl_curExtProfSlotPlus1 = 0u;
+
+// =============================================================================
+// Native OpenGL Async Hardware GPU Frame Timer (0.000ms Pipeline Stall)
+//   - Uses 4-frame GL_TIMESTAMP (glQueryCounter) ring (start/end pairs) instead
+//     of GL_TIME_ELAPSED so it NEVER nests with tl_extProf or tl_gpuClarity's
+//     GL_TIME_ELAPSED queries (zero GL_INVALID_OPERATION!).
+//   - Populates g_emaGpuDrainUs & g_lastNativeGpuUs on Native OpenGL.
+// =============================================================================
+static constexpr uint32_t kGlTimestamp        = 0x8E28u;
+static constexpr uint32_t kNativeGpuTimerRing = 4u;
+
+struct TlNativeGpuTimer {
+    bool                    resolved             = false;
+    bool                    supported            = false;
+    bool                    frameOpen            = false;
+    uint32_t                head                 = 0u;
+    uint32_t                qStart[kNativeGpuTimerRing]{};
+    uint32_t                qEnd[kNativeGpuTimerRing]{};
+    bool                    pending[kNativeGpuTimerRing]{};
+    GlGenQueries_t          pGenQueries          = nullptr;
+    GlDeleteQueries_t       pDeleteQueries       = nullptr;
+    GlQueryCounter_t        pQueryCounter        = nullptr;
+    GlGetQueryObjectiv_t    pGetQueryObjectiv    = nullptr;
+    GlGetQueryObjectui64v_t pGetQueryObjectui64v = nullptr;
+
+    void ResolveIfNeeded() noexcept {
+        if (resolved) return;
+        if (!g_nativeGlActive.load(std::memory_order_acquire) ||
+            !g_nativeIatBound.load(std::memory_order_acquire) ||
+            CurrentTrackedGlContext() == nullptr) {
+            return;
+        }
+        resolved  = true;
+        supported = false;
+        pGenQueries       = g_fnGlGenQueries ? g_fnGlGenQueries
+                          : reinterpret_cast<GlGenQueries_t>(g_wglRt.ResolveGlProc("glGenQueries"));
+        pDeleteQueries    = g_fnGlDeleteQueries ? g_fnGlDeleteQueries
+                          : reinterpret_cast<GlDeleteQueries_t>(g_wglRt.ResolveGlProc("glDeleteQueries"));
+        pQueryCounter     = reinterpret_cast<GlQueryCounter_t>(g_wglRt.ResolveGlProc("glQueryCounter"));
+        if (!pQueryCounter) {
+            pQueryCounter = reinterpret_cast<GlQueryCounter_t>(g_wglRt.ResolveGlProc("glQueryCounterEXT"));
+        }
+        pGetQueryObjectiv = g_fnGlGetQueryObjectiv ? g_fnGlGetQueryObjectiv
+                          : reinterpret_cast<GlGetQueryObjectiv_t>(g_wglRt.ResolveGlProc("glGetQueryObjectiv"));
+        pGetQueryObjectui64v = g_fnGlGetQueryObjectui64v ? g_fnGlGetQueryObjectui64v
+                             : reinterpret_cast<GlGetQueryObjectui64v_t>(g_wglRt.ResolveGlProc("glGetQueryObjectui64v"));
+        if (!pGetQueryObjectui64v) {
+            pGetQueryObjectui64v = reinterpret_cast<GlGetQueryObjectui64v_t>(g_wglRt.ResolveGlProc("glGetQueryObjectui64vEXT"));
+        }
+        if (pGenQueries && pDeleteQueries && pQueryCounter && pGetQueryObjectiv && pGetQueryObjectui64v) {
+            pGenQueries(static_cast<int32_t>(kNativeGpuTimerRing), qStart);
+            pGenQueries(static_cast<int32_t>(kNativeGpuTimerRing), qEnd);
+            bool allOk = true;
+            for (uint32_t i = 0u; i < kNativeGpuTimerRing; ++i) {
+                if (qStart[i] == 0u || qEnd[i] == 0u) {
+                    allOk = false;
+                    break;
+                }
+            }
+            if (allOk) {
+                supported = true;
+                LogMsg("[GL_NATIVE][GPU_TIMER] Async 4-frame GL_TIMESTAMP query ring active (0ms stall, non-nesting)");
+            } else {
+                pDeleteQueries(static_cast<int32_t>(kNativeGpuTimerRing), qStart);
+                pDeleteQueries(static_cast<int32_t>(kNativeGpuTimerRing), qEnd);
+                std::memset(qStart, 0, sizeof(qStart));
+                std::memset(qEnd, 0, sizeof(qEnd));
+            }
+        }
+    }
+
+    void DrainCompleted() noexcept {
+        if (!supported) return;
+        // Oldest slot is `head` (3 frames behind the slot just ended at `(head - 1) & 3`).
+        // Iterate oldest-first (skipping the slot just ended at step == kNativeGpuTimerRing - 1),
+        // stop on first not-ready (FIFO GPU queue order), skip redundant qStart avail check
+        // (qStart precedes qEnd on the same queue), and harvest at most 1 slot per frame (<=1 query/frame).
+        for (uint32_t step = 0u; step < kNativeGpuTimerRing - 1u; ++step) {
+            const uint32_t k = (head + step) & (kNativeGpuTimerRing - 1u);
+            if (!pending[k]) continue;
+            int32_t availEnd = 0;
+            pGetQueryObjectiv(qEnd[k], kGlQueryAvail, &availEnd);
+            if (availEnd == 0) break;
+            uint64_t tStart = 0ULL, tEnd = 0ULL;
+            pGetQueryObjectui64v(qStart[k], kGlQueryResult, &tStart);
+            pGetQueryObjectui64v(qEnd[k], kGlQueryResult, &tEnd);
+            pending[k] = false;
+            if (tEnd > tStart) {
+                const double gpuUs = static_cast<double>(tEnd - tStart) * 1e-3;
+                if (gpuUs >= 0.0 && gpuUs < 500000.0) {
+                    UpdateAtomicEma(g_emaGpuDrainUs, static_cast<float>(gpuUs), 0.06f);
+                    g_lastNativeGpuUs.store(static_cast<uint32_t>(gpuUs), std::memory_order_relaxed);
+                }
+            }
+            break;
+        }
+    }
+
+    void BeginFrame() noexcept {
+        if (frameOpen || !g_nativeGlActive.load(std::memory_order_relaxed)) return;
+        if (!resolved) ResolveIfNeeded();
+        if (!supported) return;
+        if (pending[head]) {
+            DrainCompleted();
+            if (pending[head]) {
+                frameOpen = false;
+                return;
+            }
+        }
+        pQueryCounter(qStart[head], kGlTimestamp);
+        frameOpen = true;
+    }
+
+    void EndFrame() noexcept {
+        if (!supported || !frameOpen) return;
+        pQueryCounter(qEnd[head], kGlTimestamp);
+        pending[head] = true;
+        head = (head + 1u) & (kNativeGpuTimerRing - 1u);
+        frameOpen = false;
+    }
+
+    void ResetContext(bool hasAliveCtx) noexcept {
+        if (hasAliveCtx && supported && pDeleteQueries) {
+            pDeleteQueries(static_cast<int32_t>(kNativeGpuTimerRing), qStart);
+            pDeleteQueries(static_cast<int32_t>(kNativeGpuTimerRing), qEnd);
+        }
+        std::memset(qStart, 0, sizeof(qStart));
+        std::memset(qEnd, 0, sizeof(qEnd));
+        std::memset(pending, 0, sizeof(pending));
+        head      = 0u;
+        frameOpen = false;
+        resolved  = false;
+        supported = false;
+    }
+};
+
+static thread_local TlNativeGpuTimer tl_nativeGpuTimer{};
 
 static bool ExtractExtIdTag(const std::string& src, std::string& outId) {
     static constexpr const char* kTag = "@HS_EXT_ID:";
@@ -6579,6 +7877,179 @@ static bool HasActiveGlslVersionDirective(const std::string& src) noexcept {
         return false;
     }
     return false;
+}
+
+static size_t FindAfterGlslVersionDirectiveOffset(const std::string& src) noexcept {
+    size_t i = 0;
+    const size_t n = src.size();
+    bool inBlockComment = false;
+    while (i < n) {
+        if (inBlockComment) {
+            if (i + 1 < n && src[i] == '*' && src[i + 1] == '/') {
+                inBlockComment = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        while (i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n')) ++i;
+        if (i >= n) break;
+        if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
+            while (i < n && src[i] != '\n') ++i;
+            continue;
+        }
+        if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
+            inBlockComment = true;
+            i += 2;
+            continue;
+        }
+        if (src[i] == '#') {
+            size_t j = i + 1;
+            while (j < n && (src[j] == ' ' || src[j] == '\t')) ++j;
+            if (j + 7 <= n && memcmp(src.data() + j, "version", 7) == 0 &&
+                (j + 7 == n || src[j + 7] == ' ' || src[j + 7] == '\t')) {
+                const size_t nl = src.find('\n', j + 7);
+                return (nl == std::string::npos) ? n : (nl + 1u);
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+static inline bool IsGlslIdentChar(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static bool TransformColourCubeAntiAnisoShaderSource(std::string& src, uint32_t& outReplacedCalls) {
+    outReplacedCalls = 0u;
+    if (src.find("gl_FragColor") == std::string::npos ||
+        src.find("HS_CC_SAMPLE_2D") != std::string::npos) {
+        return false;
+    }
+    const bool hasColourCube = (src.find("COLOUR_CUBE") != std::string::npos);
+    const bool isCombineCc = (src.find("SampleSourceDest") != std::string::npos &&
+                              src.find("CUBE_DIMENSION") != std::string::npos);
+    if (!hasColourCube && !isCombineCc) {
+        return false;
+    }
+
+    const char* targets[3]{};
+    uint32_t targetCount = 0u;
+    if (hasColourCube) {
+        targets[targetCount++] = "COLOUR_CUBE";
+    }
+    if (isCombineCc) {
+        targets[targetCount++] = "source_cc";
+        targets[targetCount++] = "dest_cc";
+    }
+
+    auto skipWs = [&](size_t& p) noexcept {
+        while (p < src.size() &&
+               (src[p] == ' ' || src[p] == '\t' || src[p] == '\r' || src[p] == '\n')) {
+            ++p;
+        }
+    };
+
+    for (size_t i = 0; i < src.size();) {
+        if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '/') {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+            continue;
+        }
+        if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            i = (i + 1 < src.size()) ? (i + 2) : src.size();
+            continue;
+        }
+        if (i + 9 <= src.size() &&
+            src.compare(i, 9, "texture2D") == 0 &&
+            (i == 0 || !IsGlslIdentChar(src[i - 1])) &&
+            (i + 9 == src.size() || !IsGlslIdentChar(src[i + 9]))) {
+            size_t j = i + 9;
+            skipWs(j);
+            if (j < src.size() && src[j] == '(') {
+                ++j;
+                skipWs(j);
+                const char* matched = nullptr;
+                size_t matchedLen = 0u;
+                for (uint32_t ti = 0u; ti < targetCount; ++ti) {
+                    const size_t tlen = strlen(targets[ti]);
+                    if (j + tlen <= src.size() &&
+                        src.compare(j, tlen, targets[ti]) == 0 &&
+                        (j + tlen == src.size() || !IsGlslIdentChar(src[j + tlen]))) {
+                        matched = targets[ti];
+                        matchedLen = tlen;
+                        break;
+                    }
+                }
+                if (matched != nullptr) {
+                    j += matchedLen;
+                    skipWs(j);
+                    if (j < src.size() && src[j] == ',') {
+                        ++j;
+                        int depth = 0;
+                        bool twoArgCall = false;
+                        while (j < src.size()) {
+                            if (j + 1 < src.size() && src[j] == '/' && src[j + 1] == '/') {
+                                j += 2;
+                                while (j < src.size() && src[j] != '\n') ++j;
+                                continue;
+                            }
+                            if (j + 1 < src.size() && src[j] == '/' && src[j + 1] == '*') {
+                                j += 2;
+                                while (j + 1 < src.size() && !(src[j] == '*' && src[j + 1] == '/')) ++j;
+                                j = (j + 1 < src.size()) ? (j + 2) : src.size();
+                                continue;
+                            }
+                            const char c = src[j];
+                            if (c == '(') {
+                                ++depth;
+                            } else if (c == ')') {
+                                if (depth == 0) {
+                                    twoArgCall = true;
+                                    break;
+                                }
+                                --depth;
+                            } else if (c == ',' && depth == 0) {
+                                // 3-argument texture2D(s, uv, bias) -> leave untouched
+                                break;
+                            }
+                            ++j;
+                        }
+                        if (twoArgCall) {
+                            src.replace(i, 9, "HS_CC_SAMPLE_2D");
+                            ++outReplacedCalls;
+                            i += 15;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        ++i;
+    }
+
+    if (outReplacedCalls == 0u) {
+        return false;
+    }
+
+    const size_t insPos = FindAfterGlslVersionDirectiveOffset(src);
+    static constexpr const char* kCcAntiAnisoHdr =
+        "#extension GL_EXT_shader_texture_lod : enable\n"
+        "#extension GL_ARB_shader_texture_lod : enable\n"
+        "#if defined(GL_EXT_shader_texture_lod)\n"
+        "#define HS_CC_SAMPLE_2D(s, uv) texture2DGradEXT((s), (uv), vec2(0.0), vec2(0.0))\n"
+        "#elif defined(GL_ARB_shader_texture_lod)\n"
+        "#define HS_CC_SAMPLE_2D(s, uv) texture2DGradARB((s), (uv), vec2(0.0), vec2(0.0))\n"
+        "#else\n"
+        "#define HS_CC_SAMPLE_2D(s, uv) texture2D((s), (uv))\n"
+        "#endif\n";
+    src.insert(insPos, kCcAntiAnisoHdr);
+    return true;
 }
 
 static thread_local bool tl_inCacheRenderUi = false;
@@ -6669,12 +8140,43 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
         // CRITICAL ORDER: Run 2D SpriteBatcher injection FIRST so TransformHd2dShaderSource's
         // ANIM_VS branch sees HS_BATCH_ACTIVE & packs HS_LOCAL_METRES cleanly from HS_BATCH_CADD.w!
         if (wantBatch) {
+            static thread_local int32_t tl_hwMaxTexUnits = 0;
+            bool allow16Slots = false;
+            const bool isNatGl = g_nativeGlActive.load(std::memory_order_acquire);
+            if (isNatGl) {
+                if (tl_hwMaxTexUnits == 0 && g_fnGlGetIntegerv) {
+                    g_fnGlGetIntegerv(0x8872u /*GL_MAX_TEXTURE_IMAGE_UNITS*/, &tl_hwMaxTexUnits);
+                }
+                allow16Slots = (tl_hwMaxTexUnits >= 24);
+            }
+            const bool allowGpuDriven = isNatGl &&
+                                        g_hwCaps.hasBufferStorage &&
+                                        g_hwCaps.hasSsbo &&
+                                        g_hwCaps.hasBindlessTexture &&
+                                        g_hwCaps.hasBaseVertex &&
+                                        g_fnGlBindBufferBase != nullptr &&
+                                        g_fnGlGetTextureHandleARB != nullptr &&
+                                        g_fnGlMakeTextureHandleResidentARB != nullptr &&
+                                        g_fnGlMakeTextureHandleNonResidentARB != nullptr &&
+                                        g_fnGlDrawElementsBaseVertex != nullptr;
             std::string sbSrc;
             const char* sbTag = nullptr;
-            if (hs_sprite_batch::TransformAnimBatchShaderSource(cur, sbSrc, sbTag)) {
+            if (hs_sprite_batch::TransformAnimBatchShaderSource(cur, sbSrc, sbTag, allow16Slots, allowGpuDriven)) {
                 const uint32_t n = g_sbShadersInjected.fetch_add(1, std::memory_order_relaxed) + 1;
-                LogMsg("[PERF][SBATCH] Injected 2D batch shader #%u (%s, shader=%u, %zu -> %zu bytes)",
-                       n, sbTag ? sbTag : "?", shader, cur.size(), sbSrc.size());
+                LogMsg("[PERF][SBATCH] Injected 2D batch shader #%u (%s, shader=%u, gpu=%d, %zu -> %zu bytes)",
+                       n, sbTag ? sbTag : "?", shader, allowGpuDriven ? 1 : 0, cur.size(), sbSrc.size());
+                if (shader != 0u && sbTag != nullptr) {
+                    uint8_t mask = 0u;
+                    const bool isVs = (strcmp(sbTag, "ANIM_BATCH_VS") == 0 || strcmp(sbTag, "ANIM_BLOOM_BATCH_VS") == 0);
+                    const bool isFs = (strcmp(sbTag, "ANIM_BATCH_FS") == 0 || strcmp(sbTag, "ANIM_BLOOM_BATCH_FS") == 0);
+                    const bool isBloom = (strncmp(sbTag, "ANIM_BLOOM_", 11) == 0);
+                    if (allowGpuDriven && (isVs || isFs)) mask |= isVs ? 1u : 2u;
+                    if (isBloom && (isVs || isFs))        mask |= isVs ? 4u : 8u;
+                    if (mask != 0u) tl_sbGpuShaders[shader] = mask;
+                    else            tl_sbGpuShaders.erase(shader);
+                } else if (shader != 0u) {
+                    tl_sbGpuShaders.erase(shader);
+                }
                 cur = std::move(sbSrc);
                 modified = true;
             }
@@ -6712,6 +8214,30 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
             cur.insert(0, "#version 100\n");
             modified = true;
         }
+        if (wantHighp) {
+            uint32_t ccTaps = 0u;
+            if (TransformColourCubeAntiAnisoShaderSource(cur, ccTaps)) {
+                const uint32_t n = g_ccAntiAnisoShadersPatched.fetch_add(1, std::memory_order_relaxed) + 1u;
+                LogMsg("[VISUAL][CC-AF] Patched ColourCube LUT zero-grad #%u (shader=%u, taps=%u)", n, shader, ccTaps);
+                modified = true;
+            }
+            static constexpr const char* kHoloUb1 = "smoothstep(1., .75, texture2D( HOLO_SAMPLER, lineUV ).g)";
+            static constexpr const char* kHoloFix1 = "(1.0 - smoothstep(.75, 1., texture2D( HOLO_SAMPLER, lineUV ).g))";
+            static constexpr const char* kHoloUb2 = "smoothstep(1., .75, texture2D( UI_HOLO_SAMPLER, lineUV ).g)";
+            static constexpr const char* kHoloFix2 = "(1.0 - smoothstep(.75, 1., texture2D( UI_HOLO_SAMPLER, lineUV ).g))";
+            size_t hpos = 0;
+            while ((hpos = cur.find(kHoloUb1, hpos)) != std::string::npos) {
+                cur.replace(hpos, strlen(kHoloUb1), kHoloFix1);
+                hpos += strlen(kHoloFix1);
+                modified = true;
+            }
+            hpos = 0;
+            while ((hpos = cur.find(kHoloUb2, hpos)) != std::string::npos) {
+                cur.replace(hpos, strlen(kHoloUb2), kHoloFix2);
+                hpos += strlen(kHoloFix2);
+                modified = true;
+            }
+        }
         if (modified) {
             const char* ptr = cur.c_str();
             const int32_t len = static_cast<int32_t>(cur.size());
@@ -6724,6 +8250,10 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
 
 static void WINAPI HookGlAttachShader(uint32_t program, uint32_t shader) {
     if (program != 0u && shader != 0u) {
+        auto git = tl_sbGpuShaders.find(shader);
+        if (git != tl_sbGpuShaders.end() && git->second != 0u) {
+            tl_sbGpuProgMask[program] |= git->second;
+        }
         auto it = tl_uiShaderTags.find(shader);
         if (it != tl_uiShaderTags.end()) {
             auto& pair = tl_uiProgAttached[program];
@@ -6751,6 +8281,7 @@ static void WINAPI HookGlAttachShader(uint32_t program, uint32_t shader) {
             // Priority: COLOURCUBE(1) / HS_VISUAL_FINAL(3) override generic UI(2) if ever mixed
             if (dstR == 0u || lrit->second == 1u || lrit->second == 3u) {
                 dstR = lrit->second;
+                ++tl_worldProgsGen;
             }
         }
     }
@@ -6768,16 +8299,10 @@ static void WINAPI HookGlAttachShader(uint32_t program, uint32_t shader) {
 static thread_local hs_gl_cache::ThreadState tl_glCache;
 static thread_local uint32_t                 tl_glCacheGen = 0;
 
-static inline hs_gl_cache::ThreadState& GetSyncedGlCache() {
-    const uint32_t curGen = g_glCacheResetGen.load(std::memory_order_acquire);
-    if (tl_glCacheGen != curGen) {
-        tl_glCache.Reset();
-        tl_glCacheGen = curGen;
-    }
-    return tl_glCache;
-}
-
 static thread_local hs_sprite_batch::SpriteBatcher tl_spriteBatcher;
+static inline bool IsBoundTex2dBindless(uint32_t texId) noexcept {
+    return tl_spriteBatcher.IsTextureBindless(texId);
+}
 static thread_local uint32_t                 tl_sbOpsGen = 0;
 static thread_local std::unordered_map<uint32_t, hs_sprite_batch::BatchProgInfo> tl_sbProgs;
 static thread_local hs_ui_batch::UiBatcher   tl_uiBatcher;
@@ -6836,6 +8361,19 @@ static thread_local std::unordered_map<uint32_t, WorldProgInfo> tl_worldProgs;
 static thread_local WorldProgInfo*                       tl_curWorldProg = nullptr;
 static thread_local uint32_t                             tl_curBoundProg = 0u;
 static thread_local uint32_t                             tl_curBoundFbo  = 0u;
+static thread_local uint32_t                             tl_curReadFbo   = 0u;
+struct FboCompleteCacheEntry {
+    uint32_t fbo   = 0u;
+    bool     valid = false;
+};
+static constexpr uint32_t kFboCompleteCacheCap = 16u;
+static thread_local FboCompleteCacheEntry                tl_fboCompleteCache[kFboCompleteCacheCap]{};
+static thread_local uint32_t                             tl_fboCompleteCount  = 0u;
+static thread_local uint32_t                             tl_fboCompleteCursor = 0u;
+static inline void InvalidateFboCompletenessCache() noexcept {
+    tl_fboCompleteCount  = 0u;
+    tl_fboCompleteCursor = 0u;
+}
 static thread_local int32_t                              tl_curVp[4]     = { 0, 0, 1280, 720 };
 static thread_local float                                tl_curClearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 static thread_local bool                                 tl_hasClearColor = false;
@@ -6847,6 +8385,51 @@ static thread_local uint32_t                             tl_cachedWindGen = 0;
 static thread_local hs_foliage::FoliageTable             tl_foliageTable;
 static thread_local uint32_t                             tl_foliageTableGen = 0;
 
+// Zero-init POD pointer cache for non-trivial thread_local render-thread singletons.
+// Eliminates ~50,000 compiler-emitted __tls_init guard calls/frame on hot GL draw/uniform/bind hooks!
+struct RtHotTlsPointers {
+    hs_sprite_batch::SpriteBatcher*       sb;
+    hs_ui_batch::UiBatcher*               ui;
+    hs_gl_cache::ThreadState*             glc;
+    hs_world_shadow::WorldShadowEngine*   ws;
+    hs_water_refl::WaterReflectionEngine* wr;
+    hs_combat::CombatVfxRenderer*         cvfx;
+    hs_foliage::FoliageTable*             fol;
+};
+static thread_local RtHotTlsPointers tl_hotPtrs{};
+
+static __declspec(noinline) void InitHotTlsPointers() noexcept {
+    tl_hotPtrs.sb   = &tl_spriteBatcher;
+    tl_hotPtrs.ui   = &tl_uiBatcher;
+    tl_hotPtrs.glc  = &tl_glCache;
+    tl_hotPtrs.ws   = &tl_worldShadow;
+    tl_hotPtrs.wr   = &tl_waterRefl;
+    tl_hotPtrs.cvfx = &tl_combatVfx;
+    tl_hotPtrs.fol  = &tl_foliageTable;
+}
+
+static inline const RtHotTlsPointers& HotTls() noexcept {
+    if (!tl_hotPtrs.sb) {
+        InitHotTlsPointers();
+    }
+    return tl_hotPtrs;
+}
+
+static inline hs_gl_cache::ThreadState& GetSyncedGlCache() {
+    auto& glc = *HotTls().glc;
+    const uint32_t curGen = g_glCacheResetGen.load(std::memory_order_relaxed);
+    if (tl_glCacheGen != curGen) {
+        const uint32_t acqGen = g_glCacheResetGen.load(std::memory_order_acquire);
+        glc.Reset();
+        tl_glCacheGen = acqGen;
+    }
+    return glc;
+}
+
+static const void* CurrentTrackedGlContext() noexcept {
+    return HotTls().glc->curContext;
+}
+
 struct GlContextProgTables {
     std::unordered_map<uint32_t, WorldProgInfo>                 worldProgs;
     std::unordered_map<uint32_t, WorldProgRole>                 shaderWorldRole;
@@ -6857,6 +8440,8 @@ struct GlContextProgTables {
     std::unordered_map<uint32_t, hs_ui_batch::UiProgInfo>       uiProgs;
     std::unordered_map<uint32_t, std::pair<hs_ui_batch::UiShaderTag, hs_ui_batch::UiShaderTag>> uiProgAttached;
     std::unordered_map<uint32_t, hs_ui_batch::UiShaderTag>      uiShaderTags;
+    std::unordered_map<uint32_t, uint8_t>                       sbGpuShaders;
+    std::unordered_map<uint32_t, uint8_t>                       sbGpuProgMask;
 };
 static thread_local std::unordered_map<const void*, GlContextProgTables> tl_ctxProgTables;
 
@@ -6875,6 +8460,8 @@ static inline void SaveActiveContextProgTables(const void* ctx) {
     dst.uiProgs         = std::move(tl_uiProgs);
     dst.uiProgAttached  = std::move(tl_uiProgAttached);
     dst.uiShaderTags    = std::move(tl_uiShaderTags);
+    dst.sbGpuShaders    = std::move(tl_sbGpuShaders);
+    dst.sbGpuProgMask   = std::move(tl_sbGpuProgMask);
     tl_worldProgs.clear();
     tl_shaderWorldRole.clear();
     tl_progWorldRole.clear();
@@ -6884,6 +8471,11 @@ static inline void SaveActiveContextProgTables(const void* ctx) {
     tl_uiProgs.clear();
     tl_uiProgAttached.clear();
     tl_uiShaderTags.clear();
+    tl_sbGpuShaders.clear();
+    tl_sbGpuProgMask.clear();
+    ++tl_sbProgsGen;
+    ++tl_uiProgsGen;
+    ++tl_worldProgsGen;
 }
 
 static inline void LoadContextProgTables(const void* ctx) {
@@ -6896,6 +8488,8 @@ static inline void LoadContextProgTables(const void* ctx) {
     tl_uiProgs.clear();
     tl_uiProgAttached.clear();
     tl_uiShaderTags.clear();
+    tl_sbGpuShaders.clear();
+    tl_sbGpuProgMask.clear();
     if (!ctx) return;
     auto it = tl_ctxProgTables.find(ctx);
     if (it != tl_ctxProgTables.end()) {
@@ -6908,6 +8502,8 @@ static inline void LoadContextProgTables(const void* ctx) {
         tl_uiProgs         = std::move(it->second.uiProgs);
         tl_uiProgAttached  = std::move(it->second.uiProgAttached);
         tl_uiShaderTags    = std::move(it->second.uiShaderTags);
+        tl_sbGpuShaders    = std::move(it->second.sbGpuShaders);
+        tl_sbGpuProgMask   = std::move(it->second.sbGpuProgMask);
         tl_ctxProgTables.erase(it);
         for (auto& kv : tl_worldProgs) {
             kv.second.shadowMaskUnitBound = false;
@@ -6917,6 +8513,9 @@ static inline void LoadContextProgTables(const void* ctx) {
             kv.second.lastFoliageCls      = -1.0f;
         }
     }
+    ++tl_sbProgsGen;
+    ++tl_uiProgsGen;
+    ++tl_worldProgsGen;
 }
 
 static inline void EraseContextProgTables(const void* ctx) {
@@ -6953,6 +8552,9 @@ static inline const hs_world_shadow::ShadowConfig& GetCachedShadowConfig() {
         tl_cachedShadowCfg.entityRecv    = st.shadowEntityRecv;
         tl_cachedShadowCfg.ovalKeep      = st.shadowOvalKeep;
         tl_cachedShadowCfg.minHeight     = st.shadowMinHeight;
+        tl_cachedShadowCfg.maxHdRes      = (g_visualClarityGrade.load(std::memory_order_relaxed) >= 3 &&
+                                            g_nativeGlActive.load(std::memory_order_acquire))
+            ? 4096u : 2048u;
         tl_cachedShadowCfg.hdMode        = st.shadowHd;
         tl_cachedShadowCfg.skipNightmare = st.shadowSkipNightmare;
         tl_cachedShadowCfg.hasLuaCam     = st.hasLuaCam;
@@ -6981,6 +8583,69 @@ static inline const hs_world_shadow::ShadowConfig& GetCachedShadowConfig() {
         tl_cachedReflCfg.luaCamRightZ  = st.luaCam[3];
         tl_cachedShadowCfgGen = gen;
     }
+    // Dynamic temporal shadow reuse stride & 1-tap fast entity receive (hysteresis-guarded, Native GL only):
+    //   stride: 1x when GPU < 4.5ms; 2x when GPU >= 5.0ms or shDef >= 64; 3x at >= 8.5ms.
+    //   1-tap receive: enable at GPU >= 6.2ms for >= 45 frames; recover to 5-tap at < 4.7ms for >= 120 frames.
+    const uint32_t rtSeq = g_rtSwapSeq.load(std::memory_order_relaxed);
+    static thread_local uint32_t tl_shadowStrideSeq = 0xFFFFFFFFu;
+    static thread_local uint32_t tl_adaptiveShadowStride = 1u;
+    static thread_local bool     tl_adaptiveFastRecv1Tap = false;
+    static thread_local uint32_t tl_fastRecvHiStreak = 0u;
+    static thread_local uint32_t tl_fastRecvLoStreak = 0u;
+    if (tl_shadowStrideSeq != rtSeq) {
+        tl_shadowStrideSeq = rtSeq;
+        if (!g_nativeGlActive.load(std::memory_order_relaxed)) {
+            tl_adaptiveShadowStride = 1u;
+            tl_adaptiveFastRecv1Tap = false;
+            tl_fastRecvHiStreak = 0u;
+            tl_fastRecvLoStreak = 0u;
+        } else {
+            const float emaGpuMs = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
+            const uint32_t shDef = g_worldShadowDeferredBatches.load(std::memory_order_relaxed);
+            if (!std::isfinite(emaGpuMs) || emaGpuMs <= 0.0f) {
+                tl_adaptiveShadowStride = 1u;
+                tl_adaptiveFastRecv1Tap = false;
+                tl_fastRecvHiStreak = 0u;
+                tl_fastRecvLoStreak = 0u;
+            } else {
+                uint32_t nextStride = tl_adaptiveShadowStride;
+                if (nextStride <= 1u) {
+                    if (emaGpuMs >= 8.5f) nextStride = 3u;
+                    else if (emaGpuMs >= 5.0f || shDef >= 64u) nextStride = 2u;
+                } else if (nextStride == 2u) {
+                    if (emaGpuMs >= 8.5f) nextStride = 3u;
+                    else if (emaGpuMs < 4.5f && shDef < 48u) nextStride = 1u;
+                } else {
+                    if (emaGpuMs < 4.5f && shDef < 48u) nextStride = 1u;
+                    else if (emaGpuMs < 7.2f) nextStride = 2u;
+                }
+                tl_adaptiveShadowStride = nextStride;
+                if (!tl_adaptiveFastRecv1Tap) {
+                    if (emaGpuMs >= 6.2f) {
+                        if (++tl_fastRecvHiStreak >= 45u) {
+                            tl_adaptiveFastRecv1Tap = true;
+                            tl_fastRecvHiStreak = 0u;
+                            tl_fastRecvLoStreak = 0u;
+                        }
+                    } else {
+                        tl_fastRecvHiStreak = 0u;
+                    }
+                } else {
+                    if (emaGpuMs < 4.7f) {
+                        if (++tl_fastRecvLoStreak >= 120u) {
+                            tl_adaptiveFastRecv1Tap = false;
+                            tl_fastRecvLoStreak = 0u;
+                            tl_fastRecvHiStreak = 0u;
+                        }
+                    } else {
+                        tl_fastRecvLoStreak = 0u;
+                    }
+                }
+            }
+        }
+    }
+    tl_cachedShadowCfg.temporalStride        = tl_adaptiveShadowStride;
+    tl_cachedShadowCfg.fastEntityReceive1Tap = tl_adaptiveFastRecv1Tap;
     return tl_cachedShadowCfg;
 }
 
@@ -7067,6 +8732,13 @@ static inline void SyncWorldShadowEngine() {
         ops.glVertexAttribPointer      = g_origGlVertexAttribPointer;
         ops.glDrawArrays               = g_origGlDrawArrays;
         ops.glDrawElements             = g_origGlDrawElements;
+        ops.glDrawElementsBaseVertex   = g_fnGlDrawElementsBaseVertex;
+        const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
+        if (isNat) {
+            ops.glMultiDrawElementsBaseVertex = reinterpret_cast<hs_world_shadow::GlShadowOps::MultiDrawElementsBaseVertex_t>(
+                g_wglRt.ResolveGlProc("glMultiDrawElementsBaseVertex"));
+        }
+        ops.glBindBufferBase           = g_fnGlBindBufferBase;
         ops.glViewport                 = g_origGlViewport;
         ops.glClearColor               = g_origGlClearColor;
         ops.glClear                    = g_origGlClear;
@@ -7082,7 +8754,6 @@ static inline void SyncWorldShadowEngine() {
         ops.glGetIntegerv              = g_fnGlGetIntegerv;
         ops.glGetError                 = g_fnGlGetError;
         ops.logFn                      = &WorldShadowLogBridge;
-        const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
         tl_worldShadow.SetOps(ops, isNat);
         tl_waterRefl.SetOps(ops, isNat);
         tl_combatVfx.SetOps(ops, isNat);
@@ -7103,8 +8774,9 @@ static inline hs_world_shadow::ShadowPassState BuildShadowPassState(uint32_t ove
     s.activeUnit    = tl_spriteBatcher.ActiveUnit();
     s.boundArrayBuf = tl_spriteBatcher.BoundArrayBuf();
     s.boundElemBuf  = tl_spriteBatcher.BoundElemBuf();
-    s.hasClearColor  = tl_hasClearColor;
-    s.glCacheTrusted = IsGlCacheOperational();
+    s.hasClearColor     = tl_hasClearColor;
+    s.glCacheTrusted    = IsGlCacheOperational();
+    s.blendCacheTrusted = s.glCacheTrusted;
     for (int i = 0; i < 4; ++i) s.clearColor[i] = tl_curClearColor[i];
     hs_sprite_batch::AttribState a0{}, a1{};
     bool a0En = false, a1En = false;
@@ -7160,6 +8832,183 @@ struct TlLookCaptureState {
 };
 
 static thread_local TlLookCaptureState tl_lookCap;
+
+static thread_local hs_gpu_clarity::GpuClarityEngine tl_gpuClarity;
+static thread_local uint32_t tl_gpuClarityOpsGen = 0u;
+static thread_local hs_klei_fastpath::KleiRenderFastPath tl_kleiFastPath;
+static thread_local uint32_t tl_kleiFastOpsGen = 0u;
+
+static inline void PublishKleiFastPathStats() noexcept {
+    const auto& s = tl_kleiFastPath.GetStats();
+    g_kFastUniHits.store(s.uniformPlanHits, std::memory_order_relaxed);
+    g_kFastUniSkips.store(s.uniformSkipped, std::memory_order_relaxed);
+    g_kFastUniFallbacks.store(s.uniformFallbacks, std::memory_order_relaxed);
+    g_kFastDrawHits.store(s.drawFastHits + s.drawIndexedFastHits, std::memory_order_relaxed);
+    g_kFastDrawMisses.store(s.drawSlowMisses + s.drawIndexedSlowMisses, std::memory_order_relaxed);
+    g_kFastLocksSaved.store(s.locksSaved, std::memory_order_relaxed);
+}
+static thread_local bool     tl_worldPostSeenThisFrame = false;
+static thread_local bool     tl_gpuClarityAppliedThisFrame = false;
+static thread_local uint32_t tl_worldPostFbo = 0u;
+static thread_local int32_t  tl_worldPostW = 0;
+static thread_local int32_t  tl_worldPostH = 0;
+
+static inline uint32_t ResolveActualCurrentFbo() noexcept;
+
+static inline void SyncGpuClarityEngine() {
+    const uint32_t gen = g_wsOpsGen.load(std::memory_order_acquire);
+    if (tl_gpuClarityOpsGen != gen || gen == 0u) {
+        hs_gpu_clarity::GlComputeOps ops{};
+        ops.glGenFramebuffers        = g_fnGlGenFramebuffers;
+        ops.glDeleteFramebuffers     = g_fnGlDeleteFramebuffers;
+        ops.glBindFramebuffer        = g_origGlBindFramebuffer; // RAW unmasked FBO bind!
+        ops.glFramebufferTexture2D   = g_fnGlFramebufferTexture2D;
+        ops.glCheckFramebufferStatus = g_fnGlCheckFramebufferStatus;
+        ops.glBlitFramebuffer        = g_fnGlBlitFramebuffer;
+        ops.glGenTextures            = g_fnGlGenTextures;
+        ops.glDeleteTextures         = g_origGlDeleteTextures;
+        ops.glActiveTexture          = g_origGlActiveTexture;
+        ops.glBindTexture            = g_origGlBindTexture;
+        ops.glTexStorage2D           = g_fnGlTexStorage2D;
+        ops.glTexParameteri          = g_origGlTexParameteri;
+        ops.glCreateShader           = g_fnGlCreateShader;
+        ops.glShaderSource           = g_origGlShaderSource;
+        ops.glCompileShader          = g_fnGlCompileShader;
+        ops.glGetShaderiv            = g_fnGlGetShaderiv;
+        ops.glGetShaderInfoLog       = g_fnGlGetShaderInfoLog;
+        ops.glDeleteShader           = g_fnGlDeleteShader;
+        ops.glCreateProgram          = g_fnGlCreateProgram;
+        ops.glAttachShader           = g_origGlAttachShader;
+        ops.glLinkProgram            = g_origGlLinkProgram;
+        ops.glGetProgramiv           = g_fnGlGetProgramiv;
+        ops.glGetProgramInfoLog      = g_fnGlGetProgramInfoLog;
+        ops.glDeleteProgram          = g_origGlDeleteProgram;
+        ops.glUseProgram             = g_origGlUseProgram;
+        ops.glGetUniformLocation     = g_fnGlGetUniformLocation;
+        ops.glUniform4f              = g_fnGlUniform4f;
+        ops.glDispatchCompute        = g_fnGlDispatchCompute;
+        ops.glMemoryBarrier          = g_fnGlMemoryBarrier;
+        ops.glBindImageTexture       = g_fnGlBindImageTexture;
+        ops.glGetIntegerv            = g_fnGlGetIntegerv;
+        ops.glIsEnabled              = g_fnGlIsEnabled;
+        ops.glEnable                 = g_origGlEnable;
+        ops.glDisable                = g_origGlDisable;
+        ops.glGenQueries             = g_fnGlGenQueries;
+        ops.glDeleteQueries          = g_fnGlDeleteQueries;
+        ops.glBeginQuery             = g_fnGlBeginQuery;
+        ops.glEndQuery               = g_fnGlEndQuery;
+        ops.glGetQueryObjectiv       = g_fnGlGetQueryObjectiv;
+        ops.glGetQueryObjectui64v    = g_fnGlGetQueryObjectui64v;
+        ops.logFn                    = &WorldShadowLogBridge;
+        tl_gpuClarity.SetOps(ops, g_gpuClaritySupported.load(std::memory_order_acquire));
+        tl_gpuClarityOpsGen = gen;
+    }
+}
+
+static inline void GpuClarityOnPostDraw() {
+    if ((tl_curLookProgRole == 1u || tl_curLookProgRole == 3u) &&
+        tl_curVp[0] == 0 && tl_curVp[1] == 0 && tl_curVp[2] >= 64 && tl_curVp[3] >= 64) {
+        tl_worldPostSeenThisFrame = true;
+        tl_worldPostFbo = ResolveActualCurrentFbo();
+        tl_worldPostW = tl_curVp[2];
+        tl_worldPostH = tl_curVp[3];
+    }
+}
+
+static inline void RunGpuClarityPreUiIfNeeded(bool fromSwap = false) {
+    if (!tl_worldPostSeenThisFrame || tl_gpuClarityAppliedThisFrame) return;
+    tl_gpuClarityAppliedThisFrame = true;
+    if (!g_nativeGlActive.load(std::memory_order_acquire)) {
+        g_gpuClarityActive.store(false, std::memory_order_relaxed);
+        g_gpuClarityGpuUs.store(0u, std::memory_order_relaxed);
+        g_gpuClarityVramKb.store(0u, std::memory_order_relaxed);
+        g_gpuClarityEffGrade.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const int grade = g_visualClarityGrade.load(std::memory_order_relaxed);
+    SyncGpuClarityEngine();
+    if (grade < 2) {
+        tl_gpuClarity.ReleaseComputeTargetsIfIdle();
+        g_gpuClarityActive.store(false, std::memory_order_relaxed);
+        g_gpuClarityGpuUs.store(0u, std::memory_order_relaxed);
+        g_gpuClarityVramKb.store(0u, std::memory_order_relaxed);
+        g_gpuClarityEffGrade.store(grade, std::memory_order_relaxed);
+        return;
+    }
+    FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    FlushDeferredWorldShadowsIfPending();
+    CommitLazyBatchBindings();
+    const auto& tls = HotTls();
+    if (tls.ui->EnsureDstProgramBound()) {
+        tls.glc->curProgram = tls.ui->CurrentProgramId();
+    }
+    const uint32_t curActualFbo = ResolveActualCurrentFbo();
+    const uint32_t targetFbo = fromSwap ? GetDxgiFlip().OffscreenFbo() : curActualFbo;
+    const bool validCurVp = (!fromSwap && tl_curVp[0] == 0 && tl_curVp[1] == 0 && tl_curVp[2] >= 64 && tl_curVp[3] >= 64);
+    const int32_t targetW = validCurVp ? tl_curVp[2] : tl_worldPostW;
+    const int32_t targetH = validCurVp ? tl_curVp[3] : tl_worldPostH;
+    hs_gpu_clarity::ClarityConfig cfg{};
+    cfg.grade              = grade;
+    cfg.strength           = g_visualClarityStrength.load(std::memory_order_relaxed);
+    cfg.allowAdaptiveGrade = true;
+    cfg.emaFrameGpuMs      = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
+    cfg.targetGpuBudgetMs  = 5.5f;
+    cfg.adaptiveUpFrames   = 360u;
+    cfg.adaptiveUpMarginMs = 2.0f;
+
+    static thread_local uint32_t tl_logTargetFbo = 0xFFFFFFFFu;
+    static thread_local uint32_t tl_logWorldFbo  = 0xFFFFFFFFu;
+    static thread_local bool     tl_logFromSwap  = false;
+    static thread_local int32_t  tl_logW         = -1;
+    static thread_local int32_t  tl_logH         = -1;
+    static thread_local int      tl_logGrade     = -1;
+    static thread_local int      tl_logStrPct    = -1;
+    const int strPct = static_cast<int>(cfg.strength * 100.0f + 0.5f);
+    if (tl_logTargetFbo != targetFbo || tl_logWorldFbo != tl_worldPostFbo ||
+        tl_logFromSwap != fromSwap || tl_logW != targetW || tl_logH != targetH ||
+        tl_logGrade != grade || tl_logStrPct != strPct) {
+        tl_logTargetFbo = targetFbo;
+        tl_logWorldFbo  = tl_worldPostFbo;
+        tl_logFromSwap  = fromSwap;
+        tl_logW         = targetW;
+        tl_logH         = targetH;
+        tl_logGrade     = grade;
+        tl_logStrPct    = strPct;
+        LogMsg("[VISUAL][GPU_CLARITY] Pre-UI dispatch -> targetFbo=%u (worldPostFbo=%u, fromSwap=%d, %dx%d, grade=%d, str=%.2f)",
+               targetFbo, tl_worldPostFbo, fromSwap ? 1 : 0, targetW, targetH, grade, static_cast<double>(cfg.strength));
+    }
+
+    hs_gpu_clarity::KnownGlState known{};
+    known.drawFbo = static_cast<int32_t>(curActualFbo);
+    known.readFbo = static_cast<int32_t>(curActualFbo);
+    if (IsGlCacheOperational()) {
+        const auto& glc = GetSyncedGlCache();
+        if (glc.curProgram != hs_gl_cache::kInvalidId) {
+            known.curProgram = static_cast<int32_t>(glc.curProgram);
+        }
+        if (glc.activeUnit >= 0 && glc.activeUnit < static_cast<int32_t>(hs_gl_cache::kMaxTexUnits)) {
+            known.activeTexEnum = 0x84C0 + glc.activeUnit;
+        }
+        if (glc.boundTex2D[0] != hs_gl_cache::kInvalidId) {
+            known.boundTex0 = static_cast<int32_t>(glc.boundTex2D[0]);
+        }
+        known.scissorEnabled = glc.caps[3]; // CapIndex(GL_SCISSOR_TEST) == 3
+    }
+    static thread_local uint32_t tl_gpuClarityTimerFrame = 0u;
+    const bool extQueryOpen = (g_extProfCount.load(std::memory_order_relaxed) > 0u) && tl_extProf.queryOpen;
+    known.sampleTimer = !extQueryOpen && ((tl_gpuClarityTimerFrame++ & 7u) == 0u);
+
+    const bool ran = tl_gpuClarity.ProcessFrame(targetFbo, targetW, targetH, cfg, &known);
+    if (ran) {
+        tl_glCache.ResetBindingsOnly();
+        ClearLazyBatchBindings();
+    }
+    g_gpuClarityActive.store(tl_gpuClarity.IsActive(), std::memory_order_relaxed);
+    g_gpuClarityGpuUs.store(static_cast<uint32_t>(tl_gpuClarity.LastGpuMs() * 1000.0f), std::memory_order_relaxed);
+    g_gpuClarityVramKb.store(tl_gpuClarity.VramExtraKb(), std::memory_order_relaxed);
+    g_gpuClarityEffGrade.store(tl_gpuClarity.EffectiveGrade(), std::memory_order_relaxed);
+    g_gpuClarityAdaptSteps.store(tl_gpuClarity.AdaptiveGradeSteps(), std::memory_order_relaxed);
+}
 
 static inline void SyncLookSamplerOps() {
     const uint32_t gen = g_wsOpsGen.load(std::memory_order_acquire);
@@ -7298,7 +9147,7 @@ static inline void SyncCurProgEntityReceiveUniforms(const hs_world_shadow::Shado
         g_origGlUniform1i(tl_curWorldProg->locShadowMask, static_cast<int32_t>(hs_world_shadow::kCompositeTexUnit));
         tl_curWorldProg->shadowMaskUnitBound = true;
     }
-    const uint32_t curGen = tl_worldShadow.FrameRecvGen();
+    const uint32_t curGen = (tl_worldShadow.FrameRecvGen() << 1u) | (cfg.fastEntityReceive1Tap ? 1u : 0u);
     if (tl_curWorldProg->lastRecvGen != curGen && g_fnGlUniform4fv) {
         float rBounds[4], rTint[4];
         tl_worldShadow.GetEntityReceiveUniforms(cfg, rBounds, rTint);
@@ -7312,6 +9161,78 @@ static inline void SyncCurProgEntityReceiveUniforms(const hs_world_shadow::Shado
     }
 }
 
+struct UnbProgBin {
+    uint32_t prog;
+    uint32_t cnt;
+};
+static thread_local bool       tl_inGameRender    = false;
+static thread_local bool       tl_inPostProc      = false;
+static thread_local uint32_t   tl_rtXrayCounter   = 0u;
+static thread_local bool       tl_rtXrayThisFrame = false;
+static thread_local int64_t    tl_rtLmQpc         = 0;
+static thread_local int64_t    tl_rtShReplayQpc   = 0;
+static thread_local int64_t    tl_rtShUnbQpc      = 0;
+static thread_local int64_t    tl_rtSbTryQpc      = 0;
+static thread_local int64_t    tl_rtSbFlushQpc    = 0;
+static thread_local int64_t    tl_rtUnbDrawQpc    = 0;
+static thread_local uint32_t   tl_rtShUnbCnt      = 0u;
+static thread_local uint32_t   tl_rtUnbDrawCnt    = 0u;
+static thread_local UnbProgBin tl_rtUnbBins[16]   = {};
+static thread_local uint32_t   tl_rtUnbBinCnt     = 0u;
+
+static inline bool IsRtWorldXrayActive() noexcept {
+    return tl_rtXrayThisFrame && tl_inGameRender && !tl_inPostProc;
+}
+
+// Zero-init POD per-frame/per-program sprite draw cache:
+// Hoists GetCachedShadowConfig / GetCachedWaterReflConfig / SyncFoliageAndWind /
+// SetShadowActive / SetShadowHints / ResolveWindCamRight out of the 12,000 draws/frame hot loop!
+struct RtDrawFrameCache {
+    bool                                  valid;
+    bool                                  isBloomProg;
+    bool                                  anyShadow;
+    bool                                  anyRefl;
+    bool                                  anyShadowOrRefl;
+    bool                                  anyWind;
+    bool                                  anyCombat;
+    bool                                  anyFx;
+    bool                                  foliageNonEmpty;
+    bool                                  hintsApplied;
+    float                                 windCamRightX;
+    float                                 windCamRightZ;
+    const hs_world_shadow::ShadowConfig*  scfg;
+    const hs_water_refl::WaterReflConfig* rcfg;
+    const hs_foliage::WindFieldState*     wcfg;
+};
+static thread_local RtDrawFrameCache tl_drawFrameCache{};
+
+static inline void RecordUnbDrawProg(uint32_t prog) noexcept {
+    if (!IsRtWorldXrayActive()) return;
+    ++tl_rtUnbDrawCnt;
+    for (uint32_t i = 0; i < tl_rtUnbBinCnt; ++i) {
+        if (tl_rtUnbBins[i].prog == prog) {
+            ++tl_rtUnbBins[i].cnt;
+            return;
+        }
+    }
+    if (tl_rtUnbBinCnt < 16u) {
+        tl_rtUnbBins[tl_rtUnbBinCnt++] = UnbProgBin{ prog, 1u };
+    }
+}
+
+static inline void FlushDeferredWorldShadowsIfPending() {
+    if (!tl_worldShadow.HasDeferredBatches()) return;
+    CommitLazyBatchBindings();
+    SyncWorldShadowEngine();
+    const auto saved = BuildShadowPassState();
+    const int64_t t0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+    tl_worldShadow.FlushDeferredBatchedShadows(GetCachedShadowConfig(), saved, GetSyncedGlCache());
+    if (t0 != 0) {
+        const int64_t t1 = NowQpc();
+        if (t1 > t0) tl_rtShReplayQpc += (t1 - t0);
+    }
+}
+
 static inline void EnsureShadowCompositeAndBeginWrite(const hs_world_shadow::ShadowConfig& cfg) {
     if (!tl_worldShadow.NeedsCompositeOrBeginWrite(tl_curBoundFbo, cfg)) return;
     // Flush any pending OnGround LAYER_WORLD_BACKGROUND sprites FIRST so our ground shadow quad
@@ -7319,6 +9240,8 @@ static inline void EnsureShadowCompositeAndBeginWrite(const hs_world_shadow::Sha
     if (tl_spriteBatcher.HasPending()) {
         tl_spriteBatcher.Flush(hs_sprite_batch::FlushReason::State);
     }
+    FlushDeferredWorldShadowsIfPending();
+    CommitLazyBatchBindings();
     SyncWorldShadowEngine();
     const bool wasReady  = g_worldShadowReady.load(std::memory_order_relaxed);
     const bool wasFailed = g_worldShadowFailed.load(std::memory_order_relaxed);
@@ -7334,6 +9257,7 @@ static inline void EnsureShadowCompositeAndBeginWrite(const hs_world_shadow::Sha
         if (!wasReady || wasFailed) {
             // Bump HD-2D state gen so AnimBloom immediately drops legacy blue-channel projection!
             g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+            tl_drawFrameCache.valid = false;
         }
     } else if (nowFailed) {
         g_worldShadowReady.store(false, std::memory_order_release);
@@ -7342,6 +9266,7 @@ static inline void EnsureShadowCompositeAndBeginWrite(const hs_world_shadow::Sha
         if (wasReady || !wasFailed) {
             // Bump HD-2D state gen so AnimBloom immediately restores legacy blue-channel projection!
             g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+            tl_drawFrameCache.valid = false;
         }
     }
     // Immediately arm 3D height-compared shadow receiving on the already-bound standing program!
@@ -7376,6 +9301,58 @@ static inline void SyncCurProgWindUniforms() {
         }
         tl_curWorldProg->lastWindGen = curGen;
     }
+}
+
+static __declspec(noinline) void ApplyDrawFrameShadowHints(const RtHotTlsPointers& tls, RtDrawFrameCache& fc) noexcept {
+    if (!fc.scfg || fc.isBloomProg) {
+        fc.hintsApplied = true;
+        return;
+    }
+    const auto& ws = *tls.ws;
+    tls.sb->SetShadowHints(fc.scfg->skipNightmare, ws.HasCamRight(),
+                           ws.CamRightX(), ws.CamRightZ(), fc.scfg->minHeight);
+    float crX = 0.70710678f, crZ = -0.70710678f;
+    ResolveWindCamRight(crX, crZ);
+    fc.windCamRightX = crX;
+    fc.windCamRightZ = crZ;
+    fc.hintsApplied  = true;
+}
+
+static __declspec(noinline) void RefreshDrawFrameCache(const RtHotTlsPointers& tls) noexcept {
+    auto& fc = tl_drawFrameCache;
+    const auto& scfg = GetCachedShadowConfig();
+    const auto& rcfg = tl_cachedReflCfg;
+    const auto& wcfg = SyncFoliageAndWind();
+    const bool isBloomProg     = tls.sb->IsCurrentProgramBloomPass();
+    const bool anyShadow       = !isBloomProg && hs_world_shadow::HasAnyShadowLight(scfg);
+    const bool anyRefl         = !isBloomProg && rcfg.IsEnabled();
+    const bool anyShadowOrRefl = anyShadow || anyRefl;
+    const bool anyWind         = wcfg.IsActive();
+    const bool anyCombat       = !isBloomProg && g_combatImpact.IsEnabled();
+    fc.isBloomProg     = isBloomProg;
+    fc.anyShadow       = anyShadow;
+    fc.anyRefl         = anyRefl;
+    fc.anyShadowOrRefl = anyShadowOrRefl;
+    fc.anyWind         = anyWind;
+    fc.anyCombat       = anyCombat;
+    fc.anyFx           = anyShadowOrRefl || anyWind || anyCombat;
+    fc.foliageNonEmpty = !tls.fol->IsEmpty();
+    fc.scfg            = &scfg;
+    fc.rcfg            = &rcfg;
+    fc.wcfg            = &wcfg;
+    tls.sb->SetShadowActive(anyShadowOrRefl);
+    if (!isBloomProg) {
+        ApplyDrawFrameShadowHints(tls, fc);
+        if (tl_curWorldProg && tl_curWorldProg->locWindParams >= 0 &&
+            tl_curWorldProg->lastWindGen != tl_cachedWindGen) {
+            SyncCurProgWindUniforms();
+        }
+    } else {
+        fc.windCamRightX = 0.70710678f;
+        fc.windCamRightZ = -0.70710678f;
+        fc.hintsApplied  = true;
+    }
+    fc.valid = true;
 }
 
 static inline void SyncOceanReflUniforms() {
@@ -7440,6 +9417,7 @@ static inline void EnsureWaterReflBeginWrite(const hs_water_refl::WaterReflConfi
     if (tl_spriteBatcher.HasPending()) {
         tl_spriteBatcher.Flush(hs_sprite_batch::FlushReason::State);
     }
+    CommitLazyBatchBindings();
     SyncWorldShadowEngine();
     const auto saved = BuildShadowPassState();
     const bool ok = tl_waterRefl.OnBeforeFirstStandingEntity(rcfg, saved, GetSyncedGlCache());
@@ -7453,24 +9431,211 @@ static void OnSpriteBatchShadowMirror(uint32_t indexCount, void*) {
     const auto& rcfg = GetCachedWaterReflConfig();
     const bool wantRefl   = tl_waterRefl.BeganWriteThisFrame() && rcfg.IsEnabled();
     if (!wantShadow && !wantRefl) return;
-    SyncWorldShadowEngine();
-    const auto saved = BuildShadowPassState(tl_spriteBatcher.CurrentProgramId());
-    if (wantShadow) {
-        tl_worldShadow.MirrorBatchedSprites(indexCount, GetCachedShadowConfig(), saved, GetSyncedGlCache(),
-                                            tl_spriteBatcher.LastFlushShadowBoundsXZ());
+
+    // Zero Per-Flush FBO Ping-Pong: when AZDO Persistent Ring holds this batch's untouched
+    // vertices/indices until SwapBuffers, defer shadow rasterization to ONE single FBO bind
+    // at end-of-world (100% bit-exact GL_MAX commutative parity, eliminates ~390 FBO switches/frame!).
+    bool shadowDeferred = false;
+    const bool isGpu = tl_spriteBatcher.LastFlushIsGpuDriven();
+    if (wantShadow && tl_spriteBatcher.LastFlushUsedPersistentRing()) {
+        if (isGpu) {
+            shadowDeferred = tl_worldShadow.RecordBatchedShadowGpu(
+                tl_spriteBatcher.LastFlushVboId(),
+                tl_spriteBatcher.LastFlushIboId(),
+                tl_spriteBatcher.LastFlushSsboId(),
+                indexCount,
+                tl_spriteBatcher.LastFlushBaseVertex(),
+                tl_spriteBatcher.LastFlushIndexByteOffset(),
+                tl_spriteBatcher.LastFlushShadowBoundsXZ(),
+                tl_curBoundFbo);
+        } else {
+            shadowDeferred = tl_worldShadow.RecordBatchedShadow(
+                tl_spriteBatcher.LastFlushVboId(),
+                tl_spriteBatcher.LastFlushIboId(),
+                indexCount,
+                tl_spriteBatcher.LastFlushVertByteOffset(),
+                tl_spriteBatcher.LastFlushIndexByteOffset(),
+                tl_spriteBatcher.LastFlushTexCount(),
+                tl_spriteBatcher.LastFlushTexIds(),
+                tl_spriteBatcher.LastFlushShadowBoundsXZ(),
+                tl_curBoundFbo);
+        }
     }
-    if (wantRefl) {
-        tl_waterRefl.MirrorBatchedSprites(indexCount, rcfg, saved, GetSyncedGlCache());
+    if ((wantShadow && !shadowDeferred) || wantRefl) {
+        if (!isGpu) {
+            tl_spriteBatcher.PrepareForImmediateShadowMirror();
+        }
+        SyncWorldShadowEngine();
+        const auto saved = BuildShadowPassState(tl_spriteBatcher.CurrentProgramId());
+        if (wantShadow && !shadowDeferred) {
+            if (isGpu) {
+                tl_worldShadow.MirrorBatchedSpritesGpu(
+                    tl_spriteBatcher.LastFlushSsboId(),
+                    indexCount,
+                    tl_spriteBatcher.LastFlushBaseVertex(),
+                    tl_spriteBatcher.LastFlushIndexByteOffset(),
+                    GetCachedShadowConfig(), saved, GetSyncedGlCache(),
+                    tl_spriteBatcher.LastFlushShadowBoundsXZ());
+            } else {
+                tl_worldShadow.MirrorBatchedSprites(indexCount, GetCachedShadowConfig(), saved, GetSyncedGlCache(),
+                                                    tl_spriteBatcher.LastFlushShadowBoundsXZ(),
+                                                    tl_spriteBatcher.LastFlushIndexByteOffset());
+            }
+        }
+        if (wantRefl) {
+            if (isGpu) {
+                tl_waterRefl.MirrorBatchedSpritesGpu(
+                    tl_spriteBatcher.LastFlushSsboId(),
+                    indexCount,
+                    tl_spriteBatcher.LastFlushBaseVertex(),
+                    tl_spriteBatcher.LastFlushIndexByteOffset(),
+                    rcfg, saved, GetSyncedGlCache());
+            } else {
+                tl_waterRefl.MirrorBatchedSprites(indexCount, rcfg, saved, GetSyncedGlCache(),
+                                                  tl_spriteBatcher.LastFlushIndexByteOffset());
+            }
+        }
     }
+}
+
+// 100% IAT-Sealed Lazy GL Binding State for SpriteBatcher (eliminates ~10,000 wasted
+// glBindBuffer / glVertexAttribPointer / glActiveTexture / atlas glBindTexture calls per frame!):
+//   - Audited against all 76 libGLESv2.dll imports in dontstarve_steam_x64.exe.
+//   - Only defers while IsGlCacheOperational() && SpriteBatcher is enabled & on an eligible program.
+//   - Commits exact desired driver state before EVERY consumer (unbatched draw, buffer/tex upload,
+//     texParam, delete, program switch, FBO bind, glGetIntegerv, SwapBuffers, MakeCurrent).
+static thread_local bool     tl_lazyArrBufDirty     = false;
+static thread_local bool     tl_lazyElemBufDirty    = false;
+static thread_local uint16_t tl_lazyAttribDirtyMask = 0u;
+static thread_local uint32_t tl_lazyTex2dDirtyMask  = 0u;
+static thread_local bool     tl_lazyActiveUnitDirty = false;
+
+static inline bool CanDeferBatchBindings() noexcept {
+    if (!IsGlCacheOperational()) return false;
+    const auto* sb = HotTls().sb;
+    return sb->IsEnabled() && sb->IsCurrentProgramEligible();
+}
+
+static inline void ClearLazyBatchBindings() noexcept {
+    tl_lazyArrBufDirty     = false;
+    tl_lazyElemBufDirty    = false;
+    tl_lazyAttribDirtyMask = 0u;
+    tl_lazyTex2dDirtyMask  = 0u;
+    tl_lazyActiveUnitDirty = false;
+}
+
+static __declspec(noinline) void CommitLazyBatchBindingsSlow() noexcept {
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
+    if (sb.IsStickySessionActive()) {
+        sb.EndStickyBatchSession();
+    }
+    if (!tl_lazyArrBufDirty && !tl_lazyElemBufDirty &&
+        tl_lazyAttribDirtyMask == 0u && tl_lazyTex2dDirtyMask == 0u &&
+        !tl_lazyActiveUnitDirty) {
+        return;
+    }
+    auto& st = GetSyncedGlCache();
+    // 1. Commit deferred glVertexAttribPointer calls (each binds its captured VBO!)
+    uint16_t amask = tl_lazyAttribDirtyMask;
+    tl_lazyAttribDirtyMask = 0u;
+    if (amask != 0u && g_origGlVertexAttribPointer && g_origGlBindBuffer) {
+        uint32_t curDrvArr = (st.boundArrayBuf != hs_gl_cache::kInvalidId) ? st.boundArrayBuf : 0xFFFFFFFFu;
+        for (uint32_t idx = 0u; amask != 0u && idx < 16u; ++idx) {
+            const uint16_t bit = static_cast<uint16_t>(1u << idx);
+            if ((amask & bit) == 0u) continue;
+            amask &= static_cast<uint16_t>(~bit);
+            hs_sprite_batch::AttribState a{};
+            bool en = false;
+            sb.GetAttribState(idx, a, en);
+            if (!a.valid) continue;
+            if (curDrvArr != a.buffer) {
+                g_origGlBindBuffer(0x8892u /*GL_ARRAY_BUFFER*/, a.buffer);
+                curDrvArr = a.buffer;
+                st.boundArrayBuf = a.buffer;
+                tl_lazyArrBufDirty = true;
+            }
+            g_origGlVertexAttribPointer(idx, a.size, a.type, a.normalized, a.stride, a.pointer);
+        }
+    }
+    // 2. Commit deferred ARRAY_BUFFER & ELEMENT_ARRAY_BUFFER bindings
+    if (tl_lazyArrBufDirty) {
+        tl_lazyArrBufDirty = false;
+        const uint32_t wantArr = sb.BoundArrayBuf();
+        if (g_origGlBindBuffer && st.boundArrayBuf != wantArr) {
+            g_origGlBindBuffer(0x8892u /*GL_ARRAY_BUFFER*/, wantArr);
+            st.boundArrayBuf = wantArr;
+        }
+    }
+    if (tl_lazyElemBufDirty) {
+        tl_lazyElemBufDirty = false;
+        const uint32_t wantElem = sb.BoundElemBuf();
+        if (g_origGlBindBuffer && st.boundElementBuf != wantElem) {
+            g_origGlBindBuffer(0x8893u /*GL_ELEMENT_ARRAY_BUFFER*/, wantElem);
+            st.boundElementBuf = wantElem;
+        }
+    }
+    // 3. Commit deferred atlas GL_TEXTURE_2D bindings (units 0..15)
+    uint32_t tmask = tl_lazyTex2dDirtyMask;
+    tl_lazyTex2dDirtyMask = 0u;
+    if (tmask != 0u && g_origGlActiveTexture && g_origGlBindTexture) {
+        for (uint32_t u = 0u; tmask != 0u && u < 16u; ++u) {
+            const uint32_t bit = (1u << u);
+            if ((tmask & bit) == 0u) continue;
+            tmask &= ~bit;
+            const uint32_t wantTex = tl_boundTex2d[u];
+            if (st.boundTex2D[u] != wantTex) {
+                if (st.activeUnit != static_cast<int32_t>(u)) {
+                    g_origGlActiveTexture(0x84C0u + u);
+                    st.activeUnit = static_cast<int32_t>(u);
+                    tl_lazyActiveUnitDirty = true;
+                }
+                g_origGlBindTexture(0x0DE1u /*GL_TEXTURE_2D*/, wantTex);
+                st.boundTex2D[u] = wantTex;
+            }
+        }
+    }
+    // 4. Commit deferred glActiveTexture
+    if (tl_lazyActiveUnitDirty) {
+        tl_lazyActiveUnitDirty = false;
+        const uint32_t wantUnit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        if (g_origGlActiveTexture && st.activeUnit != static_cast<int32_t>(wantUnit)) {
+            g_origGlActiveTexture(0x84C0u + wantUnit);
+            st.activeUnit = static_cast<int32_t>(wantUnit);
+        }
+    }
+}
+
+static inline void CommitLazyBatchBindings() noexcept {
+    const auto& tls = HotTls();
+    if (!tls.sb->IsStickySessionActive() &&
+        !tl_lazyArrBufDirty && !tl_lazyElemBufDirty &&
+        tl_lazyAttribDirtyMask == 0u && tl_lazyTex2dDirtyMask == 0u &&
+        !tl_lazyActiveUnitDirty) {
+        return;
+    }
+    CommitLazyBatchBindingsSlow();
 }
 
 static void OnSpriteBatchPostFlush(uint32_t activeUnit, uint32_t arrayBuf, uint32_t elemBuf, uint32_t batchWposLoc, void*) {
     auto& st = GetSyncedGlCache();
-    st.activeUnit      = static_cast<int32_t>(activeUnit);
-    st.boundArrayBuf   = arrayBuf;
-    st.boundElementBuf = elemBuf;
+    if (IsGlCacheOperational()) {
+        // deferHostRestore_ skipped restoring Klei's VBO/IBO/attrib0/activeUnit back to driver:
+        // invalidate driver cache & mark lazy dirty so unbatched draws/uploads commit exact state!
+        st.activeUnit          = -1;
+        st.boundArrayBuf       = hs_gl_cache::kInvalidId;
+        st.boundElementBuf     = hs_gl_cache::kInvalidId;
+        tl_lazyArrBufDirty     = true;
+        tl_lazyElemBufDirty    = true;
+        tl_lazyAttribDirtyMask |= 1u; // POS2D_UV (loc 0)
+        tl_lazyActiveUnitDirty = true;
+    } else {
+        st.activeUnit      = static_cast<int32_t>(activeUnit);
+        st.boundArrayBuf   = arrayBuf;
+        st.boundElementBuf = elemBuf;
+    }
     for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
-        const uint32_t u = hs_sprite_batch::kBatchTexUnitBase + s;
+        const uint32_t u = hs_sprite_batch::BatchSlotToTexUnit(s);
         if (u < hs_gl_cache::kMaxTexUnits) {
             st.boundTex2D[u] = hs_gl_cache::kInvalidId;
         }
@@ -7491,8 +9656,48 @@ static void OnSpriteBatchPostFlush(uint32_t activeUnit, uint32_t arrayBuf, uint3
     }
 }
 
-static inline void SyncSpriteBatcher() {
-    const uint32_t gen = g_sbOpsGen.load(std::memory_order_acquire);
+static void OnSpriteBatchStickyFlushSync(bool touchedTexUnits, bool enteredSticky,
+                                         uint32_t batchWposLoc, void*) {
+    if (touchedTexUnits) {
+        // Sticky Flush() switched the GPU's active texture unit directly (units 6..23) without
+        // going through HookGlActiveTexture; force the next host bind/draw to reassert activeUnit.
+        tl_lazyActiveUnitDirty = true;
+    }
+    if (!IsGlCacheOperational()) return;
+    auto& st = GetSyncedGlCache();
+    if (touchedTexUnits) {
+        st.activeUnit = -1;
+        for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+            const uint32_t tu = hs_sprite_batch::BatchSlotToTexUnit(s);
+            if (tu < hs_gl_cache::kMaxTexUnits) {
+                st.boundTex2D[tu] = hs_gl_cache::kInvalidId;
+            }
+        }
+    }
+    if (enteredSticky) {
+        st.boundArrayBuf = hs_gl_cache::kInvalidId;
+        st.boundElementBuf = hs_gl_cache::kInvalidId;
+        auto invalidateAttr = [&](uint32_t loc) {
+            if (loc < 16u) {
+                const uint32_t bit = (1u << loc);
+                st.attribKnownMask &= ~bit;
+                st.attribEnabledMask &= ~bit;
+            }
+        };
+        invalidateAttr(batchWposLoc);
+        invalidateAttr(5u); // HS_BATCH_CMULT
+        invalidateAttr(6u); // HS_BATCH_CADD
+        const int32_t locAct = tl_spriteBatcher.CurrentBatchActiveLoc();
+        if (locAct >= 0) {
+            st.InvalidateUniform(tl_spriteBatcher.CurrentProgramId(), locAct);
+        }
+    }
+}
+
+static thread_local bool tl_sbSyncedThisFrame = false;
+
+static __declspec(noinline) void SyncSpriteBatcherSlow(uint32_t gen) {
+    auto& sb = *HotTls().sb;
     if (tl_sbOpsGen != gen) {
         hs_sprite_batch::GlBatchOps ops{};
         ops.glGenBuffers               = g_fnGlGenBuffers;
@@ -7506,24 +9711,110 @@ static inline void SyncSpriteBatcher() {
         ops.glBindTexture              = g_origGlBindTexture;
         ops.glUniform1f                = g_origGlUniform1f;
         ops.glUniform1i                = g_origGlUniform1i;
+        ops.glUniform3fv               = g_origGlUniform3fv;
+        ops.glUniform4fv               = g_origGlUniform4fv;
         ops.glUniformMatrix4fv         = g_origGlUniformMatrix4fv;
         ops.glVertexAttribPointer      = g_origGlVertexAttribPointer;
         ops.glEnableVertexAttribArray  = g_origGlEnableVertexAttribArray;
         ops.glDisableVertexAttribArray = g_origGlDisableVertexAttribArray;
         ops.glDrawElements             = g_origGlDrawElements;
+        ops.glDrawElementsBaseVertex   = g_fnGlDrawElementsBaseVertex;
         ops.glGetIntegerv              = g_fnGlGetIntegerv;
         ops.glGetBufferParameteriv     = g_fnGlGetBufferParameteriv;
         ops.glGetBufferSubData         = g_fnGlGetBufferSubData;
         ops.onPostFlushRestore         = &OnSpriteBatchPostFlush;
+        ops.onStickyFlushSync          = &OnSpriteBatchStickyFlushSync;
         ops.onShadowMirrorBatch        = &OnSpriteBatchShadowMirror;
         ops.callbackCtx                = nullptr;
-        tl_spriteBatcher.SetOps(ops);
+        ops.glBufferStorage            = g_fnGlBufferStorage;
+        ops.glFenceSync                = g_fnGlFenceSync;
+        ops.glClientWaitSync           = g_fnGlClientWaitSync;
+        ops.glDeleteSync               = g_fnGlDeleteSync;
+        ops.glBindBufferBase           = g_fnGlBindBufferBase;
+        ops.glGetTextureHandleARB      = g_fnGlGetTextureHandleARB;
+        ops.glMakeTextureHandleResidentARB    = g_fnGlMakeTextureHandleResidentARB;
+        ops.glMakeTextureHandleNonResidentARB = g_fnGlMakeTextureHandleNonResidentARB;
+        ops.nowQpc                     = &NowQpc;
+        ops.preferOrphanSubData        = true;
+        sb.SetOps(ops);
         tl_sbOpsGen = gen;
     }
+    sb.SetShadowCacheMaxBytes(g_tierShadowCacheBytes.load(std::memory_order_relaxed));
+    sb.SetPersistentRingPreferred(g_tierPersistentRing.load(std::memory_order_relaxed));
+    sb.SetGpuDrivenPreferred(g_elasticGpuDriven.load(std::memory_order_relaxed));
+    sb.SetElasticRingBudget(
+        g_elasticGpuRingVerts.load(std::memory_order_relaxed),
+        g_elasticGpuRingIndices.load(std::memory_order_relaxed),
+        g_elasticGpuRingInsts.load(std::memory_order_relaxed));
+    sb.SetDeferHostRestore(IsGlCacheOperational());
     const bool want = g_spriteBatchActive.load(std::memory_order_acquire) &&
                       g_optSpriteBatch.load(std::memory_order_relaxed);
-    if (tl_spriteBatcher.IsEnabled() != want) {
-        tl_spriteBatcher.SetEnabled(want);
+    if (sb.IsEnabled() != want) {
+        sb.SetEnabled(want);
+    }
+    tl_sbSyncedThisFrame = true;
+}
+
+static inline void SyncSpriteBatcher() {
+    const uint32_t gen = g_sbOpsGen.load(std::memory_order_relaxed);
+    if (tl_sbSyncedThisFrame && tl_sbOpsGen == gen) {
+        return;
+    }
+    SyncSpriteBatcherSlow(g_sbOpsGen.load(std::memory_order_acquire));
+}
+
+static thread_local hs_pbo_tex::PersistentPboTexRing tl_pboTexRing;
+static thread_local uint32_t tl_pboOpsGen = 0u;
+static thread_local bool     tl_pboSyncedThisFrame = false;
+
+static inline void SyncPboTexRing() noexcept {
+    const uint32_t gen = g_sbOpsGen.load(std::memory_order_acquire);
+    if (tl_pboSyncedThisFrame && tl_pboOpsGen == gen) {
+        return;
+    }
+    if (tl_pboOpsGen != gen) {
+        hs_pbo_tex::GlPboOps ops{};
+        ops.glGenBuffers           = g_fnGlGenBuffers;
+        ops.glDeleteBuffers        = g_origGlDeleteBuffers;
+        ops.glBindBuffer           = g_origGlBindBuffer;
+        ops.glBufferStorage        = g_fnGlBufferStorage;
+        ops.glMapBufferRange       = g_fnGlMapBufferRange;
+        ops.glUnmapBuffer          = g_fnGlUnmapBuffer;
+        ops.glGetBufferParameteriv = g_fnGlGetBufferParameteriv;
+        ops.glFenceSync            = g_fnGlFenceSync;
+        ops.glClientWaitSync       = g_fnGlClientWaitSync;
+        ops.glDeleteSync           = g_fnGlDeleteSync;
+        tl_pboTexRing.SetOps(ops);
+        tl_pboOpsGen = gen;
+    }
+    const bool want = g_nativeGlActive.load(std::memory_order_acquire) && g_hwCaps.hasBufferStorage;
+    const int tier = g_cfgHardwareTier.load(std::memory_order_relaxed);
+    const uint8_t pres = g_elasticPressureLevel.load(std::memory_order_relaxed);
+    const size_t slotBytes = (tier <= 0 || pres >= 2u)
+        ? hs_pbo_tex::kMinSlotBytes
+        : hs_pbo_tex::kDefaultSlotBytes;
+    tl_pboTexRing.SetSlotBytes(slotBytes);
+    tl_pboTexRing.SetEnabled(want);
+    tl_pboSyncedThisFrame = true;
+}
+
+static thread_local hs_pbo_tex::PreallocTexIdPool tl_texIdPool;
+static thread_local uint32_t tl_texPoolOpsGen = 0u;
+
+static inline void SyncTexIdPool() noexcept {
+    const uint32_t gen = g_sbOpsGen.load(std::memory_order_acquire);
+    if (tl_texPoolOpsGen != gen) {
+        hs_pbo_tex::GlTexPoolOps ops{};
+        ops.glGenTextures    = g_fnGlGenTextures;
+        ops.glDeleteTextures = g_origGlDeleteTextures;
+        tl_texIdPool.SetOps(ops);
+        tl_texPoolOpsGen = gen;
+    }
+    const bool want = g_nativeGlActive.load(std::memory_order_acquire) &&
+                      (g_fnGlGenTextures != nullptr) &&
+                      (g_origGlDeleteTextures != nullptr);
+    if (tl_texIdPool.IsEnabled() != want) {
+        tl_texIdPool.SetEnabled(want);
     }
 }
 
@@ -7535,7 +9826,7 @@ static void OnUiBatchPostFlush(uint32_t dstProg, uint32_t activeUnit, uint32_t a
     st.boundArrayBuf   = arrayBuf;
     st.boundElementBuf = elemBuf;
     for (uint32_t s = 0; s < hs_ui_batch::kMaxUiTexSlots; ++s) {
-        const uint32_t u = hs_ui_batch::kUiTexUnitBase + s;
+        const uint32_t u = hs_ui_batch::UiSlotToTexUnit(s);
         if (u < hs_gl_cache::kMaxTexUnits) {
             st.boundTex2D[u] = hs_gl_cache::kInvalidId;
         }
@@ -7585,6 +9876,7 @@ static inline void SyncUiBatcher() {
         ops.onPostFlushRestore         = &OnUiBatchPostFlush;
         ops.callbackCtx                = nullptr;
         ops.preferHighp                = g_nativeGlActive.load(std::memory_order_acquire);
+        ops.preferOrphanSubData        = true;
         tl_uiBatcher.SetOps(ops);
         tl_uiOpsGen = gen;
     }
@@ -7600,43 +9892,62 @@ static thread_local int64_t tl_rtFrameStartQpc = 0;
 static inline void StampRtFrameStart() noexcept {
     if (tl_rtFrameStartQpc == 0) {
         tl_rtFrameStartQpc = NowQpc();
+        tl_nativeGpuTimer.BeginFrame();
     }
 }
 
 static void FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason reason) {
-    if (tl_spriteBatcher.HasPending()) {
+    const auto& tls = HotTls();
+    if (tls.sb->HasPending()) {
         SyncSpriteBatcher();
-        tl_spriteBatcher.Flush(reason);
+        const int64_t t0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+        tls.sb->Flush(reason);
+        if (t0 != 0) {
+            const int64_t t1 = NowQpc();
+            if (t1 > t0) tl_rtSbFlushQpc += (t1 - t0);
+        }
     }
-    if (tl_uiBatcher.HasPending()) {
+    if (tls.ui->HasPending()) {
         SyncUiBatcher();
-        tl_uiBatcher.Flush(reason);
+        tls.ui->Flush(reason);
     }
 }
 
 static inline void FlushSpriteBatchStateCause(StateFlushCause cause) {
-    if (tl_spriteBatcher.HasPending()) {
+    const auto& tls = HotTls();
+    if (tls.sb->HasPending()) {
         const size_t idx = static_cast<size_t>(cause);
         if (idx < static_cast<size_t>(StateFlushCause::Count)) {
             InterlockedIncrement64(&g_sbStateCause[idx]);
         }
         SyncSpriteBatcher();
-        tl_spriteBatcher.Flush(hs_sprite_batch::FlushReason::State);
+        const int64_t t0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+        tls.sb->Flush(hs_sprite_batch::FlushReason::State);
+        if (t0 != 0) {
+            const int64_t t1 = NowQpc();
+            if (t1 > t0) tl_rtSbFlushQpc += (t1 - t0);
+        }
     }
-    if (tl_uiBatcher.HasPending()) {
+    if (tls.ui->HasPending()) {
         SyncUiBatcher();
-        tl_uiBatcher.Flush(hs_sprite_batch::FlushReason::State);
+        tls.ui->Flush(hs_sprite_batch::FlushReason::State);
     }
 }
 
 static inline void EnsureUiDstProgramBoundAndSyncCache() {
-    if (tl_uiBatcher.EnsureDstProgramBound()) {
-        tl_glCache.curProgram = tl_uiBatcher.CurrentProgramId();
+    const auto& tls = HotTls();
+    if (tls.ui->EnsureDstProgramBound()) {
+        tls.glc->curProgram = tls.ui->CurrentProgramId();
     }
 }
 
+static thread_local int64_t tl_sbStencilPrevFlushes = 0;
+static thread_local int64_t tl_sbStencilPrevDraws   = 0;
+
 static inline void FlushSpriteBatchStatsToGlobals() {
     const auto d = tl_spriteBatcher.TakeStatsDelta();
+    tl_sbStencilPrevFlushes = 0;
+    tl_sbStencilPrevDraws   = 0;
     if (d.drawsIn)      InterlockedAdd64(&g_sbDrawsIn,      static_cast<LONG64>(d.drawsIn));
     if (d.drawsBatched) InterlockedAdd64(&g_sbDrawsBatched, static_cast<LONG64>(d.drawsBatched));
     if (d.flushes)      InterlockedAdd64(&g_sbFlushes,      static_cast<LONG64>(d.flushes));
@@ -7644,6 +9955,41 @@ static inline void FlushSpriteBatchStatsToGlobals() {
     if (d.bypassDraws)  InterlockedAdd64(&g_sbBypassDraws,  static_cast<LONG64>(d.bypassDraws));
     for (size_t i = 0; i < static_cast<size_t>(hs_sprite_batch::FlushReason::Count); ++i) {
         if (d.flReason[i]) InterlockedAdd64(&g_sbFlReason[i], static_cast<LONG64>(d.flReason[i]));
+    }
+    g_sbPersistentRingActive.store(tl_spriteBatcher.IsPersistentRingActive(), std::memory_order_relaxed);
+    g_sbShadowCacheUsedBytes.store(tl_spriteBatcher.ShadowCacheTotalBytes(), std::memory_order_relaxed);
+    g_sbGpuDrivenActive.store(tl_spriteBatcher.IsGpuDrivenActive(), std::memory_order_relaxed);
+    g_sbBindlessCount.store(tl_spriteBatcher.BindlessResidentCount(), std::memory_order_relaxed);
+    g_sbGpuDrivenDraws.store(tl_spriteBatcher.GpuDrivenDraws(), std::memory_order_relaxed);
+    const auto& sbDiag = tl_spriteBatcher.GetDiagCounters();
+    g_sbDiagModeSwitches.store(sbDiag.gpuModeSwitches, std::memory_order_relaxed);
+    g_sbDiagLatchFrames.store(sbDiag.gpuLatchFrames, std::memory_order_relaxed);
+    g_sbDiagDenyHits.store(sbDiag.gpuDenyHits, std::memory_order_relaxed);
+    g_sbDiagDenyMutated.store(sbDiag.gpuDenyMutated, std::memory_order_relaxed);
+    g_sbDiagDenyNullAlloc.store(sbDiag.gpuDenyNullAlloc, std::memory_order_relaxed);
+    g_sbDiagDenyHandleZero.store(sbDiag.gpuDenyHandleZero, std::memory_order_relaxed);
+    g_sbDiagRingOvf.store(sbDiag.gpuRingOverflow, std::memory_order_relaxed);
+    g_sbDiagFallbackRing.store(sbDiag.cpuFallbackRing, std::memory_order_relaxed);
+    g_sbDiagShadowFetch.store(tl_spriteBatcher.ShadowCacheGpuFetches(), std::memory_order_relaxed);
+    g_sbDiagPeakVerts.store(sbDiag.peakFrameVerts, std::memory_order_relaxed);
+    g_sbDiagPeakIndices.store(sbDiag.peakFrameIndices, std::memory_order_relaxed);
+    g_sbDiagPeakInsts.store(sbDiag.peakFrameInsts, std::memory_order_relaxed);
+    g_sbDiagLatched.store(tl_spriteBatcher.IsGpuLatchedOff(), std::memory_order_relaxed);
+    g_pboTexActive.store(tl_pboTexRing.IsActive(), std::memory_order_relaxed);
+    g_pboTexUploads.store(tl_pboTexRing.UploadCount(), std::memory_order_relaxed);
+    g_pboTexBytes.store(tl_pboTexRing.UploadBytes(), std::memory_order_relaxed);
+    g_pboTexOverflows.store(tl_pboTexRing.OverflowFallbacks(), std::memory_order_relaxed);
+    g_pboTexTimeouts.store(tl_pboTexRing.WaitTimeouts(), std::memory_order_relaxed);
+    g_pboTexSlotSkips.store(tl_pboTexRing.SlotSkips(), std::memory_order_relaxed);
+    g_texPoolHits.store(tl_texIdPool.HitCount(), std::memory_order_relaxed);
+    g_texPoolRefills.store(tl_texIdPool.RefillCount(), std::memory_order_relaxed);
+    g_texPoolAvail.store(tl_texIdPool.AvailableCount(), std::memory_order_relaxed);
+    hs_sprite_batch::SpriteBatcher::DeniedTexSample denySample{};
+    while (tl_spriteBatcher.PopDeniedTexSample(denySample)) {
+        const char* rName = (denySample.reason == 1u) ? "mutated_resident"
+                          : (denySample.reason == 2u) ? "null_alloc"
+                          : (denySample.reason == 3u) ? "handle_zero" : "other";
+        LogMsg("[DIAG][BTEX_DENY] tex=%u reason=%s(%u)", denySample.texId, rName, static_cast<unsigned>(denySample.reason));
     }
     const auto u = tl_uiBatcher.TakeStatsDelta();
     if (u.drawsIn)      InterlockedAdd64(&g_uiDrawsIn,      static_cast<LONG64>(u.drawsIn));
@@ -7653,6 +9999,9 @@ static inline void FlushSpriteBatchStatsToGlobals() {
     if (u.bypassDraws)  InterlockedAdd64(&g_uiBypassDraws,  static_cast<LONG64>(u.bypassDraws));
     if (u.progSkips)    InterlockedAdd64(&g_uiProgSkips,    static_cast<LONG64>(u.progSkips));
     if (u.readbacks)    InterlockedAdd64(&g_uiReadbacks,    static_cast<LONG64>(u.readbacks));
+    for (size_t i = 0; i < static_cast<size_t>(hs_sprite_batch::FlushReason::Count); ++i) {
+        if (u.flReason[i]) InterlockedAdd64(&g_uiFlReason[i], static_cast<LONG64>(u.flReason[i]));
+    }
 }
 
 static inline void FlushGlCacheStatsIfReady(hs_gl_cache::ThreadState& st) {
@@ -7688,6 +10037,11 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent();
 static void OnVbPoolBindBuffer(uint32_t target, uint32_t buffer, void*) {
     tl_spriteBatcher.OnBindBuffer(target, buffer);
     tl_uiBatcher.OnBindBuffer(target, buffer);
+    if (target == 0x8892u) {
+        tl_lazyArrBufDirty = false;
+    } else if (target == 0x8893u) {
+        tl_lazyElemBufDirty = false;
+    }
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
         st.ShouldCallBindBuffer(target, buffer);
@@ -7719,12 +10073,22 @@ static void* WINAPI HookEglGetDisplay(void* display_id) {
         if (!g_nativeGlProbed.load(std::memory_order_acquire)) {
             const auto mode = static_cast<hs_native_gl::BackendMode>(g_cfgRenderBackend.load(std::memory_order_relaxed));
             const auto res = hs_native_gl::ProbeNativeEs2Support(mode, g_wglRt);
+            g_hwCaps.glMajor            = res.glMajor;
+            g_hwCaps.glMinor            = res.glMinor;
+            g_hwCaps.hasBufferStorage   = res.hasBufferStorage;
+            g_hwCaps.hasSsbo            = res.hasSsbo;
+            g_hwCaps.hasBindlessTexture = res.hasBindlessTexture;
+            g_hwCaps.hasBaseVertex      = res.hasBaseVertex;
+            g_hwCaps.isNativeGl         = res.supported;
             if (res.supported) {
                 g_activeGlRendererName = !res.renderer.empty() ? res.renderer : "Native OpenGL Compat";
                 g_nativeGlActive.store(true, std::memory_order_release);
-                LogMsg("[GL_NATIVE] Probe PASS -> activating Native WGL OpenGL Compat (ES2+SteamOverlay, mode=%s, vendor=%s, renderer=%s, version=%s, procs=%d/76, aniso=%d, bufStorage=%d, mapRange=%d)",
+                const bool computeCapable = res.hasComputeShader && res.hasImageLoadStore;
+                g_gpuClaritySupported.store(computeCapable, std::memory_order_release);
+                LogMsg("[GL_NATIVE] Probe PASS -> activating Native WGL OpenGL Compat (ES2+SteamOverlay, mode=%s, vendor=%s, renderer=%s, version=%s, procs=%d/76, aniso=%d, bufStorage=%d, mapRange=%d, compute43=%d, ssbo=%d, bindless=%d, baseVtx=%d)",
                        hs_native_gl::BackendModeName(mode), res.vendor.c_str(), res.renderer.c_str(), res.version.c_str(),
-                       res.resolvedProcs, res.hasAniso ? 1 : 0, res.hasBufferStorage ? 1 : 0, res.hasMapBufferRange ? 1 : 0);
+                       res.resolvedProcs, res.hasAniso ? 1 : 0, res.hasBufferStorage ? 1 : 0, res.hasMapBufferRange ? 1 : 0,
+                       computeCapable ? 1 : 0, res.hasSsbo ? 1 : 0, res.hasBindlessTexture ? 1 : 0, res.hasBaseVertex ? 1 : 0);
 
                 const auto flipMode = static_cast<hs_dxgi_flip::FlipMode>(g_cfgDxgiFlipPresent.load(std::memory_order_relaxed));
                 const auto flipRes = hs_dxgi_flip::ProbeDxgiFlipSupport(flipMode, g_wglRt);
@@ -7739,11 +10103,13 @@ static void* WINAPI HookEglGetDisplay(void* display_id) {
             } else {
                 g_activeGlRendererName = "ANGLE D3D9";
                 g_nativeGlActive.store(false, std::memory_order_release);
+                g_gpuClaritySupported.store(false, std::memory_order_release);
                 LogMsg("[GL_NATIVE] Using ANGLE D3D9 backend (mode=%s, reason=%s, vendor=%s, renderer=%s)",
                        hs_native_gl::BackendModeName(mode), res.reason.c_str(),
                        res.vendor.c_str(), res.renderer.c_str());
             }
             g_nativeGlProbed.store(true, std::memory_order_release);
+            ApplyElasticPoolPlan(true);
         }
         ReleaseSRWLockExclusive(&g_nativeGlLock);
     }
@@ -7930,37 +10296,113 @@ static void* WINAPI HookEglGetProcAddress(const char* procname) {
     return g_origEglGetProcAddress ? g_origEglGetProcAddress(procname) : nullptr;
 }
 
+static inline bool IsStencilTestDisabledSynced(hs_gl_cache::ThreadState& st) noexcept {
+    if (st.caps[4] < 0 && g_fnGlGetIntegerv) {
+        int32_t drvEn = 1;
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilTest, &drvEn);
+        st.caps[4] = (drvEn != 0) ? 1 : 0;
+    }
+    return st.caps[4] == 0;
+}
+
+static inline void SyncStencilStateIfUnknown(hs_gl_cache::ThreadState& st) noexcept {
+    if (!g_fnGlGetIntegerv) return;
+    if (!st.stencilFuncValid) {
+        int32_t fn = 0, ref = 0, fmask = 0;
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilFuncPname, &fn);
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilRefPname, &ref);
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilValueMaskPname, &fmask);
+        st.RecordStencilFunc(static_cast<uint32_t>(fn), ref, static_cast<uint32_t>(fmask));
+    }
+    if (!st.stencilWriteMaskValid) {
+        int32_t wm = 0;
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilWritemaskPname, &wm);
+        st.RecordStencilMask(static_cast<uint32_t>(wm));
+    }
+    if (!st.stencilOpValid) {
+        int32_t fail = 0, zfail = 0, zpass = 0;
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilFailPname, &fail);
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilPassDepthFailPname, &zfail);
+        g_fnGlGetIntegerv(hs_gl_cache::kGlStencilPassDepthPassPname, &zpass);
+        st.RecordStencilOp(static_cast<uint32_t>(fail), static_cast<uint32_t>(zfail), static_cast<uint32_t>(zpass));
+    }
+}
+
+static inline void CommitDeferredStencilFunc(hs_gl_cache::ThreadState& st) noexcept {
+    uint32_t fn = 0u, fmask = 0u;
+    int32_t ref = 0;
+    if (st.TakeDeferredStencilFunc(fn, ref, fmask) && g_origGlStencilFunc) {
+        g_origGlStencilFunc(fn, ref, fmask);
+    }
+}
+
+static inline void CommitDeferredStencilMask(hs_gl_cache::ThreadState& st) noexcept {
+    uint32_t m = 0u;
+    if (st.TakeDeferredStencilMask(m) && g_origGlStencilMask) {
+        g_origGlStencilMask(m);
+    }
+}
+
+static inline void CommitDeferredStencilOp(hs_gl_cache::ThreadState& st) noexcept {
+    uint32_t fail = 0u, zfail = 0u, zpass = 0u;
+    if (st.TakeDeferredStencilOp(fail, zfail, zpass) && g_origGlStencilOp) {
+        g_origGlStencilOp(fail, zfail, zpass);
+    }
+}
+
+static inline void CommitDeferredStencilState(hs_gl_cache::ThreadState& st) noexcept {
+    if (!st.HasDeferredStencilState()) return;
+    CommitDeferredStencilFunc(st);
+    CommitDeferredStencilMask(st);
+    CommitDeferredStencilOp(st);
+}
+
 static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, void* ctx) {
     const void* prevCtx = tl_glCache.curContext;
     if (prevCtx != nullptr) {
         // Always flush pending sprite/UI batches while prevCtx is still current (even if prevCtx == ctx,
         // because eglMakeCurrent may be rebinding draw/read surfaces!).
         FlushSpriteBatchIfPending();
+        FlushDeferredWorldShadowsIfPending();
         tl_spriteBatcher.CommitDeferredMatrixW();
         tl_uiBatcher.FlushDeferredStateForCurrentProg();
+        CommitLazyBatchBindings();
+        CommitDeferredStencilState(tl_glCache);
     }
     if (prevCtx != ctx) {
         if (prevCtx != nullptr) {
             // Free per-context scratch GPU objects WHILE prevCtx is still current,
             // but NEVER discard per-context program tables before eglMakeCurrent succeeds (preserves A->B->A!).
             tl_spriteBatcher.ReleaseGpuResources();
+            tl_pboTexRing.ReleaseGpu(true);
+            tl_texIdPool.ReleaseGpu(true);
             tl_uiBatcher.ResetContextState(true);
             tl_extProf.ResetContext(true);
+            ++tl_extProfGen;
+            tl_curExtProfSlotPlus1 = 0u;
+            tl_nativeGpuTimer.ResetContext(true);
             tl_worldShadow.ResetContext(true);
             tl_waterRefl.ResetContext(true);
             tl_combatVfx.ResetContext(true);
             tl_lookCap.OnContextReset();
+            tl_gpuClarity.OnContextReset(true);
             if (GetDxgiFlip().IsActive()) {
                 GetDxgiFlip().ReleaseGlResources(true);
             }
             g_vbPool.ResetAndRelease(true);
         } else {
+            tl_pboTexRing.ReleaseGpu(false);
+            tl_texIdPool.ReleaseGpu(false);
             tl_uiBatcher.ResetContextState(false);
             tl_extProf.ResetContext(false);
+            ++tl_extProfGen;
+            tl_curExtProfSlotPlus1 = 0u;
+            tl_nativeGpuTimer.ResetContext(false);
             tl_worldShadow.ResetContext(false);
             tl_waterRefl.ResetContext(false);
             tl_combatVfx.ResetContext(false);
             tl_lookCap.OnContextReset();
+            tl_gpuClarity.OnContextReset(false);
             g_vbPool.ResetAndRelease(false);
         }
     }
@@ -8008,17 +10450,33 @@ static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, voi
     } else {
         ok = g_origEglMakeCurrent ? g_origEglMakeCurrent(dpy, draw, read, ctx) : 0u;
     }
+    g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
+    tl_kleiFastPath.InvalidateAll();
     if (ok) {
+        ClearLazyBatchBindings();
+        tl_drawFrameCache.valid = false;
         tl_glCache.OnMakeCurrent(ctx);
         if (prevCtx != ctx) {
+            ResetMipTexTracker(ctx);
             if (prevCtx != nullptr) {
                 SaveActiveContextProgTables(prevCtx);
             }
             LoadContextProgTables(ctx);
             tl_spriteBatcher.ResetContext(ctx);
+            tl_pboTexRing.ResetContext(ctx, false);
+            tl_pboSyncedThisFrame = false;
+            tl_texIdPool.ResetContext(ctx, false);
+            if (ctx != nullptr && g_nativeGlActive.load(std::memory_order_acquire) &&
+                g_nativeIatBound.load(std::memory_order_acquire)) {
+                SyncTexIdPool();
+                tl_texIdPool.RefillIfLow();
+            }
             tl_curWorldProg = nullptr;
             tl_curBoundProg = 0u;
             tl_curBoundFbo  = 0u;
+            tl_curReadFbo   = 0u;
+            InvalidateFboCompletenessCache();
+            tl_bloomLegacyShadowActive = false;
             const bool wasShadowReady = g_worldShadowReady.exchange(false, std::memory_order_acq_rel);
             g_worldShadowFailed.store(false, std::memory_order_release);
             g_worldShadowRes.store(0u, std::memory_order_relaxed);
@@ -8055,10 +10513,15 @@ static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, voi
         // When prevCtx == ctx (pre-switch cleanup was skipped), preserve live GPU handles in SpriteBatcher /
         // UiBatcher / WorldShadow so nothing is orphaned or leaked while prevCtx stays active!
         tl_glCache.ResetBindingsOnly();
+        InvalidateFboCompletenessCache();
+        tl_drawFrameCache.valid = false;
         tl_spriteBatcher.ResetContext(const_cast<void*>(prevCtx));
         if (prevCtx == ctx && prevCtx != nullptr) {
             tl_uiBatcher.ResetBindingsOnly();
         } else {
+            tl_pboTexRing.ResetContext(const_cast<void*>(prevCtx), false);
+            tl_pboSyncedThisFrame = false;
+            tl_texIdPool.ResetContext(const_cast<void*>(prevCtx), false);
             tl_uiBatcher.ResetContextState(false);
             const bool wasShadowReady = g_worldShadowReady.exchange(false, std::memory_order_acq_rel);
             g_worldShadowRes.store(0u, std::memory_order_relaxed);
@@ -8071,8 +10534,18 @@ static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, voi
 }
 
 static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
+    RegisterRenderThreadForHitchSampler();
+    RenderWorkPhaseScope phaseScope(6u);
     FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    FlushDeferredWorldShadowsIfPending();
+    tl_spriteBatcher.OnEndFrame();
+    tl_pboTexRing.OnEndFrame();
+    tl_sbSyncedThisFrame = false;
+    tl_pboSyncedThisFrame = false;
+    tl_drawFrameCache.valid = false;
     FlushSpriteBatchStatsToGlobals();
+    CommitLazyBatchBindings();
+    CommitDeferredStencilState(tl_glCache);
     if (tl_combatVfx.ShouldRenderOnLeaveFbo(tl_curBoundFbo, 0xFFFFFFFFu)) {
         const auto saved = BuildShadowPassState();
         tl_combatVfx.RenderIntoPrimaryRt(g_combatImpact, NowQpc(), g_qpcInvFreq, saved, GetSyncedGlCache());
@@ -8088,13 +10561,26 @@ static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
         g_worldShadowUsesMax.store(tl_worldShadow.UsesGlMax(), std::memory_order_relaxed);
         g_worldShadowRes.store(tl_worldShadow.Resolution(), std::memory_order_relaxed);
         g_worldShadowDraws.store(tl_worldShadow.LastFrameShadowDraws(), std::memory_order_relaxed);
-        g_worldShadowBatchDraws.store(tl_worldShadow.LastFrameBatchedDraws(), std::memory_order_relaxed);
-        g_worldShadowUnbatchedDraws.store(tl_worldShadow.LastFrameUnbatchedDraws(), std::memory_order_relaxed);
+        g_worldShadowReuseSkips.store(tl_worldShadow.ShadowReuseSkips(), std::memory_order_relaxed);
+        g_worldShadowFastRecv1Tap.store(tl_worldShadow.IsFastEntityReceive1Tap(), std::memory_order_relaxed);
+        if (!tl_worldShadow.LastFrameReused()) {
+            g_worldShadowBatchDraws.store(tl_worldShadow.LastFrameBatchedDraws(), std::memory_order_relaxed);
+            g_worldShadowUnbatchedDraws.store(tl_worldShadow.LastFrameUnbatchedDraws(), std::memory_order_relaxed);
+            g_worldShadowDeferredBatches.store(tl_worldShadow.LastFrameDeferredBatches(), std::memory_order_relaxed);
+            g_worldShadowCoalescedDraws.store(tl_worldShadow.LastFrameCoalescedDraws(), std::memory_order_relaxed);
+        }
+    } else {
+        g_worldShadowFastRecv1Tap.store(false, std::memory_order_relaxed);
     }
     if (g_extProfCount.load(std::memory_order_acquire) > 0u) {
         tl_extProf.DrainAllActive();
     }
+    if (tl_worldPostSeenThisFrame && !tl_gpuClarityAppliedThisFrame) {
+        RunGpuClarityPreUiIfNeeded(true);
+    }
     LookCaptureOnSwapBuffers();
+    tl_worldPostSeenThisFrame = false;
+    tl_gpuClarityAppliedThisFrame = false;
     const int64_t t0 = NowQpc();
     if (tl_rtFrameStartQpc != 0 && t0 > tl_rtFrameStartQpc && g_qpcToUs > 0.0) {
         const double rtUs = static_cast<double>(t0 - tl_rtFrameStartQpc) * g_qpcToUs;
@@ -8110,6 +10596,7 @@ static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
     uint32_t rc = 0u;
     if (g_nativeGlActive.load(std::memory_order_acquire)) {
         tl_uiBatcher.EnsureDstProgramBound();
+        tl_nativeGpuTimer.EndFrame();
         auto& flip = GetDxgiFlip();
         if (flip.IsActive()) {
             const int32_t interval = g_pendingSwapInterval.load(std::memory_order_relaxed);
@@ -8120,13 +10607,19 @@ static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
         // Steam Overlay / RTSS / GPU overlays may mutate GL bindings inside SwapBuffers:
         // invalidate cached bindings (keeping per-program uniform shadow table) so next frame is 100% immune!
         tl_glCache.ResetBindingsOnly();
+        ClearLazyBatchBindings();
         tl_uiBatcher.OnPostSwapBuffers();
+        tl_nativeGpuTimer.DrainCompleted();
+        SyncTexIdPool();
+        tl_texIdPool.RefillIfLow();
     } else if (g_origEglSwapBuffers) {
         rc = g_origEglSwapBuffers(dpy, surface);
     }
     const int64_t t1 = NowQpc();
     g_rtThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     g_rtSwapSeq.fetch_add(1u, std::memory_order_release);
+    g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
+    PublishKleiFastPathStats();
     const double swapUs = static_cast<double>(t1 - t0) * g_qpcToUs;
     tl_rtFrameStartQpc = 0;
     if (swapUs >= 0.0 && swapUs <= 60000000.0) {
@@ -8148,33 +10641,145 @@ static uint32_t WINAPI HookEglSwapBuffers(void* dpy, void* surface) {
 }
 
 static void WINAPI HookGlActiveTexture(uint32_t texture) {
-    tl_spriteBatcher.OnActiveTexture(texture);
-    tl_uiBatcher.OnActiveTexture(texture);
+    const auto& tls = HotTls();
+    tl_activeTexUnit = (texture >= 0x84C0u && texture < 0x84E0u) ? (texture - 0x84C0u) : 0u;
+    tls.sb->OnActiveTexture(texture);
+    tls.ui->OnActiveTexture(texture);
     if (!g_origGlActiveTexture) return;
+    if (CanDeferBatchBindings() && texture >= 0x84C0u && texture < 0x84D0u) {
+        tl_lazyActiveUnitDirty = true;
+        return;
+    }
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
         const bool call = st.ShouldCallActiveTexture(texture);
         FlushGlCacheStatsIfReady(st);
         if (!call) return;
     }
+    tl_lazyActiveUnitDirty = false;
     g_origGlActiveTexture(texture);
 }
 
+static __declspec(noinline) bool NeedsMipTexUpgradeSlow(uint32_t texture) noexcept {
+    auto it = tl_mipTexGen.find(texture);
+    if (it == tl_mipTexGen.end() || it->second.gen == tl_mipTexLastGen) {
+        return false;
+    }
+    if (HotTls().sb->IsTextureBindless(texture)) {
+        it->second.gen = tl_mipTexLastGen;
+        if (tl_mipTexPending > 0u) --tl_mipTexPending;
+        return false;
+    }
+    return true;
+}
+
+static inline bool NeedsMipTexUpgrade(uint32_t target, uint32_t texture) noexcept {
+    if (tl_mipTexPending == 0u || target != 0x0DE1u || texture == 0u) return false;
+    return NeedsMipTexUpgradeSlow(texture);
+}
+
+static __declspec(noinline) void MaybeUpgradeBoundMipTexSlow(uint32_t texture) noexcept {
+    auto it = tl_mipTexGen.find(texture);
+    if (it == tl_mipTexGen.end() || it->second.gen == tl_mipTexLastGen) return;
+    if (HotTls().sb->IsTextureBindless(texture)) {
+        it->second.gen = tl_mipTexLastGen;
+        if (tl_mipTexPending > 0u) --tl_mipTexPending;
+        return;
+    }
+    ApplyCurrentVisualParamsToBoundTex(it->second.origMinFilter, true);
+    it->second.gen = tl_mipTexLastGen;
+    if (tl_mipTexPending > 0u) --tl_mipTexPending;
+}
+
+static inline void MaybeUpgradeBoundMipTex(uint32_t target, uint32_t texture) noexcept {
+    if (tl_mipTexPending == 0u || target != 0x0DE1u || texture == 0u) return;
+    MaybeUpgradeBoundMipTexSlow(texture);
+}
+
+static __declspec(noinline) void RefreshMipTexPendingOnGenChange(uint32_t curGen) noexcept {
+    tl_mipTexLastGen = curGen;
+    tl_mipTexPending = tl_mipTexGen.size();
+}
+
 static void WINAPI HookGlBindTexture(uint32_t target, uint32_t texture) {
-    if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
-    tl_spriteBatcher.OnBindTexture(target, texture);
-    tl_uiBatcher.OnBindTexture(target, texture);
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
+    auto& ui = *tls.ui;
+    SyncMipTexTrackerContext();
+    const uint32_t curGen = g_visualTexParamGen.load(std::memory_order_relaxed);
+    if (curGen != tl_mipTexLastGen) {
+        RefreshMipTexPendingOnGenChange(g_visualTexParamGen.load(std::memory_order_acquire));
+    }
+    const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+    if (target == 0x0DE1u) {
+        tl_boundTex2d[unit] = texture;
+    }
+    if (sb.HasPending()) SyncSpriteBatcher();
+    sb.OnBindTexture(target, texture);
+    ui.OnBindTexture(target, texture);
     if (!g_origGlBindTexture) return;
-    if (IsGlCacheOperational()) {
+    if (target == 0x0DE1u && unit < 16u && !NeedsMipTexUpgrade(target, texture) &&
+        IsGlCacheOperational() && sb.IsEnabled() && sb.IsCurrentProgramEligible() &&
+        sb.IsUnitEntityAtlas(unit)) {
+        tl_lazyTex2dDirtyMask |= (1u << unit);
+        return;
+    }
+    const bool glCacheOk = IsGlCacheOperational();
+    if (tl_lazyActiveUnitDirty ||
+        (glCacheOk && GetSyncedGlCache().activeUnit != static_cast<int32_t>(unit))) {
+        const bool wasLazy = tl_lazyActiveUnitDirty;
+        tl_lazyActiveUnitDirty = false;
+        if (glCacheOk) {
+            auto& st = GetSyncedGlCache();
+            if (g_origGlActiveTexture && st.activeUnit != static_cast<int32_t>(unit)) {
+                g_origGlActiveTexture(0x84C0u + unit);
+                st.activeUnit = static_cast<int32_t>(unit);
+            }
+        } else if (wasLazy && g_origGlActiveTexture) {
+            g_origGlActiveTexture(0x84C0u + unit);
+        }
+    }
+    if (target == 0x0DE1u && unit < 16u) {
+        tl_lazyTex2dDirtyMask &= ~(1u << unit);
+    }
+    if (glCacheOk) {
         auto& st = GetSyncedGlCache();
         const bool call = st.ShouldCallBindTexture(target, texture);
         FlushGlCacheStatsIfReady(st);
-        if (!call) return;
+        if (!call) {
+            // Texture is already bound to active unit -> safe to upgrade/restore its AF & LOD bias in place!
+            MaybeUpgradeBoundMipTex(target, texture);
+            return;
+        }
+    }
+    if (target == 0x0DE1u && unit >= hs_sprite_batch::kBatchTexUnitBase) {
+        sb.InvalidateStickyTexUnit(unit);
     }
     g_origGlBindTexture(target, texture);
+    MaybeUpgradeBoundMipTex(target, texture);
 }
 
 static void WINAPI HookGlDeleteTextures(int32_t n, const uint32_t* textures) {
+    InvalidateFboCompletenessCache();
+    FlushDeferredWorldShadowsIfPending();
+    CommitLazyBatchBindings();
+    SyncMipTexTrackerContext();
+    if (n > 0 && textures != nullptr) {
+        for (int32_t i = 0; i < n; ++i) {
+            const uint32_t id = textures[i];
+            if (id == 0u) continue;
+            auto it = tl_mipTexGen.find(id);
+            if (it != tl_mipTexGen.end()) {
+                if (it->second.gen != tl_mipTexLastGen && tl_mipTexPending > 0u) {
+                    --tl_mipTexPending;
+                }
+                tl_mipTexGen.erase(it);
+            }
+            for (uint32_t u = 0u; u < 32u; ++u) {
+                if (tl_boundTex2d[u] == id) tl_boundTex2d[u] = 0u;
+            }
+        }
+    }
     if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
     tl_spriteBatcher.OnDeleteTextures(n, textures);
     if (tl_uiBatcher.HasPending()) SyncUiBatcher();
@@ -8182,6 +10787,21 @@ static void WINAPI HookGlDeleteTextures(int32_t n, const uint32_t* textures) {
     tl_glCache.OnDeleteTextures(n, textures);
     if (g_origGlDeleteTextures) {
         g_origGlDeleteTextures(n, textures);
+    }
+}
+
+static void WINAPI HookGlGenTextures(int32_t n, uint32_t* textures) {
+    if (n > 0 && textures != nullptr &&
+        g_nativeGlActive.load(std::memory_order_relaxed) &&
+        g_nativeIatBound.load(std::memory_order_relaxed)) {
+        if (tl_texIdPool.TryAcquire(n, textures)) {
+            return;
+        }
+    }
+    if (g_origGlGenTextures) {
+        g_origGlGenTextures(n, textures);
+    } else if (g_fnGlGenTextures) {
+        g_fnGlGenTextures(n, textures);
     }
 }
 
@@ -8225,7 +10845,11 @@ static void WINAPI HookGlEnable(uint32_t cap) {
     }
     FlushSpriteBatchStateCause(StateFlushCause::Cap);
     if (IsGlCacheOperational()) {
-        GetSyncedGlCache().RecordEnableDisable(cap, true);
+        auto& st = GetSyncedGlCache();
+        if (cap == hs_gl_cache::kGlStencilTest) {
+            CommitDeferredStencilState(st);
+        }
+        st.RecordEnableDisable(cap, true);
     }
     g_origGlEnable(cap);
 }
@@ -8246,9 +10870,23 @@ static void WINAPI HookGlDisable(uint32_t cap) {
 }
 
 static void WINAPI HookGlBindBuffer(uint32_t target, uint32_t buffer) {
-    tl_spriteBatcher.OnBindBuffer(target, buffer);
-    tl_uiBatcher.OnBindBuffer(target, buffer);
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
+    sb.OnBindBuffer(target, buffer);
+    tls.ui->OnBindBuffer(target, buffer);
     if (!g_origGlBindBuffer) return;
+    if (IsGlCacheOperational() && sb.IsEnabled() && sb.IsCurrentProgramEligible() && tls.glc->caps[4] != 1) {
+        if (target == 0x8892u /*GL_ARRAY_BUFFER*/) {
+            tl_lazyArrBufDirty = true;
+            return;
+        }
+        if (target == 0x8893u /*GL_ELEMENT_ARRAY_BUFFER*/) {
+            tl_lazyElemBufDirty = true;
+            return;
+        }
+    }
+    if (target == 0x8892u) tl_lazyArrBufDirty = false;
+    else if (target == 0x8893u) tl_lazyElemBufDirty = false;
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
         const bool call = st.ShouldCallBindBuffer(target, buffer);
@@ -8260,6 +10898,8 @@ static void WINAPI HookGlBindBuffer(uint32_t target, uint32_t buffer) {
 
 static void WINAPI HookGlDeleteBuffers(int32_t n, const uint32_t* buffers) {
     if (n <= 0 || !buffers) return;
+    g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
+    CommitLazyBatchBindings();
     tl_spriteBatcher.OnDeleteBuffers(n, buffers);
     tl_uiBatcher.OnDeleteBuffers(n, buffers);
     tl_glCache.OnDeleteBuffers(n, buffers);
@@ -8355,9 +10995,10 @@ static void WINAPI HookGlDepthFunc(uint32_t func) {
 }
 
 static void WINAPI HookGlEnableVertexAttribArray(uint32_t index) {
-    if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
-    tl_spriteBatcher.OnEnableDisableVertexAttribArray(index, true);
-    tl_uiBatcher.OnEnableDisableVertexAttribArray(index, true);
+    const auto& tls = HotTls();
+    if (tls.sb->HasPending()) SyncSpriteBatcher();
+    tls.sb->OnEnableDisableVertexAttribArray(index, true);
+    tls.ui->OnEnableDisableVertexAttribArray(index, true);
     if (!g_origGlEnableVertexAttribArray) return;
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
@@ -8369,9 +11010,10 @@ static void WINAPI HookGlEnableVertexAttribArray(uint32_t index) {
 }
 
 static void WINAPI HookGlDisableVertexAttribArray(uint32_t index) {
-    if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
-    tl_spriteBatcher.OnEnableDisableVertexAttribArray(index, false);
-    tl_uiBatcher.OnEnableDisableVertexAttribArray(index, false);
+    const auto& tls = HotTls();
+    if (tls.sb->HasPending()) SyncSpriteBatcher();
+    tls.sb->OnEnableDisableVertexAttribArray(index, false);
+    tls.ui->OnEnableDisableVertexAttribArray(index, false);
     if (!g_origGlDisableVertexAttribArray) return;
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
@@ -8461,24 +11103,44 @@ static void WINAPI HookGlUniform1f(int32_t location, float x) {
     g_origGlUniform1f(location, x);
 }
 
+static void WINAPI HookGlUniform1fv(int32_t location, int32_t count, const float* v) {
+    if (!g_origGlUniform1fv) return;
+    EnsureUiDstProgramBoundAndSyncCache();
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_1F, v, sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+        if (!call) return;
+    }
+    FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::UniOther);
+    if (tl_uiBatcher.HasPending()) {
+        SyncUiBatcher();
+        tl_uiBatcher.Flush(hs_sprite_batch::FlushReason::UniOther);
+        EnsureUiDstProgramBoundAndSyncCache();
+    }
+    g_origGlUniform1fv(location, count, v);
+}
+
 static void WINAPI HookGlUniform1i(int32_t location, int32_t x) {
     if (!g_origGlUniform1i) return;
-    if (tl_uiBatcher.IsCurrentProgramEligible()) {
+    const auto& tls = HotTls();
+    if (tls.ui->IsCurrentProgramEligible()) {
         SyncUiBatcher();
-        if (tl_uiBatcher.OnUniform1i(location, x)) {
-            tl_glCache.InvalidateUniform(tl_uiBatcher.CurrentProgramId(), location);
+        if (tls.ui->OnUniform1i(location, x)) {
+            tls.glc->InvalidateUniform(tls.ui->CurrentProgramId(), location);
             return;
         }
     }
     EnsureUiDstProgramBoundAndSyncCache();
+    bool call = true;
     if (IsGlUniformCacheOperational()) {
         auto& st = GetSyncedGlCache();
-        const bool call = st.ShouldCallUniform(location, 1, 0, hs_gl_cache::UNI_1I, &x, sizeof(int32_t));
+        call = st.ShouldCallUniform(location, 1, 0, hs_gl_cache::UNI_1I, &x, sizeof(int32_t));
         FlushGlCacheStatsIfReady(st);
-        if (!call) return;
     }
-    if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
-    tl_spriteBatcher.OnUniform1i(location, x);
+    if (call && tls.sb->HasPending()) SyncSpriteBatcher();
+    tls.sb->OnUniform1i(location, x, call);
+    if (!call) return;
     g_origGlUniform1i(location, x);
 }
 
@@ -8497,36 +11159,102 @@ static void WINAPI HookGlUniform2fv(int32_t location, int32_t count, const float
 
 static void WINAPI HookGlUniform3fv(int32_t location, int32_t count, const float* v) {
     if (!g_origGlUniform3fv) return;
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
     if (tl_curWorldProg && location >= 0 && location == tl_curWorldProg->locParams && count == 1 && v != nullptr) {
         tl_curWorldProg->lastParamsY = v[1];
     }
+    SyncSpriteBatcher();
+    if (sb.TryAbsorbFloatParams(location, count, v) || sb.TryAbsorbParams(location, count, v)) {
+        tls.glc->InvalidateUniform(sb.CurrentProgramId(), location);
+        return;
+    }
     EnsureUiDstProgramBoundAndSyncCache();
+    bool call = true;
     if (IsGlUniformCacheOperational()) {
         auto& st = GetSyncedGlCache();
-        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_3FV, v, 3 * sizeof(float));
+        call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_3FV, v, 3 * sizeof(float));
         FlushGlCacheStatsIfReady(st);
-        if (!call) return;
     }
-    if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
-    tl_spriteBatcher.OnUniform3fv(location, count, v);
-    if (tl_uiBatcher.HasPending()) {
+    if (call && sb.HasPending()) SyncSpriteBatcher();
+    static std::atomic<uint32_t> s_uniDiagLogs{0u};
+    if (call && sb.HasPending() &&
+        g_rtSwapSeq.load(std::memory_order_relaxed) >= 400u &&
+        s_uniDiagLogs.load(std::memory_order_relaxed) < 3u) {
+        const uint32_t curIdx = s_uniDiagLogs.fetch_add(1u, std::memory_order_relaxed);
+        if (curIdx < 3u) {
+            LogMsg("[DIAG][UNI_FLUSH] u3 prog=%u loc=%d cnt=%d v=(%.3f,%.3f,%.3f)",
+                   sb.CurrentProgramId(), location, count,
+                   v ? static_cast<double>(v[0]) : 0.0,
+                   v ? static_cast<double>(v[1]) : 0.0,
+                   v ? static_cast<double>(v[2]) : 0.0);
+        }
+    }
+    sb.OnUniform3fv(location, count, v, call);
+    if (!call) return;
+    if (tls.ui->HasPending()) {
         SyncUiBatcher();
-        tl_uiBatcher.Flush(hs_sprite_batch::FlushReason::Uni3);
+        tls.ui->Flush(hs_sprite_batch::FlushReason::Uni3);
     }
     g_origGlUniform3fv(location, count, v);
 }
 
 static void WINAPI HookGlUniform4fv(int32_t location, int32_t count, const float* v) {
     if (!g_origGlUniform4fv) return;
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
+    SyncSpriteBatcher();
+    if (sb.TryAbsorbOceanBlend(location, count, v)) {
+        tls.glc->InvalidateUniform(sb.CurrentProgramId(), location);
+        return;
+    }
+    EnsureUiDstProgramBoundAndSyncCache();
+    bool call = true;
+    if (IsGlUniformCacheOperational()) {
+        auto& st = GetSyncedGlCache();
+        call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_4FV, v, 4 * sizeof(float));
+        FlushGlCacheStatsIfReady(st);
+    }
+    if (call && sb.HasPending()) SyncSpriteBatcher();
+    static std::atomic<uint32_t> s_uni4DiagLogs{0u};
+    if (call && sb.HasPending() &&
+        g_rtSwapSeq.load(std::memory_order_relaxed) >= 400u &&
+        s_uni4DiagLogs.load(std::memory_order_relaxed) < 3u) {
+        const uint32_t curIdx = s_uni4DiagLogs.fetch_add(1u, std::memory_order_relaxed);
+        if (curIdx < 3u) {
+            LogMsg("[DIAG][UNI_FLUSH] u4 prog=%u loc=%d cnt=%d v=(%.3f,%.3f,%.3f,%.3f)",
+                   sb.CurrentProgramId(), location, count,
+                   v ? static_cast<double>(v[0]) : 0.0,
+                   v ? static_cast<double>(v[1]) : 0.0,
+                   v ? static_cast<double>(v[2]) : 0.0,
+                   v ? static_cast<double>(v[3]) : 0.0);
+        }
+    }
+    sb.OnUniform4fv(location, count, v, call);
+    if (!call) return;
+    if (tls.ui->HasPending()) {
+        SyncUiBatcher();
+        tls.ui->Flush(hs_sprite_batch::FlushReason::Uni4);
+    }
+    g_origGlUniform4fv(location, count, v);
+}
+
+static void WINAPI HookGlUniformMatrix2fv(int32_t location, int32_t count, uint8_t transpose, const float* value) {
+    if (!g_origGlUniformMatrix2fv) return;
     EnsureUiDstProgramBoundAndSyncCache();
     if (IsGlUniformCacheOperational()) {
         auto& st = GetSyncedGlCache();
-        const bool call = st.ShouldCallUniform(location, count, 0, hs_gl_cache::UNI_4FV, v, 4 * sizeof(float));
+        const bool call = st.ShouldCallUniform(location, count, transpose, hs_gl_cache::UNI_MAT2, value, 4 * sizeof(float));
         FlushGlCacheStatsIfReady(st);
         if (!call) return;
     }
-    FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::Uni4);
-    g_origGlUniform4fv(location, count, v);
+    FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::UniMat);
+    if (tl_uiBatcher.HasPending()) {
+        SyncUiBatcher();
+        tl_uiBatcher.Flush(hs_sprite_batch::FlushReason::UniMat);
+        EnsureUiDstProgramBoundAndSyncCache();
+    }
+    g_origGlUniformMatrix2fv(location, count, transpose, value);
 }
 
 static void WINAPI HookGlUniformMatrix3fv(int32_t location, int32_t count, uint8_t transpose, const float* value) {
@@ -8544,17 +11272,22 @@ static void WINAPI HookGlUniformMatrix3fv(int32_t location, int32_t count, uint8
 
 static void WINAPI HookGlUniformMatrix4fv(int32_t location, int32_t count, uint8_t transpose, const float* value) {
     if (!g_origGlUniformMatrix4fv) return;
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
     if (tl_curWorldProg && location >= 0 && count == 1 && transpose == 0 && value != nullptr) {
         if (location == tl_curWorldProg->locMatrixP) {
-            tl_worldShadow.OnMatrixP(value);
-            tl_combatVfx.OnMatrixP(value);
+            tls.ws->OnMatrixP(value);
+            tls.cvfx->OnMatrixP(value);
+            tl_drawFrameCache.hintsApplied = false;
         } else if (location == tl_curWorldProg->locMatrixV) {
-            tl_worldShadow.OnMatrixV(value);
-            tl_waterRefl.OnMatrixV(value);
-            tl_combatVfx.OnMatrixV(value);
+            tls.ws->OnMatrixV(value);
+            tls.wr->OnMatrixV(value);
+            tls.cvfx->OnMatrixV(value);
+            tl_drawFrameCache.hintsApplied = false;
         } else if (location == tl_curWorldProg->locPv) {
-            tl_worldShadow.OnMatrixPV(value);
-            tl_combatVfx.OnMatrixPV(value);
+            tls.ws->OnMatrixPV(value);
+            tls.cvfx->OnMatrixPV(value);
+            tl_drawFrameCache.hintsApplied = false;
         } else if (location == tl_curWorldProg->locMatrixW) {
             std::memcpy(tl_curWorldProg->lastMatrixW, value, sizeof(tl_curWorldProg->lastMatrixW));
             tl_curWorldProg->hasMatrixW = true;
@@ -8566,15 +11299,15 @@ static void WINAPI HookGlUniformMatrix4fv(int32_t location, int32_t count, uint8
         }
     }
     SyncSpriteBatcher();
-    if (tl_spriteBatcher.TryAbsorbMatrixW(location, count, transpose, value) ||
-        tl_spriteBatcher.TryAbsorbColourXform(location, count, transpose, value)) {
-        tl_glCache.InvalidateUniform(tl_spriteBatcher.CurrentProgramId(), location);
+    if (sb.TryAbsorbMatrixW(location, count, transpose, value) ||
+        sb.TryAbsorbColourXform(location, count, transpose, value)) {
+        tls.glc->InvalidateUniform(sb.CurrentProgramId(), location);
         return;
     }
-    if (tl_uiBatcher.IsCurrentProgramEligible()) {
+    if (tls.ui->IsCurrentProgramEligible()) {
         SyncUiBatcher();
-        if (tl_uiBatcher.TryAbsorbMatrix4(location, count, transpose, value)) {
-            tl_glCache.InvalidateUniform(tl_uiBatcher.CurrentProgramId(), location);
+        if (tls.ui->TryAbsorbMatrix4(location, count, transpose, value)) {
+            tls.glc->InvalidateUniform(tls.ui->CurrentProgramId(), location);
             return;
         }
     }
@@ -8590,8 +11323,10 @@ static void WINAPI HookGlUniformMatrix4fv(int32_t location, int32_t count, uint8
 }
 
 static void WINAPI HookGlBufferData(uint32_t target, ptrdiff_t size, const void* data, uint32_t usage) {
+    CommitLazyBatchBindings();
     SyncSpriteBatcher();
-    const uint32_t bufId = tl_spriteBatcher.BoundBufferForTarget(target);
+    const auto& tls = HotTls();
+    const uint32_t bufId = tls.sb->BoundBufferForTarget(target);
     if (bufId != 0u) {
         const bool isDyn = (usage != 0x88E4u /*GL_STATIC_DRAW*/);
         // Capture all small VBOs/IBOs (<= 64 KB) on RenderThread so UI/Font draws NEVER hit
@@ -8600,11 +11335,11 @@ static void WINAPI HookGlBufferData(uint32_t target, ptrdiff_t size, const void*
         const bool captureUi = g_optSpriteBatch.load(std::memory_order_relaxed) &&
                                (size > 0 && static_cast<size_t>(size) <= hs_ui_batch::kMaxUiShadowCaptureBytes);
         if (size > 0 && data != nullptr) {
-            tl_spriteBatcher.OnBufferUpload(bufId, data, static_cast<size_t>(size), isDyn);
-            tl_uiBatcher.OnBufferUpload(bufId, data, static_cast<size_t>(size), captureUi);
+            tls.sb->OnBufferUpload(bufId, data, static_cast<size_t>(size), isDyn);
+            tls.ui->OnBufferUpload(bufId, data, static_cast<size_t>(size), captureUi);
         } else {
-            tl_spriteBatcher.OnBufferUpload(bufId, nullptr, 0u, isDyn);
-            tl_uiBatcher.OnBufferUpload(bufId, nullptr, 0u, false);
+            tls.sb->OnBufferUpload(bufId, nullptr, 0u, isDyn);
+            tls.ui->OnBufferUpload(bufId, nullptr, 0u, false);
         }
     }
     if (g_origGlBufferData) {
@@ -8613,8 +11348,26 @@ static void WINAPI HookGlBufferData(uint32_t target, ptrdiff_t size, const void*
 }
 
 static void WINAPI HookGlVertexAttribPointer(uint32_t index, int32_t size, uint32_t type, uint8_t normalized, int32_t stride, const void* ptr) {
-    tl_spriteBatcher.OnVertexAttribPointer(index, size, type, normalized, stride, ptr);
-    tl_uiBatcher.OnVertexAttribPointer(index, size, type, normalized, stride, ptr);
+    const auto& tls = HotTls();
+    auto& sb = *tls.sb;
+    sb.OnVertexAttribPointer(index, size, type, normalized, stride, ptr);
+    tls.ui->OnVertexAttribPointer(index, size, type, normalized, stride, ptr);
+    if (index < 16u && IsGlCacheOperational() && sb.IsEnabled() && sb.IsCurrentProgramEligible()) {
+        tl_lazyAttribDirtyMask |= static_cast<uint16_t>(1u << index);
+        return;
+    }
+    if (tl_lazyArrBufDirty) {
+        tl_lazyArrBufDirty = false;
+        const uint32_t wantArr = sb.BoundArrayBuf();
+        auto& st = GetSyncedGlCache();
+        if (g_origGlBindBuffer && st.boundArrayBuf != wantArr) {
+            g_origGlBindBuffer(0x8892u /*GL_ARRAY_BUFFER*/, wantArr);
+            st.boundArrayBuf = wantArr;
+        }
+    }
+    if (index < 16u) {
+        tl_lazyAttribDirtyMask &= static_cast<uint16_t>(~(1u << index));
+    }
     if (g_origGlVertexAttribPointer) {
         g_origGlVertexAttribPointer(index, size, type, normalized, stride, ptr);
     }
@@ -8750,113 +11503,169 @@ static void LogHauntedDrawDiag(const char* fn, uint32_t mode, int32_t count,
            static_cast<double>(tl_curWorldProg->lastMatrixW[14]));
 }
 
+template <typename DispatchFn>
+static inline bool TryHandleSpriteBatchDraw(const RtHotTlsPointers& tls,
+                                            DispatchFn&& dispatchBatch,
+                                            const char* tag,
+                                            uint32_t mode,
+                                            int32_t diagA,
+                                            int32_t count) {
+    auto& fc = tl_drawFrameCache;
+    if (!fc.valid) {
+        RefreshDrawFrameCache(tls);
+    }
+    if (fc.isBloomProg && tl_bloomLegacyShadowActive) {
+        return false;
+    }
+    if (!fc.anyFx) {
+        const int64_t sbT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+        const bool batched = dispatchBatch(0u, 0.0f, 0.0f);
+        if (sbT0 != 0) {
+            const int64_t sbT1 = NowQpc();
+            if (sbT1 > sbT0) tl_rtSbTryQpc += (sbT1 - sbT0);
+        }
+        if (batched) return true;
+        LogSpriteBatchDiagOnce(tag, mode, diagA, count);
+        return false;
+    }
+    if (!fc.hintsApplied) {
+        ApplyDrawFrameShadowHints(tls, fc);
+    }
+    auto& sb = *tls.sb;
+    const bool isStand = sb.IsCurrentMatrixWStanding();
+    if (!fc.isBloomProg && isStand) {
+        tls.cvfx->OnStandingEntityDraw(tl_curBoundFbo);
+        if (fc.anyShadow && tls.ws->NeedsCompositeOrBeginWrite(tl_curBoundFbo, *fc.scfg)) {
+            EnsureShadowCompositeAndBeginWrite(*fc.scfg);
+        }
+        if (fc.anyRefl && tls.wr->NeedsBeginWrite(tl_curBoundFbo, *fc.rcfg)) {
+            EnsureWaterReflBeginWrite(*fc.rcfg);
+        }
+    }
+    uint8_t fCls = 0u;
+    float swayBase = 0.0f, wakeBase = 0.0f;
+    if (isStand && fc.anyWind && fc.foliageNonEmpty) {
+        if (const float* mw = sb.CurrentMatrixW()) {
+            fCls = tls.fol->QueryClass(mw[12], mw[14]);
+            if (fCls != 0u) {
+                hs_foliage::ComputeEntitySwayBase(fCls, mw[12], mw[14], *fc.wcfg,
+                                                  fc.windCamRightX, fc.windCamRightZ, swayBase, wakeBase);
+            }
+        }
+    }
+    const int64_t sbT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+    const bool batched = dispatchBatch(fCls, swayBase, wakeBase);
+    if (sbT0 != 0) {
+        const int64_t sbT1 = NowQpc();
+        if (sbT1 > sbT0) tl_rtSbTryQpc += (sbT1 - sbT0);
+    }
+    if (batched) return true;
+    LogSpriteBatchDiagOnce(tag, mode, diagA, count);
+    return false;
+}
+
+static inline bool IsStencilDirectBypassActive(const RtHotTlsPointers& tls) noexcept {
+    return IsGlCacheOperational() && tls.glc->caps[4] == 1;
+}
+
+static inline bool IsColorWriteFullyMasked(const RtHotTlsPointers& tls) noexcept {
+    return IsGlCacheOperational() && tls.glc->colorMask == 0;
+}
+
 static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count) {
+    if (tl_curLookProgRole == 2u && tl_curBoundFbo == 0u && tl_worldPostSeenThisFrame && !tl_gpuClarityAppliedThisFrame) {
+        RunGpuClarityPreUiIfNeeded(false);
+    }
     if (g_lookMatcher.IsCaptureArmed()) {
         LookCaptureOnPreDraw();
     }
+    const auto& tls = HotTls();
     SyncSpriteBatcher();
     if (tl_curWorldProg) {
         if (tl_curWorldProg->role == WorldProgRole::Ground) {
-            tl_worldShadow.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_combatVfx.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.ws->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.cvfx->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
         } else if (tl_curWorldProg->role == WorldProgRole::Ocean) {
-            tl_worldShadow.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_combatVfx.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_waterRefl.OnOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.ws->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.cvfx->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.wr->OnOceanDraw(tl_curBoundFbo, tl_curVp);
             SyncOceanReflUniforms();
         }
     }
-    if (tl_spriteBatcher.IsEnabled() && tl_spriteBatcher.IsCurrentProgramEligible()) {
-        const auto& scfg = GetCachedShadowConfig();
-        const auto& rcfg = GetCachedWaterReflConfig();
-        const auto& wcfg = SyncFoliageAndWind();
-        SyncCurProgWindUniforms();
-        tl_spriteBatcher.SetShadowHints(scfg.skipNightmare, tl_worldShadow.HasCamRight(),
-                                        tl_worldShadow.CamRightX(), tl_worldShadow.CamRightZ(), scfg.minHeight);
-        const bool isStand = tl_spriteBatcher.IsCurrentMatrixWStanding();
-        if (isStand) {
-            tl_combatVfx.OnStandingEntityDraw(tl_curBoundFbo);
-            if (tl_worldShadow.NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
-                EnsureShadowCompositeAndBeginWrite(scfg);
-            }
-            if (tl_waterRefl.NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
-                EnsureWaterReflBeginWrite(rcfg);
-            }
-        }
-        uint8_t fCls = 0u;
-        float swayBase = 0.0f, wakeBase = 0.0f;
-        if (isStand && wcfg.IsActive()) {
-            if (const float* mw = tl_spriteBatcher.CurrentMatrixW()) {
-                fCls = tl_foliageTable.QueryClass(mw[12], mw[14]);
-                if (fCls != 0u) {
-                    float crX = 0.70710678f, crZ = -0.70710678f;
-                    ResolveWindCamRight(crX, crZ);
-                    hs_foliage::ComputeEntitySwayBase(fCls, mw[12], mw[14], wcfg, crX, crZ, swayBase, wakeBase);
-                }
-            }
-        }
-        if (tl_spriteBatcher.TryBatchDrawArrays(mode, first, count, fCls, swayBase, wakeBase)) {
+    auto& sb = *tls.sb;
+    if (sb.IsEnabled() && sb.IsCurrentProgramEligible()) {
+        if (IsStencilDirectBypassActive(tls)) {
+            g_sbStencilBypassDraws.fetch_add(1ULL, std::memory_order_relaxed);
+        } else if (TryHandleSpriteBatchDraw(
+                tls,
+                [&](uint8_t fCls, float swayBase, float wakeBase) {
+                    return sb.TryBatchDrawArrays(mode, first, count, fCls, swayBase, wakeBase);
+                },
+                "DA", mode, first, count)) {
             return;
         }
-        LogSpriteBatchDiagOnce("DA", mode, first, count);
-    } else if (tl_uiBatcher.IsCurrentProgramEligible()) {
+    } else if (tls.ui->IsCurrentProgramEligible()) {
         SyncUiBatcher();
-        if (tl_uiBatcher.IsEnabled()) {
-            if (tl_uiBatcher.TryBatchDrawArrays(mode, first, count)) {
+        if (tls.ui->IsEnabled()) {
+            if (tls.ui->TryBatchDrawArrays(mode, first, count)) {
                 return;
             }
             LogUiBatchDiagOnce("DA", mode, count);
         }
     }
-    tl_spriteBatcher.PrepareForUnbatchedDraw();
-    tl_uiBatcher.PrepareForUnbatchedDraw();
+    sb.PrepareForUnbatchedDraw();
+    tls.ui->PrepareForUnbatchedDraw();
+    CommitLazyBatchBindings();
     bool mirrorShadow = false;
     bool mirrorRefl   = false;
     float mirrorEntX = 0.0f, mirrorEntZ = 0.0f;
     if (tl_curWorldProg && tl_curWorldProg->canCastShadow) {
-        const auto& scfg = GetCachedShadowConfig();
-        const auto& rcfg = GetCachedWaterReflConfig();
-        const auto& wcfg = SyncFoliageAndWind();
-        SyncCurProgWindUniforms();
+        auto& fc = tl_drawFrameCache;
+        if (!fc.valid) {
+            RefreshDrawFrameCache(tls);
+        }
+        const auto& scfg = *fc.scfg;
+        const auto& rcfg = *fc.rcfg;
         const float* mat = tl_curWorldProg->isSkinned
             ? (tl_curWorldProg->hasXform ? tl_curWorldProg->lastXform : nullptr)
             : (tl_curWorldProg->hasMatrixW ? tl_curWorldProg->lastMatrixW : nullptr);
         const bool isStand = (mat != nullptr) && hs_world_shadow::IsStandingMatrix(mat);
         if (tl_curWorldProg->locFoliageCls >= 0 && g_origGlUniform1f) {
             // Hard-exclude skinned & haunted programs (players, mobs, bosses) from foliage deformation!
-            const float wantCls = (isStand && !tl_curWorldProg->isSkinned && !tl_curWorldProg->isHaunted && wcfg.IsActive())
-                ? static_cast<float>(tl_foliageTable.QueryClass(mat[12], mat[14])) : 0.0f;
+            const float wantCls = (isStand && !tl_curWorldProg->isSkinned && !tl_curWorldProg->isHaunted &&
+                                   fc.anyWind && fc.foliageNonEmpty)
+                ? static_cast<float>(tls.fol->QueryClass(mat[12], mat[14])) : 0.0f;
             if (tl_curWorldProg->lastFoliageCls != wantCls) {
                 g_origGlUniform1f(tl_curWorldProg->locFoliageCls, wantCls);
-                tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locFoliageCls);
+                tls.glc->InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locFoliageCls);
                 tl_curWorldProg->lastFoliageCls = wantCls;
             }
         }
-        if (isStand) {
-            tl_combatVfx.OnStandingEntityDraw(tl_curBoundFbo);
-            if (hs_world_shadow::HasAnyShadowLight(scfg)) {
-                if (tl_worldShadow.NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
+        if (isStand && !IsColorWriteFullyMasked(tls)) {
+            tls.cvfx->OnStandingEntityDraw(tl_curBoundFbo);
+            if (fc.anyShadow) {
+                if (tls.ws->NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
                     EnsureShadowCompositeAndBeginWrite(scfg);
                 }
-                if (tl_worldShadow.BeganWriteThisFrame() &&
-                    tl_worldShadow.IsInsideWorldPass(tl_curBoundFbo) &&
+                if (tls.ws->BeganWriteThisFrame() &&
+                    tls.ws->IsInsideWorldPass(tl_curBoundFbo) &&
                     tl_curWorldProg->lastParamsY <= 0.35f &&
                     (!scfg.skipNightmare || tl_curWorldProg->lastColorAlpha >= 0.72f) &&
-                    tl_worldShadow.IsEntityInsideShadowBox(mat[12], mat[14])) {
+                    tls.ws->IsEntityInsideShadowBox(mat[12], mat[14])) {
                     mirrorShadow = true;
                     mirrorEntX   = mat[12];
                     mirrorEntZ   = mat[14];
                 }
             }
-            if (rcfg.IsEnabled()) {
-                if (tl_waterRefl.NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
+            if (fc.anyRefl) {
+                if (tls.wr->NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
                     EnsureWaterReflBeginWrite(rcfg);
                 }
-                if (tl_waterRefl.BeganWriteThisFrame() &&
-                    tl_waterRefl.IsInsideWorldPass(tl_curBoundFbo) &&
+                if (tls.wr->BeganWriteThisFrame() &&
+                    tls.wr->IsInsideWorldPass(tl_curBoundFbo) &&
                     tl_curWorldProg->lastParamsY <= 0.35f &&
                     (!rcfg.skipNightmare || tl_curWorldProg->lastColorAlpha >= 0.72f) &&
-                    tl_waterRefl.IsEntityInsideReflBox(mat[12], mat[14])) {
+                    tls.wr->IsEntityInsideReflBox(mat[12], mat[14])) {
                     mirrorRefl = true;
                 }
             }
@@ -8867,30 +11676,45 @@ static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count)
             g_hauntDiagDraws.load(std::memory_order_relaxed) < 60u) {
             LogHauntedDrawDiag("DA", mode, count, mirrorShadow, mirrorRefl);
         }
-        const int32_t extSlot = tl_extProf.curExtSlot;
-        if (extSlot >= 0) {
-            ExecuteExtProfiledDraw(extSlot, [&]() { g_origGlDrawArrays(mode, first, count); });
+        const uint32_t extSlotP1 = tl_curExtProfSlotPlus1;
+        const int64_t unbT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+        if (extSlotP1 != 0u) {
+            ExecuteExtProfiledDraw(static_cast<int32_t>(extSlotP1 - 1u), [&]() { g_origGlDrawArrays(mode, first, count); });
         } else {
             g_origGlDrawArrays(mode, first, count);
+        }
+        if (unbT0 != 0) {
+            const int64_t unbT1 = NowQpc();
+            if (unbT1 > unbT0) tl_rtUnbDrawQpc += (unbT1 - unbT0);
+            RecordUnbDrawProg(tl_curBoundProg);
+        }
+        if (tl_curLookProgRole == 1u || tl_curLookProgRole == 3u) {
+            GpuClarityOnPostDraw();
         }
         if (g_lookMatcher.IsCaptureArmed()) {
             LookCaptureOnPostDraw();
         }
         if (mirrorShadow && tl_curWorldProg) {
-            const auto& scfg = GetCachedShadowConfig();
+            const auto& scfg = tl_drawFrameCache.scfg ? *tl_drawFrameCache.scfg : GetCachedShadowConfig();
             const auto saved = BuildShadowPassState();
-            tl_worldShadow.MirrorCurrentProgramDraw(
+            const int64_t shT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+            tls.ws->MirrorCurrentProgramDraw(
                 tl_curWorldProg->locShadowPass,
                 tl_curWorldProg->locShadowBounds,
                 tl_curWorldProg->locShadowCamR,
                 scfg, saved, GetSyncedGlCache(),
                 [&]() { g_origGlDrawArrays(mode, first, count); },
                 tl_curWorldProg->locShadowPt, true, mirrorEntX, mirrorEntZ);
+            if (shT0 != 0) {
+                const int64_t shT1 = NowQpc();
+                if (shT1 > shT0) tl_rtShUnbQpc += (shT1 - shT0);
+                ++tl_rtShUnbCnt;
+            }
         }
         if (mirrorRefl && tl_curWorldProg) {
-            const auto& rcfg = GetCachedWaterReflConfig();
+            const auto& rcfg = tl_drawFrameCache.rcfg ? *tl_drawFrameCache.rcfg : GetCachedWaterReflConfig();
             const auto saved = BuildShadowPassState();
-            tl_waterRefl.MirrorCurrentProgramDraw(
+            tls.wr->MirrorCurrentProgramDraw(
                 tl_curWorldProg->locShadowPass,
                 tl_curWorldProg->locShadowBounds,
                 tl_curWorldProg->locShadowCamR,
@@ -8902,112 +11726,99 @@ static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count)
 }
 
 static void WINAPI HookGlDrawElements(uint32_t mode, int32_t count, uint32_t type, const void* indices) {
+    if (tl_curLookProgRole == 2u && tl_curBoundFbo == 0u && tl_worldPostSeenThisFrame && !tl_gpuClarityAppliedThisFrame) {
+        RunGpuClarityPreUiIfNeeded(false);
+    }
     if (g_lookMatcher.IsCaptureArmed()) {
         LookCaptureOnPreDraw();
     }
+    const auto& tls = HotTls();
     SyncSpriteBatcher();
     if (tl_curWorldProg) {
         if (tl_curWorldProg->role == WorldProgRole::Ground) {
-            tl_worldShadow.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_combatVfx.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.ws->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.cvfx->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
         } else if (tl_curWorldProg->role == WorldProgRole::Ocean) {
-            tl_worldShadow.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_combatVfx.OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
-            tl_waterRefl.OnOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.ws->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.cvfx->OnGroundOrOceanDraw(tl_curBoundFbo, tl_curVp);
+            tls.wr->OnOceanDraw(tl_curBoundFbo, tl_curVp);
             SyncOceanReflUniforms();
         }
     }
-    if (tl_spriteBatcher.IsEnabled() && tl_spriteBatcher.IsCurrentProgramEligible()) {
-        const auto& scfg = GetCachedShadowConfig();
-        const auto& rcfg = GetCachedWaterReflConfig();
-        const auto& wcfg = SyncFoliageAndWind();
-        SyncCurProgWindUniforms();
-        tl_spriteBatcher.SetShadowHints(scfg.skipNightmare, tl_worldShadow.HasCamRight(),
-                                        tl_worldShadow.CamRightX(), tl_worldShadow.CamRightZ(), scfg.minHeight);
-        const bool isStand = tl_spriteBatcher.IsCurrentMatrixWStanding();
-        if (isStand) {
-            tl_combatVfx.OnStandingEntityDraw(tl_curBoundFbo);
-            if (tl_worldShadow.NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
-                EnsureShadowCompositeAndBeginWrite(scfg);
-            }
-            if (tl_waterRefl.NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
-                EnsureWaterReflBeginWrite(rcfg);
-            }
-        }
-        uint8_t fCls = 0u;
-        float swayBase = 0.0f, wakeBase = 0.0f;
-        if (isStand && wcfg.IsActive()) {
-            if (const float* mw = tl_spriteBatcher.CurrentMatrixW()) {
-                fCls = tl_foliageTable.QueryClass(mw[12], mw[14]);
-                if (fCls != 0u) {
-                    float crX = 0.70710678f, crZ = -0.70710678f;
-                    ResolveWindCamRight(crX, crZ);
-                    hs_foliage::ComputeEntitySwayBase(fCls, mw[12], mw[14], wcfg, crX, crZ, swayBase, wakeBase);
-                }
-            }
-        }
-        if (tl_spriteBatcher.TryBatchDrawElements(mode, count, type, indices, fCls, swayBase, wakeBase)) {
+    auto& sb = *tls.sb;
+    if (sb.IsEnabled() && sb.IsCurrentProgramEligible()) {
+        if (IsStencilDirectBypassActive(tls)) {
+            g_sbStencilBypassDraws.fetch_add(1ULL, std::memory_order_relaxed);
+        } else if (TryHandleSpriteBatchDraw(
+                tls,
+                [&](uint8_t fCls, float swayBase, float wakeBase) {
+                    return sb.TryBatchDrawElements(mode, count, type, indices, fCls, swayBase, wakeBase);
+                },
+                "DE", mode, static_cast<int32_t>(type), count)) {
             return;
         }
-        LogSpriteBatchDiagOnce("DE", mode, static_cast<int32_t>(type), count);
-    } else if (tl_uiBatcher.IsCurrentProgramEligible()) {
+    } else if (tls.ui->IsCurrentProgramEligible()) {
         SyncUiBatcher();
-        if (tl_uiBatcher.IsEnabled()) {
-            if (tl_uiBatcher.TryBatchDrawElements(mode, count, type, indices)) {
+        if (tls.ui->IsEnabled()) {
+            if (tls.ui->TryBatchDrawElements(mode, count, type, indices)) {
                 return;
             }
             LogUiBatchDiagOnce("DE", mode, count);
         }
     }
-    tl_spriteBatcher.PrepareForUnbatchedDraw();
-    tl_uiBatcher.PrepareForUnbatchedDraw();
+    sb.PrepareForUnbatchedDraw();
+    tls.ui->PrepareForUnbatchedDraw();
+    CommitLazyBatchBindings();
     bool mirrorShadow = false;
     bool mirrorRefl   = false;
     float mirrorEntX = 0.0f, mirrorEntZ = 0.0f;
     if (tl_curWorldProg && tl_curWorldProg->canCastShadow) {
-        const auto& scfg = GetCachedShadowConfig();
-        const auto& rcfg = GetCachedWaterReflConfig();
-        const auto& wcfg = SyncFoliageAndWind();
-        SyncCurProgWindUniforms();
+        auto& fc = tl_drawFrameCache;
+        if (!fc.valid) {
+            RefreshDrawFrameCache(tls);
+        }
+        const auto& scfg = *fc.scfg;
+        const auto& rcfg = *fc.rcfg;
         const float* mat = tl_curWorldProg->isSkinned
             ? (tl_curWorldProg->hasXform ? tl_curWorldProg->lastXform : nullptr)
             : (tl_curWorldProg->hasMatrixW ? tl_curWorldProg->lastMatrixW : nullptr);
         const bool isStand = (mat != nullptr) && hs_world_shadow::IsStandingMatrix(mat);
         if (tl_curWorldProg->locFoliageCls >= 0 && g_origGlUniform1f) {
             // Hard-exclude skinned & haunted programs (players, mobs, bosses) from foliage deformation!
-            const float wantCls = (isStand && !tl_curWorldProg->isSkinned && !tl_curWorldProg->isHaunted && wcfg.IsActive())
-                ? static_cast<float>(tl_foliageTable.QueryClass(mat[12], mat[14])) : 0.0f;
+            const float wantCls = (isStand && !tl_curWorldProg->isSkinned && !tl_curWorldProg->isHaunted &&
+                                   fc.anyWind && fc.foliageNonEmpty)
+                ? static_cast<float>(tls.fol->QueryClass(mat[12], mat[14])) : 0.0f;
             if (tl_curWorldProg->lastFoliageCls != wantCls) {
                 g_origGlUniform1f(tl_curWorldProg->locFoliageCls, wantCls);
-                tl_glCache.InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locFoliageCls);
+                tls.glc->InvalidateUniform(tl_curBoundProg, tl_curWorldProg->locFoliageCls);
                 tl_curWorldProg->lastFoliageCls = wantCls;
             }
         }
-        if (isStand) {
-            tl_combatVfx.OnStandingEntityDraw(tl_curBoundFbo);
-            if (hs_world_shadow::HasAnyShadowLight(scfg)) {
-                if (tl_worldShadow.NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
+        if (isStand && !IsColorWriteFullyMasked(tls)) {
+            tls.cvfx->OnStandingEntityDraw(tl_curBoundFbo);
+            if (fc.anyShadow) {
+                if (tls.ws->NeedsCompositeOrBeginWrite(tl_curBoundFbo, scfg)) {
                     EnsureShadowCompositeAndBeginWrite(scfg);
                 }
-                if (tl_worldShadow.BeganWriteThisFrame() &&
-                    tl_worldShadow.IsInsideWorldPass(tl_curBoundFbo) &&
+                if (tls.ws->BeganWriteThisFrame() &&
+                    tls.ws->IsInsideWorldPass(tl_curBoundFbo) &&
                     tl_curWorldProg->lastParamsY <= 0.35f &&
                     (!scfg.skipNightmare || tl_curWorldProg->lastColorAlpha >= 0.72f) &&
-                    tl_worldShadow.IsEntityInsideShadowBox(mat[12], mat[14])) {
+                    tls.ws->IsEntityInsideShadowBox(mat[12], mat[14])) {
                     mirrorShadow = true;
                     mirrorEntX   = mat[12];
                     mirrorEntZ   = mat[14];
                 }
             }
-            if (rcfg.IsEnabled()) {
-                if (tl_waterRefl.NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
+            if (fc.anyRefl) {
+                if (tls.wr->NeedsBeginWrite(tl_curBoundFbo, rcfg)) {
                     EnsureWaterReflBeginWrite(rcfg);
                 }
-                if (tl_waterRefl.BeganWriteThisFrame() &&
-                    tl_waterRefl.IsInsideWorldPass(tl_curBoundFbo) &&
+                if (tls.wr->BeganWriteThisFrame() &&
+                    tls.wr->IsInsideWorldPass(tl_curBoundFbo) &&
                     tl_curWorldProg->lastParamsY <= 0.35f &&
                     (!rcfg.skipNightmare || tl_curWorldProg->lastColorAlpha >= 0.72f) &&
-                    tl_waterRefl.IsEntityInsideReflBox(mat[12], mat[14])) {
+                    tls.wr->IsEntityInsideReflBox(mat[12], mat[14])) {
                     mirrorRefl = true;
                 }
             }
@@ -9018,30 +11829,45 @@ static void WINAPI HookGlDrawElements(uint32_t mode, int32_t count, uint32_t typ
             g_hauntDiagDraws.load(std::memory_order_relaxed) < 60u) {
             LogHauntedDrawDiag("DE", mode, count, mirrorShadow, mirrorRefl);
         }
-        const int32_t extSlot = tl_extProf.curExtSlot;
-        if (extSlot >= 0) {
-            ExecuteExtProfiledDraw(extSlot, [&]() { g_origGlDrawElements(mode, count, type, indices); });
+        const uint32_t extSlotP1 = tl_curExtProfSlotPlus1;
+        const int64_t unbT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+        if (extSlotP1 != 0u) {
+            ExecuteExtProfiledDraw(static_cast<int32_t>(extSlotP1 - 1u), [&]() { g_origGlDrawElements(mode, count, type, indices); });
         } else {
             g_origGlDrawElements(mode, count, type, indices);
+        }
+        if (unbT0 != 0) {
+            const int64_t unbT1 = NowQpc();
+            if (unbT1 > unbT0) tl_rtUnbDrawQpc += (unbT1 - unbT0);
+            RecordUnbDrawProg(tl_curBoundProg);
+        }
+        if (tl_curLookProgRole == 1u || tl_curLookProgRole == 3u) {
+            GpuClarityOnPostDraw();
         }
         if (g_lookMatcher.IsCaptureArmed()) {
             LookCaptureOnPostDraw();
         }
         if (mirrorShadow && tl_curWorldProg) {
-            const auto& scfg = GetCachedShadowConfig();
+            const auto& scfg = tl_drawFrameCache.scfg ? *tl_drawFrameCache.scfg : GetCachedShadowConfig();
             const auto saved = BuildShadowPassState();
-            tl_worldShadow.MirrorCurrentProgramDraw(
+            const int64_t shT0 = IsRtWorldXrayActive() ? NowQpc() : 0;
+            tls.ws->MirrorCurrentProgramDraw(
                 tl_curWorldProg->locShadowPass,
                 tl_curWorldProg->locShadowBounds,
                 tl_curWorldProg->locShadowCamR,
                 scfg, saved, GetSyncedGlCache(),
                 [&]() { g_origGlDrawElements(mode, count, type, indices); },
                 tl_curWorldProg->locShadowPt, true, mirrorEntX, mirrorEntZ);
+            if (shT0 != 0) {
+                const int64_t shT1 = NowQpc();
+                if (shT1 > shT0) tl_rtShUnbQpc += (shT1 - shT0);
+                ++tl_rtShUnbCnt;
+            }
         }
         if (mirrorRefl && tl_curWorldProg) {
-            const auto& rcfg = GetCachedWaterReflConfig();
+            const auto& rcfg = tl_drawFrameCache.rcfg ? *tl_drawFrameCache.rcfg : GetCachedWaterReflConfig();
             const auto saved = BuildShadowPassState();
-            tl_waterRefl.MirrorCurrentProgramDraw(
+            tls.wr->MirrorCurrentProgramDraw(
                 tl_curWorldProg->locShadowPass,
                 tl_curWorldProg->locShadowBounds,
                 tl_curWorldProg->locShadowCamR,
@@ -9055,6 +11881,7 @@ static void WINAPI HookGlDrawElements(uint32_t mode, int32_t count, uint32_t typ
 static void WINAPI HookGlBindFramebuffer(uint32_t target, uint32_t framebuffer) {
     StampRtFrameStart();
     FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    CommitLazyBatchBindings();
     if ((target == 0x8D40u /*GL_FRAMEBUFFER*/ || target == 0x8CA9u /*GL_DRAW_FRAMEBUFFER*/) &&
         g_combatImpact.IsEnabled()) {
         SyncWorldShadowEngine();
@@ -9067,17 +11894,21 @@ static void WINAPI HookGlBindFramebuffer(uint32_t target, uint32_t framebuffer) 
     if (target == 0x8D40u /*GL_FRAMEBUFFER*/ || target == 0x8CA9u /*GL_DRAW_FRAMEBUFFER*/) {
         tl_curBoundFbo = framebuffer;
     }
+    if (target == 0x8D40u /*GL_FRAMEBUFFER*/ || target == 0x8CA8u /*GL_READ_FRAMEBUFFER*/) {
+        tl_curReadFbo = framebuffer;
+    }
 }
 
 static void WINAPI HookGlDeleteFramebuffers(int32_t n, const uint32_t* framebuffers) {
+    InvalidateFboCompletenessCache();
     if (tl_spriteBatcher.HasPending()) {
         FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
     }
-    if (n > 0 && framebuffers != nullptr && tl_curBoundFbo != 0u) {
+    if (n > 0 && framebuffers != nullptr && (tl_curBoundFbo != 0u || tl_curReadFbo != 0u)) {
         for (int32_t i = 0; i < n; ++i) {
-            if (framebuffers[i] != 0u && framebuffers[i] == tl_curBoundFbo) {
-                tl_curBoundFbo = 0u;
-                break;
+            if (framebuffers[i] != 0u) {
+                if (framebuffers[i] == tl_curBoundFbo) tl_curBoundFbo = 0u;
+                if (framebuffers[i] == tl_curReadFbo)  tl_curReadFbo  = 0u;
             }
         }
     }
@@ -9088,8 +11919,66 @@ static void WINAPI HookGlDeleteFramebuffers(int32_t n, const uint32_t* framebuff
     }
 }
 
+static uint32_t WINAPI HookGlCheckFramebufferStatus(uint32_t target) {
+    auto orig = g_origGlCheckFramebufferStatus ? g_origGlCheckFramebufferStatus : g_fnGlCheckFramebufferStatus;
+    if (!orig) return 0u;
+    if (g_fboCompleteCacheHooksReady.load(std::memory_order_relaxed) &&
+        (target == 0x8D40u /*GL_FRAMEBUFFER*/ || target == 0x8CA9u /*GL_DRAW_FRAMEBUFFER*/ || target == 0x8CA8u /*GL_READ_FRAMEBUFFER*/)) {
+        const uint32_t logicalFbo = (target == 0x8CA8u) ? tl_curReadFbo : tl_curBoundFbo;
+        const uint32_t keyFbo = (logicalFbo == 0u && GetDxgiFlip().IsActive()) ? GetDxgiFlip().OffscreenFbo() : logicalFbo;
+        for (uint32_t i = 0u; i < tl_fboCompleteCount; ++i) {
+            if (tl_fboCompleteCache[i].valid && tl_fboCompleteCache[i].fbo == keyFbo) {
+                g_fboChkSkipped.fetch_add(1ULL, std::memory_order_relaxed);
+                return 0x8CD5u /*GL_FRAMEBUFFER_COMPLETE*/;
+            }
+        }
+        const uint32_t status = orig(target);
+        if (status == 0x8CD5u /*GL_FRAMEBUFFER_COMPLETE*/) {
+            if (tl_fboCompleteCount < kFboCompleteCacheCap) {
+                tl_fboCompleteCache[tl_fboCompleteCount++] = FboCompleteCacheEntry{ keyFbo, true };
+            } else {
+                tl_fboCompleteCache[tl_fboCompleteCursor % kFboCompleteCacheCap] = FboCompleteCacheEntry{ keyFbo, true };
+                ++tl_fboCompleteCursor;
+            }
+        }
+        return status;
+    }
+    return orig(target);
+}
+
+static void WINAPI HookGlFramebufferTexture2D(uint32_t target, uint32_t attachment, uint32_t textarget,
+                                              uint32_t texture, int32_t level) {
+    InvalidateFboCompletenessCache();
+    auto orig = g_origGlFramebufferTexture2D ? g_origGlFramebufferTexture2D : g_fnGlFramebufferTexture2D;
+    if (orig) orig(target, attachment, textarget, texture, level);
+}
+
+static void WINAPI HookGlFramebufferRenderbuffer(uint32_t target, uint32_t attachment,
+                                                 uint32_t renderbuffertarget, uint32_t renderbuffer) {
+    InvalidateFboCompletenessCache();
+    auto orig = g_origGlFramebufferRenderbuffer ? g_origGlFramebufferRenderbuffer : g_fnGlFramebufferRenderbuffer;
+    if (orig) orig(target, attachment, renderbuffertarget, renderbuffer);
+}
+
+static void WINAPI HookGlDeleteRenderbuffers(int32_t n, const uint32_t* renderbuffers) {
+    InvalidateFboCompletenessCache();
+    auto orig = g_origGlDeleteRenderbuffers ? g_origGlDeleteRenderbuffers : g_fnGlDeleteRenderbuffers;
+    if (orig) orig(n, renderbuffers);
+}
+
+static void WINAPI HookGlRenderbufferStorage(uint32_t target, uint32_t internalformat, int32_t width, int32_t height) {
+    InvalidateFboCompletenessCache();
+    auto orig = g_origGlRenderbufferStorage ? g_origGlRenderbufferStorage : g_fnGlRenderbufferStorage;
+    if (orig) orig(target, internalformat, width, height);
+}
+
 static void WINAPI HookGlGetIntegerv(uint32_t pname, int32_t* params) {
     if (!g_fnGlGetIntegerv) return;
+    if (pname >= 0x0B91u && pname <= 0x0B98u && IsGlCacheOperational()) {
+        CommitDeferredStencilState(GetSyncedGlCache());
+    } else if (pname == 0x8894u || pname == 0x8895u || pname == 0x8069u || pname == 0x84E0u) {
+        CommitLazyBatchBindings();
+    }
     g_fnGlGetIntegerv(pname, params);
     if (params && (pname == 0x8CA6u /*GL_FRAMEBUFFER_BINDING*/ || pname == 0x8CAAu /*GL_READ_FRAMEBUFFER_BINDING*/)) {
         const uint32_t offFbo = GetDxgiFlip().OffscreenFbo();
@@ -9102,6 +11991,9 @@ static void WINAPI HookGlGetIntegerv(uint32_t pname, int32_t* params) {
 static void WINAPI HookGlClear(uint32_t mask) {
     StampRtFrameStart();
     FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    if ((mask & 0x0400u /*GL_STENCIL_BUFFER_BIT*/) != 0u && IsGlCacheOperational()) {
+        CommitDeferredStencilMask(GetSyncedGlCache());
+    }
     if (tl_curBoundFbo == 0u && (mask & 0x4000u /*GL_COLOR_BUFFER_BIT*/) != 0u && GetDxgiFlip().IsActive()) {
         GetDxgiFlip().EnsureSizeForCurrentWindow();
     }
@@ -9124,21 +12016,151 @@ static void WINAPI HookGlFinish() {
     }
 }
 
-// Split-peek GlStateCache dedup for stencil & polygon-offset calls:
-//   - DST only imports glStencilFunc/Mask/Op (never *Separate), and neither WorldShadow nor WaterRefl
-//     mutates stencil func/mask/op. ResetBindingsOnly() clears all stencil state on every SwapBuffers
-//     and eglMakeCurrent (immune to Steam/RTSS overlays). Eliminates ~932k redundant sn flushes!
+static uint32_t WINAPI HookGlGetError() {
+    if (g_nativeGlActive.load(std::memory_order_relaxed) &&
+        (tl_inAsyncTexJob || g_inGameplay.load(std::memory_order_relaxed) != 0)) {
+        g_glErrSkipped.fetch_add(1ULL, std::memory_order_relaxed);
+        return 0u; // GL_NO_ERROR — eliminates synchronous NVIDIA pipeline drain on per-upload/per-frame glGetError()
+    }
+    return g_origGlGetError ? g_origGlGetError() : (g_fnGlGetError ? g_fnGlGetError() : 0u);
+}
+
+// OpenGL ES 2.0 / 4.6 Spec-Exact Lazy Stencil Commit + GlStateCache Dedup (Spec §4.1.5):
+//   - Defers glStencilFunc / glStencilMask / glStencilOp with ZERO SpriteBatcher flush and ZERO
+//     driver call whenever GL_STENCIL_TEST == 0 OR when GL_STENCIL_TEST == 1 and the state change
+//     is mathematically a 100% no-op on draws (op==KEEP/KEEP/KEEP -> wmask inert; wmask==0 -> op
+//     inert; GL_ALWAYS->GL_ALWAYS with writes disabled -> ref/fmask inert).
+//   - Commits exact deferred state right before any active stencil transition, glEnable(STENCIL),
+//     glClear(STENCIL), glGetIntegerv(STENCIL_*), SwapBuffers, or MakeCurrent!
+static inline void LogStencilFlushDiagOnce(const char* kind, const hs_gl_cache::ThreadState& st,
+                                           uint32_t a, int32_t b, uint32_t c) noexcept {
+    static std::atomic<uint32_t> s_diagCnt{0u};
+    if (!tl_spriteBatcher.HasPending()) return;
+    if (g_rtSwapSeq.load(std::memory_order_relaxed) < 400u) return;
+    if (s_diagCnt.load(std::memory_order_relaxed) >= 4u) return;
+    if (s_diagCnt.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+        LogMsg("[DIAG][STENCIL_FLUSH] %s(0x%X,%d,0x%X) | cap=%d curFn=0x%X/%d/0x%X curWm=0x%X curOp=0x%X/0x%X/0x%X prog=%u",
+               kind, a, b, c, static_cast<int>(st.caps[4]),
+               st.stencilFunc, st.stencilRef, st.stencilFuncMask, st.stencilWriteMask,
+               st.stencilOpFail, st.stencilOpZfail, st.stencilOpZpass,
+               tl_spriteBatcher.CurrentProgramId());
+    }
+}
+
 static void WINAPI HookGlStencilFunc(uint32_t func, int32_t ref, uint32_t mask) {
     if (!g_origGlStencilFunc) return;
+    uint32_t cachedOpZpass = 0u;
     if (IsGlCacheOperational()) {
         auto& st = GetSyncedGlCache();
         const bool redundant = st.IsStencilFuncRedundant(func, ref, mask);
         FlushGlCacheStatsIfReady(st);
         if (redundant) return;
+        if (IsStencilTestDisabledSynced(st)) {
+            st.DeferStencilFunc(func, ref, mask);
+            return;
+        }
+        SyncStencilStateIfUnknown(st);
+        if (st.CanDeferStencilFuncWhenEnabled(func)) {
+            st.DeferStencilFunc(func, ref, mask);
+            return;
+        }
+        cachedOpZpass = st.stencilOpValid ? st.stencilOpZpass : 0u;
+        LogStencilFlushDiagOnce("Func", st, func, ref, mask);
+    }
+    const auto& tls = HotTls();
+    const bool sbWasPending = tls.sb->HasPending();
+    uint32_t flushProgId = 0u;
+    int64_t pendingSprites = 1;
+    if (sbWasPending) {
+        flushProgId = tls.sb->CurrentProgramId();
+        const auto sbBefore = tls.sb->GetStats();
+        if (tl_sbStencilPrevFlushes == sbBefore.flushes && sbBefore.drawsBatched >= tl_sbStencilPrevDraws) {
+            pendingSprites = std::max<int64_t>(1, sbBefore.drawsBatched - tl_sbStencilPrevDraws);
+        }
     }
     FlushSpriteBatchStateCause(StateFlushCause::Stencil);
+    if (sbWasPending) {
+        const auto sbAfter = tls.sb->GetStats();
+        tl_sbStencilPrevFlushes = sbAfter.flushes;
+        tl_sbStencilPrevDraws   = sbAfter.drawsBatched;
+
+        struct StencilSrcEntry {
+            uint32_t progId;
+            uint32_t func;
+            uint32_t opZpass;
+            int32_t  lastRef;
+            uint32_t flushCount;
+            uint64_t pendingSpritesSum;
+        };
+        static thread_local StencilSrcEntry tl_stencilSrcTable[8]{};
+        static thread_local uint32_t tl_stencilSrcUsed = 0u;
+        static thread_local uint32_t tl_stencilSrcTotal = 0u;
+        static thread_local int64_t  tl_stencilSrcLastReportQpc = 0;
+
+        uint32_t matchIdx = 8u;
+        for (uint32_t i = 0u; i < tl_stencilSrcUsed; ++i) {
+            if (tl_stencilSrcTable[i].progId == flushProgId &&
+                tl_stencilSrcTable[i].func == func &&
+                tl_stencilSrcTable[i].opZpass == cachedOpZpass) {
+                matchIdx = i;
+                break;
+            }
+        }
+        if (matchIdx < 8u) {
+            tl_stencilSrcTable[matchIdx].lastRef = ref;
+            ++tl_stencilSrcTable[matchIdx].flushCount;
+            tl_stencilSrcTable[matchIdx].pendingSpritesSum += static_cast<uint64_t>(pendingSprites);
+        } else if (tl_stencilSrcUsed < 8u) {
+            tl_stencilSrcTable[tl_stencilSrcUsed++] = StencilSrcEntry{
+                flushProgId, func, cachedOpZpass, ref, 1u, static_cast<uint64_t>(pendingSprites)
+            };
+        }
+        ++tl_stencilSrcTotal;
+
+        const int64_t nowQpc = NowQpc();
+        if (tl_stencilSrcLastReportQpc == 0) {
+            tl_stencilSrcLastReportQpc = nowQpc;
+        } else if (g_qpcFreq > 0 && (nowQpc - tl_stencilSrcLastReportQpc) >= g_qpcFreq * 10) {
+            if (tl_stencilSrcTotal >= 1000u && tl_stencilSrcUsed > 0u) {
+                uint32_t order[8]{0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u};
+                for (uint32_t i = 0u; i < tl_stencilSrcUsed; ++i) {
+                    for (uint32_t j = i + 1u; j < tl_stencilSrcUsed; ++j) {
+                        if (tl_stencilSrcTable[order[j]].flushCount > tl_stencilSrcTable[order[i]].flushCount) {
+                            const uint32_t tmp = order[i];
+                            order[i] = order[j];
+                            order[j] = tmp;
+                        }
+                    }
+                }
+                char topBuf[512]{};
+                size_t pos = 0u;
+                const uint32_t limit = std::min<uint32_t>(tl_stencilSrcUsed, 4u);
+                for (uint32_t k = 0u; k < limit; ++k) {
+                    const auto& e = tl_stencilSrcTable[order[k]];
+                    const double avgSp = (e.flushCount > 0u)
+                        ? (static_cast<double>(e.pendingSpritesSum) / static_cast<double>(e.flushCount))
+                        : 0.0;
+                    const int n = snprintf(topBuf + pos, sizeof(topBuf) - pos,
+                                           "%sp=%u fn=0x%X opZ=0x%X ref=%d cnt=%u avgSp=%.1f",
+                                           (k > 0u ? " | " : ""),
+                                           e.progId, e.func, e.opZpass, e.lastRef, e.flushCount, avgSp);
+                    if (n <= 0) break;
+                    pos += static_cast<size_t>(n);
+                    if (pos + 4u >= sizeof(topBuf)) break;
+                }
+                LogMsg("[DIAG][STENCIL_SRC] 10sFlushes=%u top=[%s]", tl_stencilSrcTotal, topBuf);
+            }
+            std::memset(tl_stencilSrcTable, 0, sizeof(tl_stencilSrcTable));
+            tl_stencilSrcUsed = 0u;
+            tl_stencilSrcTotal = 0u;
+            tl_stencilSrcLastReportQpc = nowQpc;
+        }
+    }
     if (IsGlCacheOperational()) {
-        GetSyncedGlCache().RecordStencilFunc(func, ref, mask);
+        auto& st = GetSyncedGlCache();
+        CommitDeferredStencilMask(st);
+        CommitDeferredStencilOp(st);
+        st.RecordStencilFunc(func, ref, mask);
     }
     g_origGlStencilFunc(func, ref, mask);
 }
@@ -9150,10 +12172,23 @@ static void WINAPI HookGlStencilMask(uint32_t mask) {
         const bool redundant = st.IsStencilMaskRedundant(mask);
         FlushGlCacheStatsIfReady(st);
         if (redundant) return;
+        if (IsStencilTestDisabledSynced(st)) {
+            st.DeferStencilMask(mask);
+            return;
+        }
+        SyncStencilStateIfUnknown(st);
+        if (st.CanDeferStencilMaskWhenEnabled()) {
+            st.DeferStencilMask(mask);
+            return;
+        }
+        LogStencilFlushDiagOnce("Mask", st, mask, 0, 0);
     }
     FlushSpriteBatchStateCause(StateFlushCause::Stencil);
     if (IsGlCacheOperational()) {
-        GetSyncedGlCache().RecordStencilMask(mask);
+        auto& st = GetSyncedGlCache();
+        CommitDeferredStencilFunc(st);
+        CommitDeferredStencilOp(st);
+        st.RecordStencilMask(mask);
     }
     g_origGlStencilMask(mask);
 }
@@ -9165,10 +12200,23 @@ static void WINAPI HookGlStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass
         const bool redundant = st.IsStencilOpRedundant(fail, zfail, zpass);
         FlushGlCacheStatsIfReady(st);
         if (redundant) return;
+        if (IsStencilTestDisabledSynced(st)) {
+            st.DeferStencilOp(fail, zfail, zpass);
+            return;
+        }
+        SyncStencilStateIfUnknown(st);
+        if (st.CanDeferStencilOpWhenEnabled()) {
+            st.DeferStencilOp(fail, zfail, zpass);
+            return;
+        }
+        LogStencilFlushDiagOnce("Op", st, fail, static_cast<int32_t>(zfail), zpass);
     }
     FlushSpriteBatchStateCause(StateFlushCause::Stencil);
     if (IsGlCacheOperational()) {
-        GetSyncedGlCache().RecordStencilOp(fail, zfail, zpass);
+        auto& st = GetSyncedGlCache();
+        CommitDeferredStencilFunc(st);
+        CommitDeferredStencilMask(st);
+        st.RecordStencilOp(fail, zfail, zpass);
     }
     g_origGlStencilOp(fail, zfail, zpass);
 }
@@ -9188,24 +12236,195 @@ static void WINAPI HookGlPolygonOffset(float factor, float units) {
     g_origGlPolygonOffset(factor, units);
 }
 
+static thread_local bool tl_inLightMapRender = false;
+
+static void RecordPboUploadDiag(uint32_t internalformat, int32_t width, int32_t height, uint64_t bytes) noexcept {
+    static std::atomic<uint32_t> s_pboTopLogs{0u};
+    if (s_pboTopLogs.load(std::memory_order_relaxed) >= 3u) return;
+    struct PboDiagBucket {
+        uint32_t fmt   = 0u;
+        int32_t  w     = 0;
+        int32_t  h     = 0;
+        uint32_t count = 0u;
+        uint64_t bytes = 0ULL;
+    };
+    static constexpr uint32_t kBuckets = 8u;
+    static thread_local PboDiagBucket tl_buckets[kBuckets]{};
+    static thread_local uint32_t      tl_bucketUsed   = 0u;
+    static thread_local uint32_t      tl_totalUploads = 0u;
+    static thread_local uint64_t      tl_totalBytes   = 0ULL;
+    static thread_local int64_t       tl_winStartQpc  = 0;
+
+    const int64_t now = NowQpc();
+    if (tl_winStartQpc == 0) {
+        tl_winStartQpc = now;
+    }
+
+    ++tl_totalUploads;
+    tl_totalBytes += bytes;
+
+    uint32_t match = kBuckets;
+    for (uint32_t i = 0u; i < tl_bucketUsed; ++i) {
+        if (tl_buckets[i].fmt == internalformat && tl_buckets[i].w == width && tl_buckets[i].h == height) {
+            match = i;
+            break;
+        }
+    }
+    if (match >= kBuckets && tl_bucketUsed < kBuckets) {
+        match = tl_bucketUsed++;
+        tl_buckets[match] = PboDiagBucket{ internalformat, width, height, 0u, 0ULL };
+    } else if (match >= kBuckets) {
+        uint32_t minIdx = 0u;
+        for (uint32_t i = 1u; i < kBuckets; ++i) {
+            if (tl_buckets[i].count < tl_buckets[minIdx].count) minIdx = i;
+        }
+        match = minIdx;
+        tl_buckets[match] = PboDiagBucket{ internalformat, width, height, 0u, 0ULL };
+    }
+    tl_buckets[match].count += 1u;
+    tl_buckets[match].bytes += bytes;
+
+    if (g_qpcFreq > 0 && (now - tl_winStartQpc) >= g_qpcFreq * 10) {
+        if (tl_totalUploads >= 200u && s_pboTopLogs.fetch_add(1u, std::memory_order_relaxed) < 3u) {
+            char topBuf[256]{};
+            size_t pos = 0u;
+            bool used[kBuckets]{};
+            for (uint32_t k = 0u; k < 3u && k < tl_bucketUsed; ++k) {
+                uint32_t best = kBuckets;
+                for (uint32_t i = 0u; i < tl_bucketUsed; ++i) {
+                    if (!used[i] && (best >= kBuckets || tl_buckets[i].count > tl_buckets[best].count)) {
+                        best = i;
+                    }
+                }
+                if (best >= kBuckets) break;
+                used[best] = true;
+                const auto& b = tl_buckets[best];
+                const int n = snprintf(topBuf + pos, sizeof(topBuf) - pos,
+                                       "%s0x%X:%dx%d=%ux(%.1fMB)",
+                                       (pos > 0u ? ", " : ""), b.fmt, b.w, b.h, b.count,
+                                       static_cast<double>(b.bytes) / (1024.0 * 1024.0));
+                if (n <= 0) break;
+                pos += static_cast<size_t>(n);
+                if (pos + 8u >= sizeof(topBuf)) break;
+            }
+            LogMsg("[DIAG][PBO_TOP] total=%u (%.1fMB/10s) top=[%s]",
+                   tl_totalUploads, static_cast<double>(tl_totalBytes) / (1024.0 * 1024.0),
+                   topBuf[0] ? topBuf : "none");
+        }
+        tl_bucketUsed   = 0u;
+        tl_totalUploads = 0u;
+        tl_totalBytes   = 0ULL;
+        tl_winStartQpc  = now;
+    }
+}
+
 static void WINAPI HookGlTexImage2D(uint32_t target, int32_t level, int32_t internalformat, int32_t width,
                                     int32_t height, int32_t border, uint32_t format, uint32_t type, const void* pixels) {
+    if (level == 0) {
+        InvalidateFboCompletenessCache();
+    }
     FlushSpriteBatchStateCause(StateFlushCause::TexImg);
-    if (g_origGlTexImage2D) {
-        // Desktop GL Compatibility spec: GL_BGRA_EXT (0x80E1) is valid as `format`,
-        // while `internalformat` must be GL_RGBA (0x1908) on strict desktop GL drivers (AMD/Intel).
-        if (internalformat == 0x80E1 && g_nativeGlActive.load(std::memory_order_acquire)) {
-            internalformat = 0x1908;
+    CommitLazyBatchBindings();
+    if (!g_origGlTexImage2D) return;
+    if (target == 0x0DE1u) {
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        if (boundTex != 0u) {
+            tl_spriteBatcher.OnTexImageMutated(boundTex, pixels == nullptr);
         }
+    }
+    const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
+
+    // 16-bit half-float HDR LightMap (RGBA16F) upgrade inside LightMap::InitRenderTarget (Native OpenGL only)
+    if (tl_inLightMapRender && isNat &&
+        target == 0x0DE1u && level == 0 && pixels == nullptr && width >= 128 && height >= 128 &&
+        (internalformat == 0x1908 || internalformat == 0x1907 || internalformat == 0x80E1)) {
+        if (g_visualHdrLightmap.load(std::memory_order_relaxed) &&
+            !g_visualHdrLightmapFailed.load(std::memory_order_relaxed)) {
+            if (g_fnGlGetError) {
+                while (g_fnGlGetError() != 0u) {}
+            }
+            g_origGlTexImage2D(target, 0, 0x881A /*GL_RGBA16F*/, width, height, 0,
+                               0x1908u /*GL_RGBA*/, 0x140Bu /*GL_HALF_FLOAT*/, nullptr);
+            const uint32_t glErr = g_fnGlGetError ? g_fnGlGetError() : 0u;
+            if (glErr == 0u) {
+                g_visualHdrLightmapActive.store(true, std::memory_order_relaxed);
+                LogMsg("[VISUAL][HDR_LM] Upgraded LightMap RT -> RGBA16F (%dx%d)", width, height);
+                return;
+            }
+            g_visualHdrLightmapFailed.store(true, std::memory_order_relaxed);
+            g_visualHdrLightmapActive.store(false, std::memory_order_relaxed);
+            LogMsg("[VISUAL][HDR_LM] RGBA16F unavailable (glErr=0x%X) -> falling back cleanly to RGBA8", glErr);
+        } else {
+            g_visualHdrLightmapActive.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // Desktop GL Compatibility spec: GL_BGRA_EXT (0x80E1) is valid as `format`,
+    // while `internalformat` must be GL_RGBA (0x1908) on strict desktop GL drivers (AMD/Intel).
+    if (internalformat == 0x80E1 && isNat) {
+        internalformat = 0x1908;
+    }
+    const int64_t glT0 = tl_inAsyncTexJob ? NowQpc() : 0;
+    bool usedPbo = false;
+    if (isNat && pixels != nullptr) {
+        SyncPboTexRing();
+        usedPbo = tl_pboTexRing.TryUploadTexImage2D(
+            g_origGlTexImage2D, target, level, internalformat, width, height, border, format, type, pixels);
+    }
+    if (!usedPbo) {
         g_origGlTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+    } else if (width > 0 && height > 0) {
+        const uint64_t approxBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ULL;
+        RecordPboUploadDiag(static_cast<uint32_t>(internalformat), width, height, approxBytes);
+    }
+    if (glT0 != 0) {
+        const int64_t glT1 = NowQpc();
+        if (glT1 > glT0) tl_texJobGlQpc += (glT1 - glT0);
+        ++tl_texJobGlCalls;
+        if (usedPbo) ++tl_texJobPboHits;
+        if (width > tl_texJobMaxW) tl_texJobMaxW = width;
+        if (height > tl_texJobMaxH) tl_texJobMaxH = height;
+        tl_texJobFmt = static_cast<uint32_t>(internalformat);
     }
 }
 
 static void WINAPI HookGlCompressedTexImage2D(uint32_t target, int32_t level, uint32_t internalformat, int32_t width,
                                               int32_t height, int32_t border, int32_t imageSize, const void* data) {
+    if (level == 0) {
+        InvalidateFboCompletenessCache();
+    }
     FlushSpriteBatchStateCause(StateFlushCause::TexImg);
+    CommitLazyBatchBindings();
+    if (target == 0x0DE1u) {
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        if (boundTex != 0u) {
+            tl_spriteBatcher.OnTexImageMutated(boundTex, data == nullptr);
+        }
+    }
     if (g_origGlCompressedTexImage2D) {
-        g_origGlCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+        const int64_t glT0 = tl_inAsyncTexJob ? NowQpc() : 0;
+        bool usedPbo = false;
+        if (data != nullptr && imageSize > 0 && g_nativeGlActive.load(std::memory_order_acquire)) {
+            SyncPboTexRing();
+            usedPbo = tl_pboTexRing.TryUploadCompressedTexImage2D(
+                g_origGlCompressedTexImage2D, target, level, internalformat, width, height, border, imageSize, data);
+        }
+        if (!usedPbo) {
+            g_origGlCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+        } else {
+            RecordPboUploadDiag(internalformat, width, height, static_cast<uint64_t>(imageSize));
+        }
+        if (glT0 != 0) {
+            const int64_t glT1 = NowQpc();
+            if (glT1 > glT0) tl_texJobGlQpc += (glT1 - glT0);
+            ++tl_texJobGlCalls;
+            if (usedPbo) ++tl_texJobPboHits;
+            if (width > tl_texJobMaxW) tl_texJobMaxW = width;
+            if (height > tl_texJobMaxH) tl_texJobMaxH = height;
+            tl_texJobFmt = internalformat;
+        }
     }
 }
 
@@ -9263,6 +12482,7 @@ static void EraseProgSlotLocked(void* ctx, uint32_t program) {
 }
 
 static void WINAPI HookGlLinkProgram(uint32_t program) {
+    g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
     if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
     tl_spriteBatcher.OnDeleteOrLinkProgram(program);
     if (tl_uiBatcher.HasPending()) SyncUiBatcher();
@@ -9336,6 +12556,7 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
             binfo.locColourXform = g_fnGlGetUniformLocation(program, "COLOUR_XFORM");
             binfo.locFloatParams = g_fnGlGetUniformLocation(program, "FLOAT_PARAMS");
             binfo.locParams      = g_fnGlGetUniformLocation(program, "PARAMS");
+            binfo.locOceanBlend  = g_fnGlGetUniformLocation(program, "OCEAN_BLEND_PARAMS");
             binfo.locPos2dUv     = g_fnGlGetAttribLocation(program, "POS2D_UV");
             binfo.locBatchWpos   = g_fnGlGetAttribLocation(program, "HS_BATCH_WPOS");
             binfo.locBatchCMult  = g_fnGlGetAttribLocation(program, "HS_BATCH_CMULT");
@@ -9350,6 +12571,9 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
                 binfo.locBatchTex[s] = g_fnGlGetUniformLocation(program, uName);
                 if (binfo.locBatchTex[s] >= 0) ++validTexLocs;
             }
+            binfo.progMaxTexSlots = (binfo.locBatchTex[8] >= 0 && validTexLocs >= 16)
+                ? hs_sprite_batch::kMaxBatchTexSlots
+                : hs_sprite_batch::kLegacyBatchTexSlots;
             binfo.eligible = (binfo.locMatrixW >= 0 &&
                               binfo.locPos2dUv == 0 &&
                               binfo.locBatchWpos >= 0 &&
@@ -9358,13 +12582,19 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
                               binfo.locSampler0 >= 0 &&
                               binfo.locSampler1 >= 0);
             if (binfo.eligible) {
+                auto gpit = tl_sbGpuProgMask.find(program);
+                auto wroleIt = tl_progWorldRole.find(program);
+                binfo.hasGpuDriven = (gpit != tl_sbGpuProgMask.end() && (gpit->second & 3u) == 3u);
+                binfo.isBloomPass  = (gpit != tl_sbGpuProgMask.end() && (gpit->second & 12u) != 0u) ||
+                                     (wroleIt != tl_progWorldRole.end() && wroleIt->second == WorldProgRole::AnimBloom);
+                binfo.hasParamsAbsorption = binfo.hasGpuDriven && !binfo.isBloomPass && (binfo.locParams >= 0);
                 tl_sbProgs[program] = binfo;
                 const uint32_t total = g_sbProgsLinked.fetch_add(1, std::memory_order_relaxed) + 1;
-                LogMsg("[PERF][SBATCH] Linked batchable anim program #%u (prog=%u, pos=%d wpos=%d cm=%d ca=%d matW=%d cx=%d act=%d texLocs=%d triple=%d)",
+                LogMsg("[PERF][SBATCH] Linked batchable anim program #%u (prog=%u, pos=%d wpos=%d cm=%d ca=%d matW=%d cx=%d act=%d texLocs=%d triple=%d gpu=%d bloom=%d)",
                        total, program, binfo.locPos2dUv, binfo.locBatchWpos,
                        binfo.locBatchCMult, binfo.locBatchCAdd,
                        binfo.locMatrixW, binfo.locColourXform, binfo.locBatchActive, validTexLocs,
-                       binfo.locSampler5 >= 0 ? 1 : 0);
+                       binfo.locSampler5 >= 0 ? 1 : 0, binfo.hasGpuDriven ? 1 : 0, binfo.isBloomPass ? 1 : 0);
             } else {
                 tl_sbProgs.erase(program);
             }
@@ -9424,6 +12654,8 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
         tl_sbProgs.erase(program);
         tl_uiProgs.erase(program);
     }
+    ++tl_sbProgsGen;
+    ++tl_uiProgsGen;
 
     WorldProgRole wRole = WorldProgRole::None;
     if (linkedOk && program != 0u && g_fnGlGetUniformLocation) {
@@ -9480,6 +12712,7 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
         if (tl_curBoundProg == program) tl_curWorldProg = nullptr;
         tl_worldProgs.erase(program);
     }
+    ++tl_worldProgsGen;
 
     bool newlyLinkedHd2d = false;
     AcquireSRWLockExclusive(&g_hd2dProgLock);
@@ -9511,6 +12744,7 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
         while (cur > 0 && !g_hd2dProgsLinked.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed)) {}
     }
     ReleaseSRWLockExclusive(&g_hd2dProgLock);
+    g_hd2dProgLayoutGen.fetch_add(1u, std::memory_order_release);
 
     if (newlyLinkedHd2d) {
         const uint32_t total = g_hd2dProgsLinked.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9566,60 +12800,179 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
             tl_extProf.progSlotMap.erase(prevIt);
         }
     }
+    ++tl_extProfGen;
 }
 
+struct UseProgCacheEntry {
+    void*                           ctx           = nullptr;
+    uint32_t                        program       = 0u;
+    uint32_t                        hd2dLayoutGen = 0u;
+    uint32_t                        sbGen         = 0u;
+    uint32_t                        uiGen         = 0u;
+    uint32_t                        worldGen      = 0u;
+    uint32_t                        extGen        = 0u;
+    int32_t                         extSlot       = -1;
+    bool                            progLinkedOk  = false;
+    bool                            hasHd2d       = false;
+    WorldProgRole                   slotRole      = WorldProgRole::None;
+    uint8_t                         lookProgRole  = 0u;
+    int32_t                         locP          = -1;
+    int32_t                         locS          = -1;
+    int32_t                         locT          = -1;
+    int32_t                         locSh         = -1;
+    int32_t                         locSh2        = -1;
+    int32_t                         locOc         = -1;
+    int32_t                         locOcPbr      = -1;
+    int32_t                         locSp         = -1;
+    int32_t                         locSd         = -1;
+    int32_t                         locDet        = -1;
+    int32_t                         locSplatPt[hs_world_shadow::kMaxPointShadowLights] = { -1, -1, -1 };
+    uint32_t                        slotLastGen   = 0u;
+    hs_sprite_batch::BatchProgInfo* sbInfo        = nullptr;
+    hs_ui_batch::UiProgInfo*        uiInfo        = nullptr;
+    WorldProgInfo*                  worldProg     = nullptr;
+};
+static thread_local UseProgCacheEntry tl_useProgCache[256]{};
+
 static void WINAPI HookGlUseProgram(uint32_t program) {
-    if (program > 0u && !tl_extProf.progSlotMap.empty()) {
-        auto eit = tl_extProf.progSlotMap.find(program);
-        tl_extProf.curExtSlot = (eit != tl_extProf.progSlotMap.end()) ? eit->second : -1;
-    } else {
-        tl_extProf.curExtSlot = -1;
-    }
-    void* const curCtx = tl_glCache.curContext;
+    tl_drawFrameCache.valid = false;
+    void* const curCtx = HotTls().glc->curContext;
     bool progLinkedOk = false;
     bool hasHd2d = false;
     WorldProgRole slotRole = WorldProgRole::None;
     int32_t locP = -1, locS = -1, locT = -1;
     int32_t locSh = -1, locSh2 = -1, locOc = -1, locOcPbr = -1, locSp = -1, locSd = -1, locDet = -1;
     int32_t locSplatPt[hs_world_shadow::kMaxPointShadowLights] = { -1, -1, -1 };
-    uint32_t slotLastGen = 0;
-
-    if (program > 0) {
-        AcquireSRWLockShared(&g_hd2dProgLock);
-        if (Hd2dProgSlot* slot = FindProgSlotLocked(curCtx, program)) {
-            progLinkedOk = slot->linkedOk;
-            hasHd2d      = slot->hasAny && slot->linkedOk;
-            slotRole     = slot->role;
-            locP         = slot->locParams;
-            locS         = slot->locSun;
-            locT         = slot->locTint;
-            locSh        = slot->locShade;
-            locSh2       = slot->locShade2;
-            locOc        = slot->locOcean;
-            locOcPbr     = slot->locOceanPbr;
-            locSp        = slot->locShadProj;
-            locSd        = slot->locShadDyn;
-            locDet       = slot->locDetail;
-            for (uint32_t si = 0u; si < hs_world_shadow::kMaxPointShadowLights; ++si) {
-                locSplatPt[si] = slot->locSplatPt[si];
-            }
-            slotLastGen  = slot->lastGen;
-        }
-        ReleaseSRWLockShared(&g_hd2dProgLock);
-    }
-
+    uint32_t slotLastGen = 0u;
     hs_sprite_batch::BatchProgInfo* sbInfo = nullptr;
     hs_ui_batch::UiProgInfo*        uiInfo = nullptr;
-    if (program > 0) {
-        auto it = tl_sbProgs.find(program);
-        if (it != tl_sbProgs.end() && it->second.eligible) {
-            sbInfo = &it->second;
-        } else {
-            auto uit = tl_uiProgs.find(program);
-            if (uit != tl_uiProgs.end() && uit->second.eligible && uit->second.ctx == curCtx) {
-                uiInfo = &uit->second;
+    WorldProgInfo*                  worldProg = nullptr;
+    uint8_t                         lookProgRole = 0u;
+    UseProgCacheEntry*              cacheEntry = nullptr;
+
+    if (program > 0u) {
+        UseProgCacheEntry& ce = tl_useProgCache[program & 255u];
+        const uint32_t curHd2dGen = g_hd2dProgLayoutGen.load(std::memory_order_acquire);
+        if (ce.program == program &&
+            ce.ctx == curCtx &&
+            ce.hd2dLayoutGen == curHd2dGen &&
+            ce.sbGen == tl_sbProgsGen &&
+            ce.uiGen == tl_uiProgsGen &&
+            ce.worldGen == tl_worldProgsGen &&
+            ce.extGen == tl_extProfGen) {
+            progLinkedOk = ce.progLinkedOk;
+            hasHd2d      = ce.hasHd2d;
+            slotRole     = ce.slotRole;
+            locP         = ce.locP;
+            locS         = ce.locS;
+            locT         = ce.locT;
+            locSh        = ce.locSh;
+            locSh2       = ce.locSh2;
+            locOc        = ce.locOc;
+            locOcPbr     = ce.locOcPbr;
+            locSp        = ce.locSp;
+            locSd        = ce.locSd;
+            locDet       = ce.locDet;
+            for (uint32_t si = 0u; si < hs_world_shadow::kMaxPointShadowLights; ++si) {
+                locSplatPt[si] = ce.locSplatPt[si];
             }
+            slotLastGen  = ce.slotLastGen;
+            sbInfo       = ce.sbInfo;
+            uiInfo       = ce.uiInfo;
+            worldProg    = ce.worldProg;
+            lookProgRole = ce.lookProgRole;
+            if (g_extProfCount.load(std::memory_order_relaxed) > 0u) {
+                tl_extProf.curExtSlot  = ce.extSlot;
+                tl_curExtProfSlotPlus1 = (ce.extSlot >= 0) ? static_cast<uint32_t>(ce.extSlot + 1) : 0u;
+            } else {
+                tl_curExtProfSlotPlus1 = 0u;
+            }
+        } else {
+            int32_t extSlot = -1;
+            if (!tl_extProf.progSlotMap.empty()) {
+                auto eit = tl_extProf.progSlotMap.find(program);
+                if (eit != tl_extProf.progSlotMap.end()) extSlot = eit->second;
+            }
+            if (g_extProfCount.load(std::memory_order_relaxed) > 0u) {
+                tl_extProf.curExtSlot  = extSlot;
+                tl_curExtProfSlotPlus1 = (extSlot >= 0) ? static_cast<uint32_t>(extSlot + 1) : 0u;
+            } else {
+                tl_curExtProfSlotPlus1 = 0u;
+            }
+
+            AcquireSRWLockShared(&g_hd2dProgLock);
+            if (Hd2dProgSlot* slot = FindProgSlotLocked(curCtx, program)) {
+                progLinkedOk = slot->linkedOk;
+                hasHd2d      = slot->hasAny && slot->linkedOk;
+                slotRole     = slot->role;
+                locP         = slot->locParams;
+                locS         = slot->locSun;
+                locT         = slot->locTint;
+                locSh        = slot->locShade;
+                locSh2       = slot->locShade2;
+                locOc        = slot->locOcean;
+                locOcPbr     = slot->locOceanPbr;
+                locSp        = slot->locShadProj;
+                locSd        = slot->locShadDyn;
+                locDet       = slot->locDetail;
+                for (uint32_t si = 0u; si < hs_world_shadow::kMaxPointShadowLights; ++si) {
+                    locSplatPt[si] = slot->locSplatPt[si];
+                }
+                slotLastGen  = slot->lastGen;
+            }
+            ReleaseSRWLockShared(&g_hd2dProgLock);
+
+            auto it = tl_sbProgs.find(program);
+            if (it != tl_sbProgs.end() && it->second.eligible) {
+                sbInfo = &it->second;
+            } else {
+                auto uit = tl_uiProgs.find(program);
+                if (uit != tl_uiProgs.end() && uit->second.eligible && uit->second.ctx == curCtx) {
+                    uiInfo = &uit->second;
+                }
+            }
+
+            auto wit = tl_worldProgs.find(program);
+            worldProg = (wit != tl_worldProgs.end()) ? &wit->second : nullptr;
+            auto lrit = tl_lookProgRole.find(program);
+            lookProgRole = (lrit != tl_lookProgRole.end()) ? lrit->second : 0u;
+
+            ce.ctx           = curCtx;
+            ce.program       = program;
+            ce.hd2dLayoutGen = curHd2dGen;
+            ce.sbGen         = tl_sbProgsGen;
+            ce.uiGen         = tl_uiProgsGen;
+            ce.worldGen      = tl_worldProgsGen;
+            ce.extGen        = tl_extProfGen;
+            ce.extSlot       = extSlot;
+            ce.progLinkedOk  = progLinkedOk;
+            ce.hasHd2d       = hasHd2d;
+            ce.slotRole      = slotRole;
+            ce.lookProgRole  = lookProgRole;
+            ce.locP          = locP;
+            ce.locS          = locS;
+            ce.locT          = locT;
+            ce.locSh         = locSh;
+            ce.locSh2        = locSh2;
+            ce.locOc         = locOc;
+            ce.locOcPbr      = locOcPbr;
+            ce.locSp         = locSp;
+            ce.locSd         = locSd;
+            ce.locDet        = locDet;
+            for (uint32_t si = 0u; si < hs_world_shadow::kMaxPointShadowLights; ++si) {
+                ce.locSplatPt[si] = locSplatPt[si];
+            }
+            ce.slotLastGen   = slotLastGen;
+            ce.sbInfo        = sbInfo;
+            ce.uiInfo        = uiInfo;
+            ce.worldProg     = worldProg;
         }
+        cacheEntry = &ce;
+    } else {
+        if (g_extProfCount.load(std::memory_order_relaxed) > 0u) {
+            tl_extProf.curExtSlot = -1;
+        }
+        tl_curExtProfSlotPlus1 = 0u;
     }
 
     // CRITICAL ORDERING: Flush any pending Sprite/UI batch BEFORE updating glCache.curProgram!
@@ -9628,19 +12981,15 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
     // and skipping subsequent glUseProgram calls.
     SyncSpriteBatcher();
     tl_spriteBatcher.OnUseProgram(program, sbInfo);
+    if (sbInfo == nullptr) {
+        CommitLazyBatchBindings();
+    }
     SyncUiBatcher();
     const bool uiDeferred = tl_uiBatcher.OnUseProgram(program, uiInfo);
 
-    tl_curBoundProg = program;
-    if (program > 0u) {
-        auto wit = tl_worldProgs.find(program);
-        tl_curWorldProg = (wit != tl_worldProgs.end()) ? &wit->second : nullptr;
-        auto lrit = tl_lookProgRole.find(program);
-        tl_curLookProgRole = (lrit != tl_lookProgRole.end()) ? lrit->second : 0u;
-    } else {
-        tl_curWorldProg = nullptr;
-        tl_curLookProgRole = 0u;
-    }
+    tl_curBoundProg    = program;
+    tl_curWorldProg    = worldProg;
+    tl_curLookProgRole = lookProgRole;
 
     if (uiDeferred) {
         // UI program switch was absorbed without calling glUseProgram on the GPU:
@@ -9734,6 +13083,19 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
                 slot->lastGen = curGen;
             }
             ReleaseSRWLockExclusive(&g_hd2dProgLock);
+            if (cacheEntry) {
+                cacheEntry->slotLastGen = curGen;
+            }
+        }
+    }
+    if (!uiDeferred) {
+        if (slotRole == WorldProgRole::AnimBloom || (sbInfo != nullptr && sbInfo->isBloomPass)) {
+            const auto& scfg = GetCachedShadowConfig();
+            const bool wsActive = g_worldShadowReady.load(std::memory_order_acquire) &&
+                                  !g_worldShadowFailed.load(std::memory_order_acquire);
+            tl_bloomLegacyShadowActive = (scfg.projOn > 0.5f) && !wsActive;
+        } else {
+            tl_bloomLegacyShadowActive = false;
         }
     }
     if (!uiDeferred && tl_curWorldProg) {
@@ -9747,9 +13109,14 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
 }
 
 static void WINAPI HookGlDeleteProgram(uint32_t program) {
+    g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
+    if (tl_curBoundProg == program) {
+        tl_drawFrameCache.valid = false;
+    }
     if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
     tl_spriteBatcher.OnDeleteOrLinkProgram(program);
     tl_sbProgs.erase(program);
+    tl_sbGpuProgMask.erase(program);
     if (tl_uiBatcher.HasPending()) SyncUiBatcher();
     tl_uiBatcher.OnDeleteOrLinkProgram(program);
     tl_uiProgs.erase(program);
@@ -9772,13 +13139,21 @@ static void WINAPI HookGlDeleteProgram(uint32_t program) {
             uint32_t c = g_extProfSlots[oldS].linkedProgs.load(std::memory_order_relaxed);
             while (c > 0u && !g_extProfSlots[oldS].linkedProgs.compare_exchange_weak(c, c - 1u, std::memory_order_relaxed)) {}
         }
-        if (tl_extProf.curExtSlot == oldS) tl_extProf.curExtSlot = -1;
+        if (tl_extProf.curExtSlot == oldS) {
+            tl_extProf.curExtSlot = -1;
+            tl_curExtProfSlotPlus1 = 0u;
+        }
         tl_extProf.progSlotMap.erase(epIt);
     }
     tl_glCache.OnDeleteOrLinkProgram(program);
     AcquireSRWLockExclusive(&g_hd2dProgLock);
     EraseProgSlotLocked(tl_glCache.curContext, program);
     ReleaseSRWLockExclusive(&g_hd2dProgLock);
+    ++tl_sbProgsGen;
+    ++tl_uiProgsGen;
+    ++tl_worldProgsGen;
+    ++tl_extProfGen;
+    g_hd2dProgLayoutGen.fetch_add(1u, std::memory_order_release);
     if (g_origGlDeleteProgram) {
         g_origGlDeleteProgram(program);
     }
@@ -9787,47 +13162,177 @@ static void WINAPI HookGlDeleteProgram(uint32_t program) {
 static thread_local double g_tlsLastPostProcUs = 0.0;
 
 static void HookGameRender(void* self, void* renderData) {
+    RegisterRenderThreadForHitchSampler();
+    RenderWorkPhaseScope phaseScope(3u);
     g_tlsLastPostProcUs = 0.0;
     const int64_t t0 = NowQpc();
+    struct RtGameRenderScope {
+        bool prev;
+        bool prevXray;
+        RtGameRenderScope() noexcept : prev(tl_inGameRender), prevXray(tl_rtXrayThisFrame) {
+            tl_inGameRender    = true;
+            tl_rtXrayThisFrame = !prev && ((tl_rtXrayCounter++ & 63u) == 0u);
+            tl_drawFrameCache.valid = false;
+            if (tl_rtXrayThisFrame) {
+                tl_rtLmQpc       = 0;
+                tl_rtShReplayQpc = 0;
+                tl_rtShUnbQpc    = 0;
+                tl_rtSbTryQpc    = 0;
+                tl_rtSbFlushQpc  = 0;
+                tl_rtUnbDrawQpc  = 0;
+                tl_rtShUnbCnt    = 0u;
+                tl_rtUnbDrawCnt  = 0u;
+                tl_rtUnbBinCnt   = 0u;
+            }
+            tl_sbSyncedThisFrame = false;
+            HotTls().sb->BeginFrameProfile(IsRtWorldXrayActive());
+        }
+        ~RtGameRenderScope() {
+            tl_inGameRender    = prev;
+            tl_rtXrayThisFrame = prevXray;
+        }
+    } rtScope;
+
+    // Reset any leftover post-world UI anim accumulators from the previous frame so
+    // world inlineHookUs measures 100% strictly this frame's RenderThread world pass!
+    if (g_tlsAnimState) {
+        ThreadLocalAnimState& tls = *g_tlsAnimState;
+        tls.FlushCounters();
+        tls.frameHookAccumQpc   = 0;
+        tls.frameShedWorkQpc    = 0;
+        tls.frameSampleIdx      = 0;
+        tls.frameTweenEnts      = 0;
+        tls.frameInlineMainEnts = 0;
+        tls.frameTweenBones     = 0;
+        tls.frameShedCount      = 0;
+        tls.frameShedLevel      = 0;
+    }
+
+    // Multi-Core Parallel 240Hz Skeletal Pre-Interpolation (synchronously joined BEFORE g_origGameRender!)
+    uint32_t mtDispatched = 0u, mtEnts = 0u, mtBones = 0u, mtShed = 0u;
+    double mtAnimUs = 0.0;
+    if (g_skeletalTweenEnabled.load(std::memory_order_relaxed) != 0 &&
+        g_altRenderCheckVerified && g_hwCaps.logicalCores >= 4u) {
+        auto& pool = GetMtSkeletalPool();
+        static std::atomic<bool> s_mtLogged{false};
+        const uint32_t maxWorkers = g_elasticMaxSkeletalWorkers.load(std::memory_order_relaxed);
+        if (pool.EnsureStarted(g_hwCaps.logicalCores, &MtEvalSkeletalJob, &MtResetShardState, nullptr, maxWorkers)) {
+            if (!s_mtLogged.exchange(true, std::memory_order_relaxed)) {
+                LogMsg("[PERF][MT_ANIM] Parallel 240Hz Skeletal Pool ACTIVE (shards=%u, buckets=%u, cores=%u, f16c=%d)",
+                       pool.NumShards(), pool.NumBuckets(), g_hwCaps.logicalCores, hs_skeletal::CpuHasF16c() ? 1 : 0);
+            }
+            const int64_t mtT0 = NowQpc();
+            mtDispatched = pool.DispatchAndJoin(mtT0, g_worldResetGen.load(std::memory_order_acquire),
+                                                mtEnts, mtBones, mtShed);
+            if (mtDispatched > 0u) {
+                mtAnimUs = static_cast<double>(NowQpc() - mtT0) * g_qpcToUs;
+            }
+        }
+    } else {
+        GetMtSkeletalPool().ClearStaged();
+    }
+
     if (g_origGameRender) {
         g_origGameRender(self, renderData);
     }
+
+    {
+        auto& pool = GetMtSkeletalPool();
+        if (pool.HasActiveResults()) {
+            pool.EndFrame();
+        }
+        if (mtDispatched > 0u) {
+            pool.ForEachShardState([](ThreadLocalAnimState& st) { st.FlushCounters(); });
+        }
+    }
+
     const double totalGameUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
     const double worldUs = std::max(0.0, totalGameUs - g_tlsLastPostProcUs);
     const uint32_t worldU32 = static_cast<uint32_t>(std::clamp(worldUs, 0.0, 60000000.0));
     g_lastWorldRenderUs.store(worldU32, std::memory_order_relaxed);
     g_frameWorldUs.fetch_add(worldU32, std::memory_order_relaxed);
     UpdateAtomicEma(g_emaWorldRenderUs, static_cast<float>(worldUs), 0.06f);
+    if (tl_rtXrayThisFrame) {
+        static constexpr float kXrayEmaAlpha = 0.25f; // 1/64 frame sampling -> ~1s EMA time constant at 240 FPS
+        UpdateAtomicEma(g_emaWxLmUs,       static_cast<float>(static_cast<double>(tl_rtLmQpc)       * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxShReplayUs, static_cast<float>(static_cast<double>(tl_rtShReplayQpc) * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxShUnbUs,    static_cast<float>(static_cast<double>(tl_rtShUnbQpc)    * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbTryUs,    static_cast<float>(static_cast<double>(tl_rtSbTryQpc)    * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbFlushUs,  static_cast<float>(static_cast<double>(tl_rtSbFlushQpc)  * g_qpcToUs), kXrayEmaAlpha);
+        const auto sbProf = HotTls().sb->TakeFrameProfile();
+        UpdateAtomicEma(g_emaWxSbResUs,    static_cast<float>(static_cast<double>(sbProf.tryResolveQpc)  * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbInFlUs,   static_cast<float>(static_cast<double>(sbProf.tryInFlushQpc)  * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbWaitUs,   static_cast<float>(static_cast<double>(sbProf.flushWaitQpc)   * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbUpUs,     static_cast<float>(static_cast<double>(sbProf.flushUploadQpc) * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxSbDrwUs,    static_cast<float>(static_cast<double>(sbProf.flushDrawQpc)   * g_qpcToUs), kXrayEmaAlpha);
+        UpdateAtomicEma(g_emaWxUnbDrawUs,  static_cast<float>(static_cast<double>(tl_rtUnbDrawQpc)  * g_qpcToUs), kXrayEmaAlpha);
+        uint32_t topProg = 0u, topCnt = 0u;
+        for (uint32_t i = 0; i < tl_rtUnbBinCnt; ++i) {
+            if (tl_rtUnbBins[i].cnt > topCnt) {
+                topCnt  = tl_rtUnbBins[i].cnt;
+                topProg = tl_rtUnbBins[i].prog;
+            }
+        }
+        g_lastWxShUnbCnt.store(tl_rtShUnbCnt, std::memory_order_relaxed);
+        g_lastWxUnbDrawCnt.store(tl_rtUnbDrawCnt, std::memory_order_relaxed);
+        g_lastWxUnbTopProg.store(topProg, std::memory_order_relaxed);
+        g_lastWxUnbTopCnt.store(topCnt, std::memory_order_relaxed);
+    }
 
+    double inlineHookUs = 0.0;
+    uint32_t inlineEnts = 0u, inlineBones = 0u, inlineShed = 0u;
     if (g_tlsAnimState) {
         ThreadLocalAnimState& tls = *g_tlsAnimState;
         if (tls.frameHookAccumQpc > 0 || tls.frameTweenEnts > 0 ||
             tls.frameTweenBones > 0 || tls.frameShedCount > 0) {
-            const uint32_t hookUs = static_cast<uint32_t>(
-                std::clamp(static_cast<double>(tls.frameHookAccumQpc) * g_qpcToUs, 0.0, 60000000.0));
-            g_lastAnimHookUs.store(hookUs, std::memory_order_relaxed);
-            g_lastAnimEnts.store(tls.frameTweenEnts, std::memory_order_relaxed);
-            g_lastAnimBones.store(tls.frameTweenBones, std::memory_order_relaxed);
-            g_lastAnimShed.store(tls.frameShedCount, std::memory_order_relaxed);
-            g_frameAnimUs.fetch_add(hookUs, std::memory_order_relaxed);
-            g_frameAnimEnts.fetch_add(tls.frameTweenEnts, std::memory_order_relaxed);
-            g_frameAnimBones.fetch_add(tls.frameTweenBones, std::memory_order_relaxed);
-            g_frameAnimShed.fetch_add(tls.frameShedCount, std::memory_order_relaxed);
+            inlineHookUs = static_cast<double>(tls.frameHookAccumQpc) * g_qpcToUs;
+            inlineEnts   = tls.frameTweenEnts;
+            inlineBones  = tls.frameTweenBones;
+            inlineShed   = tls.frameShedCount;
             tls.FlushCounters();
-            tls.frameHookAccumQpc = 0;
-            tls.frameSampleIdx = 0;
-            tls.frameTweenEnts = 0;
-            tls.frameTweenBones = 0;
-            tls.frameShedCount = 0;
-            tls.frameShedLevel = 0;
+            tls.frameHookAccumQpc   = 0;
+            tls.frameShedWorkQpc    = 0;
+            tls.frameSampleIdx      = 0;
+            tls.frameTweenEnts      = 0;
+            tls.frameInlineMainEnts = 0;
+            tls.frameTweenBones     = 0;
+            tls.frameShedCount      = 0;
+            tls.frameShedLevel      = 0;
         }
+    }
+    const uint32_t totalEnts  = mtEnts + inlineEnts;
+    const uint32_t totalBones = mtBones + inlineBones;
+    const uint32_t totalShed  = mtShed + inlineShed;
+    const double   totalAnimUs = mtAnimUs + inlineHookUs;
+    const uint32_t mtU32  = static_cast<uint32_t>(std::clamp(mtAnimUs, 0.0, 60000000.0));
+    const uint32_t inlU32 = static_cast<uint32_t>(std::clamp(inlineHookUs, 0.0, 60000000.0));
+    const uint32_t hookU32 = mtU32 + inlU32;
+    UpdateAtomicEma(g_emaAnimUs,    static_cast<float>(totalAnimUs),  0.06f);
+    UpdateAtomicEma(g_emaAnimMtUs,  static_cast<float>(mtAnimUs),     0.06f);
+    UpdateAtomicEma(g_emaAnimInlUs, static_cast<float>(inlineHookUs), 0.06f);
+    if (hookU32 > 0u || totalEnts > 0u || totalBones > 0u || totalShed > 0u) {
+        g_lastAnimHookUs.store(hookU32, std::memory_order_relaxed);
+        g_lastAnimMtUs.store(mtU32, std::memory_order_relaxed);
+        g_lastAnimInlUs.store(inlU32, std::memory_order_relaxed);
+        g_lastAnimEnts.store(totalEnts, std::memory_order_relaxed);
+        g_lastAnimBones.store(totalBones, std::memory_order_relaxed);
+        g_lastAnimShed.store(totalShed, std::memory_order_relaxed);
+        RecordPeakFrameAnimStats(hookU32, mtU32, inlU32, totalEnts, totalBones, totalShed);
     }
 }
 
 static void HookPostProcessorRender(void* pp, void* renderData, uint32_t primaryTexHandle) {
+    RenderWorkPhaseScope phaseScope(4u);
+    // End of world entity pass: flush any remaining sprites and replay all deferred world shadows
+    // in ONE single FBO bind (before t0 so world shadow work is billed to world, not post!).
+    FlushSpriteBatchIfPending(hs_sprite_batch::FlushReason::End);
+    FlushDeferredWorldShadowsIfPending();
     const int64_t t0 = NowQpc();
     if (g_origPostProcessorRender) {
+        const bool prevPost = tl_inPostProc;
+        tl_inPostProc = true;
         g_origPostProcessorRender(pp, renderData, primaryTexHandle);
+        tl_inPostProc = prevPost;
     }
     const double postUs = static_cast<double>(NowQpc() - t0) * g_qpcToUs;
     g_tlsLastPostProcUs = postUs;
@@ -9916,16 +13421,95 @@ static void PrepareRenderPerfHooks(std::vector<PendingCodePatch>& patches, uint8
 
 static void HookLightMapRender(void* lightMap, uint8_t* renderData) {
     if (!g_origLightMapRender || !lightMap) return;
+    struct LmRenderScope {
+        bool prev;
+        int64_t t0;
+        bool timeRt;
+        LmRenderScope() : prev(tl_inLightMapRender), t0(0), timeRt(IsRtWorldXrayActive()) {
+            tl_inLightMapRender = true;
+            if (timeRt) t0 = NowQpc();
+        }
+        ~LmRenderScope() {
+            tl_inLightMapRender = prev;
+            if (timeRt) {
+                const int64_t t1 = NowQpc();
+                if (t1 > t0) tl_rtLmQpc += (t1 - t0);
+            }
+        }
+    } lmScope;
+
     static uint32_t s_appliedRebuildGen = 0;
+    static float    s_appliedLmScale = -1.0f;
     const uint32_t wantGen = g_lightmapRebuildGen.load(std::memory_order_acquire);
-    if (renderData && wantGen != s_appliedRebuildGen) {
+    const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
+    const bool userFullLm = g_visualFullresLightmap.load(std::memory_order_relaxed);
+
+    // Phase 4: Adaptive 0ms LightMap 1.0x <-> 0.5x hot-swap under sustained GPU pressure (Native GL only).
+    // Strictly respects user FullResLightmap=0 (NEVER forces 1.0x!).
+    static thread_local uint32_t tl_lmAdaptSeq = 0xFFFFFFFFu;
+    static thread_local bool     tl_lmAdaptHalf = false;
+    static thread_local uint32_t tl_lmHiStreak = 0u;
+    static thread_local uint32_t tl_lmLoStreak = 0u;
+    const uint32_t rtSeq = g_rtSwapSeq.load(std::memory_order_relaxed);
+    if (!userFullLm || !isNat || !g_lightmapScaleSlot) {
+        tl_lmAdaptHalf = false;
+        tl_lmHiStreak = 0u;
+        tl_lmLoStreak = 0u;
+        tl_lmAdaptSeq = rtSeq;
+    } else if (tl_lmAdaptSeq != rtSeq) {
+        tl_lmAdaptSeq = rtSeq;
+        const float emaGpuMs = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
+        if (!std::isfinite(emaGpuMs) || emaGpuMs <= 0.0f) {
+            tl_lmHiStreak = 0u;
+            tl_lmLoStreak = 0u;
+        } else if (!tl_lmAdaptHalf) {
+            if (emaGpuMs >= 7.5f) {
+                if (++tl_lmHiStreak >= 60u) {
+                    tl_lmAdaptHalf = true;
+                    tl_lmHiStreak = 0u;
+                    tl_lmLoStreak = 0u;
+                }
+            } else {
+                tl_lmHiStreak = 0u;
+            }
+        } else {
+            if (emaGpuMs < 5.2f) {
+                if (++tl_lmLoStreak >= 120u) {
+                    tl_lmAdaptHalf = false;
+                    tl_lmLoStreak = 0u;
+                    tl_lmHiStreak = 0u;
+                }
+            } else {
+                tl_lmLoStreak = 0u;
+            }
+        }
+    }
+    g_lightmapAdaptiveHalf.store(tl_lmAdaptHalf, std::memory_order_relaxed);
+
+    const float wantScale = (userFullLm && !tl_lmAdaptHalf) ? 1.0f : 0.5f;
+    if (g_lightmapScaleSlot) {
+        if (s_appliedLmScale < 0.0f) {
+            s_appliedLmScale = *g_lightmapScaleSlot;
+        }
+        *g_lightmapScaleSlot = wantScale;
+    }
+    const bool scaleMismatch = (g_lightmapScaleSlot != nullptr) && (fabsf(wantScale - s_appliedLmScale) > 0.01f);
+
+    const bool wantHdr = isNat && g_visualHdrLightmap.load(std::memory_order_relaxed) &&
+                         !g_visualHdrLightmapFailed.load(std::memory_order_relaxed);
+    const bool curHdr = g_visualHdrLightmapActive.load(std::memory_order_relaxed);
+    const bool hdrMismatch = (wantHdr != curHdr);
+    if (renderData && (wantGen != s_appliedRebuildGen || hdrMismatch || scaleMismatch)) {
         s_appliedRebuildGen = wantGen;
+        if (g_lightmapScaleSlot) s_appliedLmScale = wantScale;
         const uint8_t savedFlag = renderData[0];
         renderData[0] = 1; // Triggers Klei's native LightMap RT destroy + InitRenderTarget() rebuild!
         g_origLightMapRender(lightMap, renderData);
         renderData[0] = savedFlag;
-        LogMsg("[VISUAL] Live 0ms LightMap RT hot-swapped -> %.1fx (no reload needed!)",
-               g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5);
+        LogMsg("[VISUAL] Live 0ms LightMap RT hot-swapped -> %.1fx (%s, lmAd=%d, no reload needed!)",
+               g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5,
+               g_visualHdrLightmapActive.load(std::memory_order_relaxed) ? "RGBA16F" : "RGBA8",
+               tl_lmAdaptHalf ? 1 : 0);
         return;
     }
     g_origLightMapRender(lightMap, renderData);
@@ -9983,6 +13567,174 @@ static void PrepareLightMap240AndHotSwapHooks(std::vector<PendingCodePatch>& pat
         }
     } else {
         LogMsg("[LIGHT240] 240Hz Dynamic Light Interp skipped (AOB miss; fail-closed)");
+    }
+}
+
+static inline void SyncKleiFastPath() noexcept {
+    const uint32_t gen = g_kleiFastOpsGen.load(std::memory_order_acquire);
+    if (tl_kleiFastOpsGen == gen && gen != 0u) return;
+    tl_kleiFastOpsGen = gen;
+
+    const bool epochReady = g_kleiEpochHooksReady.load(std::memory_order_acquire);
+    tl_kleiFastPath.SetEnabled(epochReady);
+
+    hs_klei_fastpath::GlUniformDispatchOps uops{};
+    if (g_origGlUniform1f)        uops.glUniform1f        = &HookGlUniform1f;
+    if (g_origGlUniform1fv)       uops.glUniform1fv       = &HookGlUniform1fv;
+    if (g_origGlUniform2fv)       uops.glUniform2fv       = &HookGlUniform2fv;
+    if (g_origGlUniform3fv)       uops.glUniform3fv       = &HookGlUniform3fv;
+    if (g_origGlUniform4fv)       uops.glUniform4fv       = &HookGlUniform4fv;
+    if (g_origGlUniformMatrix2fv) uops.glUniformMatrix2fv = &HookGlUniformMatrix2fv;
+    if (g_origGlUniformMatrix3fv) uops.glUniformMatrix3fv = &HookGlUniformMatrix3fv;
+    if (g_origGlUniformMatrix4fv) uops.glUniformMatrix4fv = &HookGlUniformMatrix4fv;
+    tl_kleiFastPath.SetUniformOps(uops);
+
+    hs_klei_fastpath::GlDrawDispatchOps dops{};
+    if (g_origGlBindBuffer)   dops.glBindBuffer   = &HookGlBindBuffer;
+    if (g_origGlDrawArrays)   dops.glDrawArrays   = &HookGlDrawArrays;
+    if (g_origGlDrawElements) dops.glDrawElements = &HookGlDrawElements;
+    tl_kleiFastPath.SetDrawOps(dops);
+
+    tl_kleiFastPath.SetHelpers(g_kleiRendererHelpers);
+}
+
+static void HookApplyShaderUniforms(void* shaderPart, void* effectUniformTable, void* constantStore, void* rendererState) {
+    if (!g_origApplyShaderUniforms) return;
+    if (!tl_glCache.curContext) {
+        g_origApplyShaderUniforms(shaderPart, effectUniformTable, constantStore, rendererState);
+        return;
+    }
+    SyncKleiFastPath();
+    tl_kleiFastPath.FastApplyShaderUniforms(
+        shaderPart, effectUniformTable, constantStore, rendererState,
+        g_kleiRenderCacheEpoch.load(std::memory_order_acquire),
+        g_origApplyShaderUniforms);
+}
+
+static void HookDrawPrimitives(void* hwRenderer, const void* matW, uint32_t first, uint32_t count, int32_t primType) {
+    if (!g_origDrawPrimitives) return;
+    if (!tl_glCache.curContext) {
+        g_origDrawPrimitives(hwRenderer, matW, first, count, primType);
+        return;
+    }
+    SyncKleiFastPath();
+    tl_kleiFastPath.FastDrawPrimitives(
+        hwRenderer, matW, first, count, primType,
+        g_kleiRenderCacheEpoch.load(std::memory_order_acquire),
+        g_origDrawPrimitives);
+}
+
+static void HookDrawIndexed(void* hwRenderer, const void* matW, int32_t primType) {
+    if (!g_origDrawIndexed) return;
+    if (!tl_glCache.curContext) {
+        g_origDrawIndexed(hwRenderer, matW, primType);
+        return;
+    }
+    SyncKleiFastPath();
+    tl_kleiFastPath.FastDrawIndexed(
+        hwRenderer, matW, primType,
+        g_kleiRenderCacheEpoch.load(std::memory_order_acquire),
+        g_origDrawIndexed);
+}
+
+static void PrepareKleiRenderFastPathHooks(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    uint8_t* imgStart = nullptr;
+    size_t imgSize = 0;
+    const bool haveImgBounds = GetExeImageBounds(imgStart, imgSize);
+
+    // 1. HWEffect::ApplyShaderUniforms (RVA 0x385F30, stealLen=20) -> Flat L1 Plan
+    if (uint8_t* fnApply = FindUniqueInt16PatternInText(
+            textStart, textSize,
+            hs_klei_fastpath::kAobApplyShaderUniforms,
+            sizeof(hs_klei_fastpath::kAobApplyShaderUniforms) / sizeof(hs_klei_fastpath::kAobApplyShaderUniforms[0]))) {
+        if (hs_klei_fastpath::VerifyApplyShaderUniformsAbi(fnApply, textStart, textSize)) {
+            void* origApply = nullptr;
+            char msg[224];
+            snprintf(msg, sizeof(msg),
+                     "[PERF][KLEI_FAST] Hooked HWEffect::ApplyShaderUniforms @ %p -> Flat L1 Plan",
+                     static_cast<void*>(fnApply));
+            const size_t idx = patches.size();
+            if (QueuePrologueTrampolineHook(
+                    patches, fnApply, hs_klei_fastpath::kStealLenApplyShaderUniforms,
+                    reinterpret_cast<const void*>(&HookApplyShaderUniforms), origApply, msg)) {
+                g_origApplyShaderUniforms = reinterpret_cast<hs_klei_fastpath::ApplyShaderUniforms_t>(origApply);
+                g_kleiApplyUniPatchIdx = idx;
+            }
+        } else {
+            LogMsg("[PERF][KLEI_FAST] HWEffect::ApplyShaderUniforms skipped (ABI verification failed; fail-closed)");
+        }
+    } else {
+        LogMsg("[PERF][KLEI_FAST] HWEffect::ApplyShaderUniforms skipped (AOB miss; fail-closed)");
+    }
+
+    // 2. HWRenderer::DrawPrimitives (RVA 0x378C10, stealLen=20) -> Zero-Lock Effect/VB Cache
+    if (haveImgBounds) {
+        if (uint8_t* fnDp = FindUniqueInt16PatternInText(
+                textStart, textSize,
+                hs_klei_fastpath::kAobDrawPrimitives,
+                sizeof(hs_klei_fastpath::kAobDrawPrimitives) / sizeof(hs_klei_fastpath::kAobDrawPrimitives[0]))) {
+            hs_klei_fastpath::KleiRendererHelpers dpHelpers{};
+            if (hs_klei_fastpath::ResolveAndVerifyDrawPrimitivesAbi(fnDp, textStart, textSize, imgStart, imgSize, dpHelpers)) {
+                void* origDp = nullptr;
+                char msg[224];
+                snprintf(msg, sizeof(msg),
+                         "[PERF][KLEI_FAST] Hooked HWRenderer::DrawPrimitives @ %p -> Zero-Lock Effect/VB Cache (declApply=%d)",
+                         static_cast<void*>(fnDp), dpHelpers.fnVertexDeclApply ? 1 : 0);
+                const size_t idx = patches.size();
+                if (QueuePrologueTrampolineHook(
+                        patches, fnDp, hs_klei_fastpath::kStealLenDrawPrimitives,
+                        reinterpret_cast<const void*>(&HookDrawPrimitives), origDp, msg)) {
+                    g_kleiRendererHelpers = dpHelpers;
+                    g_origDrawPrimitives = reinterpret_cast<hs_klei_fastpath::DrawPrimitives_t>(origDp);
+                    g_kleiDrawPrimPatchIdx = idx;
+                }
+            } else {
+                LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawPrimitives skipped (ABI verification failed; fail-closed)");
+            }
+        } else {
+            LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawPrimitives skipped (AOB miss; fail-closed)");
+        }
+
+        // 3. HWRenderer::DrawIndexed (RVA 0x379320, stealLen=15) -> Zero-Lock Effect/IBO/VB Cache
+        if (uint8_t* fnDi = FindUniqueInt16PatternInText(
+                textStart, textSize,
+                hs_klei_fastpath::kAobDrawIndexed,
+                sizeof(hs_klei_fastpath::kAobDrawIndexed) / sizeof(hs_klei_fastpath::kAobDrawIndexed[0]))) {
+            hs_klei_fastpath::KleiRendererHelpers diHelpers{};
+            if (hs_klei_fastpath::ResolveAndVerifyDrawIndexedAbi(fnDi, textStart, textSize, imgStart, imgSize, diHelpers)) {
+                const bool helpersAgree = !g_kleiRendererHelpers.IsComplete() ||
+                    (diHelpers.fnPushMatrixW     == g_kleiRendererHelpers.fnPushMatrixW &&
+                     diHelpers.fnBindVBAndDecl   == g_kleiRendererHelpers.fnBindVBAndDecl &&
+                     diHelpers.fnResourcePoolGet == g_kleiRendererHelpers.fnResourcePoolGet &&
+                     diHelpers.fnPopConstant     == g_kleiRendererHelpers.fnPopConstant &&
+                     diHelpers.primTable         == g_kleiRendererHelpers.primTable);
+                if (helpersAgree) {
+                    void* origDi = nullptr;
+                    char msg[224];
+                    snprintf(msg, sizeof(msg),
+                             "[PERF][KLEI_FAST] Hooked HWRenderer::DrawIndexed @ %p -> Zero-Lock Effect/IBO/VB Cache",
+                             static_cast<void*>(fnDi));
+                    const size_t idx = patches.size();
+                    if (QueuePrologueTrampolineHook(
+                            patches, fnDi, hs_klei_fastpath::kStealLenDrawIndexed,
+                            reinterpret_cast<const void*>(&HookDrawIndexed), origDi, msg)) {
+                        if (!g_kleiRendererHelpers.IsComplete()) {
+                            g_kleiRendererHelpers = diHelpers;
+                        }
+                        g_origDrawIndexed = reinterpret_cast<hs_klei_fastpath::DrawIndexed_t>(origDi);
+                        g_kleiDrawIdxPatchIdx = idx;
+                    }
+                } else {
+                    LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawIndexed skipped (helper table mismatch; fail-closed)");
+                }
+            } else {
+                LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawIndexed skipped (ABI verification failed; fail-closed)");
+            }
+        } else {
+            LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawIndexed skipped (AOB miss; fail-closed)");
+        }
+    } else {
+        LogMsg("[PERF][KLEI_FAST] HWRenderer::DrawPrimitives/DrawIndexed skipped (PE image bounds unavailable; fail-closed)");
     }
 }
 
@@ -10118,14 +13870,88 @@ static void PrepareAnimCmdMainThreadPosHook(std::vector<PendingCodePatch>& patch
     }
 }
 
+static void ClientLuaSpikeCountHook(void* L, LuaDebug51*) {
+    if (!L || tl_luaStackCaptured || !g_luaGetStack || !g_luaGetInfo || !g_luaSetHook || g_qpcToUs <= 0.0) {
+        return;
+    }
+    const int64_t now = NowQpc();
+    if (now <= tl_luaHookT0Qpc) return;
+    if (static_cast<double>(now - tl_luaHookT0Qpc) * g_qpcToUs < 4500.0) {
+        return;
+    }
+    tl_luaStackCaptured = true;
+    tl_luaStackBuf[0] = '\0';
+    size_t pos = 0u;
+    for (int level = 0; level <= 4; ++level) {
+        LuaDebug51 ar{};
+        if (g_luaGetStack(L, level, &ar) == 0) break;
+        if (g_luaGetInfo(L, "nSl", &ar) == 0) break;
+        ar.short_src[sizeof(ar.short_src) - 1] = '\0';
+        const char* src = (ar.short_src[0] != '\0') ? ar.short_src : "?";
+        const char* fn  = (ar.name && ar.name[0] != '\0')
+            ? ar.name
+            : ((ar.what && ar.what[0] != '\0') ? ar.what : "?");
+        const int n = snprintf(tl_luaStackBuf + pos, sizeof(tl_luaStackBuf) - pos,
+                               "%s%s:%d(%s)", (pos > 0u ? " <- " : ""), src, ar.currentline, fn);
+        if (n <= 0) break;
+        pos += static_cast<size_t>(n);
+        if (pos + 16u >= sizeof(tl_luaStackBuf)) break;
+    }
+    if (pos == 0u) {
+        snprintf(tl_luaStackBuf, sizeof(tl_luaStackBuf), "empty");
+    }
+    g_luaSetHook(L, nullptr, 0, 0);
+}
+
 static uint64_t HookClientLuaUpdate(void* sim, uint32_t a2, uint32_t a3) {
     if (!g_origClientLuaUpdate) return 0;
+    static std::atomic<uint32_t> s_luaHookProbes{0u};
+    static thread_local int64_t  tl_lastLuaProbeQpc = 0;
+    MainWorkPhaseScope phaseScope(1u);
     const int64_t t0 = NowQpc();
+    struct LuaHookGuard {
+        void* L = nullptr;
+        bool  armed = false;
+        ~LuaHookGuard() {
+            if (armed && L && g_luaSetHook) {
+                g_luaSetHook(L, nullptr, 0, 0);
+            }
+        }
+    } hookGuard;
+    const uint32_t curProbes = s_luaHookProbes.load(std::memory_order_relaxed);
+    if (g_inGameplay.load(std::memory_order_relaxed) != 0 &&
+        s_luaSpikeLogs.load(std::memory_order_relaxed) < 8u &&
+        curProbes < 240u &&
+        (curProbes < 60u || tl_lastLuaProbeQpc == 0 ||
+         (g_qpcFreq > 0 && (t0 - tl_lastLuaProbeQpc) * 4 >= g_qpcFreq)) &&
+        g_luaSetHook && g_luaGetHook && g_luaGetStack && g_luaGetInfo &&
+        g_simLuaStateOffset > 0 && sim != nullptr) {
+        void* L = nullptr;
+        memcpy(&L, static_cast<const uint8_t*>(sim) + g_simLuaStateOffset, sizeof(L));
+        if (L != nullptr && g_luaGetHook(L) == nullptr) {
+            tl_lastLuaProbeQpc = t0;
+            s_luaHookProbes.fetch_add(1u, std::memory_order_relaxed);
+            tl_luaHookT0Qpc     = t0;
+            tl_luaStackCaptured = false;
+            tl_luaStackBuf[0]   = '\0';
+            g_luaSetHook(L, &ClientLuaSpikeCountHook, 8 /*LUA_MASKCOUNT*/, 40000);
+            hookGuard.L     = L;
+            hookGuard.armed = true;
+        }
+    }
     const uint64_t ret = g_origClientLuaUpdate(sim, a2, a3);
     const int64_t t1 = NowQpc();
     if (t1 > t0 && g_qpcToUs > 0.0) {
-        const uint32_t us = static_cast<uint32_t>(std::min(static_cast<double>(t1 - t0) * g_qpcToUs, 2000000.0));
+        const double usD = static_cast<double>(t1 - t0) * g_qpcToUs;
+        const uint32_t us = static_cast<uint32_t>(std::min(usD, 2000000.0));
         if (us > 0) g_frameLuaUs.fetch_add(us, std::memory_order_relaxed);
+        if (us >= 5000u && g_inGameplay.load(std::memory_order_relaxed) != 0 &&
+            s_luaSpikeLogs.load(std::memory_order_relaxed) < 8u &&
+            s_luaSpikeLogs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+            LogMsg("[DIAG][LUA_SPIKE] lua=%.2fms | gcKb=%d | stack=[%s]",
+                   usD * 0.001, g_lastGcKb.load(std::memory_order_relaxed),
+                   tl_luaStackCaptured ? tl_luaStackBuf : "none");
+        }
     }
     return ret;
 }
@@ -10240,6 +14066,7 @@ static void SampleClientNetTelemetry(void* netMgr, int64_t nowQpc) noexcept {
 
 static void HookClientNetUpdate(void* netMgr, float dt) {
     if (!g_origClientNetUpdate) return;
+    MainWorkPhaseScope phaseScope(2u);
     const int64_t t0 = NowQpc();
     g_origClientNetUpdate(netMgr, dt);
     const int64_t t1 = NowQpc();
@@ -10471,6 +14298,38 @@ static void PrepareLuaAndNetTelemetryHooks(std::vector<PendingCodePatch>& patche
     static VoidPtrFn_t  s_origSoundUpd = nullptr;
 
     struct LoopXrayHooks {
+        static void WallLuaSpikeCountHook(void* L, LuaDebug51*) {
+            if (!L || tl_wluaStackCaptured || !g_luaGetStack || !g_luaGetInfo || !g_luaSetHook || g_qpcToUs <= 0.0) {
+                return;
+            }
+            const int64_t now = NowQpc();
+            if (now <= tl_wluaHookT0Qpc) return;
+            if (static_cast<double>(now - tl_wluaHookT0Qpc) * g_qpcToUs < 1200.0) {
+                return;
+            }
+            tl_wluaStackCaptured = true;
+            tl_wluaStackBuf[0] = '\0';
+            size_t pos = 0u;
+            for (int level = 0; level <= 4; ++level) {
+                LuaDebug51 ar{};
+                if (g_luaGetStack(L, level, &ar) == 0) break;
+                if (g_luaGetInfo(L, "nSl", &ar) == 0) break;
+                ar.short_src[sizeof(ar.short_src) - 1] = '\0';
+                const char* src = (ar.short_src[0] != '\0') ? ar.short_src : "?";
+                const char* fn  = (ar.name && ar.name[0] != '\0')
+                    ? ar.name
+                    : ((ar.what && ar.what[0] != '\0') ? ar.what : "?");
+                const int n = snprintf(tl_wluaStackBuf + pos, sizeof(tl_wluaStackBuf) - pos,
+                                       "%s%s:%d(%s)", (pos > 0u ? " <- " : ""), src, ar.currentline, fn);
+                if (n <= 0) break;
+                pos += static_cast<size_t>(n);
+                if (pos + 16u >= sizeof(tl_wluaStackBuf)) break;
+            }
+            if (pos == 0u) {
+                snprintf(tl_wluaStackBuf, sizeof(tl_wluaStackBuf), "empty");
+            }
+            g_luaSetHook(L, nullptr, 0, 0);
+        }
         static inline void AddUs(std::atomic<uint32_t>& dst, int64_t t0) noexcept {
             const int64_t t1 = NowQpc();
             if (t1 > t0 && g_qpcToUs > 0.0) {
@@ -10480,9 +14339,73 @@ static void PrepareLuaAndNetTelemetryHooks(std::vector<PendingCodePatch>& patche
         }
         static uint64_t HookWallLua(void* sim, uint32_t a2, uint32_t a3) {
             if (!s_origWallLua) return 0;
+            static std::atomic<uint32_t> s_wluaSpikeLogs{0u};
+            static std::atomic<uint32_t> s_wluaSampleProbes{0u};
+            static std::atomic<uint32_t> s_wluaSampleLogs{0u};
+            static thread_local int64_t  tl_lastWluaSampleQpc = 0;
+            const bool prevWall = tl_wallLuaActive;
+            tl_wallLuaActive    = true;
+            tl_wallSpatialCalls = 0u;
+            tl_wallSpatialEnts  = 0u;
+            tl_wallSpatialQpc   = 0;
+            tl_wallSpatialMaxR  = 0.0f;
             const int64_t t0 = NowQpc();
+            struct WallLuaHookGuard {
+                void* L = nullptr;
+                bool  armed = false;
+                ~WallLuaHookGuard() {
+                    if (armed && L && g_luaSetHook) {
+                        g_luaSetHook(L, nullptr, 0, 0);
+                    }
+                }
+            } hookGuard;
+            if (!prevWall && g_inGameplay.load(std::memory_order_relaxed) != 0 &&
+                g_rtSwapSeq.load(std::memory_order_relaxed) >= 600u &&
+                s_wluaSampleProbes.load(std::memory_order_relaxed) < 24u &&
+                s_wluaSampleLogs.load(std::memory_order_relaxed) < 8u &&
+                (tl_lastWluaSampleQpc == 0 || (g_qpcFreq > 0 && (t0 - tl_lastWluaSampleQpc) >= g_qpcFreq * 2)) &&
+                g_luaSetHook && g_luaGetHook && g_luaGetStack && g_luaGetInfo &&
+                g_simLuaStateOffset > 0 && sim != nullptr) {
+                void* L = nullptr;
+                memcpy(&L, static_cast<const uint8_t*>(sim) + g_simLuaStateOffset, sizeof(L));
+                if (L != nullptr && g_luaGetHook(L) == nullptr) {
+                    tl_lastWluaSampleQpc = t0;
+                    s_wluaSampleProbes.fetch_add(1u, std::memory_order_relaxed);
+                    tl_wluaHookT0Qpc     = t0;
+                    tl_wluaStackCaptured = false;
+                    tl_wluaStackBuf[0]   = '\0';
+                    g_luaSetHook(L, &LoopXrayHooks::WallLuaSpikeCountHook, 8 /*LUA_MASKCOUNT*/, 30000);
+                    hookGuard.L     = L;
+                    hookGuard.armed = true;
+                }
+            }
             const uint64_t r = s_origWallLua(sim, a2, a3);
-            AddUs(g_frameWallLuaUs, t0);
+            const int64_t t1 = NowQpc();
+            tl_wallLuaActive = prevWall;
+            if (t1 > t0 && g_qpcToUs > 0.0) {
+                const double usD = static_cast<double>(t1 - t0) * g_qpcToUs;
+                const uint32_t us = static_cast<uint32_t>(std::min(usD, 60000000.0));
+                if (us > 0) g_frameWallLuaUs.fetch_add(us, std::memory_order_relaxed);
+                if (hookGuard.armed && us >= 1500u &&
+                    s_wluaSampleLogs.load(std::memory_order_relaxed) < 8u &&
+                    s_wluaSampleLogs.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+                    const double spMs = static_cast<double>(tl_wallSpatialQpc) * g_qpcToUs * 0.001;
+                    LogMsg("[DIAG][WLUA_SAMPLE] wLua=%.2fms | spatial=(calls=%u ents=%u maxR=%.1f %.2fms) | gcKb=%d | stack=[%s]",
+                           usD * 0.001, tl_wallSpatialCalls, tl_wallSpatialEnts,
+                           static_cast<double>(tl_wallSpatialMaxR), spMs,
+                           g_lastGcKb.load(std::memory_order_relaxed),
+                           tl_wluaStackCaptured ? tl_wluaStackBuf : "none");
+                } else if (us >= 8000u && g_inGameplay.load(std::memory_order_relaxed) != 0 &&
+                           s_wluaSpikeLogs.load(std::memory_order_relaxed) < 5u &&
+                           s_wluaSpikeLogs.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                    const double spMs = static_cast<double>(tl_wallSpatialQpc) * g_qpcToUs * 0.001;
+                    LogMsg("[DIAG][WLUA_SPIKE] wLua=%.2fms | spatial=(calls=%u ents=%u maxR=%.1f %.2fms) | gcKb=%d | stack=[%s]",
+                           usD * 0.001, tl_wallSpatialCalls, tl_wallSpatialEnts,
+                           static_cast<double>(tl_wallSpatialMaxR), spMs,
+                           g_lastGcKb.load(std::memory_order_relaxed),
+                           tl_wluaStackCaptured ? tl_wluaStackBuf : "none");
+                }
+            }
             return r;
         }
         static void HookEntWall(void* em, float dt) {
@@ -10565,6 +14488,16 @@ static void PrepareLuaAndNetTelemetryHooks(std::vector<PendingCodePatch>& patche
     };
 
     const bool okWL  = hookLoopSite(kAobWallLua,  sizeof(kAobWallLua)/sizeof(kAobWallLua[0]),   19, reinterpret_cast<const void*>(&LoopXrayHooks::HookWallLua),  s_origWallLua);
+    if (okWL && s_origWallLua) {
+        const auto* wfn = reinterpret_cast<const uint8_t*>(s_origWallLua);
+        if (wfn[0x27] == 0x48 && wfn[0x28] == 0x8B && wfn[0x29] == 0x89) {
+            int32_t disp = 0;
+            memcpy(&disp, wfn + 0x2A, sizeof(disp));
+            if (disp > 0 && disp < 0x1000) {
+                g_simLuaStateOffset = disp;
+            }
+        }
+    }
     const bool okEW  = hookLoopSite(kAobEntWall,  sizeof(kAobEntWall)/sizeof(kAobEntWall[0]),    8, reinterpret_cast<const void*>(&LoopXrayHooks::HookEntWall),  s_origEntWall);
     const bool okEUA = hookLoopSite(kAobEntUpdA,  sizeof(kAobEntUpdA)/sizeof(kAobEntUpdA[0]),    8, reinterpret_cast<const void*>(&LoopXrayHooks::HookEntUpd),   s_origEntUpd);
     const bool okEUB = hookLoopSite(kAobEntUpdB,  sizeof(kAobEntUpdB)/sizeof(kAobEntUpdB[0]),   12, reinterpret_cast<const void*>(&LoopXrayHooks::HookEntUpd),   s_origEntUpd);
@@ -10782,18 +14715,30 @@ static uint8_t HookHWBufferInit(void* self, const void* data) {
             size_t size = 0;
             uint32_t glUsage = 0;
             uint32_t bufId = 0;
-            if (hs_vb_pool::VbPool::IsPoolable(target, usageEnum, stride, count, size, glUsage) &&
-                g_vbPool.AcquireAndUpload(target, glUsage, size, data,
-                                          g_nativeGlActive.load(std::memory_order_relaxed), bufId)) {
+            if (hs_vb_pool::VbPool::IsPoolable(target, usageEnum, stride, count, size, glUsage)) {
                 SyncSpriteBatcher();
-                tl_spriteBatcher.OnBindBuffer(target, bufId);
-                tl_spriteBatcher.OnBufferUpload(bufId, data, size, /*isDynamic=*/true);
-                tl_uiBatcher.OnBindBuffer(target, bufId);
-                const bool captureUi = g_optSpriteBatch.load(std::memory_order_relaxed) &&
-                                       (size <= hs_ui_batch::kMaxUiShadowCaptureBytes);
-                tl_uiBatcher.OnBufferUpload(bufId, data, size, captureUi);
-                *reinterpret_cast<uint32_t*>(raw + 0x10) = bufId;
-                return 1u;
+                if (tl_spriteBatcher.IsStickySessionActive()) {
+                    tl_spriteBatcher.EndStickyBatchSession();
+                }
+                const int64_t vbT0 = NowQpc();
+                const bool vbOk = g_vbPool.AcquireAndUpload(target, glUsage, size, data, false, bufId);
+                const int64_t vbT1 = NowQpc();
+                if (g_qpcToUs > 0.0) {
+                    const double vbUsD = (vbT1 > vbT0) ? (static_cast<double>(vbT1 - vbT0) * g_qpcToUs) : 0.0;
+                    const uint64_t vbUs = static_cast<uint64_t>(std::min(vbUsD, 60000000.0));
+                    if (vbUs > 0u) g_xrayVbPoolUs.fetch_add(vbUs, std::memory_order_relaxed);
+                    g_xrayVbPoolCalls.fetch_add(1u, std::memory_order_relaxed);
+                }
+                if (vbOk) {
+                    tl_spriteBatcher.OnBindBuffer(target, bufId);
+                    tl_spriteBatcher.OnBufferUpload(bufId, data, size, /*isDynamic=*/true);
+                    tl_uiBatcher.OnBindBuffer(target, bufId);
+                    const bool captureUi = g_optSpriteBatch.load(std::memory_order_relaxed) &&
+                                           (size <= hs_ui_batch::kMaxUiShadowCaptureBytes);
+                    tl_uiBatcher.OnBufferUpload(bufId, data, size, captureUi);
+                    *reinterpret_cast<uint32_t*>(raw + 0x10) = bufId;
+                    return 1u;
+                }
             }
         }
     }
@@ -10831,6 +14776,7 @@ static bool IsOurGlHookPointer(void* p) noexcept {
            p == reinterpret_cast<void*>(&HookGlDeleteProgram) ||
            p == reinterpret_cast<void*>(&HookGlActiveTexture) ||
            p == reinterpret_cast<void*>(&HookGlBindTexture) ||
+           p == reinterpret_cast<void*>(&HookGlGenTextures) ||
            p == reinterpret_cast<void*>(&HookGlDeleteTextures) ||
            p == reinterpret_cast<void*>(&HookGlBlendFunc) ||
            p == reinterpret_cast<void*>(&HookGlDepthMask) ||
@@ -10848,10 +14794,12 @@ static bool IsOurGlHookPointer(void* p) noexcept {
            p == reinterpret_cast<void*>(&HookGlScissor) ||
            p == reinterpret_cast<void*>(&HookGlViewport) ||
            p == reinterpret_cast<void*>(&HookGlUniform1f) ||
+           p == reinterpret_cast<void*>(&HookGlUniform1fv) ||
            p == reinterpret_cast<void*>(&HookGlUniform1i) ||
            p == reinterpret_cast<void*>(&HookGlUniform2fv) ||
            p == reinterpret_cast<void*>(&HookGlUniform3fv) ||
            p == reinterpret_cast<void*>(&HookGlUniform4fv) ||
+           p == reinterpret_cast<void*>(&HookGlUniformMatrix2fv) ||
            p == reinterpret_cast<void*>(&HookGlUniformMatrix3fv) ||
            p == reinterpret_cast<void*>(&HookGlUniformMatrix4fv) ||
            p == reinterpret_cast<void*>(&HookGlBufferData) ||
@@ -10860,11 +14808,17 @@ static bool IsOurGlHookPointer(void* p) noexcept {
            p == reinterpret_cast<void*>(&HookGlDrawElements) ||
            p == reinterpret_cast<void*>(&HookGlBindFramebuffer) ||
            p == reinterpret_cast<void*>(&HookGlDeleteFramebuffers) ||
+           p == reinterpret_cast<void*>(&HookGlCheckFramebufferStatus) ||
+           p == reinterpret_cast<void*>(&HookGlFramebufferTexture2D) ||
+           p == reinterpret_cast<void*>(&HookGlFramebufferRenderbuffer) ||
+           p == reinterpret_cast<void*>(&HookGlDeleteRenderbuffers) ||
+           p == reinterpret_cast<void*>(&HookGlRenderbufferStorage) ||
            p == reinterpret_cast<void*>(&HookGlGetIntegerv) ||
            p == reinterpret_cast<void*>(&HookGlClear) ||
            p == reinterpret_cast<void*>(&HookGlClearColor) ||
            p == reinterpret_cast<void*>(&HookGlReadPixels) ||
            p == reinterpret_cast<void*>(&HookGlFinish) ||
+           p == reinterpret_cast<void*>(&HookGlGetError) ||
            p == reinterpret_cast<void*>(&HookGlStencilFunc) ||
            p == reinterpret_cast<void*>(&HookGlStencilMask) ||
            p == reinterpret_cast<void*>(&HookGlStencilOp) ||
@@ -10898,7 +14852,10 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
                 g_fnGlBufferData   = reinterpret_cast<GlBufferData_t>(p);
                 g_origGlBufferData = g_fnGlBufferData;
                 break;
-            case  15: g_fnGlCheckFramebufferStatus       = reinterpret_cast<GlCheckFramebufferStatus_t>(p); break;
+            case  15:
+                g_fnGlCheckFramebufferStatus   = reinterpret_cast<GlCheckFramebufferStatus_t>(p);
+                g_origGlCheckFramebufferStatus = g_fnGlCheckFramebufferStatus;
+                break;
             case  16: g_origGlClear                      = reinterpret_cast<GlClear_t>(p); break;
             case  17: g_origGlClearColor                 = reinterpret_cast<GlClearColor_t>(p); break;
             case  20: g_origGlColorMask                  = reinterpret_cast<GlColorMask_t>(p); break;
@@ -10914,7 +14871,10 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
                 break;
             case  31: g_origGlDeleteTextures             = reinterpret_cast<GlDeleteTextures_t>(p); break;
             case  32: g_origGlDeleteProgram              = reinterpret_cast<GlDeleteProgram_t>(p); break;
-            case  33: g_fnGlDeleteRenderbuffers          = reinterpret_cast<GlDeleteRenderbuffers_t>(p); break;
+            case  33:
+                g_fnGlDeleteRenderbuffers   = reinterpret_cast<GlDeleteRenderbuffers_t>(p);
+                g_origGlDeleteRenderbuffers = g_fnGlDeleteRenderbuffers;
+                break;
             case  34: g_fnGlDeleteShader                 = reinterpret_cast<GlDeleteShader_t>(p); break;
             case  36: g_origGlDepthFunc                  = reinterpret_cast<GlDepthFunc_t>(p); break;
             case  37: g_origGlDepthMask                  = reinterpret_cast<GlDepthMask_t>(p); break;
@@ -10928,15 +14888,27 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
                 g_fnGlFinishNative = reinterpret_cast<GlFinish_t>(p);
                 g_origGlFinish     = g_fnGlFinishNative;
                 break;
-            case  47: g_fnGlFramebufferRenderbuffer      = reinterpret_cast<GlFramebufferRenderbuffer_t>(p); break;
-            case  48: g_fnGlFramebufferTexture2D         = reinterpret_cast<GlFramebufferTexture2D_t>(p); break;
+            case  47:
+                g_fnGlFramebufferRenderbuffer   = reinterpret_cast<GlFramebufferRenderbuffer_t>(p);
+                g_origGlFramebufferRenderbuffer = g_fnGlFramebufferRenderbuffer;
+                break;
+            case  48:
+                g_fnGlFramebufferTexture2D   = reinterpret_cast<GlFramebufferTexture2D_t>(p);
+                g_origGlFramebufferTexture2D = g_fnGlFramebufferTexture2D;
+                break;
             case  49: g_origGlFrontFace                  = reinterpret_cast<GlFrontFace_t>(p); break;
             case  50: g_fnGlGenBuffers                   = reinterpret_cast<GlGenBuffers_t>(p); break;
             case  52: g_fnGlGenFramebuffers              = reinterpret_cast<GlGenFramebuffers_t>(p); break;
             case  53: g_fnGlGenRenderbuffers             = reinterpret_cast<GlGenRenderbuffers_t>(p); break;
-            case  54: g_fnGlGenTextures                  = reinterpret_cast<GlGenTextures_t>(p); break;
+            case  54:
+                g_fnGlGenTextures   = reinterpret_cast<GlGenTextures_t>(p);
+                g_origGlGenTextures = g_fnGlGenTextures;
+                break;
             case  58: g_fnGlGetAttribLocation            = reinterpret_cast<GlGetAttribLocation_t>(p); break;
-            case  61: g_fnGlGetError                     = reinterpret_cast<GlGetError_t>(p); break;
+            case  61:
+                g_fnGlGetError   = reinterpret_cast<GlGetError_t>(p);
+                g_origGlGetError = g_fnGlGetError;
+                break;
             case  64: g_fnGlGetIntegerv                  = reinterpret_cast<GlGetIntegerv_t>(p); break;
             case  65: g_fnGlGetProgramiv                 = reinterpret_cast<GlGetProgramiv_t>(p); break;
             case  66: g_fnGlGetProgramInfoLog            = reinterpret_cast<GlGetProgramInfoLog_t>(p); break;
@@ -10948,7 +14920,10 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
             case  91: g_fnGlPixelStorei                  = reinterpret_cast<GlPixelStorei_t>(p); break;
             case  92: g_origGlPolygonOffset              = reinterpret_cast<GlPolygonOffset_t>(p); break;
             case  93: g_origGlReadPixels                 = reinterpret_cast<GlReadPixels_t>(p); break;
-            case  95: g_fnGlRenderbufferStorage          = reinterpret_cast<GlRenderbufferStorage_t>(p); break;
+            case  95:
+                g_fnGlRenderbufferStorage   = reinterpret_cast<GlRenderbufferStorage_t>(p);
+                g_origGlRenderbufferStorage = g_fnGlRenderbufferStorage;
+                break;
             case  97: g_origGlScissor                    = reinterpret_cast<GlScissor_t>(p); break;
             case  99: g_origGlShaderSource               = reinterpret_cast<GlShaderSource_t>(p); break;
             case 100: g_origGlStencilFunc                = reinterpret_cast<GlStencilFunc_t>(p); break;
@@ -10957,6 +14932,7 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
             case 106: g_origGlTexImage2D                 = reinterpret_cast<GlTexImage2D_t>(p); break;
             case 109: g_origGlTexParameteri              = reinterpret_cast<GlTexParameteri_t>(p); break;
             case 112: g_origGlUniform1f                  = reinterpret_cast<GlUniform1f_t>(p); break;
+            case 113: g_origGlUniform1fv                 = reinterpret_cast<GlUniform1fv_t>(p); break;
             case 114: g_origGlUniform1i                  = reinterpret_cast<GlUniform1i_t>(p); break;
             case 117: g_origGlUniform2fv                 = reinterpret_cast<GlUniform2fv_t>(p); break;
             case 121: g_origGlUniform3fv                 = reinterpret_cast<GlUniform3fv_t>(p); break;
@@ -10964,6 +14940,7 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
                 g_origGlUniform4fv = reinterpret_cast<GlUniform4fv_t>(p);
                 g_fnGlUniform4fv   = reinterpret_cast<GlUniform4fv_t>(p);
                 break;
+            case 128: g_origGlUniformMatrix2fv           = reinterpret_cast<GlUniformMatrix2fv_t>(p); break;
             case 129: g_origGlUniformMatrix3fv           = reinterpret_cast<GlUniformMatrix3fv_t>(p); break;
             case 130: g_origGlUniformMatrix4fv           = reinterpret_cast<GlUniformMatrix4fv_t>(p); break;
             case 131: g_origGlUseProgram                 = reinterpret_cast<GlUseProgram_t>(p); break;
@@ -11000,7 +14977,30 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
     if (opt.glFenceSync)             g_fnGlFenceSync             = reinterpret_cast<GlFenceSync_t>(opt.glFenceSync);
     if (opt.glClientWaitSync)        g_fnGlClientWaitSync        = reinterpret_cast<GlClientWaitSync_t>(opt.glClientWaitSync);
     if (opt.glDeleteSync)            g_fnGlDeleteSync            = reinterpret_cast<GlDeleteSync_t>(opt.glDeleteSync);
+    void* bufStor = opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt;
+    if (bufStor)                      g_fnGlBufferStorage          = reinterpret_cast<GlBufferStorage_t>(bufStor);
+    if (opt.glTexStorage2D)           g_fnGlTexStorage2D           = reinterpret_cast<GlTexStorage2D_t>(opt.glTexStorage2D);
+    if (opt.glDrawElementsBaseVertex) g_fnGlDrawElementsBaseVertex = reinterpret_cast<GlDrawElementsBaseVertex_t>(opt.glDrawElementsBaseVertex);
+    if (opt.glBindBufferBase)         g_fnGlBindBufferBase         = reinterpret_cast<GlBindBufferBase_t>(opt.glBindBufferBase);
+    if (opt.glGetTextureHandleARB)    g_fnGlGetTextureHandleARB    = reinterpret_cast<GlGetTextureHandleArb_t>(opt.glGetTextureHandleARB);
+    if (opt.glMakeTextureHandleResidentARB)    g_fnGlMakeTextureHandleResidentARB    = reinterpret_cast<GlMakeTextureHandleResidentArb_t>(opt.glMakeTextureHandleResidentARB);
+    if (opt.glMakeTextureHandleNonResidentARB) g_fnGlMakeTextureHandleNonResidentARB = reinterpret_cast<GlMakeTextureHandleNonResidentArb_t>(opt.glMakeTextureHandleNonResidentARB);
+    if (opt.glDispatchCompute)       g_fnGlDispatchCompute       = reinterpret_cast<GlDispatchCompute_t>(opt.glDispatchCompute);
+    if (opt.glMemoryBarrier)         g_fnGlMemoryBarrier         = reinterpret_cast<GlMemoryBarrier_t>(opt.glMemoryBarrier);
+    if (opt.glBindImageTexture)      g_fnGlBindImageTexture      = reinterpret_cast<GlBindImageTexture_t>(opt.glBindImageTexture);
+    if (opt.glIsEnabled)             g_fnGlIsEnabled             = reinterpret_cast<GlIsEnabled_t>(opt.glIsEnabled);
+    if (opt.glUniform4f)             g_fnGlUniform4f             = reinterpret_cast<GlUniform4f_t>(opt.glUniform4f);
+    if (opt.glGenQueries)            g_fnGlGenQueries            = reinterpret_cast<GlGenQueries_t>(opt.glGenQueries);
+    if (opt.glDeleteQueries)         g_fnGlDeleteQueries         = reinterpret_cast<GlDeleteQueries_t>(opt.glDeleteQueries);
+    if (opt.glBeginQuery)            g_fnGlBeginQuery            = reinterpret_cast<GlBeginQuery_t>(opt.glBeginQuery);
+    if (opt.glEndQuery)              g_fnGlEndQuery              = reinterpret_cast<GlEndQuery_t>(opt.glEndQuery);
+    if (opt.glGetQueryObjectiv)      g_fnGlGetQueryObjectiv      = reinterpret_cast<GlGetQueryObjectiv_t>(opt.glGetQueryObjectiv);
+    if (opt.glGetQueryObjectui64v)   g_fnGlGetQueryObjectui64v   = reinterpret_cast<GlGetQueryObjectui64v_t>(opt.glGetQueryObjectui64v);
     if (opt.glFinish && !g_fnGlFinishNative) g_fnGlFinishNative = reinterpret_cast<GlFinish_t>(opt.glFinish);
+
+    const bool liveComputeReady = g_fnGlDispatchCompute && g_fnGlMemoryBarrier && g_fnGlBindImageTexture &&
+                                  g_fnGlTexStorage2D && g_fnGlBlitFramebuffer && g_fnGlUniform4f;
+    g_gpuClaritySupported.store(liveComputeReady, std::memory_order_release);
 
     hs_vb_pool::GlBufferOps vbOps{};
     vbOps.glGenBuffers       = g_fnGlGenBuffers;
@@ -11016,6 +15016,7 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
 
     g_sbOpsGen.fetch_add(1, std::memory_order_release);
     g_wsOpsGen.fetch_add(1, std::memory_order_release);
+    g_kleiFastOpsGen.fetch_add(1, std::memory_order_release);
     std::atomic_thread_fence(std::memory_order_release);
     g_afCapsProbeState.store(0, std::memory_order_release);
     g_hd2dIatHooked = g_optHd2dWorldShaders.load(std::memory_order_relaxed) &&
@@ -11051,13 +15052,18 @@ static void InstallGlIatHooks() {
         g_origGlDeleteBuffers    = reinterpret_cast<GlDeleteBuffers_t>(GetProcAddress(hGles, "glDeleteBuffers"));
         g_fnGlGenFramebuffers         = reinterpret_cast<GlGenFramebuffers_t>(GetProcAddress(hGles, "glGenFramebuffers"));
         g_fnGlDeleteFramebuffers      = reinterpret_cast<GlDeleteFramebuffers_t>(GetProcAddress(hGles, "glDeleteFramebuffers"));
-        g_fnGlFramebufferTexture2D    = reinterpret_cast<GlFramebufferTexture2D_t>(GetProcAddress(hGles, "glFramebufferTexture2D"));
-        g_fnGlCheckFramebufferStatus  = reinterpret_cast<GlCheckFramebufferStatus_t>(GetProcAddress(hGles, "glCheckFramebufferStatus"));
-        g_fnGlGenRenderbuffers        = reinterpret_cast<GlGenRenderbuffers_t>(GetProcAddress(hGles, "glGenRenderbuffers"));
-        g_fnGlDeleteRenderbuffers     = reinterpret_cast<GlDeleteRenderbuffers_t>(GetProcAddress(hGles, "glDeleteRenderbuffers"));
-        g_fnGlBindRenderbuffer        = reinterpret_cast<GlBindRenderbuffer_t>(GetProcAddress(hGles, "glBindRenderbuffer"));
-        g_fnGlRenderbufferStorage     = reinterpret_cast<GlRenderbufferStorage_t>(GetProcAddress(hGles, "glRenderbufferStorage"));
-        g_fnGlFramebufferRenderbuffer = reinterpret_cast<GlFramebufferRenderbuffer_t>(GetProcAddress(hGles, "glFramebufferRenderbuffer"));
+        g_fnGlFramebufferTexture2D      = reinterpret_cast<GlFramebufferTexture2D_t>(GetProcAddress(hGles, "glFramebufferTexture2D"));
+        g_origGlFramebufferTexture2D    = g_fnGlFramebufferTexture2D;
+        g_fnGlCheckFramebufferStatus    = reinterpret_cast<GlCheckFramebufferStatus_t>(GetProcAddress(hGles, "glCheckFramebufferStatus"));
+        g_origGlCheckFramebufferStatus  = g_fnGlCheckFramebufferStatus;
+        g_fnGlGenRenderbuffers          = reinterpret_cast<GlGenRenderbuffers_t>(GetProcAddress(hGles, "glGenRenderbuffers"));
+        g_fnGlDeleteRenderbuffers       = reinterpret_cast<GlDeleteRenderbuffers_t>(GetProcAddress(hGles, "glDeleteRenderbuffers"));
+        g_origGlDeleteRenderbuffers     = g_fnGlDeleteRenderbuffers;
+        g_fnGlBindRenderbuffer          = reinterpret_cast<GlBindRenderbuffer_t>(GetProcAddress(hGles, "glBindRenderbuffer"));
+        g_fnGlRenderbufferStorage       = reinterpret_cast<GlRenderbufferStorage_t>(GetProcAddress(hGles, "glRenderbufferStorage"));
+        g_origGlRenderbufferStorage     = g_fnGlRenderbufferStorage;
+        g_fnGlFramebufferRenderbuffer   = reinterpret_cast<GlFramebufferRenderbuffer_t>(GetProcAddress(hGles, "glFramebufferRenderbuffer"));
+        g_origGlFramebufferRenderbuffer = g_fnGlFramebufferRenderbuffer;
         g_fnGlGenTextures             = reinterpret_cast<GlGenTextures_t>(GetProcAddress(hGles, "glGenTextures"));
         g_origGlClearColor            = reinterpret_cast<GlClearColor_t>(GetProcAddress(hGles, "glClearColor"));
         g_fnGlGetError                = reinterpret_cast<GlGetError_t>(GetProcAddress(hGles, "glGetError"));
@@ -11076,8 +15082,9 @@ static void InstallGlIatHooks() {
         LogMsg("[VISUAL] glTexParameteri (@109) IAT hook skipped (slot not found)");
     }
 
+    bool okDbHooked = false;
     if (g_optVbPool.load(std::memory_order_relaxed)) {
-        PatchExeIatEntry("libGLESv2.dll", 29, "glDeleteBuffers", reinterpret_cast<void*>(&HookGlDeleteBuffers), g_origGlDeleteBuffers);
+        okDbHooked = PatchExeIatEntry("libGLESv2.dll", 29, "glDeleteBuffers", reinterpret_cast<void*>(&HookGlDeleteBuffers), g_origGlDeleteBuffers);
         hs_vb_pool::GlBufferOps vbOps{};
         vbOps.glGenBuffers       = g_fnGlGenBuffers;
         vbOps.glBindBuffer       = g_origGlBindBuffer;
@@ -11159,6 +15166,7 @@ static void InstallGlIatHooks() {
                     FindExeIatSlot("libGLESv2.dll", 29, "glDeleteBuffers")) {
                     okBb = PatchExeIatEntry("libGLESv2.dll",  4, "glBindBuffer",    reinterpret_cast<void*>(&HookGlBindBuffer),    g_origGlBindBuffer);
                     okDb = PatchExeIatEntry("libGLESv2.dll", 29, "glDeleteBuffers", reinterpret_cast<void*>(&HookGlDeleteBuffers), g_origGlDeleteBuffers);
+                    if (okDb) okDbHooked = true;
                 }
                 if (FindExeIatSlot("libGLESv2.dll", 44, "glEnableVertexAttribArray") &&
                     FindExeIatSlot("libGLESv2.dll", 40, "glDisableVertexAttribArray")) {
@@ -11178,14 +15186,16 @@ static void InstallGlIatHooks() {
                 bool okPo = PatchExeIatEntry("libGLESv2.dll",  92,"glPolygonOffset", reinterpret_cast<void*>(&HookGlPolygonOffset), g_origGlPolygonOffset);
 
                 if (g_optGlUniformCache.load(std::memory_order_relaxed) || wantSpriteBatch || wantWorldShadow) {
-                    bool u1f = PatchExeIatEntry("libGLESv2.dll", 112, "glUniform1f",        reinterpret_cast<void*>(&HookGlUniform1f),        g_origGlUniform1f);
-                    bool u1i = PatchExeIatEntry("libGLESv2.dll", 114, "glUniform1i",        reinterpret_cast<void*>(&HookGlUniform1i),        g_origGlUniform1i);
-                    bool u2  = PatchExeIatEntry("libGLESv2.dll", 117, "glUniform2fv",       reinterpret_cast<void*>(&HookGlUniform2fv),       g_origGlUniform2fv);
-                    bool u3  = PatchExeIatEntry("libGLESv2.dll", 121, "glUniform3fv",       reinterpret_cast<void*>(&HookGlUniform3fv),       g_origGlUniform3fv);
-                    bool u4  = PatchExeIatEntry("libGLESv2.dll", 125, "glUniform4fv",       reinterpret_cast<void*>(&HookGlUniform4fv),       g_origGlUniform4fv);
-                    bool um3 = PatchExeIatEntry("libGLESv2.dll", 129, "glUniformMatrix3fv", reinterpret_cast<void*>(&HookGlUniformMatrix3fv), g_origGlUniformMatrix3fv);
-                    bool um4 = PatchExeIatEntry("libGLESv2.dll", 130, "glUniformMatrix4fv", reinterpret_cast<void*>(&HookGlUniformMatrix4fv), g_origGlUniformMatrix4fv);
-                    okUni = (u1f && u1i && u2 && u3 && u4 && um3 && um4);
+                    bool u1f  = PatchExeIatEntry("libGLESv2.dll", 112, "glUniform1f",        reinterpret_cast<void*>(&HookGlUniform1f),        g_origGlUniform1f);
+                    bool u1fv = PatchExeIatEntry("libGLESv2.dll", 113, "glUniform1fv",       reinterpret_cast<void*>(&HookGlUniform1fv),       g_origGlUniform1fv);
+                    bool u1i  = PatchExeIatEntry("libGLESv2.dll", 114, "glUniform1i",        reinterpret_cast<void*>(&HookGlUniform1i),        g_origGlUniform1i);
+                    bool u2   = PatchExeIatEntry("libGLESv2.dll", 117, "glUniform2fv",       reinterpret_cast<void*>(&HookGlUniform2fv),       g_origGlUniform2fv);
+                    bool u3   = PatchExeIatEntry("libGLESv2.dll", 121, "glUniform3fv",       reinterpret_cast<void*>(&HookGlUniform3fv),       g_origGlUniform3fv);
+                    bool u4   = PatchExeIatEntry("libGLESv2.dll", 125, "glUniform4fv",       reinterpret_cast<void*>(&HookGlUniform4fv),       g_origGlUniform4fv);
+                    PatchExeIatEntry("libGLESv2.dll",             128, "glUniformMatrix2fv", reinterpret_cast<void*>(&HookGlUniformMatrix2fv), g_origGlUniformMatrix2fv);
+                    bool um3  = PatchExeIatEntry("libGLESv2.dll", 129, "glUniformMatrix3fv", reinterpret_cast<void*>(&HookGlUniformMatrix3fv), g_origGlUniformMatrix3fv);
+                    bool um4  = PatchExeIatEntry("libGLESv2.dll", 130, "glUniformMatrix4fv", reinterpret_cast<void*>(&HookGlUniformMatrix4fv), g_origGlUniformMatrix4fv);
+                    okUni = (u1f && u1fv && u1i && u2 && u3 && u4 && um3 && um4);
                     if (g_optGlUniformCache.load(std::memory_order_relaxed)) {
                         g_glUniformCacheActive.store(okUni, std::memory_order_release);
                         if (!okUni) g_optGlUniformCache.store(false, std::memory_order_release);
@@ -11255,8 +15265,31 @@ static void InstallGlIatHooks() {
             if (!g_origGlClear) {
                 PatchExeIatEntry("libGLESv2.dll", 16, "glClear", reinterpret_cast<void*>(&HookGlClear), g_origGlClear);
             }
+            if (!g_origGlTexImage2D) {
+                PatchExeIatEntry("libGLESv2.dll", 106, "glTexImage2D", reinterpret_cast<void*>(&HookGlTexImage2D), g_origGlTexImage2D);
+            }
+            if (!g_origGlDeleteTextures) {
+                PatchExeIatEntry("libGLESv2.dll", 31, "glDeleteTextures", reinterpret_cast<void*>(&HookGlDeleteTextures), g_origGlDeleteTextures);
+            }
+            const bool okChk = PatchExeIatEntry("libGLESv2.dll", 15, "glCheckFramebufferStatus",  reinterpret_cast<void*>(&HookGlCheckFramebufferStatus),  g_origGlCheckFramebufferStatus);
+            const bool okFbt = PatchExeIatEntry("libGLESv2.dll", 48, "glFramebufferTexture2D",    reinterpret_cast<void*>(&HookGlFramebufferTexture2D),    g_origGlFramebufferTexture2D);
+            const bool okFbr = PatchExeIatEntry("libGLESv2.dll", 47, "glFramebufferRenderbuffer", reinterpret_cast<void*>(&HookGlFramebufferRenderbuffer), g_origGlFramebufferRenderbuffer);
+            const bool okDrb = PatchExeIatEntry("libGLESv2.dll", 33, "glDeleteRenderbuffers",     reinterpret_cast<void*>(&HookGlDeleteRenderbuffers),     g_origGlDeleteRenderbuffers);
+            const bool okRbs = PatchExeIatEntry("libGLESv2.dll", 95, "glRenderbufferStorage",     reinterpret_cast<void*>(&HookGlRenderbufferStorage),     g_origGlRenderbufferStorage);
+            g_fboCompleteCacheHooksReady.store(
+                okChk && okFbt && okFbr && okDrb && okRbs &&
+                g_origGlBindFramebuffer != nullptr &&
+                g_origGlDeleteFramebuffers != nullptr &&
+                g_origGlTexImage2D != nullptr &&
+                g_origGlDeleteTextures != nullptr,
+                std::memory_order_release);
             PatchExeIatEntry("libGLESv2.dll", 64, "glGetIntegerv", reinterpret_cast<void*>(&HookGlGetIntegerv), g_fnGlGetIntegerv);
+            PatchExeIatEntry("libGLESv2.dll", 54, "glGenTextures", reinterpret_cast<void*>(&HookGlGenTextures), g_origGlGenTextures);
+            PatchExeIatEntry("libGLESv2.dll", 61, "glGetError",    reinterpret_cast<void*>(&HookGlGetError),    g_origGlGetError);
         }
+        g_kleiEpochHooksReady.store(okLnk && okDel && okMc && okSw && okDbHooked,
+                                    std::memory_order_release);
+        g_kleiFastOpsGen.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -11687,7 +15720,6 @@ MiniDumpWriteDump_t g_origMiniDumpWriteDump = nullptr;
 // Per-controller-slot disconnect throttle (re-probes disconnected Xbox slots every 500ms instead of 240Hz;
 // connected slots pass through at 0ms latency, and WM_DEVICECHANGE clears the cache instantaneously!)
 static std::atomic<int64_t> g_xinputDiscQpc[4]{};
-static std::atomic<uint64_t> g_mouseMoveCoalesced{0};
 static std::atomic<uint64_t> g_xinputThrottleHits{0};
 
 struct MinidumpExcParamLite {
@@ -11740,24 +15772,6 @@ static BOOL WINAPI HookPeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, 
             for (int i = 0; i < 4; ++i) {
                 g_xinputDiscQpc[i].store(0, std::memory_order_relaxed);
             }
-        } else if (lpMsg->message == WM_MOUSEMOVE) {
-            // Order-preserving high-polling-rate mouse coalescing (4K/8KHz mice):
-            // Only collapse strictly adjacent WM_MOUSEMOVE messages with identical (hwnd, wParam),
-            // NEVER crossing button clicks, wheel events, keyboard input, or modifier changes!
-            uint32_t collapsed = 0;
-            MSG nextMsg{};
-            while (collapsed < 64u &&
-                   g_origPeekMessageW(&nextMsg, hWnd, 0u, 0u, PM_NOREMOVE) &&
-                   nextMsg.message == WM_MOUSEMOVE &&
-                   nextMsg.hwnd == lpMsg->hwnd &&
-                   nextMsg.wParam == lpMsg->wParam) {
-                if (!g_origPeekMessageW(&nextMsg, hWnd, 0u, 0u, PM_REMOVE)) break;
-                *lpMsg = nextMsg;
-                ++collapsed;
-            }
-            if (collapsed > 0u) {
-                g_mouseMoveCoalesced.fetch_add(collapsed, std::memory_order_relaxed);
-            }
         }
     }
     if (g_qpcToUs > 0.0) {
@@ -11787,7 +15801,7 @@ static BOOL WINAPI HookMiniDumpWriteDump(HANDLE hProcess, DWORD processId, HANDL
 }
 
 static void InstallDiagnosticsAndUtilityIatHooks() {
-    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.6");
+    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.7-beta1");
     g_crashDetective.InstallUnhandledFilter();
     const bool okDump   = PatchExeIatEntry("dbghelp.dll",     0, "MiniDumpWriteDump",     reinterpret_cast<void*>(&HookMiniDumpWriteDump),    g_origMiniDumpWriteDump);
     const bool okSteam  = PatchExeIatEntry("steam_api64.dll", 0, "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&HookSteamApiRunCallbacks), g_origSteamRunCallbacks);
@@ -11809,11 +15823,17 @@ int LuaHyperSmoothSetVisual(void* L) {
     int prevAf = g_visualAnisoLevel.exchange(aniso, std::memory_order_relaxed);
     bool prevLm = g_visualFullresLightmap.exchange(fullLm, std::memory_order_relaxed);
     float prevMip = g_visualMipLodBias.exchange(mipBias, std::memory_order_relaxed);
+    if (!fullLm) {
+        g_lightmapAdaptiveHalf.store(false, std::memory_order_relaxed);
+    }
     if (g_lightmapScaleSlot) {
-        *g_lightmapScaleSlot = fullLm ? 1.0f : 0.5f;
+        *g_lightmapScaleSlot = (fullLm && !g_lightmapAdaptiveHalf.load(std::memory_order_relaxed)) ? 1.0f : 0.5f;
     }
     if (prevLm != fullLm) {
         g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
+    }
+    if (prevAf != aniso || fabsf(prevMip - mipBias) > 1e-4f) {
+        g_visualTexParamGen.fetch_add(1, std::memory_order_release);
     }
     if (prevAf != aniso || prevLm != fullLm || fabsf(prevMip - mipBias) > 1e-4f) {
         LogMsg("[VISUAL] Lua Bridge -> AF=%dx, FullResLightmap=%d (liveSwap=%d), MipLodBias=%.2f",
@@ -11826,15 +15846,57 @@ int LuaHyperSmoothSetVisual(void* L) {
 
 int LuaHyperSmoothGetVisualStats(void* L) {
     if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    const bool mipHooked = g_angleSamplerHooked.load(std::memory_order_relaxed) ||
+                           g_nativeGlActive.load(std::memory_order_acquire);
     g_luaPushNumber(L, static_cast<double>(g_visualAnisoLevel.load(std::memory_order_relaxed)));
     g_luaPushNumber(L, static_cast<double>(g_hwMaxAniso.load(std::memory_order_relaxed)));
     g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_afAppliedHits, 0, 0)));
     g_luaPushBoolean(L, g_lightmapPatched ? 1 : 0);
     g_luaPushNumber(L, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5);
-    g_luaPushBoolean(L, g_angleSamplerHooked.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushBoolean(L, mipHooked ? 1 : 0);
     g_luaPushNumber(L, static_cast<double>(g_visualMipLodBias.load(std::memory_order_relaxed)));
     g_luaPushNumber(L, static_cast<double>(InterlockedCompareExchange64(&g_mipBiasAppliedHits, 0, 0)));
     return 8;
+}
+
+int LuaHyperSmoothSetClarityGrade(void* L) {
+    if (!g_luaToNumber || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    int grade = static_cast<int>(g_luaToNumber(L, 1));
+    grade = std::clamp(grade, 0, 3);
+    const bool hdrLm = g_luaToBoolean ? (g_luaToBoolean(L, 2) != 0) : (grade >= 2);
+    float strength = static_cast<float>(g_luaToNumber(L, 3));
+    if (!(strength >= 0.0f)) strength = 1.0f;
+    strength = std::clamp(strength, 0.0f, 1.5f);
+
+    const int prevGrade = g_visualClarityGrade.exchange(grade, std::memory_order_release);
+    const bool prevHdr = g_visualHdrLightmap.exchange(hdrLm, std::memory_order_relaxed);
+    const float prevStr = g_visualClarityStrength.exchange(strength, std::memory_order_relaxed);
+    if (prevHdr != hdrLm) {
+        g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
+    }
+    if ((prevGrade >= 3) != (grade >= 3)) {
+        g_hd2dStateGen.fetch_add(1, std::memory_order_release);
+    }
+    if (prevGrade != grade || prevHdr != hdrLm || fabsf(prevStr - strength) > 0.005f) {
+        LogMsg("[VISUAL][GPU_CLARITY] Lua Bridge -> grade=%d hdrLightmap=%d str=%.2f computeReady=%d",
+               grade, hdrLm ? 1 : 0, static_cast<double>(strength),
+               g_gpuClaritySupported.load(std::memory_order_acquire) ? 1 : 0);
+    }
+    g_luaPushBoolean(L, 1);
+    return 1;
+}
+
+int LuaHyperSmoothGetClarityStats(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    g_luaPushNumber(L, static_cast<double>(g_visualClarityGrade.load(std::memory_order_relaxed)));
+    g_luaPushBoolean(L, g_gpuClaritySupported.load(std::memory_order_acquire) ? 1 : 0);
+    g_luaPushBoolean(L, g_gpuClarityActive.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_gpuClarityGpuUs.load(std::memory_order_relaxed)) * 0.001);
+    g_luaPushBoolean(L, g_visualHdrLightmapActive.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_worldShadowRes.load(std::memory_order_relaxed)));
+    g_luaPushNumber(L, static_cast<double>(g_gpuClarityVramKb.load(std::memory_order_relaxed)) / 1024.0);
+    return 7;
 }
 
 int LuaHyperSmoothSetLowLatency(void* L) {
@@ -13038,8 +17100,40 @@ int LuaHyperSmoothGetSpriteBatchStats(void* L) {
 
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.9.6");
+    g_luaPushString(L, "DST-HyperSmooth/2.9.7-beta1");
     return 1;
+}
+
+int LuaHyperSmoothSetHardwareTier(void* L) {
+    if (!g_luaToNumber || !g_luaPushNumber || !g_luaPushString) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    const int req = static_cast<int>(g_luaToNumber(L, 1));
+    ApplyHardwareTierLive(req, true);
+    const int cur = g_cfgHardwareTier.load(std::memory_order_acquire);
+    g_luaPushNumber(L, static_cast<double>(cur));
+    g_luaPushString(L, hs_hw_tier::TierName(static_cast<hs_hw_tier::HardwareTier>(cur)));
+    return 2;
+}
+
+int LuaHyperSmoothGetHardwareInfo(void* L) {
+    if (!g_luaPushNumber || !g_luaPushBoolean) return 0;
+    const int cur = g_cfgHardwareTier.load(std::memory_order_acquire);
+    const auto vbSt = g_vbPool.GetStats();
+    const size_t vbMaxMb = g_vbPool.MaxPooledBytes() / (1024u * 1024u);
+    const size_t scMaxMb = g_tierShadowCacheBytes.load(std::memory_order_relaxed) / (1024u * 1024u);
+    const size_t scUsedKb = g_sbShadowCacheUsedBytes.load(std::memory_order_relaxed) / 1024u;
+    g_luaPushNumber(L, static_cast<double>(cur));
+    g_luaPushNumber(L, static_cast<double>(g_hwCaps.logicalCores));
+    g_luaPushNumber(L, static_cast<double>(g_hwCaps.totalRamMb));
+    g_luaPushNumber(L, static_cast<double>(g_hwCaps.glMajor));
+    g_luaPushNumber(L, static_cast<double>(g_hwCaps.glMinor));
+    g_luaPushBoolean(L, g_sbPersistentRingActive.load(std::memory_order_relaxed) ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(vbMaxMb));
+    g_luaPushNumber(L, static_cast<double>(scMaxMb));
+    g_luaPushNumber(L, static_cast<double>(vbSt.pooledBytes) / 1024.0);
+    g_luaPushNumber(L, static_cast<double>(scUsedKb));
+    g_luaPushNumber(L, static_cast<double>(g_lastAnimShed.load(std::memory_order_relaxed)));
+    return 11;
 }
 
 static int LuaHyperSmoothGetBlackbox(void* L) {
@@ -13575,6 +17669,10 @@ void RegisterHyperSmoothLuaApi(void* L) {
     reg("HyperSmooth_SetSpriteBatch", &LuaHyperSmoothSetSpriteBatch);
     reg("HyperSmooth_GetSpriteBatchStats", &LuaHyperSmoothGetSpriteBatchStats);
     reg("HyperSmooth_SetStatsHold", &LuaHyperSmoothSetStatsHold);
+    reg("HyperSmooth_SetHardwareTier", &LuaHyperSmoothSetHardwareTier);
+    reg("HyperSmooth_GetHardwareInfo", &LuaHyperSmoothGetHardwareInfo);
+    reg("HyperSmooth_SetClarityGrade", &LuaHyperSmoothSetClarityGrade);
+    reg("HyperSmooth_GetClarityStats", &LuaHyperSmoothGetClarityStats);
     if (g_clientLuaApi.ReadyForFastDump()) {
         reg("HyperSmooth_FastDump", &LuaHyperSmoothFastDump);
     }
@@ -13670,6 +17768,32 @@ void HookLuaOpenLibs(void* L) {
     RegisterHyperSmoothLuaApi(L);
 }
 
+static bool TryResolvePreHookedJump(const uint8_t* src, uint64_t* outNextHop) {
+    if (!src || !outNextHop) return false;
+    if (src[0] == 0xE9) {
+        int32_t d = 0;
+        memcpy(&d, src + 1, 4);
+        *outNextHop = static_cast<uint64_t>(reinterpret_cast<intptr_t>(src + 5) + d);
+        return true;
+    }
+    if (src[0] == 0xFF && src[1] == 0x25) {
+        int32_t disp = 0;
+        memcpy(&disp, src + 2, 4);
+        const uint64_t* ptr = reinterpret_cast<const uint64_t*>(src + 6 + disp);
+        *outNextHop = *ptr;
+        return true;
+    }
+    if (src[0] == 0x48 && src[1] == 0xB8 && src[10] == 0xFF && src[11] == 0xE0) {
+        memcpy(outNextHop, src + 2, 8);
+        return true;
+    }
+    if (src[0] == 0x49 && src[1] == 0xBB && src[10] == 0x41 && src[11] == 0xFF && src[12] == 0xE3) {
+        memcpy(outNextHop, src + 2, 8);
+        return true;
+    }
+    return false;
+}
+
 void PrepareLuaBridgeHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
     constexpr uint8_t kSigOpenLibs[] = {
         0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
@@ -13718,6 +17842,24 @@ void PrepareLuaBridgeHook(std::vector<PendingCodePatch>& patches, uint8_t* textS
     constexpr char kMaskToBoolean[] = "xxxxx????xxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
     uint8_t* pOpenLibs = FindMaskedPatternInText(textStart, textSize, kSigOpenLibs, kMaskOpenLibs, sizeof(kSigOpenLibs));
+    bool openLibsPreHooked = false;
+    uint64_t openLibsPrevHop = 0;
+    if (!pOpenLibs) {
+        // Coexistence with loaders like DNH (wsock32.dll) that hook bytes 0..16 of luaL_openlibs before dinput8 runs:
+        // match the unique post-prologue tail [+17..] and LIFO-chain via the existing detour target.
+        constexpr size_t kTailOff = 17;
+        uint8_t* pTail = FindMaskedPatternInText(
+            textStart, textSize,
+            kSigOpenLibs + kTailOff, kMaskOpenLibs + kTailOff,
+            sizeof(kSigOpenLibs) - kTailOff);
+        if (pTail && pTail >= textStart + kTailOff) {
+            uint8_t* cand = pTail - kTailOff;
+            if (TryResolvePreHookedJump(cand, &openLibsPrevHop) && openLibsPrevHop != 0) {
+                pOpenLibs = cand;
+                openLibsPreHooked = true;
+            }
+        }
+    }
     uint8_t* pSetField = FindMaskedPatternInText(textStart, textSize, kSigSetField, kMaskSetField, sizeof(kSigSetField));
     uint8_t* pPushNum  = FindPatternInText(textStart, textSize, kSigPushNumber, sizeof(kSigPushNumber));
     uint8_t* pPushBool = FindPatternInText(textStart, textSize, kSigPushBoolean, sizeof(kSigPushBoolean));
@@ -13821,6 +17963,73 @@ void PrepareLuaBridgeHook(std::vector<PendingCodePatch>& patches, uint8_t* textS
            g_clientLuaApi.ReadyForFastDump() ? 1 : 0,
            g_clientLuaApi.ReadyForFastJson() ? 1 : 0);
 
+    static constexpr int16_t kAobLuaSetHook[] = {
+        0x41, 0x8B, 0xC0, 0x48, 0x85, 0xD2, 0x74, 0x04, 0x85, 0xC0, 0x75, 0x05, 0x33, 0xC0, 0x48, 0x8B,
+        0xD0, 0x88, 0x41, 0x64, 0x48, 0x89, 0x51, 0x70, 0x44, 0x89, 0x49, 0x68, 0xB8, 0x01, 0x00, 0x00,
+        0x00, 0x44, 0x89, 0x49, 0x6C, 0xC3
+    };
+    static constexpr int16_t kAobLuaGetStack[] = {
+        0x4C, 0x8B, 0x49, 0x28, 0x4C, 0x8B, 0xD9, 0x85, 0xD2, 0x7E, 0x27, 0x4C, 0x8B, 0x51, 0x50, 0x90,
+        0x4D, 0x3B, 0xCA, 0x76, 0x1B, 0x49, 0x8B, 0x41, 0x08, 0xFF, 0xCA, 0x48, 0x8B, 0x08, 0x80, 0x79
+    };
+    static constexpr int16_t kAobLuaGetInfo[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57,
+        0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0xD9, 0x33, 0xFF, 0x33, 0xC9, 0x80, 0x3A, 0x3E, 0x48, 0x8B
+    };
+    static constexpr uint8_t kSigLuaGetHook[5] = { 0x48, 0x8B, 0x41, 0x70, 0xC3 };
+    uint8_t* pSetHook  = findU16(kAobLuaSetHook);
+    uint8_t* pGetHook  = (pSetHook && (reinterpret_cast<uintptr_t>(pSetHook + 0x30 + 5) <= reinterpret_cast<uintptr_t>(textStart + textSize)) &&
+                          memcmp(pSetHook + 0x30, kSigLuaGetHook, sizeof(kSigLuaGetHook)) == 0)
+        ? (pSetHook + 0x30) : nullptr;
+    uint8_t* pGetStack = findU16(kAobLuaGetStack);
+    uint8_t* pGetInfo  = findU16(kAobLuaGetInfo);
+    const bool hookApiOk = (pSetHook != nullptr && pGetHook != nullptr && pGetStack != nullptr && pGetInfo != nullptr);
+    if (hookApiOk) {
+        g_luaSetHook  = reinterpret_cast<LuaSethook_t>(pSetHook);
+        g_luaGetHook  = reinterpret_cast<LuaGethook_t>(pGetHook);
+        g_luaGetStack = reinterpret_cast<LuaGetstack_t>(pGetStack);
+        g_luaGetInfo  = reinterpret_cast<LuaGetinfo_t>(pGetInfo);
+    }
+    LogMsg("[HOST] Client Lua Debug Hook API ready=%d", hookApiOk ? 1 : 0);
+
+    if (openLibsPreHooked) {
+        // 5-byte near E9 detour chaining LIFO into pre-existing detour (e.g. DNH wsock32)
+        uint8_t* tramp = AllocNearExecutable(pOpenLibs, 64);
+        if (!tramp) return;
+        intptr_t relToRelay = reinterpret_cast<intptr_t>(tramp + 32) - reinterpret_cast<intptr_t>(pOpenLibs + 5);
+        if (relToRelay < INT32_MIN || relToRelay > INT32_MAX) {
+            VirtualFree(tramp, 0, MEM_RELEASE);
+            return;
+        }
+        uint8_t jmpPrev[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+        memcpy(jmpPrev + 6, &openLibsPrevHop, sizeof(openLibsPrevHop));
+        memcpy(tramp, jmpPrev, 14);
+
+        uint8_t jmpHookRelay[14] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+        uint64_t hookTarget = reinterpret_cast<uint64_t>(&HookLuaOpenLibs);
+        memcpy(jmpHookRelay + 6, &hookTarget, sizeof(hookTarget));
+        memcpy(tramp + 32, jmpHookRelay, 14);
+
+        FinalizeExecPageWX(tramp, 48);
+        g_luaOpenLibsTramp = tramp;
+        g_origLuaOpenLibs = reinterpret_cast<LuaOpenLibs_t>(tramp);
+
+        PendingCodePatch p{};
+        p.addr = pOpenLibs;
+        p.len = 5;
+        p.ownedExecPage = tramp;
+        int32_t rel32 = static_cast<int32_t>(relToRelay);
+        p.bytes[0] = 0xE9;
+        memcpy(p.bytes + 1, &rel32, 4);
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "Hooked luaL_openlibs @ %p (LIFO chained -> %p) -> 0ms Direct Lua VM Bridge (W^X RX tramp)",
+                 static_cast<void*>(pOpenLibs), reinterpret_cast<void*>(static_cast<uintptr_t>(openLibsPrevHop)));
+        p.logMsg = msg;
+        patches.push_back(std::move(p));
+        return;
+    }
+
     // 17-byte trampoline for luaL_openlibs (relocates mov rax, [rip+disp32] at +10/+13)
     uint8_t* tramp = AllocNearExecutable(pOpenLibs, 64);
     if (!tramp) return;
@@ -13897,6 +18106,7 @@ void EnsureDefaultIni() {
         "dxgi_flip_present=off\n"
         "enable_vb_pool=1\n"
         "enable_sprite_batch=1\n"
+        "hardware_tier=balanced\n"
         "\n"
         "[VISUAL]\n"
         "; Player-First Default: 100%% Vanilla Pure (all visual enhancements strictly opt-in)\n"
@@ -13989,37 +18199,66 @@ bool ParseModBridgeFile(const std::wstring& path, int& outFps, bool& hasFps, int
 
 DWORD WINAPI PrewarmBundlesProc(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    std::wstring bundlesDir = g_binDir + L"..\\data\\databundles\\";
-    std::wstring search = bundlesDir + L"*.zip";
-    WIN32_FIND_DATAW fd{};
-    HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return 0;
-
     constexpr size_t kBufSize = 1024 * 1024;
     auto* buf = new uint8_t[kBufSize];
     size_t totalBytes = 0;
     DWORD t0 = GetTickCount();
 
-    do {
-        if (g_stopFlag.load(std::memory_order_relaxed) != 0) break;
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            std::wstring fpath = bundlesDir + fd.cFileName;
-            HANDLE hf = CreateFileW(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                    nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-            if (hf != INVALID_HANDLE_VALUE) {
-                DWORD nread = 0;
-                while (g_stopFlag.load(std::memory_order_relaxed) == 0 &&
-                       ReadFile(hf, buf, static_cast<DWORD>(kBufSize), &nread, nullptr) && nread > 0) {
-                    totalBytes += nread;
-                }
-                CloseHandle(hf);
-            }
+    auto warmFile = [&](const std::wstring& fpath, size_t capBytes) {
+        if (totalBytes >= capBytes || g_stopFlag.load(std::memory_order_relaxed) != 0) return;
+        HANDLE hf = CreateFileW(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return;
+        DWORD nread = 0;
+        while (g_stopFlag.load(std::memory_order_relaxed) == 0 &&
+               totalBytes < capBytes &&
+               ReadFile(hf, buf, static_cast<DWORD>(kBufSize), &nread, nullptr) && nread > 0) {
+            totalBytes += nread;
         }
-    } while (FindNextFileW(hFind, &fd));
+        CloseHandle(hf);
+    };
 
-    FindClose(hFind);
+    auto warmGlob = [&](const std::wstring& dir, const wchar_t* pat, size_t capBytes) {
+        if (totalBytes >= capBytes || g_stopFlag.load(std::memory_order_relaxed) != 0) return;
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileW((dir + pat).c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return;
+        do {
+            if (g_stopFlag.load(std::memory_order_relaxed) != 0 || totalBytes >= capBytes) break;
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                warmFile(dir + fd.cFileName, capBytes);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    };
+
+    std::wstring bundlesDir = g_binDir + L"..\\data\\databundles\\";
+    constexpr size_t kMaxPrewarmBytes = 1024ULL * 1024ULL * 1024ULL; // 1024 MB cap
+    warmGlob(bundlesDir, L"*.zip", kMaxPrewarmBytes);
+
+    if (g_tierPrewarmMods.load(std::memory_order_acquire) && totalBytes < kMaxPrewarmBytes) {
+        std::wstring modsRoot = g_binDir + L"..\\mods\\";
+        WIN32_FIND_DATAW mfd{};
+        HANDLE hm = FindFirstFileW((modsRoot + L"*").c_str(), &mfd);
+        if (hm != INVALID_HANDLE_VALUE) {
+            do {
+                if (g_stopFlag.load(std::memory_order_relaxed) != 0 || totalBytes >= kMaxPrewarmBytes) break;
+                if ((mfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                    wcscmp(mfd.cFileName, L".") != 0 && wcscmp(mfd.cFileName, L"..") != 0) {
+                    std::wstring md = modsRoot + mfd.cFileName + L"\\";
+                    warmGlob(md, L"*.zip", kMaxPrewarmBytes);
+                    warmGlob(md, L"*.tex", kMaxPrewarmBytes);
+                    warmGlob(md + L"anim\\", L"*.zip", kMaxPrewarmBytes);
+                    warmGlob(md + L"images\\", L"*.tex", kMaxPrewarmBytes);
+                }
+            } while (FindNextFileW(hm, &mfd));
+            FindClose(hm);
+        }
+    }
+
     delete[] buf;
-    LogMsg("Pre-warmed databundles: %.1f MB in %lu ms",
+    LogMsg("Pre-warmed databundles%s: %.1f MB in %lu ms",
+           g_tierPrewarmMods.load(std::memory_order_relaxed) ? "+mods" : "",
            static_cast<double>(totalBytes) / (1024.0 * 1024.0), GetTickCount() - t0);
     return 0;
 }
@@ -14058,6 +18297,12 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optTimer = ReadIniInt(L"OPTIMIZE", L"high_res_timer", 1) != 0;
     bool optPriority = ReadIniInt(L"OPTIMIZE", L"boost_priority", 1) != 0;
     bool optPrewarm = ReadIniInt(L"OPTIMIZE", L"prewarm_bundles", 1) != 0;
+    g_hwCaps = hs_hw_tier::ProbeHostCaps();
+    wchar_t optTierBuf[32] = L"balanced";
+    GetPrivateProfileStringW(L"OPTIMIZE", L"hardware_tier", L"balanced", optTierBuf, 32, g_iniPath.c_str());
+    g_optBoostPriority.store(optPriority, std::memory_order_relaxed);
+    ApplyHardwareTierLive(static_cast<int>(hs_hw_tier::ParseTier(optTierBuf)), false);
+
     bool optHybridPacer = ReadIniInt(L"OPTIMIZE", L"hybrid_frame_pacer", 1) != 0;
     bool optRtssPacer = ReadIniInt(L"OPTIMIZE", L"rtss_frame_pacer", optHybridPacer ? 1 : 0) != 0;
     bool optMimallocLua = ReadIniInt(L"OPTIMIZE", L"fast_mimalloc_lua", 1) != 0;
@@ -14142,10 +18387,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
         g_timerBoosted = true;
         LogMsg("Enabled 1ms high-resolution Windows timer.");
     }
-    // Use ABOVE_NORMAL (not HIGH) for client so 240Hz UI spinning never starves
-    // local dedicated server / DSA child worldgen processes on low-core CPUs!
-    if (optPriority && SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)) {
-        LogMsg("Boosted client process -> ABOVE_NORMAL_PRIORITY_CLASS.");
+    // Priority class & Win11 EcoQoS are managed by ApplyHardwareTierLive() (respecting boost_priority).
+    if (optPriority) {
+        LogMsg("Client process priority managed by HardwareTier (%s).",
+               hs_hw_tier::TierName(static_cast<hs_hw_tier::HardwareTier>(g_cfgHardwareTier.load(std::memory_order_relaxed))));
     }
 
     uint8_t* textStart = nullptr;
@@ -14153,11 +18398,12 @@ DWORD WINAPI WorkerProc(LPVOID) {
     if (GetTextSection(textStart, textSize)) {
         // Phase 1: Read-only AOB scanning & W^X trampoline preparation (0 threads suspended)
         std::vector<PendingCodePatch> patches;
-        patches.reserve(44);
+        patches.reserve(48);
 
         PrepareVisualFidelityHooks(patches, textStart, textSize);
         PrepareRenderPerfHooks(patches, textStart, textSize);
         PrepareLightMap240AndHotSwapHooks(patches, textStart, textSize);
+        PrepareKleiRenderFastPathHooks(patches, textStart, textSize);
         PrepareDynamicShadow240Hook(patches, textStart, textSize);
         PrepareAnimCmdMainThreadPosHook(patches, textStart, textSize);
         PrepareLuaAndNetTelemetryHooks(patches, textStart, textSize);
@@ -14277,11 +18523,22 @@ DWORD WINAPI WorkerProc(LPVOID) {
         if (isApplied(g_writePersistPatchIdx) && g_asyncBarriersReady.load(std::memory_order_acquire)) {
             g_asyncSaveActive.store(true, std::memory_order_release);
         }
+        if (isApplied(g_kleiApplyUniPatchIdx)) {
+            g_kleiApplyUniHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_kleiDrawPrimPatchIdx)) {
+            g_kleiDrawPrimHooked.store(true, std::memory_order_release);
+        }
+        if (isApplied(g_kleiDrawIdxPatchIdx)) {
+            g_kleiDrawIdxHooked.store(true, std::memory_order_release);
+        }
+        g_kleiFastOpsGen.fetch_add(1, std::memory_order_release);
     }
 
     if (optPrewarm) {
         g_prewarmThread = CreateThread(nullptr, 0, PrewarmBundlesProc, nullptr, 0, nullptr);
     }
+    g_hitchWatchdogThread = CreateThread(nullptr, 0, HitchWatchdogProc, nullptr, 0, nullptr);
 
     uint64_t lastIniTime = GetFileModTime(g_iniPath);
     uint64_t lastModTime = 0;
@@ -14363,12 +18620,14 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 const auto& asyncQ = GetAsyncSave();
                 double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
                 g_frameRing.ComputeStats(avgFps, low1Fps, p99Ms, jitterMs);
-                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz disp=%uHz | libdeflate=%lld (%.1fMB) uncomp=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld spline, %lld swap, xfade=%lld/%lld, %lld shed) | vfx240=%lld (%lld pts) | light240=%lld shadow240=%lld | pos240=%lld (byp=%lld deJit=%lld/%.2fms) | d3d9ex_lat=%u/%u | glCache=%.1f%% (%lld/%lld) glUni=%.1f%% (%lld/%lld) sbatch=%.1f%%(%lld->%lld) fsNeg=%lld/%lld json=%lld/%lld/%lld lua=%.2fms net=%.2fms swap=%.2fms | spatial=%lld (%lld cells) | tex=%lld (slice=%lld) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx mip=%.2f hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld | gl=%s vbPool=%.1f%% (%lld/%lld %uKB) | ping=%d/%dms loss=%.1f%% rpcQos=%lld/%lld asyncSave=%llu/%llu(c=%llu) combat=%u/%u(vfx=%u).",
+                LogMsg("[Summary] avg=%.0f 1%%L=%.0f p99=%.2fms jit=%.2fms sim=%dHz disp=%uHz | libdeflate=%lld (%.1fMB) uncomp=%lld (%.1fMB) | skeletal240=%lld (%lld bones, %lld spline, %lld swap, xfade=%lld/%lld, %lld shed, mt=%llu/%uT) | vfx240=%lld (%lld pts) | light240=%lld shadow240=%lld | pos240=%lld (byp=%lld deJit=%lld/%.2fms) | d3d9ex_lat=%u/%u | glCache=%.1f%% (%lld/%lld) glUni=%.1f%% (%lld/%lld) sbatch=%.1f%%(%lld->%lld) fsNeg=%lld/%lld json=%lld/%lld/%lld lua=%.2fms net=%.2fms swap=%.2fms | spatial=%lld (%lld cells) | tex=%lld (slice=%lld pbo=%d/%llu/%.1fMB) | visual(af=%dx/hw=%.0fx hits=%lld tri=%lld lm=%.1fx mip=%.2f clarity(g=%d act=%d %.2fms hdrLM=%d sh=%u vram=%uMB) hd2d(inj=%u progs=%u str=%.2f) busy=%.2fms world=%.2fms post=%.2fms gpu=%.2fms vram=%.0fMB/pk=%.0fMB) | gc(full=%lld defer=%lld) | mi_allocs=%lld | gl=%s vbPool=%.1f%% (%lld/%lld %uKB) | ping=%d/%dms loss=%.1f%% rpcQos=%lld/%lld asyncSave=%llu/%llu(c=%llu) combat=%u/%u(vfx=%u) | elastic(p=%u w=%u/%u gpu=%d btex=%u gdr=%llu).",
                        avgFps, low1Fps, p99Ms, jitterMs, g_clientSimTickRate.load(std::memory_order_relaxed),
                        g_displayRefreshHz.load(std::memory_order_relaxed),
                        hits, static_cast<double>(bytes) / (1024.0 * 1024.0),
                        uncompC, static_cast<double>(uncompB) / (1024.0 * 1024.0),
                        interp, bones, splBones, p2, xfStarts, xfFrames, shed,
+                       static_cast<unsigned long long>(GetMtSkeletalPool().TotalHits()),
+                       static_cast<unsigned>(GetMtSkeletalPool().NumShards()),
                        vfxCmds, vfxPts, light240, shadow240,
                        posInterp, posBypass, djH, djPk,
                        g_d3d9ExCurLatency.load(std::memory_order_relaxed),
@@ -14381,10 +18640,19 @@ DWORD WINAPI WorkerProc(LPVOID) {
                        static_cast<double>(g_emaNetUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaSwapUs.load(std::memory_order_relaxed)) * 0.001,
                        spQ, spC, texUp, texSl,
+                       g_pboTexActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned long long>(g_pboTexUploads.load(std::memory_order_relaxed)),
+                       static_cast<double>(g_pboTexBytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
                        g_visualAnisoLevel.load(std::memory_order_relaxed),
                        static_cast<double>(g_hwMaxAniso.load(std::memory_order_relaxed)),
                        afHits, afTri, g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5,
                        static_cast<double>(g_visualMipLodBias.load(std::memory_order_relaxed)),
+                       g_visualClarityGrade.load(std::memory_order_relaxed),
+                       g_gpuClarityActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<double>(g_gpuClarityGpuUs.load(std::memory_order_relaxed)) * 0.001,
+                       g_visualHdrLightmapActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       g_worldShadowRes.load(std::memory_order_relaxed),
+                       (g_gpuClarityVramKb.load(std::memory_order_relaxed) + 1023u) / 1024u,
                        g_hd2dShadersInjected.load(std::memory_order_relaxed),
                        g_hd2dProgsLinked.load(std::memory_order_relaxed),
                        static_cast<double>(g_hd2dMasterStr.load(std::memory_order_relaxed)),
@@ -14410,7 +18678,13 @@ DWORD WINAPI WorkerProc(LPVOID) {
                        static_cast<unsigned long long>(asyncQ.CompressedCount()),
                        g_combatImpact.TotalTriggers(),
                        g_combatImpact.TotalBound(),
-                       g_combatVfxDraws.load(std::memory_order_relaxed));
+                       g_combatVfxDraws.load(std::memory_order_relaxed),
+                       static_cast<unsigned>(g_elasticPressureLevel.load(std::memory_order_relaxed)),
+                       static_cast<unsigned>(GetMtSkeletalPool().LastActiveWorkers()),
+                       static_cast<unsigned>(GetMtSkeletalPool().NumShards()),
+                       g_sbGpuDrivenActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned>(g_sbBindlessCount.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbGpuDrivenDraws.load(std::memory_order_relaxed)));
             }
         }
 
@@ -14443,7 +18717,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
                              isRpc ? "RPC" : "RM3", pktId, pktBytes,
                              static_cast<double>(snap.slowPktUs) * 0.001);
                 }
-                LogMsg("[Hitch] peak=%.1fms (cnt=%u severe=%u[max=%.1fms] | avg=%.0f 1%%L=%.0f p99=%.1fms) | busy=%.1fms rt=%.1fms gpu=%.2fms lua=%.2fms net=%.2fms swap=%.1fms world=%.1fms post=%.1fms | loop=(wLua=%.2f eWall=%.2f eUpd=%.2f ePost=%.2f cRnd=%.2f ui=%.2f snd=%.2f stm=%.2f msg=%.2f) | anim=%.2fms (ents=%u bones=%u shed=%u) | gc=%.2fms (kb=%d full=%u/%lld) | tex=%.2fms (up=%lld slice=%lld) | zip=%.2fms shdr=%.2fms host=%.2fms | netstat=(ping=%d/%dms loss=%u.%u%% resend=%u) | spatial=%lld%s",
+                LogMsg("[Hitch] peak=%.1fms (cnt=%u severe=%u[max=%.1fms] | avg=%.0f 1%%L=%.0f p99=%.1fms) | busy=%.1fms rt=%.1fms gpu=%.2fms lua=%.2fms net=%.2fms swap=%.1fms world=%.1fms post=%.1fms | loop=(wLua=%.2f eWall=%.2f eUpd=%.2f ePost=%.2f cRnd=%.2f ui=%.2f snd=%.2f stm=%.2f msg=%.2f) | anim=%.2fms (mt=%.2f inl=%.2f ents=%u bones=%u shed=%u) | gc=%.2fms (kb=%d full=%u/%lld) | tex=%.2fms (up=%lld slice=%lld) | zip=%.2fms shdr=%.2fms host=%.2fms | netstat=(ping=%d/%dms loss=%u.%u%% resend=%u) | spatial=%lld%s",
                        static_cast<double>(snap.peakUs) * 0.001, snap.pendingCount,
                        snap.severeCount, static_cast<double>(snap.severeMaxUs) * 0.001,
                        avgFps, low1Fps, p99Ms,
@@ -14463,7 +18737,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
                        static_cast<double>(snap.soundUs) * 0.001,
                        static_cast<double>(snap.steamUs) * 0.001,
                        static_cast<double>(snap.msgUs) * 0.001,
-                       static_cast<double>(snap.animUs) * 0.001, snap.animEnts, snap.animBones, snap.animShed,
+                       static_cast<double>(snap.animUs) * 0.001,
+                       static_cast<double>(snap.animMtUs) * 0.001,
+                       static_cast<double>(snap.animInlUs) * 0.001,
+                       snap.animEnts, snap.animBones, snap.animShed,
                        static_cast<double>(snap.gcUs) * 0.001, snap.gcKb,
                        static_cast<unsigned>(snap.gcFull), gcFull,
                        static_cast<double>(snap.texUs) * 0.001, texUp, texSl,
@@ -14496,8 +18773,9 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 const double uiAvg = (uiFlu > 0) ? (static_cast<double>(uiBat) / static_cast<double>(uiFlu)) : 0.0;
                 using FR = hs_sprite_batch::FlushReason;
                 auto fr = [](FR r) { return InterlockedCompareExchange64(&g_sbFlReason[static_cast<size_t>(r)], 0, 0); };
+                auto ufr = [](FR r) { return InterlockedCompareExchange64(&g_uiFlReason[static_cast<size_t>(r)], 0, 0); };
                 auto sc = [](StateFlushCause c) { return InterlockedCompareExchange64(&g_sbStateCause[static_cast<size_t>(c)], 0, 0); };
-                LogMsg("[PerfSnap] avg=%.0f 1%%L=%.0f p99=%.1fms | busy=%.2fms (lua=%.2f net=%.2f gc=%.2f world=%.2f[anim=%.2f ents=%u bones=%u] post=%.2f) | loop=(wLua=%.2f eWall=%.2f eUpd=%.2f ePost=%.2f cRnd=%.2f ui=%.2f snd=%.2f) | rt=%.2fms swap=%.2fms | sbatch=%.1f%%(avg=%.1f fl:p=%lld u4=%lld u3=%lld um=%lld uo=%lld st=%lld[bl=%lld dp=%lld cp=%lld sn=%lld po=%lld vp=%lld ti=%lld ot=%lld] tx=%lld fu=%lld end=%lld byp=%lld) | uibatch=%.1f%%(avg=%.1f %lld->%lld skp=%lld byp=%lld rb=%lld)",
+                LogMsg("[PerfSnap] avg=%.0f 1%%L=%.0f p99=%.1fms | busy=%.2fms (lua=%.2f net=%.2f gc=%.2f world=%.2f[anim=%.2f(mt=%.2f inl=%.2f) ents=%u bones=%u] post=%.2f) | loop=(wLua=%.2f eWall=%.2f eUpd=%.2f ePost=%.2f cRnd=%.2f ui=%.2f snd=%.2f) | rt=%.2fms gpu=%.2fms swap=%.2fms | shDef=%u shCoal=%u shUnb=%u shReuse=%llu wx=(lm=%.2f shR=%.2f shU=%.2f sb=%.2f/%.2f unb=%.2f[%u p%u:%u]) | sbatch=%.1f%%(avg=%.1f fl:o=%lld p=%lld u4=%lld u3=%lld um=%lld uo=%lld st=%lld[bl=%lld dp=%lld cp=%lld sn=%lld po=%lld vp=%lld ti=%lld ot=%lld] tx=%lld fu=%lld end=%lld byp=%lld) | uibatch=%.1f%%(avg=%.1f %lld->%lld skp=%lld byp=%lld rb=%lld fl:p=%lld st=%lld tx=%lld u=%lld bp=%lld fu=%lld) | elastic(p=%u w=%u/%u gpu=%d btex=%u gdr=%llu)",
                        avgFps, low1Fps, p99Ms,
                        static_cast<double>(g_emaFrameBusyUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaLuaUs.load(std::memory_order_relaxed)) * 0.001,
@@ -14505,6 +18783,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
                        static_cast<double>(g_emaGcUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaWorldRenderUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaAnimUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaAnimMtUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaAnimInlUs.load(std::memory_order_relaxed)) * 0.001,
                        g_lastAnimEnts.load(std::memory_order_relaxed),
                        g_lastAnimBones.load(std::memory_order_relaxed),
                        static_cast<double>(g_emaPostProcUs.load(std::memory_order_relaxed)) * 0.001,
@@ -14516,16 +18796,88 @@ DWORD WINAPI WorkerProc(LPVOID) {
                        static_cast<double>(g_emaUiDrawUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaSoundUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaRenderThreadUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaGpuDrainUs.load(std::memory_order_relaxed)) * 0.001,
                        static_cast<double>(g_emaSwapUs.load(std::memory_order_relaxed)) * 0.001,
+                       g_worldShadowDeferredBatches.load(std::memory_order_relaxed),
+                       g_worldShadowCoalescedDraws.load(std::memory_order_relaxed),
+                       g_lastWxShUnbCnt.load(std::memory_order_relaxed),
+                       static_cast<unsigned long long>(g_worldShadowReuseSkips.load(std::memory_order_relaxed)),
+                       static_cast<double>(g_emaWxLmUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxShReplayUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxShUnbUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbTryUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbFlushUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxUnbDrawUs.load(std::memory_order_relaxed)) * 0.001,
+                       g_lastWxUnbDrawCnt.load(std::memory_order_relaxed),
+                       g_lastWxUnbTopProg.load(std::memory_order_relaxed),
+                       g_lastWxUnbTopCnt.load(std::memory_order_relaxed),
                        sbPct, sbAvg,
-                       fr(FR::Prog), fr(FR::Uni4), fr(FR::Uni3), fr(FR::UniMat), fr(FR::UniOther),
+                       fr(FR::Other), fr(FR::Prog), fr(FR::Uni4), fr(FR::Uni3), fr(FR::UniMat), fr(FR::UniOther),
                        fr(FR::State),
                        sc(StateFlushCause::Blend), sc(StateFlushCause::Depth), sc(StateFlushCause::Cap),
                        sc(StateFlushCause::Stencil), sc(StateFlushCause::PolyOff), sc(StateFlushCause::Viewport),
                        sc(StateFlushCause::TexImg), sc(StateFlushCause::Other),
                        fr(FR::Tex), fr(FR::Full), fr(FR::End), fr(FR::Bypass),
-                       uiPct, uiAvg, uiBat, uiFlu, uiSkp, uiByp, uiRb);
+                       uiPct, uiAvg, uiBat, uiFlu, uiSkp, uiByp, uiRb,
+                       ufr(FR::Prog), ufr(FR::State), ufr(FR::Tex),
+                       ufr(FR::Uni3) + ufr(FR::Uni4) + ufr(FR::UniMat) + ufr(FR::UniOther),
+                       ufr(FR::Bypass), ufr(FR::Full),
+                       static_cast<unsigned>(g_elasticPressureLevel.load(std::memory_order_relaxed)),
+                       static_cast<unsigned>(GetMtSkeletalPool().LastActiveWorkers()),
+                       static_cast<unsigned>(GetMtSkeletalPool().NumShards()),
+                       g_sbGpuDrivenActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned>(g_sbBindlessCount.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbGpuDrivenDraws.load(std::memory_order_relaxed)));
+                const uint64_t vbUs = g_xrayVbPoolUs.exchange(0, std::memory_order_relaxed);
+                const uint64_t vbCalls = g_xrayVbPoolCalls.exchange(0, std::memory_order_relaxed);
+                LogMsg("[SB_XRAY] res=%.2f inFl=%.2f wait=%.2f up=%.2f drw=%.2f | sw=%llu lat=%llu(now=%d) den=%llu[mut=%llu nil=%llu h0=%llu] ovf=%llu fbr=%llu fetch=%llu | pk=(v=%u i=%u s=%u) | pbo=(act=%d up=%llu %.1fMB sk=%llu ovf=%llu to=%llu) | glErrSkip=%llu texPool=(hit=%llu ref=%llu av=%u) | clEff=%d(%llu) sh1T=%d lmAd=%d | kFast=(uHit=%llu uSkip=%llu uFb=%llu dHit=%llu dMiss=%llu) kLk=%llu | mtPrev=%llu | vb=(%llu %.2fms) | fboSkip=%llu stByp=%llu",
+                       static_cast<double>(g_emaWxSbResUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbInFlUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbWaitUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbUpUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<double>(g_emaWxSbDrwUs.load(std::memory_order_relaxed)) * 0.001,
+                       static_cast<unsigned long long>(g_sbDiagModeSwitches.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagLatchFrames.load(std::memory_order_relaxed)),
+                       g_sbDiagLatched.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned long long>(g_sbDiagDenyHits.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagDenyMutated.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagDenyNullAlloc.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagDenyHandleZero.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagRingOvf.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagFallbackRing.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbDiagShadowFetch.load(std::memory_order_relaxed)),
+                       g_sbDiagPeakVerts.load(std::memory_order_relaxed),
+                       g_sbDiagPeakIndices.load(std::memory_order_relaxed),
+                       g_sbDiagPeakInsts.load(std::memory_order_relaxed),
+                       g_pboTexActive.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned long long>(g_pboTexUploads.load(std::memory_order_relaxed)),
+                       static_cast<double>(g_pboTexBytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+                       static_cast<unsigned long long>(g_pboTexSlotSkips.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_pboTexOverflows.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_pboTexTimeouts.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_glErrSkipped.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_texPoolHits.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_texPoolRefills.load(std::memory_order_relaxed)),
+                       g_texPoolAvail.load(std::memory_order_relaxed),
+                       g_gpuClarityEffGrade.load(std::memory_order_relaxed),
+                       static_cast<unsigned long long>(g_gpuClarityAdaptSteps.load(std::memory_order_relaxed)),
+                       g_worldShadowFastRecv1Tap.load(std::memory_order_relaxed) ? 1 : 0,
+                       g_lightmapAdaptiveHalf.load(std::memory_order_relaxed) ? 1 : 0,
+                       static_cast<unsigned long long>(g_kFastUniHits.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_kFastUniSkips.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_kFastUniFallbacks.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_kFastDrawHits.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_kFastDrawMisses.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_kFastLocksSaved.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(GetMtSkeletalPool().PrevBankHits()),
+                       static_cast<unsigned long long>(vbCalls),
+                       static_cast<double>(vbUs) * 0.001,
+                       static_cast<unsigned long long>(g_fboChkSkipped.load(std::memory_order_relaxed)),
+                       static_cast<unsigned long long>(g_sbStencilBypassDraws.load(std::memory_order_relaxed)));
             }
+        }
+        if ((tickCounter % 4) == 0) {
+            ApplyElasticPoolPlan(false);
         }
         if ((tickCounter & 1u) == 0u) {
             double avgFps = 0.0, low1Fps = 0.0, p99Ms = 0.0, jitterMs = 0.0;
@@ -14546,64 +18898,89 @@ DWORD WINAPI WorkerProc(LPVOID) {
             uint64_t curIniTime = GetFileModTime(g_iniPath);
             if (curIniTime != 0 && curIniTime != lastIniTime) {
                 lastIniTime = curIniTime;
-                int fps = ReadIniInt(L"FPS", L"target_fps", 240);
-                int skel = ReadIniInt(L"OPTIMIZE", L"smooth_skeletal_anim", 1);
-                int vfx = ReadIniInt(L"OPTIMIZE", L"smooth_vfx_particles", 1);
-                int wpos = ReadIniInt(L"OPTIMIZE", L"world_pos_interp", 1);
-                int d3d9lat = ReadIniInt(L"OPTIMIZE", L"d3d9ex_low_latency", 1);
-                int gsync = ReadIniInt(L"OPTIMIZE", L"low_latency_gpu_sync", 1);
-                int spq = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1);
-                int texs = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1);
-                int glsc = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1);
-                int gluc = ReadIniInt(L"OPTIMIZE", L"gl_uniform_cache", 1);
-                int fsnc = ReadIniInt(L"OPTIMIZE", L"enable_fs_neg_cache", 1);
-                int adjt = ReadIniInt(L"OPTIMIZE", L"adaptive_dejitter", 1);
-                int rqos = ReadIniInt(L"OPTIMIZE", L"enable_rpc_qos", 1);
-                int asav = ReadIniInt(L"OPTIMIZE", L"enable_async_save", 0);
-                int vbp = ReadIniInt(L"OPTIMIZE", L"enable_vb_pool", 1);
-                int sbat = ReadIniInt(L"OPTIMIZE", L"enable_sprite_batch", 1);
-                int af = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
-                if (af < 1) af = 1;
-                if (af > 16) af = 16;
-                int flm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0);
-                int mips = ReadIniInt(L"VISUAL", L"mip_lod_sharp", 0);
-                int hd2d = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1);
-                int bbOn = ReadIniInt(L"TELEMETRY", L"enable_blackbox", 1);
-                int bbMs = std::clamp(ReadIniInt(L"TELEMETRY", L"blackbox_threshold_ms", 25), 5, 500);
-                g_optBlackbox.store(bbOn != 0, std::memory_order_relaxed);
-                g_blackboxThresholdMs.store(bbMs, std::memory_order_relaxed);
-                g_skeletalTweenEnabled.store(skel ? 1 : 0, std::memory_order_relaxed);
-                g_vfxSmoothEnabled.store(vfx ? 1 : 0, std::memory_order_relaxed);
-                g_worldPosInterpEnabled.store(wpos ? 1 : 0, std::memory_order_relaxed);
-                if (g_optD3d9ExLowLatency.exchange(d3d9lat != 0, std::memory_order_relaxed) != (d3d9lat != 0)) {
-                    g_d3d9ExLatGen.fetch_add(1, std::memory_order_release);
+                if (curIniTime == g_selfIniWriteTime.load(std::memory_order_acquire)) {
+                    // Skip self-triggered mtime updates (e.g., persisting hardware_tier from Lua/UI)
+                } else {
+                    const bool luaOwns = (g_luaBridgeActive.load(std::memory_order_acquire) != 0);
+                    int fps = ReadIniInt(L"FPS", L"target_fps", 240);
+                    int skel = ReadIniInt(L"OPTIMIZE", L"smooth_skeletal_anim", 1);
+                    int vfx = ReadIniInt(L"OPTIMIZE", L"smooth_vfx_particles", 1);
+                    int wpos = ReadIniInt(L"OPTIMIZE", L"world_pos_interp", 1);
+                    int d3d9lat = ReadIniInt(L"OPTIMIZE", L"d3d9ex_low_latency", 1);
+                    int gsync = ReadIniInt(L"OPTIMIZE", L"low_latency_gpu_sync", 1);
+                    int spq = ReadIniInt(L"OPTIMIZE", L"fast_spatial_query", 1);
+                    int texs = ReadIniInt(L"OPTIMIZE", L"timeslice_tex_upload", 1);
+                    int glsc = ReadIniInt(L"OPTIMIZE", L"gl_state_cache", 1);
+                    int gluc = ReadIniInt(L"OPTIMIZE", L"gl_uniform_cache", 1);
+                    int fsnc = ReadIniInt(L"OPTIMIZE", L"enable_fs_neg_cache", 1);
+                    int adjt = ReadIniInt(L"OPTIMIZE", L"adaptive_dejitter", 1);
+                    int rqos = ReadIniInt(L"OPTIMIZE", L"enable_rpc_qos", 1);
+                    int asav = ReadIniInt(L"OPTIMIZE", L"enable_async_save", 0);
+                    int vbp = ReadIniInt(L"OPTIMIZE", L"enable_vb_pool", 1);
+                    int sbat = ReadIniInt(L"OPTIMIZE", L"enable_sprite_batch", 1);
+                    int hd2d = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1);
+                    int bbOn = ReadIniInt(L"TELEMETRY", L"enable_blackbox", 1);
+                    int bbMs = std::clamp(ReadIniInt(L"TELEMETRY", L"blackbox_threshold_ms", 25), 5, 500);
+                    g_optBlackbox.store(bbOn != 0, std::memory_order_relaxed);
+                    g_blackboxThresholdMs.store(bbMs, std::memory_order_relaxed);
+                    g_optFastSpatialQuery.store(spq != 0, std::memory_order_relaxed);
+                    g_optTexTimeSlice.store(texs != 0, std::memory_order_relaxed);
+                    const bool wantGlsc = (glsc != 0) && g_glCacheActive.load(std::memory_order_acquire);
+                    const bool wantGluc = (gluc != 0) && g_glUniformCacheActive.load(std::memory_order_acquire);
+                    if (g_optGlStateCache.exchange(wantGlsc, std::memory_order_relaxed) != wantGlsc ||
+                        g_optGlUniformCache.exchange(wantGluc, std::memory_order_relaxed) != wantGluc) {
+                        g_glCacheResetGen.fetch_add(1, std::memory_order_release);
+                    }
+                    g_optFsNegCache.store((fsnc != 0) && g_fsNegCacheActive.load(std::memory_order_acquire), std::memory_order_relaxed);
+                    g_optAdaptiveDeJitter.store(adjt != 0, std::memory_order_relaxed);
+                    g_optRpcQos.store((rqos != 0) && g_rpcQosHooked.load(std::memory_order_acquire), std::memory_order_relaxed);
+                    g_optAsyncSave.store((asav != 0) && g_asyncSaveActive.load(std::memory_order_acquire), std::memory_order_relaxed);
+                    g_optVbPool.store((vbp != 0) && g_vbPoolHooked.load(std::memory_order_acquire), std::memory_order_relaxed);
+                    g_optSpriteBatch.store((sbat != 0) && g_spriteBatchActive.load(std::memory_order_acquire), std::memory_order_release);
+                    g_optHd2dWorldShaders.store(hd2d != 0, std::memory_order_relaxed);
+
+                    if (!luaOwns) {
+                        wchar_t tierBuf[32] = L"balanced";
+                        GetPrivateProfileStringW(L"OPTIMIZE", L"hardware_tier", L"balanced", tierBuf, 32, g_iniPath.c_str());
+                        const int hotTier = static_cast<int>(hs_hw_tier::ParseTier(tierBuf));
+                        if (hotTier != g_cfgHardwareTier.load(std::memory_order_acquire)) {
+                            ApplyHardwareTierLive(hotTier, false);
+                        }
+                        int af = ReadIniInt(L"VISUAL", L"anisotropic_filter", 1);
+                        if (af < 1) af = 1;
+                        if (af > 16) af = 16;
+                        int flm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0);
+                        int mips = ReadIniInt(L"VISUAL", L"mip_lod_sharp", 0);
+                        g_skeletalTweenEnabled.store(skel ? 1 : 0, std::memory_order_relaxed);
+                        g_vfxSmoothEnabled.store(vfx ? 1 : 0, std::memory_order_relaxed);
+                        g_worldPosInterpEnabled.store(wpos ? 1 : 0, std::memory_order_relaxed);
+                        if (g_optD3d9ExLowLatency.exchange(d3d9lat != 0, std::memory_order_relaxed) != (d3d9lat != 0)) {
+                            g_d3d9ExLatGen.fetch_add(1, std::memory_order_release);
+                        }
+                        g_optLowLatencyGpuSync.store(gsync != 0, std::memory_order_relaxed);
+                        const int prevIniAf = g_visualAnisoLevel.exchange(af, std::memory_order_relaxed);
+                        const bool prevIniLm = g_visualFullresLightmap.exchange(flm != 0, std::memory_order_relaxed);
+                        const float nextIniBias = mips ? -0.45f : 0.0f;
+                        const float prevIniBias = g_visualMipLodBias.exchange(nextIniBias, std::memory_order_relaxed);
+                        if (prevIniAf != af || fabsf(prevIniBias - nextIniBias) > 1e-4f) {
+                            g_visualTexParamGen.fetch_add(1, std::memory_order_release);
+                        }
+                        if (flm == 0) {
+                            g_lightmapAdaptiveHalf.store(false, std::memory_order_relaxed);
+                        }
+                        if (g_lightmapScaleSlot) {
+                            *g_lightmapScaleSlot = (flm != 0 && !g_lightmapAdaptiveHalf.load(std::memory_order_relaxed)) ? 1.0f : 0.5f;
+                        }
+                        if (prevIniLm != (flm != 0)) {
+                            g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
+                        }
+                        LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, Vfx240=%d, WorldPos240=%d, D3D9ExLat=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d, AF=%dx, FullLM=%d, MipSharp=%d, HD2D=%d",
+                               fps, skel ? 1 : 0, vfx ? 1 : 0, wpos ? 1 : 0, d3d9lat ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0, af, flm ? 1 : 0, mips ? 1 : 0, hd2d ? 1 : 0);
+                        ApplyFpsPatch(fps);
+                    } else {
+                        LogMsg("Hot-reloaded dst_fps.ini (engine/INI flags only; Lua Bridge retains live FPS/Tier/Visual state)");
+                    }
                 }
-                g_optLowLatencyGpuSync.store(gsync != 0, std::memory_order_relaxed);
-                g_optFastSpatialQuery.store(spq != 0, std::memory_order_relaxed);
-                g_optTexTimeSlice.store(texs != 0, std::memory_order_relaxed);
-                const bool wantGlsc = (glsc != 0) && g_glCacheActive.load(std::memory_order_acquire);
-                const bool wantGluc = (gluc != 0) && g_glUniformCacheActive.load(std::memory_order_acquire);
-                if (g_optGlStateCache.exchange(wantGlsc, std::memory_order_relaxed) != wantGlsc ||
-                    g_optGlUniformCache.exchange(wantGluc, std::memory_order_relaxed) != wantGluc) {
-                    g_glCacheResetGen.fetch_add(1, std::memory_order_release);
-                }
-                g_optFsNegCache.store((fsnc != 0) && g_fsNegCacheActive.load(std::memory_order_acquire), std::memory_order_relaxed);
-                g_optAdaptiveDeJitter.store(adjt != 0, std::memory_order_relaxed);
-                g_optRpcQos.store((rqos != 0) && g_rpcQosHooked.load(std::memory_order_acquire), std::memory_order_relaxed);
-                g_optAsyncSave.store((asav != 0) && g_asyncSaveActive.load(std::memory_order_acquire), std::memory_order_relaxed);
-                g_optVbPool.store((vbp != 0) && g_vbPoolHooked.load(std::memory_order_acquire), std::memory_order_relaxed);
-                g_optSpriteBatch.store((sbat != 0) && g_spriteBatchActive.load(std::memory_order_acquire), std::memory_order_release);
-                g_visualAnisoLevel.store(af, std::memory_order_relaxed);
-                const bool prevIniLm = g_visualFullresLightmap.exchange(flm != 0, std::memory_order_relaxed);
-                g_visualMipLodBias.store(mips ? -0.45f : 0.0f, std::memory_order_relaxed);
-                g_optHd2dWorldShaders.store(hd2d != 0, std::memory_order_relaxed);
-                if (g_lightmapScaleSlot) *g_lightmapScaleSlot = (flm != 0) ? 1.0f : 0.5f;
-                if (prevIniLm != (flm != 0)) {
-                    g_lightmapRebuildGen.fetch_add(1, std::memory_order_release);
-                }
-                LogMsg("Hot-reloaded dst_fps.ini -> FPS=%d, Skeletal240=%d, Vfx240=%d, WorldPos240=%d, D3D9ExLat=%d, GpuSync=%d, SpatialZC=%d, TexSlice=%d, AF=%dx, FullLM=%d, MipSharp=%d, HD2D=%d",
-                       fps, skel ? 1 : 0, vfx ? 1 : 0, wpos ? 1 : 0, d3d9lat ? 1 : 0, gsync ? 1 : 0, spq ? 1 : 0, texs ? 1 : 0, af, flm ? 1 : 0, mips ? 1 : 0, hd2d ? 1 : 0);
-                ApplyFpsPatch(fps);
             }
         }
 
@@ -14694,6 +19071,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         g_workerThread = CreateThread(nullptr, 0, WorkerProc, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         g_stopFlag.store(1, std::memory_order_relaxed);
+        GetMtSkeletalPool().Shutdown(lpReserved != nullptr);
         g_cursorClip.ReleaseUnconditionally(true);
         // Process terminating (lpReserved != nullptr): OS reclaims threads, timers, and DLLs atomically.
         // NEVER WaitForSingleObject / FreeLibrary / timeEndPeriod under Loader Lock!

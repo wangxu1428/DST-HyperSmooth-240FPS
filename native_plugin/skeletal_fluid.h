@@ -13,6 +13,10 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace hs_skeletal {
 
@@ -69,6 +73,75 @@ inline uint16_t FloatToHalf(float f) {
         if (exp >= 31) return static_cast<uint16_t>(sign | 0x7BFFu);
     }
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | rounded);
+}
+
+// Runtime-CPUID Hardware F16C (vcvtph2ps / vcvtps2ph) — 100% IEEE-754 bit-exact & zero illegal-insn risk!
+inline bool CpuHasF16c() noexcept {
+    static const bool supported = []() -> bool {
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+        unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1u), "c"(0u));
+        // Check OSXSAVE (bit 27) + AVX (bit 28) + F16C (bit 29)
+        if ((ecx & ((1u << 27) | (1u << 28) | (1u << 29))) == ((1u << 27) | (1u << 28) | (1u << 29))) {
+            unsigned int xcr0Lo = 0, xcr0Hi = 0;
+            __asm__ volatile("xgetbv" : "=a"(xcr0Lo), "=d"(xcr0Hi) : "c"(0));
+            return (xcr0Lo & 0x6u) == 0x6u; // XMM + YMM state enabled by OS
+        }
+#endif
+        return false;
+    }();
+    return supported;
+}
+
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+__attribute__((target("f16c")))
+inline void LoadMat6F16c(const uint16_t m[6], float out[8]) noexcept {
+    alignas(16) uint16_t tmp[8] = { m[0], m[1], m[2], m[3], m[4], m[5], 0u, 0u };
+    const __m128i h0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(tmp));
+    const __m128i h1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(tmp + 4));
+    _mm_storeu_ps(out,     _mm_cvtph_ps(h0));
+    _mm_storeu_ps(out + 4, _mm_cvtph_ps(h1));
+}
+
+__attribute__((target("f16c")))
+inline void StoreMat6F16c(const float in[6], uint16_t out[6]) noexcept {
+    const __m128 v0 = _mm_loadu_ps(in);
+    const __m128 v1 = _mm_set_ps(0.0f, 0.0f, in[5], in[4]);
+    const __m128i h0 = _mm_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT);
+    const __m128i h1 = _mm_cvtps_ph(v1, _MM_FROUND_TO_NEAREST_INT);
+    alignas(16) uint16_t buf0[8], buf1[8];
+    _mm_store_si128(reinterpret_cast<__m128i*>(buf0), h0);
+    _mm_store_si128(reinterpret_cast<__m128i*>(buf1), h1);
+    out[0] = buf0[0]; out[1] = buf0[1]; out[2] = buf0[2]; out[3] = buf0[3];
+    out[4] = buf1[0]; out[5] = buf1[1];
+}
+#endif
+
+inline void LoadMat6Fast(const uint16_t m[6], float out[6]) noexcept {
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    if (CpuHasF16c()) {
+        float tmp[8];
+        LoadMat6F16c(m, tmp);
+        out[0] = tmp[0]; out[1] = tmp[1]; out[2] = tmp[2];
+        out[3] = tmp[3]; out[4] = tmp[4]; out[5] = tmp[5];
+        return;
+    }
+#endif
+    out[0] = HalfToFloat(m[0]); out[1] = HalfToFloat(m[1]); out[2] = HalfToFloat(m[2]);
+    out[3] = HalfToFloat(m[3]); out[4] = HalfToFloat(m[4]); out[5] = HalfToFloat(m[5]);
+}
+
+inline void StoreMat6Fast(float a, float b, float c, float d, float tx, float ty, uint16_t out[6]) noexcept {
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    if (CpuHasF16c()) {
+        const float in[6] = { a, b, c, d, tx, ty };
+        StoreMat6F16c(in, out);
+        return;
+    }
+#endif
+    out[0] = FloatToHalf(a);  out[1] = FloatToHalf(b);
+    out[2] = FloatToHalf(c);  out[3] = FloatToHalf(d);
+    out[4] = FloatToHalf(tx); out[5] = FloatToHalf(ty);
 }
 
 inline float WrapAngleDiff(float d) {
@@ -135,8 +208,11 @@ inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[6], flo
         return true;
     }
 
-    const float tx0 = HalfToFloat(m0h[4]), ty0 = HalfToFloat(m0h[5]);
-    const float tx1 = HalfToFloat(m1h[4]), ty1 = HalfToFloat(m1h[5]);
+    float f0[6], f1[6];
+    LoadMat6Fast(m0h, f0);
+    LoadMat6Fast(m1h, f1);
+    const float a0 = f0[0], b0 = f0[1], c0 = f0[2], d0 = f0[3], tx0 = f0[4], ty0 = f0[5];
+    const float a1 = f1[0], b1 = f1[1], c1 = f1[2], d1 = f1[3], tx1 = f1[4], ty1 = f1[5];
     const float dtx = tx1 - tx0;
     const float dty = ty1 - ty0;
     if (fabsf(dtx) > maxDist || fabsf(dty) > maxDist) return false;
@@ -149,11 +225,6 @@ inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[6], flo
         return true;
     }
 
-    const float a0 = HalfToFloat(m0h[0]), b0 = HalfToFloat(m0h[1]);
-    const float c0 = HalfToFloat(m0h[2]), d0 = HalfToFloat(m0h[3]);
-    const float a1 = HalfToFloat(m1h[0]), b1 = HalfToFloat(m1h[1]);
-    const float c1 = HalfToFloat(m1h[2]), d1 = HalfToFloat(m1h[3]);
-
     const float det0 = a0 * d0 - b0 * c0;
     const float det1 = a1 * d1 - b1 * c1;
     if (det0 * det1 < 0.0f) return false;
@@ -163,12 +234,7 @@ inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[6], flo
     // Tier 2: small-angle 2x2 delta (<= ~3.5 deg) or swarm fastOnly mode
     const float linThresh = fastOnly ? 0.35f : 0.06f;
     if (fabsf(da) < linThresh && fabsf(db) < linThresh && fabsf(dc) < linThresh && fabsf(dd) < linThresh) {
-        outh[0] = FloatToHalf(a0 + da * t);
-        outh[1] = FloatToHalf(b0 + db * t);
-        outh[2] = FloatToHalf(c0 + dc * t);
-        outh[3] = FloatToHalf(d0 + dd * t);
-        outh[4] = FloatToHalf(tx0 + dtx * t);
-        outh[5] = FloatToHalf(ty0 + dty * t);
+        StoreMat6Fast(a0 + da * t, b0 + db * t, c0 + dc * t, d0 + dd * t, tx0 + dtx * t, ty0 + dty * t, outh);
         return true;
     }
     if (fastOnly) {
@@ -198,12 +264,7 @@ inline bool TweenElementMatrix(const uint16_t m0h[6], const uint16_t m1h[6], flo
         c = c0 + dc * t; d = d0 + dd * t;
     }
 
-    outh[0] = FloatToHalf(a);
-    outh[1] = FloatToHalf(b);
-    outh[2] = FloatToHalf(c);
-    outh[3] = FloatToHalf(d);
-    outh[4] = FloatToHalf(tx0 + dtx * t);
-    outh[5] = FloatToHalf(ty0 + dty * t);
+    StoreMat6Fast(a, b, c, d, tx0 + dtx * t, ty0 + dty * t, outh);
     return true;
 }
 
@@ -234,14 +295,12 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
     constexpr float kMaxDist = 420.0f;
     constexpr float kMaxAng  = 2.35f;
 
-    const float tx0 = HalfToFloat(m0h[4]), ty0 = HalfToFloat(m0h[5]);
-    const float tx1 = HalfToFloat(m1h[4]), ty1 = HalfToFloat(m1h[5]);
+    float f0[6], f1[6];
+    LoadMat6Fast(m0h, f0);
+    LoadMat6Fast(m1h, f1);
+    const float a0 = f0[0], b0 = f0[1], c0 = f0[2], d0 = f0[3], tx0 = f0[4], ty0 = f0[5];
+    const float a1 = f1[0], b1 = f1[1], c1 = f1[2], d1 = f1[3], tx1 = f1[4], ty1 = f1[5];
     if (fabsf(tx1 - tx0) > kMaxDist || fabsf(ty1 - ty0) > kMaxDist) return false;
-
-    const float a0 = HalfToFloat(m0h[0]), b0 = HalfToFloat(m0h[1]);
-    const float c0 = HalfToFloat(m0h[2]), d0 = HalfToFloat(m0h[3]);
-    const float a1 = HalfToFloat(m1h[0]), b1 = HalfToFloat(m1h[1]);
-    const float c1 = HalfToFloat(m1h[2]), d1 = HalfToFloat(m1h[3]);
     const float det0 = a0 * d0 - b0 * c0;
     const float det1 = a1 * d1 - b1 * c1;
     if (det0 * det1 < 0.0f) return false;
@@ -249,9 +308,9 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
     bool hasM1 = false;
     float aM1 = a0, bM1 = b0, cM1 = c0, dM1 = d0, txM1 = tx0, tyM1 = ty0;
     if (mM1h) {
-        txM1 = HalfToFloat(mM1h[4]); tyM1 = HalfToFloat(mM1h[5]);
-        aM1 = HalfToFloat(mM1h[0]);  bM1 = HalfToFloat(mM1h[1]);
-        cM1 = HalfToFloat(mM1h[2]);  dM1 = HalfToFloat(mM1h[3]);
+        float fm1[6];
+        LoadMat6Fast(mM1h, fm1);
+        aM1 = fm1[0]; bM1 = fm1[1]; cM1 = fm1[2]; dM1 = fm1[3]; txM1 = fm1[4]; tyM1 = fm1[5];
         const float detM1 = aM1 * dM1 - bM1 * cM1;
         if (detM1 * det0 >= 0.0f && fabsf(tx0 - txM1) <= kMaxDist && fabsf(ty0 - tyM1) <= kMaxDist) {
             hasM1 = true;
@@ -261,9 +320,9 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
     bool hasP2 = false;
     float aP2 = a1, bP2 = b1, cP2 = c1, dP2 = d1, txP2 = tx1, tyP2 = ty1;
     if (mP2h) {
-        txP2 = HalfToFloat(mP2h[4]); tyP2 = HalfToFloat(mP2h[5]);
-        aP2 = HalfToFloat(mP2h[0]);  bP2 = HalfToFloat(mP2h[1]);
-        cP2 = HalfToFloat(mP2h[2]);  dP2 = HalfToFloat(mP2h[3]);
+        float fp2[6];
+        LoadMat6Fast(mP2h, fp2);
+        aP2 = fp2[0]; bP2 = fp2[1]; cP2 = fp2[2]; dP2 = fp2[3]; txP2 = fp2[4]; tyP2 = fp2[5];
         const float detP2 = aP2 * dP2 - bP2 * cP2;
         if (detP2 * det1 >= 0.0f && fabsf(txP2 - tx1) <= kMaxDist && fabsf(tyP2 - ty1) <= kMaxDist) {
             hasP2 = true;
@@ -295,12 +354,12 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
 
     // Tier 2: Small-angle 2x2 PCHIP directly on matrix entries (zero trig!)
     if (smallMain && smallM1 && smallP2) {
-        outh[0] = FloatToHalf(PchipScalar(aM1, a0, a1, aP2, hasM1, hasP2, t, splineStr));
-        outh[1] = FloatToHalf(PchipScalar(bM1, b0, b1, bP2, hasM1, hasP2, t, splineStr));
-        outh[2] = FloatToHalf(PchipScalar(cM1, c0, c1, cP2, hasM1, hasP2, t, splineStr));
-        outh[3] = FloatToHalf(PchipScalar(dM1, d0, d1, dP2, hasM1, hasP2, t, splineStr));
-        outh[4] = FloatToHalf(tx);
-        outh[5] = FloatToHalf(ty);
+        StoreMat6Fast(
+            PchipScalar(aM1, a0, a1, aP2, hasM1, hasP2, t, splineStr),
+            PchipScalar(bM1, b0, b1, bP2, hasM1, hasP2, t, splineStr),
+            PchipScalar(cM1, c0, c1, cP2, hasM1, hasP2, t, splineStr),
+            PchipScalar(dM1, d0, d1, dP2, hasM1, hasP2, t, splineStr),
+            tx, ty, outh);
         if (outUsedSpline) *outUsedSpline = true;
         return true;
     }
@@ -355,12 +414,7 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
         d = PchipScalar(dM1, d0, d1, dP2, hasM1, hasP2, t, splineStr);
     }
 
-    outh[0] = FloatToHalf(a);
-    outh[1] = FloatToHalf(b);
-    outh[2] = FloatToHalf(c);
-    outh[3] = FloatToHalf(d);
-    outh[4] = FloatToHalf(tx);
-    outh[5] = FloatToHalf(ty);
+    StoreMat6Fast(a, b, c, d, tx, ty, outh);
     if (outUsedSpline) *outUsedSpline = true;
     return true;
 }
@@ -379,7 +433,7 @@ inline bool TweenElementMatrixSpline(const uint16_t* mM1h,
 //       * Particle / duplicate-symbol layers
 //       * Swarm load shedding (fastOnly)
 // =============================================================================
-static constexpr uint32_t kPosePoolSlots = 512u;
+static constexpr uint32_t kPosePoolSlots = 2048u;
 static constexpr uint32_t kMaxPoseBones  = 96u;
 
 struct BoneSnap {
@@ -389,28 +443,30 @@ struct BoneSnap {
 };
 
 struct PoseCrossfadeSlot {
-    uintptr_t entity_key = 0;
-    int64_t   seen_qpc = 0;
-    int64_t   blend_start_qpc = 0;
-    float     blend_dur_sec = 0.0f;
-    float     last_axis_x[3] = { 1.0f, 0.0f, 0.0f };
-    uint16_t  last_count = 0;
-    uint16_t  blend_count = 0;
-    uint8_t   valid = 0;
-    uint8_t   blending = 0;
-    uint8_t   has_axis_x = 0;
-    uint8_t   pad = 0;
-    BoneSnap  last_pose[kMaxPoseBones];
-    BoneSnap  blend_from[kMaxPoseBones];
+    uintptr_t        entity_key = 0;
+    const AnimFrame* last_ro_frame = nullptr;
+    int64_t          seen_qpc = 0;
+    int64_t          blend_start_qpc = 0;
+    float            blend_dur_sec = 0.0f;
+    float            last_axis_x[3] = { 1.0f, 0.0f, 0.0f };
+    uint16_t         last_count = 0;
+    uint16_t         blend_count = 0;
+    uint8_t          valid = 0;
+    uint8_t          blending = 0;
+    uint8_t          has_axis_x = 0;
+    uint8_t          pad = 0;
+    BoneSnap         last_pose[kMaxPoseBones];
+    BoneSnap         blend_from[kMaxPoseBones];
 };
 
 class PoseCrossfadePool {
 public:
-    PoseCrossfadePool() {
+    PoseCrossfadePool() : slots_(kPosePoolSlots) {
         for (uint32_t i = 0; i < kPosePoolSlots; ++i) {
             slots_[i].valid = 0;
             slots_[i].blending = 0;
             slots_[i].entity_key = 0;
+            slots_[i].last_ro_frame = nullptr;
         }
     }
 
@@ -437,6 +493,7 @@ public:
         }
         PoseCrossfadeSlot* dst = emptySlot ? emptySlot : lruSlot;
         dst->entity_key = key;
+        dst->last_ro_frame = nullptr;
         dst->seen_qpc = nowQpc;
         dst->blend_start_qpc = 0;
         dst->blend_dur_sec = 0.0f;
@@ -555,6 +612,17 @@ public:
                            const AnimFrame& renderedFrame,
                            int64_t nowQpc,
                            const float* curAxisX) {
+        RecordPoseSmart(slot, renderedFrame, true, nowQpc, curAxisX);
+    }
+
+    // Bit-exact zero-copy dedup for immutable read-only frames:
+    //   - When !isWritable and the exact same immutable AnimFrame* is already recorded in slot,
+    //     only refreshes seen_qpc + facing axis (skips redundant BoneSnap memcpy with 0% loss!).
+    static void RecordPoseSmart(PoseCrossfadeSlot& slot,
+                                const AnimFrame& renderedFrame,
+                                bool isWritable,
+                                int64_t nowQpc,
+                                const float* curAxisX) {
         slot.seen_qpc = nowQpc;
         if (curAxisX) {
             slot.last_axis_x[0] = curAxisX[0];
@@ -564,6 +632,11 @@ public:
         }
         if (!renderedFrame.elements || renderedFrame.num_elements == 0 || renderedFrame.num_elements > kMaxPoseBones) {
             slot.last_count = 0;
+            slot.last_ro_frame = nullptr;
+            return;
+        }
+        if (!slot.blending && !isWritable && slot.last_count == renderedFrame.num_elements &&
+            slot.last_ro_frame == &renderedFrame) {
             return;
         }
         const uint32_t n = renderedFrame.num_elements;
@@ -575,10 +648,11 @@ public:
             std::memcpy(dst.m, e.m, sizeof(dst.m));
         }
         slot.last_count = static_cast<uint16_t>(n);
+        slot.last_ro_frame = isWritable ? nullptr : &renderedFrame;
     }
 
 private:
-    PoseCrossfadeSlot slots_[kPosePoolSlots];
+    std::vector<PoseCrossfadeSlot> slots_;
 
     static uint32_t HashKey(uintptr_t key) {
         return static_cast<uint32_t>(((key >> 4) ^ (key >> 13) ^ (key >> 23)) & (kPosePoolSlots - 1u));

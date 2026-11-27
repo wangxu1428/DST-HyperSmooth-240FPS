@@ -119,16 +119,32 @@ local cur_ray_b       = 0.78
 local cur_cloud_str   = 0.0
 local cur_canopy_str  = 0.0
 
-local stream_timer    = 99.0
-local edge_fog_acc    = 0.0
-local ground_fog_acc  = 0.0
-local fog_scan_phase  = 0
-local last_stream_x   = nil
-local last_stream_z   = nil
+local stream_timer       = 99.0
+local edge_fog_acc       = 0.0
+local ground_fog_acc     = 0.0
+local fog_scan_phase     = 0
+local edge_scan_cursor   = 0
+local stream_phase       = 0
+local canopy_scan_cursor = 0
+local cached_world_tiles = nil
+local last_stream_x      = nil
+local last_stream_z      = nil
 
 -- =============================================================================
 -- Tile Classification Helpers
 -- =============================================================================
+local function GetWorldTilesTable()
+    if type(cached_world_tiles) == "table" then
+        return cached_world_tiles
+    end
+    local wt = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    if type(wt) == "table" then
+        cached_world_tiles = wt
+        return wt
+    end
+    return nil
+end
+
 local function GetTileAt(world, x, z)
     if world == nil or world.Map == nil or type(world.Map.GetTileAtPoint) ~= "function" then
         return nil
@@ -137,16 +153,21 @@ local function GetTileAt(world, x, z)
     return ok and t or nil
 end
 
+local function GetTileFast(map_obj, fn_tile, x, z)
+    if map_obj == nil or fn_tile == nil then return nil end
+    return fn_tile(map_obj, x, 0, z)
+end
+
 local function IsForestTile(tile)
     if tile == nil then return false end
-    local WT = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    local WT = GetWorldTilesTable()
     if type(WT) ~= "table" then return false end
     return tile == WT.FOREST or tile == WT.DECIDUOUS or tile == WT.MONKEY_GROUND
 end
 
 local function IsCaveRayTile(tile)
     if tile == nil then return false end
-    local WT = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    local WT = GetWorldTilesTable()
     if type(WT) ~= "table" then return false end
     return tile == WT.SINKHOLE or tile == WT.FUNGUS
         or tile == WT.FUNGUSRED or tile == WT.FUNGUSGREEN
@@ -154,7 +175,7 @@ end
 
 local function IsVoidEdgeTile(tile)
     if tile == nil then return true end
-    local WT = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    local WT = GetWorldTilesTable()
     if type(WT) ~= "table" then return tile == 1 or tile == 255 end
     return tile == WT.IMPASSABLE or tile == WT.INVALID
 end
@@ -173,7 +194,7 @@ local function IsWalkableSurfaceLand(world, wx, wz, tile)
         local ok, oc = pcall(fnOcean, tile)
         if ok and oc == true then return false end
     end
-    local WT = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    local WT = GetWorldTilesTable()
     if type(WT) == "table" then
         if tile == WT.OCEAN_COASTAL or tile == WT.OCEAN_COASTAL_SHORE or tile == WT.OCEAN_SWELL
             or tile == WT.OCEAN_ROUGH or tile == WT.OCEAN_HAZARDOUS or tile == WT.OCEAN_BRINEPOOL
@@ -193,7 +214,7 @@ end
 
 local function GetGroundFogTileWeight(tile, is_cave)
     if tile == nil then return 0.0 end
-    local WT = rawget(G, "WORLD_TILES") or rawget(G, "GROUND")
+    local WT = GetWorldTilesTable()
     if type(WT) ~= "table" then return 0.0 end
     if is_cave then
         if tile == WT.SINKHOLE or tile == WT.FUNGUS or tile == WT.FUNGUSRED
@@ -366,6 +387,8 @@ local function StepVolumetricFog(px, pz, world, wstate, is_cave, dt)
     end
     if not EnsureFogHost() or not IsValidEnt(fog_ent) or fog_ent.VFXEffect == nil then return end
     local eff = fog_ent.VFXEffect
+    local map_obj = (world ~= nil) and world.Map or nil
+    local fn_tile = (map_obj ~= nil and type(map_obj.GetTileAtPoint) == "function") and map_obj.GetTileAtPoint or nil
 
     -- Emitter 0: World-Edge / Void Ocean Mist (world-anchored, slow dreamy drift)
     if cfg.edge_fog <= 0.005 then
@@ -378,32 +401,37 @@ local function StepVolumetricFog(px, pz, world, wstate, is_cave, dt)
             if edge_fog_acc > 1.56 then edge_fog_acc = 0.0 end
             fog_scan_phase = (fog_scan_phase + 1) % 4
             local emitted = 0
+            local probes = 0
             local STEP = 8.0
             local bx = math.floor(px / STEP) * STEP
             local bz = math.floor(pz / STEP) * STEP
-            for gz = -5, 5 do
-                if emitted >= 2 then break end
-                for gx = -5, 5 do
-                    if emitted >= 2 then break end
-                    if ((gx + gz + fog_scan_phase) % 4) == 0 then
-                        local wx = bx + gx * STEP + (math.random() - 0.5) * 4.5
-                        local wz = bz + gz * STEP + (math.random() - 0.5) * 4.5
-                        local dx, dz = wx - px, wz - pz
-                        local d2 = dx * dx + dz * dz
-                        if d2 >= 196.0 and d2 <= 2500.0 then -- 14..50 units
-                            local tile = GetTileAt(world, wx, wz)
-                            if IsVoidEdgeTile(tile) then
-                                local life = 13.0 + math.random() * 6.0
-                                local wy = 0.35 + math.random() * 0.20
-                                local vx = 0.006 + math.random() * 0.006
-                                local vz = (math.random() - 0.5) * 0.006
-                                EmitFogParticle(eff, 0, life, wx, wy, wz, vx, 0.0, vz)
-                                emitted = emitted + 1
-                                stats.edge_fog_emitted = stats.edge_fog_emitted + 1
-                            end
+            local total_cells = 121
+            local start_idx = edge_scan_cursor % total_cells
+            for step = 0, total_cells - 1 do
+                if emitted >= 2 or probes >= 12 then break end
+                local idx = (start_idx + step) % total_cells
+                local gz = math.floor(idx / 11) - 5
+                local gx = (idx % 11) - 5
+                if ((gx + gz + fog_scan_phase) % 4) == 0 then
+                    local wx = bx + gx * STEP + (math.random() - 0.5) * 4.5
+                    local wz = bz + gz * STEP + (math.random() - 0.5) * 4.5
+                    local dx, dz = wx - px, wz - pz
+                    local d2 = dx * dx + dz * dz
+                    if d2 >= 196.0 and d2 <= 2500.0 then -- 14..50 units
+                        probes = probes + 1
+                        local tile = GetTileFast(map_obj, fn_tile, wx, wz)
+                        if IsVoidEdgeTile(tile) then
+                            local life = 13.0 + math.random() * 6.0
+                            local wy = 0.35 + math.random() * 0.20
+                            local vx = 0.006 + math.random() * 0.006
+                            local vz = (math.random() - 0.5) * 0.006
+                            EmitFogParticle(eff, 0, life, wx, wy, wz, vx, 0.0, vz)
+                            emitted = emitted + 1
+                            stats.edge_fog_emitted = stats.edge_fog_emitted + 1
                         end
                     end
                 end
+                edge_scan_cursor = (idx + 1) % total_cells
             end
         end
     end
@@ -428,7 +456,7 @@ local function StepVolumetricFog(px, pz, world, wstate, is_cave, dt)
                 local dist = 7.5 + math.random() * 24.5
                 local wx = px + math.cos(ang) * dist
                 local wz = pz + math.sin(ang) * dist
-                local w = GetGroundFogTileWeight(GetTileAt(world, wx, wz), is_cave)
+                local w = GetGroundFogTileWeight(GetTileFast(map_obj, fn_tile, wx, wz), is_cave)
                 if w > 0.0 and math.random() < w then
                     local life = 14.0 + math.random() * 5.5
                     local wy = 0.35 + math.random() * 0.15
@@ -482,6 +510,7 @@ local function SpawnLocalLightRay(wx, wz, gx, gz)
         if type(anim.PlayAnimation) == "function" then anim:PlayAnimation("idle_loop", true) end
         if type(anim.SetLightOverride) == "function" then anim:SetLightOverride(1) end
         if type(anim.SetFinalOffset) == "function" then anim:SetFinalOffset(1) end
+        if type(anim.SetForceSinglePass) == "function" then anim:SetForceSinglePass(true) end
         local sc = 0.92 + CellHash(gx, gz, 11) * 0.28
         if type(anim.SetScale) == "function" then anim:SetScale(sc, sc, sc) end
         if type(anim.Hide) == "function" and type(anim.Show) == "function" then
@@ -706,189 +735,217 @@ local function EnsureController()
 end
 
 -- =============================================================================
--- Spatial Grid Streaming (Runs at ~3Hz or on >=3-tile player displacement)
+-- Spatial Grid Streaming (Staggered 3-phase execution, <= 24 tile probes/step)
 -- =============================================================================
-local function StreamSpatialGrids(px, pz, world, is_cave)
-    -- 1. Forest & Cave 3D Volumetric Light Rays (12x12 tile cells, max 14 active)
-    if cfg.lightrays <= 0.005 then
-        if stats.active_rays > 0 then ClearAllRays() end
-    else
-        local CELL = 12
-        local cpx = math.floor(px / CELL)
-        local cpz = math.floor(pz / CELL)
-        local keep = {}
-        local count = 0
-        local nf_count = 0
-        local max_rays = cfg.lightrays_all and 18 or 14
+local function StreamSpatialGrids(px, pz, world, is_cave, only_phase)
+    local run_rays   = (only_phase == nil or only_phase == 0)
+    local run_clouds = (only_phase == nil or only_phase == 1)
+    local run_canopy = (only_phase == nil or only_phase == 2)
+    local map_obj = (world ~= nil) and world.Map or nil
+    local fn_tile = (map_obj ~= nil and type(map_obj.GetTileAtPoint) == "function") and map_obj.GetTileAtPoint or nil
 
-        -- Evict distant, invalid, or disabled non-forest ray entities
-        for k, node in pairs(ray_nodes) do
-            if not (node and IsValidEnt(node.ent)) then
-                ray_nodes[k] = nil
-            elseif node.non_forest and (not cfg.lightrays_all or is_cave) then
-                if type(node.ent.Remove) == "function" then pcall(node.ent.Remove, node.ent) end
-                ray_nodes[k] = nil
-            else
-                local dx, dz = node.wx - px, node.wz - pz
-                if dx * dx + dz * dz > 1764.0 then -- > 42 tiles
+    -- Phase 0: Forest & Cave 3D Volumetric Light Rays (12x12 tile cells, max 14 active)
+    if run_rays then
+        if cfg.lightrays <= 0.005 then
+            if stats.active_rays > 0 then ClearAllRays() end
+        else
+            local CELL = 12
+            local cpx = math.floor(px / CELL)
+            local cpz = math.floor(pz / CELL)
+            local keep = {}
+            local count = 0
+            local nf_count = 0
+            local max_rays = cfg.lightrays_all and 18 or 14
+
+            -- Evict distant, invalid, or disabled non-forest ray entities
+            for k, node in pairs(ray_nodes) do
+                if not (node and IsValidEnt(node.ent)) then
+                    ray_nodes[k] = nil
+                elseif node.non_forest and (not cfg.lightrays_all or is_cave) then
                     if type(node.ent.Remove) == "function" then pcall(node.ent.Remove, node.ent) end
                     ray_nodes[k] = nil
                 else
-                    keep[k] = true
-                    count = count + 1
-                    if node.non_forest then nf_count = nf_count + 1 end
+                    local dx, dz = node.wx - px, node.wz - pz
+                    if dx * dx + dz * dz > 1764.0 then -- > 42 tiles
+                        if type(node.ent.Remove) == "function" then pcall(node.ent.Remove, node.ent) end
+                        ray_nodes[k] = nil
+                    else
+                        keep[k] = true
+                        count = count + 1
+                        if node.non_forest then nf_count = nf_count + 1 end
+                    end
                 end
             end
-        end
 
-        -- Populate deterministic forest / cave / optional all-turf base cells within [-3..3]
-        if count < max_rays then
-            for dz_c = -3, 3 do
-                for dx_c = -3, 3 do
-                    if count >= max_rays then break end
-                    local gx, gz = cpx + dx_c, cpz + dz_c
-                    local key = CellKey(gx, gz)
-                    if not keep[key] then
-                        local wx = gx * CELL + 2.0 + CellHash(gx, gz, 1) * (CELL - 4.0)
-                        local wz = gz * CELL + 2.0 + CellHash(gx, gz, 2) * (CELL - 4.0)
-                        local ddx, ddz = wx - px, wz - pz
-                        if ddx * ddx + ddz * ddz <= 1369.0 then -- <= 37 tiles
-                            local tile = GetTileAt(world, wx, wz)
-                            local prob = 0.0
-                            local is_nf = false
-                            if is_cave then
-                                if IsCaveRayTile(tile) then prob = 0.24 end
-                            else
-                                if IsForestTile(tile) then
-                                    prob = 0.48
-                                elseif cfg.lightrays_all and IsWalkableSurfaceLand(world, wx, wz, tile) then
-                                    is_nf = true
-                                    prob = HasNearbyLivingTree(wx, wz) and 0.54 or 0.22
+            -- Populate deterministic forest / cave / optional all-turf base cells within [-3..3]
+            if count < max_rays then
+                for dz_c = -3, 3 do
+                    for dx_c = -3, 3 do
+                        if count >= max_rays then break end
+                        local gx, gz = cpx + dx_c, cpz + dz_c
+                        local key = CellKey(gx, gz)
+                        if not keep[key] then
+                            local wx = gx * CELL + 2.0 + CellHash(gx, gz, 1) * (CELL - 4.0)
+                            local wz = gz * CELL + 2.0 + CellHash(gx, gz, 2) * (CELL - 4.0)
+                            local ddx, ddz = wx - px, wz - pz
+                            if ddx * ddx + ddz * ddz <= 1369.0 then -- <= 37 tiles
+                                local tile = GetTileFast(map_obj, fn_tile, wx, wz)
+                                local prob = 0.0
+                                local is_nf = false
+                                if is_cave then
+                                    if IsCaveRayTile(tile) then prob = 0.24 end
+                                else
+                                    if IsForestTile(tile) then
+                                        prob = 0.48
+                                    elseif cfg.lightrays_all and IsWalkableSurfaceLand(world, wx, wz, tile) then
+                                        is_nf = true
+                                        prob = HasNearbyLivingTree(wx, wz) and 0.54 or 0.22
+                                    end
                                 end
-                            end
-                            if prob > 0.0 and CellHash(gx, gz, 3) < prob then
-                                local ent = SpawnLocalLightRay(wx, wz, gx, gz)
-                                if ent ~= nil then
-                                    ray_nodes[key] = {
-                                        ent = ent,
-                                        wx = wx,
-                                        wz = wz,
-                                        fade = 0.0,
-                                        non_forest = is_nf,
-                                        base_gain = 0.80 + CellHash(gx, gz, 7) * 0.35,
-                                    }
-                                    count = count + 1
-                                    if is_nf then nf_count = nf_count + 1 end
+                                if prob > 0.0 and CellHash(gx, gz, 3) < prob then
+                                    local ent = SpawnLocalLightRay(wx, wz, gx, gz)
+                                    if ent ~= nil then
+                                        ray_nodes[key] = {
+                                            ent = ent,
+                                            wx = wx,
+                                            wz = wz,
+                                            fade = 0.0,
+                                            non_forest = is_nf,
+                                            base_gain = 0.80 + CellHash(gx, gz, 7) * 0.35,
+                                        }
+                                        count = count + 1
+                                        if is_nf then nf_count = nf_count + 1 end
+                                    end
                                 end
                             end
                         end
                     end
                 end
             end
+            stats.active_rays = count
+            stats.non_forest_rays = nf_count
         end
-        stats.active_rays = count
-        stats.non_forest_rays = nf_count
     end
 
-    -- 2A. Dynamic Drifting Cloud Shadows (Surface only, 36x36 large cells)
+    if not (run_clouds or run_canopy) then
+        return
+    end
+
+    -- Phase 1/2 shared ShadeRenderer resolution
     local SR = nil
     if (cfg.cloud_shade > 0.005 or cfg.canopy_shade > 0.005) then
         SR = EnsureShadeTypes()
     end
 
-    if cfg.cloud_shade <= 0.005 or is_cave or SR == nil or cloud_shade_type == nil then
-        if stats.active_clouds > 0 then
-            ClearShadeHandles(cloud_handles, cloud_shade_type)
-            stats.active_clouds = 0
-        end
-        DisarmShadeType(SR, cloud_shade_type, true)
-    else
-        ArmCloudTexture(SR)
-        local CCELL = 36
-        local cpx = math.floor(px / CCELL)
-        local cpz = math.floor(pz / CCELL)
-        local ccount = 0
-        for k, rec in pairs(cloud_handles) do
-            local dx, dz = rec.wx - px, rec.wz - pz
-            if dx * dx + dz * dz > 10000.0 then -- > 100 tiles
-                if type(SR.RemoveShade) == "function" then
-                    pcall(SR.RemoveShade, SR, cloud_shade_type, rec.handle)
-                end
-                cloud_handles[k] = nil
-            else
-                ccount = ccount + 1
+    -- Phase 1: Dynamic Drifting Cloud Shadows (Surface only, 36x36 large cells)
+    if run_clouds then
+        if cfg.cloud_shade <= 0.005 or is_cave or SR == nil or cloud_shade_type == nil then
+            if stats.active_clouds > 0 then
+                ClearShadeHandles(cloud_handles, cloud_shade_type)
+                stats.active_clouds = 0
             end
-        end
-        for dz_c = -2, 2 do
-            for dx_c = -2, 2 do
-                local gx, gz = cpx + dx_c, cpz + dz_c
-                local key = CellKey(gx, gz)
-                if cloud_handles[key] == nil and CellHash(gx, gz, 31) < 0.62 then
-                    local wx = gx * CCELL + CellHash(gx, gz, 33) * CCELL
-                    local wz = gz * CCELL + CellHash(gx, gz, 37) * CCELL
-                    local rot = CellHash(gx, gz, 41) * 360.0
-                    local sc = 18.0 + CellHash(gx, gz, 43) * 11.0
-                    if type(SR.SpawnShade) == "function" then
-                        local ok, h = pcall(SR.SpawnShade, SR, cloud_shade_type, wx, wz, rot, sc)
-                        if ok and h ~= nil then
-                            cloud_handles[key] = { handle = h, wx = wx, wz = wz }
-                            ccount = ccount + 1
-                        end
+            DisarmShadeType(SR, cloud_shade_type, true)
+        else
+            ArmCloudTexture(SR)
+            local CCELL = 36
+            local cpx = math.floor(px / CCELL)
+            local cpz = math.floor(pz / CCELL)
+            local ccount = 0
+            for k, rec in pairs(cloud_handles) do
+                local dx, dz = rec.wx - px, rec.wz - pz
+                if dx * dx + dz * dz > 10000.0 then -- > 100 tiles
+                    if type(SR.RemoveShade) == "function" then
+                        pcall(SR.RemoveShade, SR, cloud_shade_type, rec.handle)
                     end
+                    cloud_handles[k] = nil
+                else
+                    ccount = ccount + 1
                 end
             end
-        end
-        stats.active_clouds = ccount
-    end
-
-    -- 2B. Deep-Forest Dappled Canopy Shade (Surface Forest/Deciduous, 8x8 cells)
-    if cfg.canopy_shade <= 0.005 or is_cave or SR == nil or canopy_shade_type == nil then
-        if stats.active_canopy > 0 then
-            ClearShadeHandles(canopy_handles, canopy_shade_type)
-            stats.active_canopy = 0
-        end
-        DisarmShadeType(SR, canopy_shade_type, false)
-    else
-        ArmCanopyTexture(SR)
-        local FCELL = 8
-        local cpx = math.floor(px / FCELL)
-        local cpz = math.floor(pz / FCELL)
-        local fcount = 0
-        for k, rec in pairs(canopy_handles) do
-            local dx, dz = rec.wx - px, rec.wz - pz
-            if dx * dx + dz * dz > 1600.0 then -- > 40 tiles
-                if type(SR.RemoveShade) == "function" then
-                    pcall(SR.RemoveShade, SR, canopy_shade_type, rec.handle)
-                end
-                canopy_handles[k] = nil
-            else
-                fcount = fcount + 1
-            end
-        end
-        for dz_c = -4, 4 do
-            for dx_c = -4, 4 do
-                if fcount >= 48 then break end
-                local gx, gz = cpx + dx_c, cpz + dz_c
-                local key = CellKey(gx, gz)
-                if canopy_handles[key] == nil and CellHash(gx, gz, 53) < 0.54 then
-                    local wx = gx * FCELL + 1.5 + CellHash(gx, gz, 59) * (FCELL - 3.0)
-                    local wz = gz * FCELL + 1.5 + CellHash(gx, gz, 61) * (FCELL - 3.0)
-                    local ddx, ddz = wx - px, wz - pz
-                    if ddx * ddx + ddz * ddz <= 1156.0 and IsForestTile(GetTileAt(world, wx, wz)) then
-                        local rot = CellHash(gx, gz, 67) * 360.0
-                        local sc = 3.2 + CellHash(gx, gz, 71) * 1.5
+            for dz_c = -2, 2 do
+                for dx_c = -2, 2 do
+                    local gx, gz = cpx + dx_c, cpz + dz_c
+                    local key = CellKey(gx, gz)
+                    if cloud_handles[key] == nil and CellHash(gx, gz, 31) < 0.62 then
+                        local wx = gx * CCELL + CellHash(gx, gz, 33) * CCELL
+                        local wz = gz * CCELL + CellHash(gx, gz, 37) * CCELL
+                        local rot = CellHash(gx, gz, 41) * 360.0
+                        local sc = 18.0 + CellHash(gx, gz, 43) * 11.0
                         if type(SR.SpawnShade) == "function" then
-                            local ok, h = pcall(SR.SpawnShade, SR, canopy_shade_type, wx, wz, rot, sc)
+                            local ok, h = pcall(SR.SpawnShade, SR, cloud_shade_type, wx, wz, rot, sc)
                             if ok and h ~= nil then
-                                canopy_handles[key] = { handle = h, wx = wx, wz = wz }
-                                fcount = fcount + 1
+                                cloud_handles[key] = { handle = h, wx = wx, wz = wz }
+                                ccount = ccount + 1
                             end
                         end
                     end
                 end
             end
+            stats.active_clouds = ccount
         end
-        stats.active_canopy = fcount
+    end
+
+    -- Phase 2: Deep-Forest Dappled Canopy Shade (Surface Forest/Deciduous, 8x8 cells, <= 24 tile probes/step)
+    if run_canopy then
+        if cfg.canopy_shade <= 0.005 or is_cave or SR == nil or canopy_shade_type == nil then
+            if stats.active_canopy > 0 then
+                ClearShadeHandles(canopy_handles, canopy_shade_type)
+                stats.active_canopy = 0
+            end
+            DisarmShadeType(SR, canopy_shade_type, false)
+        else
+            ArmCanopyTexture(SR)
+            local FCELL = 8
+            local cpx = math.floor(px / FCELL)
+            local cpz = math.floor(pz / FCELL)
+            local fcount = 0
+            for k, rec in pairs(canopy_handles) do
+                local dx, dz = rec.wx - px, rec.wz - pz
+                if dx * dx + dz * dz > 1600.0 then -- > 40 tiles
+                    if type(SR.RemoveShade) == "function" then
+                        pcall(SR.RemoveShade, SR, canopy_shade_type, rec.handle)
+                    end
+                    canopy_handles[k] = nil
+                else
+                    fcount = fcount + 1
+                end
+            end
+            if fcount < 48 then
+                local probes = 0
+                local total_cells = 81 -- 9x9 grid (-4..4)
+                local start_idx = (only_phase == nil) and 0 or (canopy_scan_cursor % total_cells)
+                for step = 0, total_cells - 1 do
+                    if fcount >= 48 then break end
+                    if only_phase ~= nil and probes >= 24 then break end
+                    local idx = (start_idx + step) % total_cells
+                    local dz_c = math.floor(idx / 9) - 4
+                    local dx_c = (idx % 9) - 4
+                    local gx, gz = cpx + dx_c, cpz + dz_c
+                    local key = CellKey(gx, gz)
+                    if canopy_handles[key] == nil and CellHash(gx, gz, 53) < 0.54 then
+                        local wx = gx * FCELL + 1.5 + CellHash(gx, gz, 59) * (FCELL - 3.0)
+                        local wz = gz * FCELL + 1.5 + CellHash(gx, gz, 61) * (FCELL - 3.0)
+                        local ddx, ddz = wx - px, wz - pz
+                        if ddx * ddx + ddz * ddz <= 1156.0 then
+                            probes = probes + 1
+                            if IsForestTile(GetTileFast(map_obj, fn_tile, wx, wz)) then
+                                local rot = CellHash(gx, gz, 67) * 360.0
+                                local sc = 3.2 + CellHash(gx, gz, 71) * 1.5
+                                if type(SR.SpawnShade) == "function" then
+                                    local ok, h = pcall(SR.SpawnShade, SR, canopy_shade_type, wx, wz, rot, sc)
+                                    if ok and h ~= nil then
+                                        canopy_handles[key] = { handle = h, wx = wx, wz = wz }
+                                        fcount = fcount + 1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    canopy_scan_cursor = (idx + 1) % total_cells
+                end
+            end
+            stats.active_canopy = fcount
+        end
     end
 end
 
@@ -991,14 +1048,20 @@ function HS_VOLLIGHT.StepUpdate(dt)
     local wstate = (world ~= nil and type(world.state) == "table") and world.state or nil
     local is_cave = (world ~= nil and type(world.HasTag) == "function" and world:HasTag("cave")) == true
 
-    -- Periodic or displacement-triggered spatial grid streaming (~3Hz)
+    -- Periodic or displacement-triggered staggered spatial grid streaming
+    local force_all_phases = (stream_timer >= 90.0)
     stream_timer = stream_timer + dt
     local moved_far = (last_stream_x == nil)
         or ((px - last_stream_x) * (px - last_stream_x) + (pz - last_stream_z) * (pz - last_stream_z) >= 9.0)
-    if stream_timer >= 0.33 or moved_far then
+    if force_all_phases then
         stream_timer = 0.0
         last_stream_x, last_stream_z = px, pz
-        StreamSpatialGrids(px, pz, world, is_cave)
+        StreamSpatialGrids(px, pz, world, is_cave, nil)
+    elseif stream_timer >= 0.35 or (moved_far and stream_timer >= 0.20) then
+        stream_timer = 0.0
+        last_stream_x, last_stream_z = px, pz
+        StreamSpatialGrids(px, pz, world, is_cave, stream_phase)
+        stream_phase = (stream_phase + 1) % 3
     end
 
     -- Time-of-day & weather lighting targets
@@ -1157,6 +1220,13 @@ function HS_VOLLIGHT.Shutdown()
     cur_canopy_str = 0.0
     edge_fog_acc = 0.0
     ground_fog_acc = 0.0
+    stream_phase = 0
+    edge_scan_cursor = 0
+    canopy_scan_cursor = 0
+    cached_world_tiles = nil
+    last_stream_x = nil
+    last_stream_z = nil
+    stream_timer = 99.0
     if IsValidEnt(ctrl_ent) and type(ctrl_ent.Remove) == "function" then
         pcall(ctrl_ent.Remove, ctrl_ent)
     end

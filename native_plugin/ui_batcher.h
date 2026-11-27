@@ -54,12 +54,19 @@ inline constexpr uint32_t kGlMaxTextureImageUnits   = 0x8872u;
 inline constexpr uint32_t kMapWriteInvalidateBuf    = 0x0002u | 0x0008u;          // WRITE | INVALIDATE_BUFFER (safe orphan on wrap)
 inline constexpr uint32_t kMapWriteAppendUnsync     = 0x0002u | 0x0004u | 0x0020u; // WRITE | INVALIDATE_RANGE | UNSYNC (disjoint tail!)
 
-inline constexpr uint32_t kUiTexUnitBase            = 6u; // GL_TEXTURE6 .. GL_TEXTURE13 (unused by DST UI)
-inline constexpr uint32_t kMaxUiTexSlots            = 8u;
+inline constexpr uint32_t kUiTexUnitBase            = 6u;  // GL_TEXTURE6 .. GL_TEXTURE13 (first 8 slots)
+inline constexpr uint32_t kUiTexUnitHiBase          = 16u; // GL_TEXTURE16 .. GL_TEXTURE23 (slots 8..15)
+inline constexpr uint32_t kLegacyUiTexSlots         = 8u;
+inline constexpr uint32_t kMaxUiTexSlots            = 16u;
 inline constexpr uint32_t kMaxUiVerts               = 16384u; // max per single flush
+inline constexpr uint32_t kUiRingSlots              = 4u;     // 4-slot Mode-4 orphan+upload ring (0 glMapBufferRange stalls)
+
+inline constexpr uint32_t UiSlotToTexUnit(uint32_t slot) noexcept {
+    return (slot < 8u) ? (kUiTexUnitBase + slot) : (kUiTexUnitHiBase + (slot - 8u));
+}
 inline constexpr uint32_t kMaxUiIndices             = 32768u; // max per single flush (uint16 safe)
-inline constexpr uint32_t kUiStreamBufVerts         = 65536u; // 4 MB AZDO linear append VBO (zero race!)
-inline constexpr uint32_t kUiStreamBufIndices       = 131072u; // 256 KB AZDO linear append IBO (zero race!)
+inline constexpr uint32_t kUiStreamBufVerts         = 65536u; // 4 MB legacy append VBO capacity
+inline constexpr uint32_t kUiStreamBufIndices       = 131072u; // 256 KB legacy append IBO capacity
 inline constexpr uint32_t kMaxUiSingleVerts         = 4096u;
 inline constexpr uint32_t kMaxUiSingleIndices       = 8192u;
 inline constexpr size_t   kMaxUiShadowCaptureBytes  = 256u * 1024u;
@@ -208,6 +215,7 @@ struct UiGlOps {
     SyncStateAfterFlush_t      onPostFlushRestore         = nullptr;
     void*                      callbackCtx                = nullptr;
     bool                       preferHighp                = false;
+    bool                       preferOrphanSubData        = false; // True in production: 4-slot Mode-4 orphan+glBufferSubData (0 glMapBufferRange stalls)
 };
 
 struct UiBatchStats {
@@ -218,6 +226,7 @@ struct UiBatchStats {
     int64_t bypassDraws  = 0;
     int64_t progSkips    = 0;
     int64_t readbacks    = 0;
+    int64_t flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Count)] = {};
 };
 
 // Pure read-only classifier for DST's vanilla UI & Font GLSL shaders
@@ -337,15 +346,19 @@ public:
     void ResetContextState(bool deleteGpuObjects) {
         if (deleteGpuObjects && gpuReady_) {
             if (ops_.glDeleteBuffers) {
-                if (streamVbo_ != 0u) ops_.glDeleteBuffers(1, &streamVbo_);
-                if (streamIbo_ != 0u) ops_.glDeleteBuffers(1, &streamIbo_);
+                for (uint32_t s = 0u; s < kUiRingSlots; ++s) {
+                    if (streamVbos_[s] != 0u) ops_.glDeleteBuffers(1, &streamVbos_[s]);
+                    if (streamIbos_[s] != 0u) ops_.glDeleteBuffers(1, &streamIbos_[s]);
+                }
             }
             if (ops_.glDeleteProgram && uberProg_ != 0u) {
                 ops_.glDeleteProgram(uberProg_);
             }
         }
-        streamVbo_        = 0u;
-        streamIbo_        = 0u;
+        std::memset(streamVbos_, 0, sizeof(streamVbos_));
+        std::memset(streamIbos_, 0, sizeof(streamIbos_));
+        activeRingSlots_  = 0u;
+        ringIdx_          = 0u;
         streamVboCursor_  = 0u;
         streamIboCursor_  = 0u;
         streamVboShrunk_  = false;
@@ -799,8 +812,12 @@ public:
         return true;
     }
 
-    void Flush(hs_sprite_batch::FlushReason /*reason*/ = hs_sprite_batch::FlushReason::Other) {
+    void Flush(hs_sprite_batch::FlushReason reason = hs_sprite_batch::FlushReason::Other) {
         if (indexCount_ == 0u) return;
+        const size_t rIdx = static_cast<size_t>(reason);
+        if (rIdx < static_cast<size_t>(hs_sprite_batch::FlushReason::Count)) {
+            ++stats_.flReason[rIdx];
+        }
         const uint32_t flushVerts   = vertCount_;
         const uint32_t flushIndices = indexCount_;
         const uint32_t flushTexCnt  = batchTexCount_;
@@ -815,100 +832,126 @@ public:
             return;
         }
 
-        const uint32_t vbo = streamVbo_;
-        const uint32_t ibo = streamIbo_;
+        const uint32_t slot = (activeRingSlots_ > 1u) ? ringIdx_ : 0u;
+        if (activeRingSlots_ > 1u) {
+            ringIdx_ = (ringIdx_ + 1u) % activeRingSlots_;
+        }
+        const uint32_t vbo = streamVbos_[slot];
+        const uint32_t ibo = streamIbos_[slot];
         const size_t vBytes = static_cast<size_t>(flushVerts) * sizeof(UiBatchedVertex);
         const size_t iBytes = static_cast<size_t>(flushIndices) * sizeof(uint16_t);
-        constexpr size_t kVboCap = static_cast<size_t>(kUiStreamBufVerts) * sizeof(UiBatchedVertex);
-        constexpr size_t kIboCap = static_cast<size_t>(kUiStreamBufIndices) * sizeof(uint16_t);
+        constexpr size_t kLegacyVboCap = static_cast<size_t>(kUiStreamBufVerts) * sizeof(UiBatchedVertex);
+        constexpr size_t kLegacyIboCap = static_cast<size_t>(kUiStreamBufIndices) * sizeof(uint16_t);
+        constexpr size_t kSlotVboCap   = static_cast<size_t>(kMaxUiVerts) * sizeof(UiBatchedVertex);
+        constexpr size_t kSlotIboCap   = static_cast<size_t>(kMaxUiIndices) * sizeof(uint16_t);
 
         ops_.glUseProgram(uberProg_);
 
-        // Bind up to 8 UI/Font atlas textures onto GL_TEXTURE6..GL_TEXTURE13
+        // Bind up to 16 UI/Font atlas textures onto GL_TEXTURE6..13 and GL_TEXTURE16..23
         for (uint32_t s = 0; s < flushTexCnt; ++s) {
-            ops_.glActiveTexture(kGlTexture0 + kUiTexUnitBase + s);
+            ops_.glActiveTexture(kGlTexture0 + UiSlotToTexUnit(s));
             ops_.glBindTexture(kGlTexture2D, batchTexIds_[s]);
         }
 
-        // AZDO Linear Streaming Append Ring:
-        //   - Disjoint tail append uses WRITE|INVALIDATE_RANGE|UNSYNCHRONIZED (0 GPU overlap, 0 stall!)
-        //   - Wrap-to-0 orphan uses WRITE|INVALIDATE_BUFFER (NO UNSYNCHRONIZED -> 0% GPU/CPU race!)
-        //   - Fallback upload advances cursor past [0, bytes) (or marks shrunk for full re-orphan),
-        //     and glUnmapBuffer() return value is checked so corrupted unmaps safely fall back!
-        size_t vBaseOffset = 0;
-        ops_.glBindBuffer(kGlArrayBuffer, vbo);
-        bool vUploaded = false;
-        if (ops_.glMapBufferRange && ops_.glUnmapBuffer && vBytes <= kVboCap) {
-            if (streamVboShrunk_ && ops_.glBufferData) {
-                ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
-                streamVboShrunk_ = false;
-                streamVboCursor_ = 0u;
+        size_t vBaseOffset = 0u;
+        size_t iBaseOffset = 0u;
+        if (activeRingSlots_ > 1u) {
+            // 4-slot Mode-4 rotating orphan + glBufferSubData (ZERO glMapBufferRange stalls on RTX!)
+            ops_.glBindBuffer(kGlArrayBuffer, vbo);
+            if (ops_.glBufferData) {
+                if (ops_.glBufferSubData && vBytes < kSlotVboCap) {
+                    ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kSlotVboCap), nullptr, kGlStreamDraw);
+                    ops_.glBufferSubData(kGlArrayBuffer, 0, static_cast<ptrdiff_t>(vBytes), verts_.data());
+                } else {
+                    ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(vBytes), verts_.data(), kGlStreamDraw);
+                }
             }
-            if (!streamVboShrunk_) {
-                const bool wrap = (streamVboCursor_ + vBytes > kVboCap);
-                const size_t off = wrap ? 0u : streamVboCursor_;
-                const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
-                if (void* mapped = ops_.glMapBufferRange(kGlArrayBuffer, static_cast<ptrdiff_t>(off),
-                                                         static_cast<ptrdiff_t>(vBytes), flags)) {
-                    std::memcpy(mapped, verts_.data(), vBytes);
-                    if (ops_.glUnmapBuffer(kGlArrayBuffer) != 0) {
-                        vBaseOffset      = off;
-                        streamVboCursor_ = off + vBytes;
-                        vUploaded        = true;
+            ops_.glBindBuffer(kGlElementArrayBuffer, ibo);
+            if (ops_.glBufferData) {
+                if (ops_.glBufferSubData && iBytes < kSlotIboCap) {
+                    ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kSlotIboCap), nullptr, kGlStreamDraw);
+                    ops_.glBufferSubData(kGlElementArrayBuffer, 0, static_cast<ptrdiff_t>(iBytes), indices_.data());
+                } else {
+                    ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(iBytes), indices_.data(), kGlStreamDraw);
+                }
+            }
+        } else {
+            // Legacy single-slot AZDO linear streaming append ring
+            constexpr size_t kVboCap = kLegacyVboCap;
+            constexpr size_t kIboCap = kLegacyIboCap;
+            ops_.glBindBuffer(kGlArrayBuffer, vbo);
+            bool vUploaded = false;
+            if (ops_.glMapBufferRange && ops_.glUnmapBuffer && vBytes <= kVboCap) {
+                if (streamVboShrunk_ && ops_.glBufferData) {
+                    ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
+                    streamVboShrunk_ = false;
+                    streamVboCursor_ = 0u;
+                }
+                if (!streamVboShrunk_) {
+                    const bool wrap = (streamVboCursor_ + vBytes > kVboCap);
+                    const size_t off = wrap ? 0u : streamVboCursor_;
+                    const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
+                    if (void* mapped = ops_.glMapBufferRange(kGlArrayBuffer, static_cast<ptrdiff_t>(off),
+                                                             static_cast<ptrdiff_t>(vBytes), flags)) {
+                        std::memcpy(mapped, verts_.data(), vBytes);
+                        if (ops_.glUnmapBuffer(kGlArrayBuffer) != 0) {
+                            vBaseOffset      = off;
+                            streamVboCursor_ = off + vBytes;
+                            vUploaded        = true;
+                        }
                     }
                 }
             }
-        }
-        if (!vUploaded && ops_.glBufferData) {
-            vBaseOffset = 0u;
-            if (ops_.glBufferSubData && vBytes <= kVboCap) {
-                ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
-                ops_.glBufferSubData(kGlArrayBuffer, 0, static_cast<ptrdiff_t>(vBytes), verts_.data());
-                streamVboShrunk_ = false;
-                streamVboCursor_ = vBytes;
-            } else {
-                ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(vBytes), verts_.data(), kGlStreamDraw);
-                streamVboShrunk_ = true;
-                streamVboCursor_ = kVboCap;
+            if (!vUploaded && ops_.glBufferData) {
+                vBaseOffset = 0u;
+                if (ops_.glBufferSubData && vBytes <= kVboCap) {
+                    ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(kVboCap), nullptr, kGlStreamDraw);
+                    ops_.glBufferSubData(kGlArrayBuffer, 0, static_cast<ptrdiff_t>(vBytes), verts_.data());
+                    streamVboShrunk_ = false;
+                    streamVboCursor_ = vBytes;
+                } else {
+                    ops_.glBufferData(kGlArrayBuffer, static_cast<ptrdiff_t>(vBytes), verts_.data(), kGlStreamDraw);
+                    streamVboShrunk_ = true;
+                    streamVboCursor_ = kVboCap;
+                }
             }
-        }
 
-        size_t iBaseOffset = 0;
-        const size_t iAligned = (iBytes + 3u) & ~static_cast<size_t>(3u);
-        ops_.glBindBuffer(kGlElementArrayBuffer, ibo);
-        bool iUploaded = false;
-        if (ops_.glMapBufferRange && ops_.glUnmapBuffer && iAligned <= kIboCap) {
-            if (streamIboShrunk_ && ops_.glBufferData) {
-                ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
-                streamIboShrunk_ = false;
-                streamIboCursor_ = 0u;
-            }
-            if (!streamIboShrunk_) {
-                const bool wrap = (streamIboCursor_ + iAligned > kIboCap);
-                const size_t off = wrap ? 0u : streamIboCursor_;
-                const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
-                if (void* mapped = ops_.glMapBufferRange(kGlElementArrayBuffer, static_cast<ptrdiff_t>(off),
-                                                         static_cast<ptrdiff_t>(iBytes), flags)) {
-                    std::memcpy(mapped, indices_.data(), iBytes);
-                    if (ops_.glUnmapBuffer(kGlElementArrayBuffer) != 0) {
-                        iBaseOffset      = off;
-                        streamIboCursor_ = off + iAligned;
-                        iUploaded        = true;
+            const size_t iAligned = (iBytes + 3u) & ~static_cast<size_t>(3u);
+            ops_.glBindBuffer(kGlElementArrayBuffer, ibo);
+            bool iUploaded = false;
+            if (ops_.glMapBufferRange && ops_.glUnmapBuffer && iAligned <= kIboCap) {
+                if (streamIboShrunk_ && ops_.glBufferData) {
+                    ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
+                    streamIboShrunk_ = false;
+                    streamIboCursor_ = 0u;
+                }
+                if (!streamIboShrunk_) {
+                    const bool wrap = (streamIboCursor_ + iAligned > kIboCap);
+                    const size_t off = wrap ? 0u : streamIboCursor_;
+                    const uint32_t flags = wrap ? kMapWriteInvalidateBuf : kMapWriteAppendUnsync;
+                    if (void* mapped = ops_.glMapBufferRange(kGlElementArrayBuffer, static_cast<ptrdiff_t>(off),
+                                                             static_cast<ptrdiff_t>(iBytes), flags)) {
+                        std::memcpy(mapped, indices_.data(), iBytes);
+                        if (ops_.glUnmapBuffer(kGlElementArrayBuffer) != 0) {
+                            iBaseOffset      = off;
+                            streamIboCursor_ = off + iAligned;
+                            iUploaded        = true;
+                        }
                     }
                 }
             }
-        }
-        if (!iUploaded && ops_.glBufferData) {
-            iBaseOffset = 0u;
-            if (ops_.glBufferSubData && iAligned <= kIboCap) {
-                ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
-                ops_.glBufferSubData(kGlElementArrayBuffer, 0, static_cast<ptrdiff_t>(iBytes), indices_.data());
-                streamIboShrunk_ = false;
-                streamIboCursor_ = iAligned;
-            } else {
-                ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(iBytes), indices_.data(), kGlStreamDraw);
-                streamIboShrunk_ = true;
-                streamIboCursor_ = kIboCap;
+            if (!iUploaded && ops_.glBufferData) {
+                iBaseOffset = 0u;
+                if (ops_.glBufferSubData && iAligned <= kIboCap) {
+                    ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(kIboCap), nullptr, kGlStreamDraw);
+                    ops_.glBufferSubData(kGlElementArrayBuffer, 0, static_cast<ptrdiff_t>(iBytes), indices_.data());
+                    streamIboShrunk_ = false;
+                    streamIboCursor_ = iAligned;
+                } else {
+                    ops_.glBufferData(kGlElementArrayBuffer, static_cast<ptrdiff_t>(iBytes), indices_.data(), kGlStreamDraw);
+                    streamIboShrunk_ = true;
+                    streamIboCursor_ = kIboCap;
+                }
             }
         }
 
@@ -965,6 +1008,9 @@ public:
         out.bypassDraws  = stats_.bypassDraws  - lastFlushed_.bypassDraws;
         out.progSkips    = stats_.progSkips    - lastFlushed_.progSkips;
         out.readbacks    = stats_.readbacks    - lastFlushed_.readbacks;
+        for (size_t i = 0; i < static_cast<size_t>(hs_sprite_batch::FlushReason::Count); ++i) {
+            out.flReason[i] = stats_.flReason[i] - lastFlushed_.flReason[i];
+        }
         lastFlushed_ = stats_;
         return out;
     }
@@ -1235,6 +1281,19 @@ private:
         if (gpuReady_ && uberProg_ != 0u) return true;
         if (gpuInitFailed_ || uberFailed_) return false;
 
+        auto cleanupRingBufs = [&]() {
+            if (ops_.glDeleteBuffers) {
+                for (uint32_t s = 0u; s < kUiRingSlots; ++s) {
+                    if (streamVbos_[s] != 0u) ops_.glDeleteBuffers(1, &streamVbos_[s]);
+                    if (streamIbos_[s] != 0u) ops_.glDeleteBuffers(1, &streamIbos_[s]);
+                }
+            }
+            std::memset(streamVbos_, 0, sizeof(streamVbos_));
+            std::memset(streamIbos_, 0, sizeof(streamIbos_));
+            activeRingSlots_ = 0u;
+            ringIdx_         = 0u;
+        };
+
         if (!gpuReady_) {
             if (!ops_.glGenBuffers || !ops_.glBindBuffer || !ops_.glBufferData) {
                 gpuInitFailed_ = true;
@@ -1243,53 +1302,72 @@ private:
             if (ops_.glGetIntegerv) {
                 int32_t maxUnits = 8;
                 ops_.glGetIntegerv(kGlMaxTextureImageUnits, &maxUnits);
-                if (maxUnits <= static_cast<int32_t>(kUiTexUnitBase) + 1) {
-                    gpuInitFailed_ = true;
-                    return false;
+                if (maxUnits >= 24) {
+                    maxTexSlots_ = kMaxUiTexSlots; // 16 slots: TEXTURE6..13 + TEXTURE16..23
+                } else if (maxUnits >= static_cast<int32_t>(kUiTexUnitBase + kLegacyUiTexSlots)) {
+                    maxTexSlots_ = kLegacyUiTexSlots;
+                } else {
+                    if (maxUnits <= static_cast<int32_t>(kUiTexUnitBase) + 1) {
+                        gpuInitFailed_ = true;
+                        return false;
+                    }
+                    maxTexSlots_ = static_cast<uint32_t>(maxUnits) - kUiTexUnitBase;
                 }
-                const uint32_t avail = static_cast<uint32_t>(maxUnits) - kUiTexUnitBase;
-                maxTexSlots_ = (avail < kMaxUiTexSlots) ? avail : kMaxUiTexSlots;
+            } else {
+                maxTexSlots_ = kLegacyUiTexSlots;
             }
-            ops_.glGenBuffers(1, &streamVbo_);
-            ops_.glGenBuffers(1, &streamIbo_);
-            if (streamVbo_ == 0u || streamIbo_ == 0u) {
-                if (ops_.glDeleteBuffers) {
-                    if (streamVbo_ != 0u) ops_.glDeleteBuffers(1, &streamVbo_);
-                    if (streamIbo_ != 0u) ops_.glDeleteBuffers(1, &streamIbo_);
+
+            const uint32_t wantSlots = ops_.preferOrphanSubData ? kUiRingSlots : 1u;
+            std::memset(streamVbos_, 0, sizeof(streamVbos_));
+            std::memset(streamIbos_, 0, sizeof(streamIbos_));
+            ops_.glGenBuffers(static_cast<int32_t>(wantSlots), streamVbos_);
+            ops_.glGenBuffers(static_cast<int32_t>(wantSlots), streamIbos_);
+
+            bool genOk = true;
+            for (uint32_t s = 0u; s < wantSlots; ++s) {
+                if (streamVbos_[s] == 0u || streamIbos_[s] == 0u) {
+                    genOk = false;
+                    break;
                 }
-                streamVbo_ = 0u;
-                streamIbo_ = 0u;
+            }
+            if (!genOk) {
+                cleanupRingBufs();
                 gpuInitFailed_ = true;
                 return false;
             }
-            constexpr ptrdiff_t kWantVboBytes = static_cast<ptrdiff_t>(kUiStreamBufVerts * sizeof(UiBatchedVertex));
-            constexpr ptrdiff_t kWantIboBytes = static_cast<ptrdiff_t>(kUiStreamBufIndices * sizeof(uint16_t));
-            ops_.glBindBuffer(kGlArrayBuffer, streamVbo_);
-            ops_.glBufferData(kGlArrayBuffer, kWantVboBytes, nullptr, kGlStreamDraw);
-            int32_t vAlloc = static_cast<int32_t>(kWantVboBytes);
-            if (ops_.glGetBufferParameteriv) {
-                vAlloc = 0;
-                ops_.glGetBufferParameteriv(kGlArrayBuffer, hs_sprite_batch::kGlBufferSize, &vAlloc);
-            }
-            ops_.glBindBuffer(kGlElementArrayBuffer, streamIbo_);
-            ops_.glBufferData(kGlElementArrayBuffer, kWantIboBytes, nullptr, kGlStreamDraw);
-            int32_t iAlloc = static_cast<int32_t>(kWantIboBytes);
-            if (ops_.glGetBufferParameteriv) {
-                iAlloc = 0;
-                ops_.glGetBufferParameteriv(kGlElementArrayBuffer, hs_sprite_batch::kGlBufferSize, &iAlloc);
+
+            const ptrdiff_t kWantVboBytes = static_cast<ptrdiff_t>((wantSlots > 1u ? kMaxUiVerts : kUiStreamBufVerts) * sizeof(UiBatchedVertex));
+            const ptrdiff_t kWantIboBytes = static_cast<ptrdiff_t>((wantSlots > 1u ? kMaxUiIndices : kUiStreamBufIndices) * sizeof(uint16_t));
+            bool allocOk = true;
+            for (uint32_t s = 0u; s < wantSlots; ++s) {
+                ops_.glBindBuffer(kGlArrayBuffer, streamVbos_[s]);
+                ops_.glBufferData(kGlArrayBuffer, kWantVboBytes, nullptr, kGlStreamDraw);
+                int32_t vAlloc = static_cast<int32_t>(kWantVboBytes);
+                if (ops_.glGetBufferParameteriv) {
+                    vAlloc = 0;
+                    ops_.glGetBufferParameteriv(kGlArrayBuffer, hs_sprite_batch::kGlBufferSize, &vAlloc);
+                }
+                ops_.glBindBuffer(kGlElementArrayBuffer, streamIbos_[s]);
+                ops_.glBufferData(kGlElementArrayBuffer, kWantIboBytes, nullptr, kGlStreamDraw);
+                int32_t iAlloc = static_cast<int32_t>(kWantIboBytes);
+                if (ops_.glGetBufferParameteriv) {
+                    iAlloc = 0;
+                    ops_.glGetBufferParameteriv(kGlElementArrayBuffer, hs_sprite_batch::kGlBufferSize, &iAlloc);
+                }
+                if (vAlloc < static_cast<int32_t>(kWantVboBytes) || iAlloc < static_cast<int32_t>(kWantIboBytes)) {
+                    allocOk = false;
+                    break;
+                }
             }
             ops_.glBindBuffer(kGlArrayBuffer, boundArrayBuf_);
             ops_.glBindBuffer(kGlElementArrayBuffer, boundElemBuf_);
-            if (vAlloc < static_cast<int32_t>(kWantVboBytes) || iAlloc < static_cast<int32_t>(kWantIboBytes)) {
-                if (ops_.glDeleteBuffers) {
-                    ops_.glDeleteBuffers(1, &streamVbo_);
-                    ops_.glDeleteBuffers(1, &streamIbo_);
-                }
-                streamVbo_ = 0u;
-                streamIbo_ = 0u;
+            if (!allocOk) {
+                cleanupRingBufs();
                 gpuInitFailed_ = true;
                 return false;
             }
+            activeRingSlots_ = wantSlots;
+            ringIdx_         = 0u;
             streamVboCursor_ = 0u;
             streamIboCursor_ = 0u;
             streamVboShrunk_ = false;
@@ -1300,12 +1378,7 @@ private:
         if (uberProg_ == 0u) {
             auto failUber = [&]() -> bool {
                 uberFailed_ = true;
-                if (ops_.glDeleteBuffers) {
-                    if (streamVbo_ != 0u) ops_.glDeleteBuffers(1, &streamVbo_);
-                    if (streamIbo_ != 0u) ops_.glDeleteBuffers(1, &streamIbo_);
-                }
-                streamVbo_ = 0u;
-                streamIbo_ = 0u;
+                cleanupRingBufs();
                 gpuReady_  = false;
                 return false;
             };
@@ -1332,67 +1405,67 @@ private:
                 "    v_tc1  = HS_UI_TC1;\n"
                 "}\n";
 
-            const char* kUberFs = ops_.preferHighp
+            std::string fsSrc;
+            fsSrc.reserve(1600);
+            fsSrc += ops_.preferHighp
                 ? "#if defined( GL_ES )\nprecision highp float;\n#endif\n"
-                  "uniform sampler2D u_tex0;\nuniform sampler2D u_tex1;\n"
-                  "uniform sampler2D u_tex2;\nuniform sampler2D u_tex3;\n"
-                  "uniform sampler2D u_tex4;\nuniform sampler2D u_tex5;\n"
-                  "uniform sampler2D u_tex6;\nuniform sampler2D u_tex7;\n"
-                  "varying vec4 v_uvsm;\nvarying vec4 v_col;\nvarying vec4 v_tc1;\n"
-                  "void main() {\n"
-                  "    float s = v_uvsm.z;\n"
-                  "    vec4 tex;\n"
-                  "    if (s < 0.5)      tex = texture2D(u_tex0, v_uvsm.xy);\n"
-                  "    else if (s < 1.5) tex = texture2D(u_tex1, v_uvsm.xy);\n"
-                  "    else if (s < 2.5) tex = texture2D(u_tex2, v_uvsm.xy);\n"
-                  "    else if (s < 3.5) tex = texture2D(u_tex3, v_uvsm.xy);\n"
-                  "    else if (s < 4.5) tex = texture2D(u_tex4, v_uvsm.xy);\n"
-                  "    else if (s < 5.5) tex = texture2D(u_tex5, v_uvsm.xy);\n"
-                  "    else if (s < 6.5) tex = texture2D(u_tex6, v_uvsm.xy);\n"
-                  "    else              tex = texture2D(u_tex7, v_uvsm.xy);\n"
-                  "    float m = v_uvsm.w;\n"
-                  "    if (m < 0.5) {\n"
-                  "        gl_FragColor = tex * v_col;\n"
-                  "    } else if (m < 1.5) {\n"
-                  "        float g = dot(tex, v_tc1);\n"
-                  "        gl_FragColor = vec4(g, g, g, g) * v_col;\n"
-                  "    } else {\n"
-                  "        float val = dot(tex, v_tc1);\n"
-                  "        float glyph = val > 0.5 ? (2.0 * val - 1.0) : 0.0;\n"
-                  "        vec4 p = vec4(glyph, glyph, glyph, val > 0.5 ? 1.0 : (2.0 * val));\n"
-                  "        gl_FragColor = p * v_col;\n"
-                  "    }\n"
-                  "}\n"
-                : "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
-                  "uniform sampler2D u_tex0;\nuniform sampler2D u_tex1;\n"
-                  "uniform sampler2D u_tex2;\nuniform sampler2D u_tex3;\n"
-                  "uniform sampler2D u_tex4;\nuniform sampler2D u_tex5;\n"
-                  "uniform sampler2D u_tex6;\nuniform sampler2D u_tex7;\n"
-                  "varying vec4 v_uvsm;\nvarying vec4 v_col;\nvarying vec4 v_tc1;\n"
-                  "void main() {\n"
-                  "    float s = v_uvsm.z;\n"
-                  "    vec4 tex;\n"
-                  "    if (s < 0.5)      tex = texture2D(u_tex0, v_uvsm.xy);\n"
-                  "    else if (s < 1.5) tex = texture2D(u_tex1, v_uvsm.xy);\n"
-                  "    else if (s < 2.5) tex = texture2D(u_tex2, v_uvsm.xy);\n"
-                  "    else if (s < 3.5) tex = texture2D(u_tex3, v_uvsm.xy);\n"
-                  "    else if (s < 4.5) tex = texture2D(u_tex4, v_uvsm.xy);\n"
-                  "    else if (s < 5.5) tex = texture2D(u_tex5, v_uvsm.xy);\n"
-                  "    else if (s < 6.5) tex = texture2D(u_tex6, v_uvsm.xy);\n"
-                  "    else              tex = texture2D(u_tex7, v_uvsm.xy);\n"
-                  "    float m = v_uvsm.w;\n"
-                  "    if (m < 0.5) {\n"
-                  "        gl_FragColor = tex * v_col;\n"
-                  "    } else if (m < 1.5) {\n"
-                  "        float g = dot(tex, v_tc1);\n"
-                  "        gl_FragColor = vec4(g, g, g, g) * v_col;\n"
-                  "    } else {\n"
-                  "        float val = dot(tex, v_tc1);\n"
-                  "        float glyph = val > 0.5 ? (2.0 * val - 1.0) : 0.0;\n"
-                  "        vec4 p = vec4(glyph, glyph, glyph, val > 0.5 ? 1.0 : (2.0 * val));\n"
-                  "        gl_FragColor = p * v_col;\n"
-                  "    }\n"
-                  "}\n";
+                : "#if defined( GL_ES )\nprecision mediump float;\n#endif\n";
+            const uint32_t slotCap = (maxTexSlots_ >= kMaxUiTexSlots) ? kMaxUiTexSlots : kLegacyUiTexSlots;
+            for (uint32_t s = 0; s < slotCap; ++s) {
+                char udecl[48];
+                snprintf(udecl, sizeof(udecl), "uniform sampler2D u_tex%u;\n", s);
+                fsSrc += udecl;
+            }
+            fsSrc +=
+                "varying vec4 v_uvsm;\nvarying vec4 v_col;\nvarying vec4 v_tc1;\n"
+                "void main() {\n"
+                "    float s = v_uvsm.z;\n"
+                "    vec4 tex;\n";
+            if (slotCap >= 16u) {
+                fsSrc +=
+                    "    if (s < 7.5) {\n"
+                    "        if (s < 3.5) {\n"
+                    "            if (s < 1.5) tex = (s < 0.5) ? texture2D(u_tex0, v_uvsm.xy) : texture2D(u_tex1, v_uvsm.xy);\n"
+                    "            else         tex = (s < 2.5) ? texture2D(u_tex2, v_uvsm.xy) : texture2D(u_tex3, v_uvsm.xy);\n"
+                    "        } else {\n"
+                    "            if (s < 5.5) tex = (s < 4.5) ? texture2D(u_tex4, v_uvsm.xy) : texture2D(u_tex5, v_uvsm.xy);\n"
+                    "            else         tex = (s < 6.5) ? texture2D(u_tex6, v_uvsm.xy) : texture2D(u_tex7, v_uvsm.xy);\n"
+                    "        }\n"
+                    "    } else {\n"
+                    "        if (s < 11.5) {\n"
+                    "            if (s < 9.5) tex = (s < 8.5)  ? texture2D(u_tex8, v_uvsm.xy)  : texture2D(u_tex9, v_uvsm.xy);\n"
+                    "            else         tex = (s < 10.5) ? texture2D(u_tex10, v_uvsm.xy) : texture2D(u_tex11, v_uvsm.xy);\n"
+                    "        } else {\n"
+                    "            if (s < 13.5) tex = (s < 12.5) ? texture2D(u_tex12, v_uvsm.xy) : texture2D(u_tex13, v_uvsm.xy);\n"
+                    "            else          tex = (s < 14.5) ? texture2D(u_tex14, v_uvsm.xy) : texture2D(u_tex15, v_uvsm.xy);\n"
+                    "        }\n"
+                    "    }\n";
+            } else {
+                fsSrc +=
+                    "    if (s < 0.5)      tex = texture2D(u_tex0, v_uvsm.xy);\n"
+                    "    else if (s < 1.5) tex = texture2D(u_tex1, v_uvsm.xy);\n"
+                    "    else if (s < 2.5) tex = texture2D(u_tex2, v_uvsm.xy);\n"
+                    "    else if (s < 3.5) tex = texture2D(u_tex3, v_uvsm.xy);\n"
+                    "    else if (s < 4.5) tex = texture2D(u_tex4, v_uvsm.xy);\n"
+                    "    else if (s < 5.5) tex = texture2D(u_tex5, v_uvsm.xy);\n"
+                    "    else if (s < 6.5) tex = texture2D(u_tex6, v_uvsm.xy);\n"
+                    "    else              tex = texture2D(u_tex7, v_uvsm.xy);\n";
+            }
+            fsSrc +=
+                "    float m = v_uvsm.w;\n"
+                "    if (m < 0.5) {\n"
+                "        gl_FragColor = tex * v_col;\n"
+                "    } else if (m < 1.5) {\n"
+                "        float g = dot(tex, v_tc1);\n"
+                "        gl_FragColor = vec4(g, g, g, g) * v_col;\n"
+                "    } else {\n"
+                "        float val = dot(tex, v_tc1);\n"
+                "        float glyph = val > 0.5 ? (2.0 * val - 1.0) : 0.0;\n"
+                "        vec4 p = vec4(glyph, glyph, glyph, val > 0.5 ? 1.0 : (2.0 * val));\n"
+                "        gl_FragColor = p * v_col;\n"
+                "    }\n"
+                "}\n";
+            const char* kUberFs = fsSrc.c_str();
 
             auto compile = [&](uint32_t type, const char* src) -> uint32_t {
                 uint32_t sh = ops_.glCreateShader(type);
@@ -1440,12 +1513,12 @@ private:
             }
 
             ops_.glUseProgram(prog);
-            for (uint32_t s = 0; s < kMaxUiTexSlots; ++s) {
+            for (uint32_t s = 0; s < maxTexSlots_; ++s) {
                 char nm[16];
                 snprintf(nm, sizeof(nm), "u_tex%u", s);
                 const int32_t loc = ops_.glGetUniformLocation(prog, nm);
                 if (loc >= 0) {
-                    ops_.glUniform1i(loc, static_cast<int32_t>(kUiTexUnitBase + s));
+                    ops_.glUniform1i(loc, static_cast<int32_t>(UiSlotToTexUnit(s)));
                 }
             }
             ops_.glUseProgram(dstProgram_);
@@ -1461,10 +1534,12 @@ private:
     bool                         gpuInitFailed_   = false;
     uint32_t                     uberProg_        = 0;
     bool                         uberFailed_      = false;
-    uint32_t                     maxTexSlots_     = kMaxUiTexSlots;
+    uint32_t                     maxTexSlots_     = kLegacyUiTexSlots;
 
-    uint32_t                     streamVbo_       = 0;
-    uint32_t                     streamIbo_       = 0;
+    uint32_t                     streamVbos_[kUiRingSlots]{};
+    uint32_t                     streamIbos_[kUiRingSlots]{};
+    uint32_t                     activeRingSlots_ = 0;
+    uint32_t                     ringIdx_         = 0;
     size_t                       streamVboCursor_ = 0;
     size_t                       streamIboCursor_ = 0;
     bool                         streamVboShrunk_ = false;

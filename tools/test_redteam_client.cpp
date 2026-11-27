@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cwchar>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #include "../native_plugin/gl_state_cache.h"
@@ -37,8 +38,16 @@
 #include "../native_plugin/sprite_batcher.h"
 #include "../native_plugin/world_pos_smooth.h"
 #include "../native_plugin/skeletal_fluid.h"
+#include "../native_plugin/skeletal_mt_pool.h"
 #include "../native_plugin/combat_impact.h"
 #include "../native_plugin/look_matcher.h"
+#include "../native_plugin/hardware_tier.h"
+#include "../native_plugin/elastic_pool.h"
+#include "../native_plugin/pbo_tex_ring.h"
+#include "../native_plugin/foliage_field.h"
+#include "../native_plugin/world_shadow_engine.h"
+#include "../native_plugin/gpu_clarity_engine.h"
+#include "../native_plugin/klei_render_fastpath.h"
 #include "../third_party/libdeflate-1.23/libdeflate.h"
 
 #define CHECK(cond) do { \
@@ -1448,14 +1457,36 @@ int main() {
         CHECK(gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &posZero, 4));
         CHECK(!gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &posZero, 4));
         CHECK(gl.ShouldCallUniform(1, 1, 0, hs_gl_cache::UNI_1F, &negZero, 4)); // bit-exact -0.0f miss!
+        // UNI_1F count>1 (glUniform1fv) invalidates [loc, loc+count) and shares UNI_1F coherency with glUniform1f
+        float f4 = 0.75f;
+        CHECK(gl.ShouldCallUniform(4, 1, 0, hs_gl_cache::UNI_1F, &f4, 4));
+        CHECK(gl.ShouldCallUniform(5, 1, 0, hs_gl_cache::UNI_1F, &f4, 4));
+        CHECK(gl.ShouldCallUniform(3, 3, 0, hs_gl_cache::UNI_1F, &f4, 4)); // count=3 -> invalidates [3, 6)
+        CHECK(gl.ShouldCallUniform(4, 1, 0, hs_gl_cache::UNI_1F, &f4, 4));
+        CHECK(gl.ShouldCallUniform(5, 1, 0, hs_gl_cache::UNI_1F, &f4, 4));
+        // UNI_MAT2 (glUniformMatrix2fv)
+        float mat2[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+        float mat2Mod[4] = {1.0f, 0.5f, 0.0f, 1.0f};
+        CHECK(gl.ShouldCallUniform(6, 1, 0, hs_gl_cache::UNI_MAT2, mat2, 16));
+        CHECK(!gl.ShouldCallUniform(6, 1, 0, hs_gl_cache::UNI_MAT2, mat2, 16));
+        CHECK(gl.ShouldCallUniform(6, 1, 0, hs_gl_cache::UNI_MAT2, mat2Mod, 16));
+        CHECK(gl.ShouldCallUniform(6, 1, 1, hs_gl_cache::UNI_MAT2, mat2Mod, 16)); // transpose!=0 bypasses
+        CHECK(gl.ShouldCallUniform(7, 1, 0, hs_gl_cache::UNI_MAT2, mat2, 16));
+        CHECK(gl.ShouldCallUniform(6, 2, 0, hs_gl_cache::UNI_MAT2, mat2, 16)); // count=2 invalidates [6, 8)
+        CHECK(gl.ShouldCallUniform(6, 1, 0, hs_gl_cache::UNI_MAT2, mat2Mod, 16));
+        CHECK(gl.ShouldCallUniform(7, 1, 0, hs_gl_cache::UNI_MAT2, mat2, 16));
         float v4[4] = {1.0f, 2.0f, 3.0f, 4.0f};
         float mat4[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
         CHECK(!gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
         CHECK(gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64));
         CHECK(!gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64));
-        // Bypass cases: count>1, transpose!=0, loc>=64
+        // Bypass cases: count>1 (must invalidate [loc, loc+count) slots), transpose!=0, loc>=64
         CHECK(gl.ShouldCallUniform(2, 2, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16)); // count>1 invalidated slot 2
+        CHECK(gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64)); // count=2 also invalidated slot 3
+        CHECK(!gl.ShouldCallUniform(2, 1, 0, hs_gl_cache::UNI_4FV, v4, 16));
+        CHECK(!gl.ShouldCallUniform(3, 1, 0, hs_gl_cache::UNI_MAT4, mat4, 64));
         CHECK(gl.ShouldCallUniform(3, 1, 1, hs_gl_cache::UNI_MAT4, mat4, 64));
         CHECK(gl.ShouldCallUniform(64, 1, 0, hs_gl_cache::UNI_1I, &u1i, 4));
         // InvalidateUniform (HD2D raw write sync)
@@ -2073,34 +2104,42 @@ int main() {
             auto st = pool.GetStats();
             CHECK(st.pooledCount == 1 && st.pooledBytes == 512 && st.misses == 1 && st.hits == 0);
 
-            // Age 0 & Age 1 must miss (2-frame GPU safety fence); stagger id1 (frame 0) and id2 (frame 1)
+            // Age 0..kMinRetireAgeFrames-1 must miss (GPU safety fence); stagger id1 (frame 0) and id2 (frame 1)
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id2));
             CHECK(id2 == 2 && pool.GetStats().hits == 0);
             pool.OnEndFrame(); // Age 1 for id1
             CHECK(pool.TryRecycle(id2)); // Age 0 for id2
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id3));
             CHECK(id3 == 3 && pool.GetStats().hits == 0);
-            pool.OnEndFrame(); // Age 2 for id1, Age 1 for id2!
+            pool.OnEndFrame(); // Age 2 for id1, Age 1 for id2
+            pool.OnEndFrame(); // Age 3 for id1, Age 2 for id2
+            uint32_t id3b = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id3b));
+            CHECK(id3b == 4 && pool.GetStats().hits == 0); // Age 3 < kMinRetireAgeFrames(6) -> must miss!
+            pool.OnEndFrame(); // Age 4 for id1, Age 3 for id2
+            pool.OnEndFrame(); // Age 5 for id1, Age 4 for id2
+            pool.OnEndFrame(); // Age 6 for id1, Age 5 for id2!
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, true, id4));
             CHECK(id4 == id1);
             st = pool.GetStats();
-            CHECK(st.hits == 1 && st.pooledCount == 1 && st.pooledBytes == 512);
-            pool.OnEndFrame(); // Age 2 for id2!
+            CHECK(st.hits == 1 && st.pooledCount == 1 && st.pooledBytes == 512 && st.mapUploads >= 1);
+            pool.OnEndFrame(); // Age 6 for id2!
             uint32_t id5 = 0;
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, payload, false, id5));
             st = pool.GetStats();
-            CHECK(id5 == id2 && st.hits == 2 && st.pooledCount == 0 && st.pooledBytes == 0 && mk.subDataCalls >= 1 && mk.mapCalls >= 1);
-            CHECK(pool.TryRecycle(id3) && pool.TryRecycle(id4) && pool.TryRecycle(id5));
+            CHECK(id5 == id2 && st.hits == 2 && st.pooledCount == 0 && st.pooledBytes == 0 &&
+                  mk.subDataCalls >= 1 && mk.mapCalls >= 1 && st.subDataUploads >= 1 && st.mapUploads >= 1);
+            CHECK(pool.TryRecycle(id3) && pool.TryRecycle(id3b) && pool.TryRecycle(id4) && pool.TryRecycle(id5));
 
             // Idle eviction (>600 frames at 60-frame cadence)
             for (int f = 0; f < 660; ++f) pool.OnEndFrame();
             st = pool.GetStats();
-            CHECK(st.evicted == 3 && st.pooledCount == 0 && st.pooledBytes == 0 && mk.deletedIds.size() == 3);
+            CHECK(st.evicted == 4 && st.pooledCount == 0 && st.pooledBytes == 0 && mk.deletedIds.size() == 4);
             pool.ResetAndRelease(true);
             CHECK(!pool.HasEntries());
         }
 
-        // Regression: 600 consecutive recycle + 2-frame age + hit cycles (> kMaxPooledCount 512)
+        // Regression: 600 consecutive recycle + kMinRetireAgeFrames + hit cycles (> kMaxPooledCount 512)
         {
             MockGlCtx mk{};
             VbPool pool;
@@ -2109,14 +2148,12 @@ int main() {
             uint32_t got = 0;
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, got));
             CHECK(pool.TryRecycle(got));
-            pool.OnEndFrame();
-            pool.OnEndFrame();
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) pool.OnEndFrame();
             for (int i = 0; i < 600; ++i) {
                 got = 0;
                 CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, got));
                 CHECK(pool.TryRecycle(got));
-                pool.OnEndFrame();
-                pool.OnEndFrame();
+                for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) pool.OnEndFrame();
             }
             uint32_t finalId = 0;
             CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 128, d, true, finalId));
@@ -2186,13 +2223,11 @@ int main() {
             uint32_t id1 = 0, id2 = 0, id3 = 0;
             CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, true, id1));
             CHECK(livePool.TryRecycle(id1));
-            livePool.OnEndFrame();
-            livePool.OnEndFrame();
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) livePool.OnEndFrame();
             CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, true, id2));
             CHECK(id2 == id1 && livePool.GetStats().hits == 1 && pErr() == 0);
             CHECK(livePool.TryRecycle(id2));
-            livePool.OnEndFrame();
-            livePool.OnEndFrame();
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) livePool.OnEndFrame();
             CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 256, vtx, false, id3));
             CHECK(id3 == id1 && livePool.GetStats().hits == 2 && pErr() == 0);
             livePool.ResetAndRelease(true);
@@ -2697,7 +2732,8 @@ int main() {
             CHECK(liveInfo.locPos2dUv == 0 && liveInfo.locBatchCMult == 5 && liveInfo.locBatchCAdd == 6 &&
                   liveInfo.locBatchWpos == 7 && liveInfo.locBatchActive >= 0 &&
                   liveInfo.locMatrixW >= 0 && liveInfo.locColourXform >= 0);
-            for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) {
+            liveInfo.progMaxTexSlots = 8u;
+            for (uint32_t s = 0; s < 8u; ++s) {
                 char uName[24]; std::snprintf(uName, sizeof(uName), "HS_BATCH_TEX%u", s);
                 liveInfo.locBatchTex[s] = pGetUniLoc(prg, uName);
                 CHECK(liveInfo.locBatchTex[s] >= 0);
@@ -4095,6 +4131,4577 @@ int main() {
                     rGen.deltaEBefore, rGen.deltaEAfter, rGen.elapsedMs);
     }
 
-    std::printf("ALL 29 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH, STENCIL-CACHE, PLL-WORLD-POS, FLUID-SKELETAL, COMBAT-IMPACT, LOOK-MATCH & ASTAR TESTS PASSED!\n");
+    // 30. HardwareTier Budgets + Low-RAM Clamp + VbPool Dynamic Limits + SpriteBatcher SSE2 Parity
+    {
+        using namespace hs_hw_tier;
+        HardwareCaps caps32g{};
+        caps32g.logicalCores = 16;
+        caps32g.totalRamMb   = 32768ULL;
+        const auto bLow  = ComputeTierBudget(HardwareTier::Low, caps32g);
+        const auto bBal  = ComputeTierBudget(HardwareTier::Balanced, caps32g);
+        const auto bUnl  = ComputeTierBudget(HardwareTier::Unleashed, caps32g);
+        CHECK(bLow.vbPoolMaxBytes == 32u * 1024u * 1024u && bBal.vbPoolMaxBytes == 64u * 1024u * 1024u && bUnl.vbPoolMaxBytes == 256u * 1024u * 1024u);
+        CHECK(bLow.spriteShadowCacheBytes == 32u * 1024u * 1024u && bBal.spriteShadowCacheBytes == 64u * 1024u * 1024u && bUnl.spriteShadowCacheBytes == 256u * 1024u * 1024u);
+        CHECK(bLow.animShedL1Ents == 500u && bBal.animShedL1Ents == 900u && bUnl.animShedL1Ents == 3500u);
+        CHECK(!bLow.prewarmMods && !bBal.prewarmMods && bUnl.prewarmMods);
+        CHECK(!bLow.persistentSpriteRing && bBal.persistentSpriteRing && bUnl.persistentSpriteRing);
+
+        HardwareCaps caps8g{};
+        caps8g.logicalCores = 4;
+        caps8g.totalRamMb   = 8192ULL;
+        const auto bClamp = ComputeTierBudget(HardwareTier::Unleashed, caps8g);
+        CHECK(bClamp.vbPoolMaxBytes <= 64u * 1024u * 1024u);
+        CHECK(bClamp.spriteShadowCacheBytes <= 64u * 1024u * 1024u);
+        CHECK(bClamp.gcHeadroomMinKb <= 262144);
+        CHECK(!bClamp.prewarmMods);
+
+        // VbPool::SetLimits(256MB, 4096, 7200) -> recycles 40MB (> old 32MB ceiling) cleanly!
+        {
+            static uint32_t s_vbId = 1;
+            hs_vb_pool::VbPool pool;
+            pool.SetLimits(256u * 1024u * 1024u, 4096u, 7200u);
+            CHECK(pool.MaxPooledBytes() == 256u * 1024u * 1024u);
+            hs_vb_pool::GlBufferOps vops{};
+            vops.glGenBuffers    = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_vbId++; };
+            vops.glBindBuffer    = [](uint32_t, uint32_t) WINAPI {};
+            vops.glBufferData    = [](uint32_t, ptrdiff_t, const void*, uint32_t) WINAPI {};
+            vops.glBufferSubData = [](uint32_t, ptrdiff_t, ptrdiff_t, const void*) WINAPI {};
+            vops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            pool.SetOps(vops);
+            std::vector<uint32_t> ids;
+            for (int i = 0; i < 20; ++i) {
+                uint32_t id = 0;
+                CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 2u * 1024u * 1024u, nullptr, false, id));
+                ids.push_back(id);
+            }
+            for (uint32_t id : ids) CHECK(pool.TryRecycle(id));
+            const auto pst = pool.GetStats();
+            CHECK(pst.pooledBytes == 40ULL * 1024ULL * 1024ULL && pst.pooledCount == 20u);
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) pool.OnEndFrame();
+            uint32_t reId = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 2u * 1024u * 1024u, nullptr, false, reId));
+            CHECK(pool.GetStats().hits == 1);
+            pool.ResetAndRelease(false);
+        }
+
+        // SpriteBatcher SSE2 4-vertex vs exact scalar parity across spans 1, 3, 4, 5, 8, 13, 16
+        {
+            using namespace hs_sprite_batch;
+            struct SseMock {
+                uint32_t nextId = 500;
+                uint32_t bv = 0, bi = 0, act = 0, tex[16]{};
+                std::unordered_map<uint32_t, std::vector<uint8_t>> bufs;
+                std::vector<BatchedVertex> outVerts;
+            };
+            static SseMock* g_sm = nullptr;
+            SseMock sm{};
+            g_sm = &sm;
+            GlBatchOps sops{};
+            sops.glGenBuffers    = [](int32_t n, uint32_t* p) WINAPI { for (int32_t i = 0; i < n; ++i) p[i] = g_sm->nextId++; };
+            sops.glDeleteBuffers = [](int32_t n, const uint32_t* p) WINAPI { for (int32_t i = 0; i < n; ++i) g_sm->bufs.erase(p[i]); };
+            sops.glBindBuffer    = [](uint32_t t, uint32_t id) WINAPI {
+                if (t == kGlArrayBuffer) g_sm->bv = id; else if (t == kGlElementArrayBuffer) g_sm->bi = id;
+            };
+            sops.glBufferData = [](uint32_t t, ptrdiff_t sz, const void* d, uint32_t) WINAPI {
+                const uint32_t id = (t == kGlArrayBuffer) ? g_sm->bv : g_sm->bi;
+                auto& v = g_sm->bufs[id];
+                v.resize(static_cast<size_t>(sz));
+                if (d && sz > 0) std::memcpy(v.data(), d, static_cast<size_t>(sz));
+            };
+            sops.glBufferSubData = [](uint32_t t, ptrdiff_t off, ptrdiff_t sz, const void* d) WINAPI {
+                const uint32_t id = (t == kGlArrayBuffer) ? g_sm->bv : g_sm->bi;
+                auto& v = g_sm->bufs[id];
+                if (d && static_cast<size_t>(off + sz) <= v.size()) std::memcpy(v.data() + off, d, static_cast<size_t>(sz));
+            };
+            sops.glActiveTexture = [](uint32_t u) WINAPI { if (u >= kGlTexture0 && u < kGlTexture0 + 16u) g_sm->act = u - kGlTexture0; };
+            sops.glBindTexture   = [](uint32_t, uint32_t tx) WINAPI { g_sm->tex[g_sm->act] = tx; };
+            sops.glUniform1f     = [](int32_t, float) WINAPI {};
+            sops.glUniform1i     = [](int32_t, int32_t) WINAPI {};
+            sops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            sops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            sops.glEnableVertexAttribArray  = [](uint32_t) WINAPI {};
+            sops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            sops.glGetIntegerv = [](uint32_t pn, int32_t* o) WINAPI { if (pn == kGlMaxTextureImageUnits) *o = 16; };
+            sops.glGetBufferParameteriv = [](uint32_t t, uint32_t pn, int32_t* o) WINAPI {
+                const uint32_t id = (t == kGlArrayBuffer) ? g_sm->bv : g_sm->bi;
+                auto it = g_sm->bufs.find(id);
+                *o = (pn == kGlBufferSize && it != g_sm->bufs.end()) ? static_cast<int32_t>(it->second.size()) : 0;
+            };
+            sops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {
+                const auto& vb = g_sm->bufs[g_sm->bv];
+                const size_t n = vb.size() / sizeof(BatchedVertex);
+                g_sm->outVerts.resize(n);
+                if (n > 0) std::memcpy(g_sm->outVerts.data(), vb.data(), n * sizeof(BatchedVertex));
+            };
+
+            BatchProgInfo prog{};
+            prog.checked = true; prog.eligible = true;
+            prog.locBatchActive = 1; prog.locMatrixW = 2; prog.locFloatParams = 3;
+            prog.locPos2dUv = 0; prog.locBatchWpos = 7;
+            prog.locSampler0 = 10; prog.locSampler1 = 11; prog.locSampler5 = 12;
+            for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) prog.locBatchTex[s] = static_cast<int32_t>(20 + s);
+
+            SpriteBatcher sb;
+            sb.SetOps(sops);
+            sb.SetEnabled(true);
+            sb.OnUseProgram(1, &prog);
+            sb.OnEnableDisableVertexAttribArray(0, true);
+            sb.OnActiveTexture(kGlTexture0 + 0u); sb.OnBindTexture(kGlTexture2D, 101u);
+            sb.OnActiveTexture(kGlTexture0 + 1u); sb.OnBindTexture(kGlTexture2D, 102u);
+            sb.OnActiveTexture(kGlTexture0 + 5u); sb.OnBindTexture(kGlTexture2D, 103u);
+
+            const float mtx[16] = {
+                1.75f,  0.25f, -0.35f, 0.0f,
+               -0.45f,  2.10f,  0.15f, 0.0f,
+                0.0f,   0.0f,   1.0f,  0.0f,
+               12.5f,  -3.25f, 44.0f,  1.0f
+            };
+            const uint32_t spans[] = { 1u, 3u, 4u, 5u, 8u, 13u, 16u };
+            const float uEncs[3] = { 0.2f, 2.4f, 4.6f };
+            for (bool camRightOn : { true, false }) {
+                sb.SetShadowHints(true, camRightOn, 0.6f, 0.8f, 0.0f);
+                const float rLen = std::sqrt(mtx[0]*mtx[0] + mtx[1]*mtx[1] + mtx[2]*mtx[2]);
+                const float rux = mtx[0]/rLen, ruy = mtx[1]/rLen, ruz = mtx[2]/rLen;
+                for (uint32_t sp : spans) {
+                    std::vector<float> verts(sp * 4u);
+                    for (uint32_t i = 0; i < sp; ++i) {
+                        verts[i * 4u + 0u] = static_cast<float>(i) * 0.37f - 1.1f;
+                        verts[i * 4u + 1u] = static_cast<float>(i) * 0.51f + 0.2f;
+                        verts[i * 4u + 2u] = uEncs[i % 3u];
+                        verts[i * 4u + 3u] = 0.1f * static_cast<float>(i);
+                    }
+                    std::vector<uint16_t> idxs(sp * 3u);
+                    for (uint32_t i = 0; i < sp; ++i) {
+                        idxs[i * 3u + 0u] = static_cast<uint16_t>(i > 0u ? i - 1u : 0u);
+                        idxs[i * 3u + 1u] = static_cast<uint16_t>(i);
+                        idxs[i * 3u + 2u] = static_cast<uint16_t>(i);
+                    }
+                    sb.OnBindBuffer(kGlArrayBuffer, 0);
+                    sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, verts.data());
+                    sb.OnBindBuffer(kGlElementArrayBuffer, 0);
+                    CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                    CHECK(sb.TryBatchDrawElements(kGlTriangles, static_cast<int32_t>(idxs.size()), kGlUnsignedShort, idxs.data()));
+                    sb.Flush(FlushReason::End);
+                    CHECK(sm.outVerts.size() >= sp);
+                    for (uint32_t i = 0; i < sp; ++i) {
+                        const float x = verts[i * 4u + 0u], y = verts[i * 4u + 1u];
+                        const float dx = mtx[0]*x + mtx[4]*y;
+                        const float dy = mtx[1]*x + mtx[5]*y;
+                        const float dz = mtx[2]*x + mtx[6]*y;
+                        const float expWx = dx + mtx[12];
+                        const float expWy = dy + mtx[13];
+                        const float expWz = dz + mtx[14];
+                        const float expPad = camRightOn ? (dx*0.6f + dz*0.8f) : (dx*rux + dy*ruy + dz*ruz);
+                        const float expSlot = static_cast<float>(i % 3u);
+                        const BatchedVertex& bv = sm.outVerts[i];
+                        CHECK(std::fabs(bv.wx - expWx) < 1e-5f);
+                        CHECK(std::fabs(bv.wy - expWy) < 1e-5f);
+                        CHECK(std::fabs(bv.wz - expWz) < 1e-5f);
+                        CHECK(std::fabs(bv.pad - expPad) < 1e-5f);
+                        CHECK(std::fabs(bv.slot - expSlot) < 1e-5f);
+                    }
+                }
+            }
+            sb.ReleaseGpuResources();
+        }
+        std::printf("[PASS] 30. HardwareTier Budgets (Low/Bal/Unleashed + 8GB Clamp), VbPool SetLimits(256MB) & SpriteBatcher SSE2 Parity verified!\n");
+    }
+
+    // =========================================================================
+    // 31. Mega-Base 100+ FPS Optimization Pack:
+    //     - Lazy Stencil Commit (0 flushes / 0 driver calls while GL_STENCIL_TEST == OFF,
+    //       exact commit on glEnable(STENCIL) / glClear(STENCIL), cancel-on-return-to-driver)
+    //     - Lockless 3-Frame Bump-Allocated AZDO Persistent Ring (50 flushes/frame -> 0 intra-frame
+    //       fences/waits, 1 fence per OnEndFrame(), exact non-zero VBO/IBO byte offsets)
+    //     - PoseCrossfadePool 2048-slot zero-thrash + RecordPoseSmart read-only pointer dedup
+    // =========================================================================
+    {
+        // 31A: Lazy Stencil Commit state machine
+        {
+            hs_gl_cache::ThreadState st;
+            st.OnMakeCurrent(reinterpret_cast<void*>(0x1234));
+            CHECK(!st.IsStencilTestKnownDisabled()); // fail-closed while caps[4] == -1
+            st.RecordEnableDisable(hs_gl_cache::kGlStencilTest, false);
+            CHECK(st.IsStencilTestKnownDisabled());
+            st.RecordStencilMask(0x00u);
+            CHECK(!st.HasDeferredStencilState());
+            // Toggle 0x00 -> 0xFF -> 0x00 while STENCIL_TEST == OFF: returns to driver value -> NOT dirty!
+            CHECK(!st.IsStencilMaskRedundant(0xFFu));
+            st.DeferStencilMask(0xFFu);
+            CHECK(st.HasDeferredStencilState());
+            CHECK(st.IsStencilMaskRedundant(0xFFu));
+            CHECK(!st.IsStencilMaskRedundant(0x00u));
+            st.DeferStencilMask(0x00u);
+            CHECK(!st.HasDeferredStencilState());
+            uint32_t outM = 999u;
+            CHECK(!st.TakeDeferredStencilMask(outM));
+            // Diverge all 3 stencil states while STENCIL_TEST == OFF -> TakeDeferred emits exact latest values!
+            st.DeferStencilMask(0xFFu);
+            st.DeferStencilFunc(0x0206u, 4, 0xFFu);
+            st.DeferStencilOp(0x1E00u, 0x1E00u, 0x1E01u);
+            CHECK(st.HasDeferredStencilState());
+            CHECK(st.TakeDeferredStencilMask(outM) && outM == 0xFFu);
+            uint32_t fn = 0u, fm = 0u, opF = 0u, opZf = 0u, opZp = 0u;
+            int32_t ref = 0;
+            CHECK(st.TakeDeferredStencilFunc(fn, ref, fm) && fn == 0x0206u && ref == 4 && fm == 0xFFu);
+            CHECK(st.TakeDeferredStencilOp(opF, opZf, opZp) && opF == 0x1E00u && opZf == 0x1E00u && opZp == 0x1E01u);
+            CHECK(!st.HasDeferredStencilState());
+            // Re-deferring the now-committed values stays clean
+            st.DeferStencilMask(0xFFu);
+            CHECK(!st.HasDeferredStencilState());
+            st.ResetBindingsOnly();
+            CHECK(!st.IsStencilTestKnownDisabled());
+            CHECK(!st.HasDeferredStencilState());
+        }
+
+        // 31B: Lockless 3-Frame Bump-Allocated AZDO Persistent Ring (50 flushes in 1 frame -> 0 intra-frame stalls!)
+        {
+            using namespace hs_sprite_batch;
+            struct AzdoMock {
+                uint32_t nextBuf = 500u;
+                uint32_t curArr = 0u, curElem = 0u;
+                std::vector<uint8_t> vboStore;
+                std::vector<uint8_t> iboStore;
+                uint32_t vboId = 0u, iboId = 0u;
+                int32_t  vboSz = 0, iboSz = 0;
+                uint32_t fenceCreated = 0u;
+                uint32_t fenceWaited  = 0u;
+                uint32_t fenceDeleted = 0u;
+                uint32_t drawCalls    = 0u;
+                std::vector<uintptr_t> drawIdxOffsets;
+                std::vector<uintptr_t> mirrorIdxOffsets;
+            };
+            static AzdoMock am;
+            am = AzdoMock{};
+
+            GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* out) {
+                for (int32_t i = 0; i < n; ++i) out[i] = ++am.nextBuf;
+            };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+            ops.glBindBuffer = [](uint32_t target, uint32_t buf) {
+                if (target == kGlArrayBuffer) am.curArr = buf;
+                else if (target == kGlElementArrayBuffer) am.curElem = buf;
+            };
+            ops.glBufferData = [](uint32_t, ptrdiff_t, const void*, uint32_t) {};
+            ops.glBufferStorage = [](uint32_t target, ptrdiff_t size, const void*, uint32_t) {
+                if (target == kGlArrayBuffer) {
+                    am.vboId = am.curArr;
+                    am.vboSz = static_cast<int32_t>(size);
+                    am.vboStore.assign(static_cast<size_t>(size), 0u);
+                } else if (target == kGlElementArrayBuffer) {
+                    am.iboId = am.curElem;
+                    am.iboSz = static_cast<int32_t>(size);
+                    am.iboStore.assign(static_cast<size_t>(size), 0u);
+                }
+            };
+            ops.glGetBufferParameteriv = [](uint32_t target, uint32_t pname, int32_t* p) {
+                if (pname == kGlBufferSize && p) {
+                    *p = (target == kGlArrayBuffer) ? am.vboSz : am.iboSz;
+                }
+            };
+            ops.glMapBufferRange = [](uint32_t target, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                if (target == kGlArrayBuffer) return am.vboStore.data();
+                if (target == kGlElementArrayBuffer) return am.iboStore.data();
+                return nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) -> void* {
+                ++am.fenceCreated;
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(0xA000u + am.fenceCreated));
+            };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) -> uint32_t {
+                ++am.fenceWaited;
+                return 0x911Au; // GL_ALREADY_SIGNALED
+            };
+            ops.glDeleteSync = [](void*) { ++am.fenceDeleted; };
+            ops.glActiveTexture = [](uint32_t) {};
+            ops.glBindTexture = [](uint32_t, uint32_t) {};
+            ops.glUniform1f = [](int32_t, float) {};
+            ops.glUniform1i = [](int32_t, int32_t) {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) {};
+            ops.glEnableVertexAttribArray = [](uint32_t) {};
+            ops.glDisableVertexAttribArray = [](uint32_t) {};
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void* idxOff) {
+                ++am.drawCalls;
+                am.drawIdxOffsets.push_back(reinterpret_cast<uintptr_t>(idxOff));
+            };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) {
+                if (pname == kGlMaxTextureImageUnits && p) *p = 16;
+            };
+
+            SpriteBatcher sb;
+            ops.callbackCtx = &sb;
+            ops.onShadowMirrorBatch = [](uint32_t, void* ctx) {
+                auto* b = reinterpret_cast<SpriteBatcher*>(ctx);
+                am.mirrorIdxOffsets.push_back(b->LastFlushIndexByteOffset());
+            };
+            sb.SetOps(ops);
+            sb.ResetContext(reinterpret_cast<void*>(0x4444));
+            sb.SetPersistentRingPreferred(true);
+            sb.SetEnabled(true);
+            sb.SetShadowActive(true);
+
+            BatchProgInfo prog{};
+            prog.eligible = true;
+            prog.locBatchActive = 1;
+            prog.locMatrixW = 2;
+            prog.locPos2dUv = 0;
+            prog.locBatchWpos = 7;
+            prog.samplerUnit0 = 0;
+            sb.OnUseProgram(28u, &prog);
+            sb.OnEnableDisableVertexAttribArray(0, true);
+            sb.OnActiveTexture(kGlTexture0);
+            sb.OnBindTexture(kGlTexture2D, 777u);
+
+            const float mtx[16] = {
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                5, 0, 3, 1
+            };
+            const float quad[16] = {
+                0, 0, 0.2f, 0.2f,
+                1, 0, 0.8f, 0.2f,
+                1, 2, 0.8f, 0.8f,
+                0, 2, 0.2f, 0.8f
+            };
+            const uint16_t idxs[6] = { 0, 1, 2, 0, 2, 3 };
+            sb.OnBindBuffer(kGlArrayBuffer, 0);
+            sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, quad);
+            sb.OnBindBuffer(kGlElementArrayBuffer, 0);
+
+            // Frame 0: 50 consecutive flushes -> MUST trigger ZERO fences & ZERO waits intra-frame!
+            for (int f = 0; f < 50; ++f) {
+                CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+                sb.Flush(FlushReason::Tex);
+            }
+            CHECK(sb.IsPersistentRingActive());
+            CHECK(am.drawCalls == 50u);
+            CHECK(am.fenceCreated == 0u);
+            CHECK(am.fenceWaited == 0u);
+            CHECK(am.drawIdxOffsets.size() == 50u);
+            CHECK(am.mirrorIdxOffsets.size() == 50u);
+            for (size_t i = 0; i < 50u; ++i) {
+                const uintptr_t expectedOff = i * 6u * sizeof(uint16_t);
+                CHECK(am.drawIdxOffsets[i] == expectedOff);
+                CHECK(am.mirrorIdxOffsets[i] == expectedOff);
+            }
+
+            // End Frame 0 -> places EXACTLY 1 fence!
+            sb.OnEndFrame();
+            CHECK(am.fenceCreated == 1u);
+            CHECK(am.fenceWaited == 0u);
+
+            // Frames 1 & 2 -> still 0 waits (slots 1 & 2 unused yet)
+            for (int fr = 1; fr <= 2; ++fr) {
+                CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+                sb.Flush(FlushReason::End);
+                sb.OnEndFrame();
+            }
+            CHECK(am.fenceCreated == 3u);
+            CHECK(am.fenceWaited == 0u);
+
+            // Frame 3 wraps back to slot 0 -> waits ONCE on Frame 0's fence, then 0 waits for remaining flushes!
+            for (int f = 0; f < 10; ++f) {
+                CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+                sb.Flush(FlushReason::Tex);
+            }
+            CHECK(am.fenceWaited == 1u);
+            CHECK(am.fenceCreated == 3u);
+            sb.ReleaseGpuResources();
+        }
+
+        // 31C: PoseCrossfadePool 2048-slot zero-thrash + RecordPoseSmart read-only pointer dedup
+        {
+            CHECK(hs_skeletal::kPosePoolSlots == 2048u);
+            auto pool = std::make_unique<hs_skeletal::PoseCrossfadePool>();
+            hs_skeletal::AnimElement elems[2]{};
+            elems[0].layer_hash = 10u; elems[0].symbol_hash = 20u; elems[0].m[0] = hs_skeletal::FloatToHalf(1.0f); elems[0].m[3] = hs_skeletal::FloatToHalf(1.0f);
+            elems[1].layer_hash = 11u; elems[1].symbol_hash = 21u; elems[1].m[0] = hs_skeletal::FloatToHalf(1.0f); elems[1].m[3] = hs_skeletal::FloatToHalf(1.0f);
+            hs_skeletal::AnimFrame roFrame{};
+            roFrame.elements = elems;
+            roFrame.num_elements = 2u;
+            const float axis[3] = { 1.0f, 0.0f, 0.0f };
+            auto* slot = pool->FindOrAlloc(0x10010u, 1000);
+            CHECK(slot != nullptr);
+            hs_skeletal::PoseCrossfadePool::RecordPoseSmart(*slot, roFrame, false, 1000, axis);
+            CHECK(slot->last_ro_frame == &roFrame && slot->last_count == 2u);
+            // Mutate last_pose[0].m[0] sentinel -> second read-only call with SAME &roFrame MUST skip memcpy!
+            slot->last_pose[0].m[0] = 0x1234u;
+            hs_skeletal::PoseCrossfadePool::RecordPoseSmart(*slot, roFrame, false, 2000, axis);
+            CHECK(slot->last_pose[0].m[0] == 0x1234u && slot->seen_qpc == 2000);
+            // Writable call MUST copy fresh data and clear last_ro_frame!
+            hs_skeletal::PoseCrossfadePool::RecordPoseSmart(*slot, roFrame, true, 3000, axis);
+            CHECK(slot->last_ro_frame == nullptr && slot->last_pose[0].m[0] == elems[0].m[0]);
+        }
+
+        std::printf("[PASS] 31. Lazy Stencil Commit, Lockless 3-Frame AZDO Bump Ring & Zero-Thrash PosePool verified!\n");
+    }
+
+    // =========================================================================
+    // 32. Round 3 Zero-Compromise Multi-Core + 16-Slot Batch + Hardware F16C:
+    //     - 32A: Hardware F16C LoadMat6Fast/StoreMat6Fast bit-exact parity across normal FP16 range
+    //     - 32B: 16-Texture-Slot SpriteBatcher (16 distinct textures -> 1 DrawCall, units 6..13+16..23,
+    //            skipping 14/15 Shadow/BlueNoise; ANGLE 8-slot fallback intact)
+    //     - 32C: Lock-Free Deterministic-Shard 6-Core SkeletalMtPool (2000 ents x 20 frames + reset +
+    //            mutation rejection + 100% deterministic parity + clean shutdown)
+    // =========================================================================
+    {
+        // 32A: Hardware F16C parity
+        {
+            const bool hasF16c = hs_skeletal::CpuHasF16c();
+            const uint16_t testMats[4][6] = {
+                { hs_skeletal::FloatToHalf(1.0f), hs_skeletal::FloatToHalf(0.0f), hs_skeletal::FloatToHalf(0.0f),
+                  hs_skeletal::FloatToHalf(1.0f), hs_skeletal::FloatToHalf(-42.5f), hs_skeletal::FloatToHalf(128.25f) },
+                { hs_skeletal::FloatToHalf(0.866f), hs_skeletal::FloatToHalf(-0.5f), hs_skeletal::FloatToHalf(0.5f),
+                  hs_skeletal::FloatToHalf(0.866f), hs_skeletal::FloatToHalf(15.75f), hs_skeletal::FloatToHalf(-3.125f) },
+                { hs_skeletal::FloatToHalf(-1.25f), hs_skeletal::FloatToHalf(0.125f), hs_skeletal::FloatToHalf(-0.25f),
+                  hs_skeletal::FloatToHalf(1.5f), hs_skeletal::FloatToHalf(0.0f), hs_skeletal::FloatToHalf(0.0f) },
+                { hs_skeletal::FloatToHalf(0.001f), hs_skeletal::FloatToHalf(-0.002f), hs_skeletal::FloatToHalf(3.5f),
+                  hs_skeletal::FloatToHalf(-7.25f), hs_skeletal::FloatToHalf(312.5f), hs_skeletal::FloatToHalf(-210.0f) }
+            };
+            for (int r = 0; r < 4; ++r) {
+                float loaded[6]{};
+                hs_skeletal::LoadMat6Fast(testMats[r], loaded);
+                for (int c = 0; c < 6; ++c) {
+                    const float sw = hs_skeletal::HalfToFloat(testMats[r][c]);
+                    CHECK(std::fabs(loaded[c] - sw) <= 1e-6f);
+                }
+                uint16_t stored[6]{};
+                hs_skeletal::StoreMat6Fast(loaded[0], loaded[1], loaded[2], loaded[3], loaded[4], loaded[5], stored);
+                for (int c = 0; c < 6; ++c) {
+                    CHECK(std::fabs(hs_skeletal::HalfToFloat(stored[c]) - loaded[c]) <= 1e-4f);
+                }
+            }
+            (void)hasF16c;
+        }
+
+        // 32B: 16-Texture-Slot SpriteBatcher + unit skip (14, 15 untouched) + ANGLE 8-slot fallback
+        {
+            using namespace hs_sprite_batch;
+            // Verify shader transform 8-slot vs 16-slot
+            const std::string fakeAnimFs =
+                "precision highp float;\n"
+                "uniform sampler2D SAMPLER[2];\n"
+                "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+                "void main() {\n"
+                "    vec4 colour;\n"
+                "#if defined( TRIPLE_ATLAS )\n"
+                "    colour = texture2D(SAMPLER[0], PS_TEXCOORD.xy);\n"
+                "#else\n"
+                "    colour = texture2D(SAMPLER[0], PS_TEXCOORD.xy);\n"
+                "#endif\n"
+                "    if (BLOOM_TOGGLE == 1.0) {}\n"
+                "    gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+                "    CalculateLightingContribution();\n"
+                "}\n";
+            std::string fs8, fs16;
+            const char* tag8 = nullptr; const char* tag16 = nullptr;
+            CHECK(TransformAnimBatchShaderSource(fakeAnimFs, fs8, tag8, false));
+            CHECK(TransformAnimBatchShaderSource(fakeAnimFs, fs16, tag16, true));
+            CHECK(fs8.find("HS_BATCH_TEX7") != std::string::npos && fs8.find("HS_BATCH_TEX8") == std::string::npos);
+            CHECK(fs16.find("HS_BATCH_TEX15") != std::string::npos);
+
+            // Verify 16 distinct textures coalesce into 1 single glDrawElements on 32-unit GPU & never touch unit 14/15!
+            struct S16Mock {
+                uint32_t nextBuf = 800u;
+                uint32_t draws = 0u;
+                uint32_t curUnit = 0u;
+                uint32_t boundTex[32]{};
+                bool     touched14or15 = false;
+            };
+            static S16Mock m16;
+            m16 = S16Mock{};
+            GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* out) { for (int32_t i = 0; i < n; ++i) out[i] = ++m16.nextBuf; };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+            ops.glBindBuffer = [](uint32_t, uint32_t) {};
+            ops.glBufferData = [](uint32_t, ptrdiff_t, const void*, uint32_t) {};
+            ops.glGetBufferParameteriv = [](uint32_t, uint32_t pname, int32_t* p) {
+                if (pname == kGlBufferSize && p) *p = 2 * 1024 * 1024;
+            };
+            ops.glActiveTexture = [](uint32_t u) {
+                const uint32_t idx = (u >= kGlTexture0 && u < kGlTexture0 + 32u) ? (u - kGlTexture0) : 0u;
+                m16.curUnit = idx;
+                if (idx == 14u || idx == 15u) m16.touched14or15 = true;
+            };
+            ops.glBindTexture = [](uint32_t, uint32_t tex) {
+                if (m16.curUnit < 32u) m16.boundTex[m16.curUnit] = tex;
+            };
+            ops.glUniform1f = [](int32_t, float) {};
+            ops.glUniform1i = [](int32_t, int32_t) {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) {};
+            ops.glEnableVertexAttribArray = [](uint32_t) {};
+            ops.glDisableVertexAttribArray = [](uint32_t) {};
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) { ++m16.draws; };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) {
+                if (pname == kGlMaxTextureImageUnits && p) *p = 32;
+            };
+
+            SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.ResetContext(reinterpret_cast<void*>(0x1616));
+            sb.SetEnabled(true);
+            BatchProgInfo prog{};
+            prog.eligible = true;
+            prog.locBatchActive = 1;
+            prog.locMatrixW = 2;
+            prog.locPos2dUv = 0;
+            prog.locBatchWpos = 7;
+            prog.samplerUnit0 = 0;
+            prog.progMaxTexSlots = 16u;
+            for (uint32_t s = 0; s < 16u; ++s) prog.locBatchTex[s] = static_cast<int32_t>(10 + s);
+            sb.OnUseProgram(28u, &prog);
+            sb.OnEnableDisableVertexAttribArray(0, true);
+            const float mtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float quad[16] = { 0,0,0.2f,0.2f, 1,0,0.8f,0.2f, 1,1,0.8f,0.8f, 0,1,0.2f,0.8f };
+            const uint16_t idxs[6] = { 0,1,2, 0,2,3 };
+            sb.OnBindBuffer(kGlArrayBuffer, 0);
+            sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, quad);
+            sb.OnBindBuffer(kGlElementArrayBuffer, 0);
+            for (uint32_t t = 0; t < 16u; ++t) {
+                sb.OnActiveTexture(kGlTexture0);
+                sb.OnBindTexture(kGlTexture2D, 1000u + t);
+                CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+            }
+            CHECK(m16.draws == 0u); // ALL 16 distinct textures fit inside ONE batch!
+            sb.Flush(FlushReason::End);
+            CHECK(m16.draws == 1u);
+            CHECK(!m16.touched14or15);
+            for (uint32_t s = 0; s < 16u; ++s) {
+                CHECK(m16.boundTex[BatchSlotToTexUnit(s)] == 1000u + s);
+            }
+            sb.ReleaseGpuResources();
+        }
+
+        // 32C: Lock-Free 6-Shard Multi-Core SkeletalMtPool Stress + Reset + Mutation Guard
+        {
+            struct MockShardState {
+                uint32_t frameTweenEnts = 0;
+                uint32_t frameTweenBones = 0;
+                uint32_t frameShedCount = 0;
+                uint8_t  frameShedLevel = 0;
+                uint32_t resets = 0;
+            };
+            struct MockSlot {
+                uintptr_t key = 0;
+                float     outVal = 0.0f;
+            };
+            auto evalFn = [](MockShardState& st, const hs_skeletal_mt::MtAnimJob& job,
+                             int64_t nowQpc, MockSlot& slot, void*) -> const void* {
+                slot.key = job.entityKey;
+                slot.outVal = job.time * 2.0f + static_cast<float>(job.playMode) + static_cast<float>(nowQpc & 7);
+                ++st.frameTweenEnts;
+                st.frameTweenBones += 12u;
+                return &slot;
+            };
+            auto resetFn = [](MockShardState& st) { ++st.resets; };
+
+            hs_skeletal_mt::SkeletalMtPool<MockShardState, MockSlot> pool;
+            CHECK(pool.EnsureStarted(20u, evalFn, resetFn));
+            CHECK(pool.NumShards() == 12u);
+            CHECK(pool.NumBuckets() == 16u);
+
+            constexpr uint32_t kNumEnts = 2000u;
+            std::vector<uint8_t> fakeCmds(kNumEnts * 64u, 0u);
+            for (uint32_t fr = 0; fr < 20u; ++fr) {
+                const uint32_t resetGen = (fr >= 10u) ? 2u : 1u;
+                for (uint32_t e = 0; e < kNumEnts; ++e) {
+                    hs_skeletal_mt::MtAnimJob j{};
+                    j.cmdPtr    = &fakeCmds[e * 64u];
+                    j.entityKey = 0x100000ULL + e * 64ULL;
+                    j.animPtr   = reinterpret_cast<const void*>(0x200000ULL + (e % 32u) * 64ULL);
+                    j.playMode  = static_cast<int32_t>(e & 1u);
+                    j.time      = static_cast<float>(fr) * 0.033f + static_cast<float>(e & 15u) * 0.01f;
+                    pool.StageJob(j);
+                }
+                uint32_t ents = 0, bones = 0, shed = 0;
+                const int64_t qpc = 100000 + fr;
+                CHECK(pool.DispatchAndJoin(qpc, resetGen, ents, bones, shed) == kNumEnts);
+                CHECK(ents == kNumEnts && bones == kNumEnts * 12u && shed == 0u);
+                for (uint32_t e = 0; e < kNumEnts; ++e) {
+                    const void* cmd = &fakeCmds[e * 64u];
+                    const void* ap  = reinterpret_cast<const void*>(0x200000ULL + (e % 32u) * 64ULL);
+                    const int32_t pm = static_cast<int32_t>(e & 1u);
+                    const float tm = static_cast<float>(fr) * 0.033f + static_cast<float>(e & 15u) * 0.01f;
+                    const auto* out = static_cast<const MockSlot*>(pool.LookupResult(cmd, ap, pm, tm));
+                    CHECK(out != nullptr);
+                    CHECK(out->key == 0x100000ULL + e * 64ULL);
+                    const float expV = tm * 2.0f + static_cast<float>(pm) + static_cast<float>(qpc & 7);
+                    CHECK(std::fabs(out->outVal - expV) < 1e-5f);
+                    // Mutation fail-closed check: slightly different time MUST return nullptr!
+                    if (e == 0u) {
+                        CHECK(pool.LookupResult(cmd, ap, pm, tm + 0.05f) == nullptr);
+                    }
+                }
+                pool.EndFrame();
+                // After EndFrame(), lookup MUST return nullptr
+                CHECK(pool.LookupResult(&fakeCmds[0], reinterpret_cast<const void*>(0x200000ULL), 0, 0.0f) == nullptr);
+            }
+            uint32_t totalResets = 0u;
+            pool.ForEachShardState([&](MockShardState& st) { totalResets += st.resets; });
+            CHECK(totalResets == 32u); // 16 buckets x 2 worldResetGen transitions!
+            pool.Shutdown(false);
+        }
+
+        std::printf("[PASS] 32. Hardware F16C Parity, 16-Slot SpriteBatcher (16->1 Draw, Units 6..13+16..23) & 12-Core/16-Bucket SkeletalMtPool (2000x20 Stress) verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 33: OpenGL ES 2.0 / 4.6 Spec §4.1.5 Complete Lossless Stencil Deferral
+    //          (proves GL_STENCIL_TEST == 1 no-op masking/op/func deferral & active
+    //           transition fail-closed flush + exact commit ordering!)
+    // -------------------------------------------------------------------------
+    {
+        using namespace hs_gl_cache;
+        constexpr uint32_t kGlReplace  = 0x1E01u;
+        constexpr uint32_t kGlNotEqual = 0x0205u;
+
+        ThreadState st;
+        st.curContext = reinterpret_cast<void*>(0x1234);
+        st.RecordEnableDisable(kGlStencilTest, true);
+        st.RecordStencilFunc(kGlStencilAlways, 0, 0xFFu);
+        st.RecordStencilMask(0xFFu);
+        st.RecordStencilOp(kGlStencilKeep, kGlStencilKeep, kGlStencilKeep);
+
+        // 1. With GL_STENCIL_TEST == 1 and op == (KEEP, KEEP, KEEP):
+        //    glStencilMask(0) MUST defer (0 draw effect!)
+        CHECK(!st.IsStencilTestKnownDisabled());
+        CHECK(st.CanDeferStencilMaskWhenEnabled());
+        st.DeferStencilMask(0x00u);
+        CHECK(st.stencilWriteMaskDirty && st.stencilWriteMask == 0x00u && st.drvStencilWriteMask == 0xFFu);
+
+        // 2. Now logical wmask == 0: glStencilOp(KEEP, KEEP, REPLACE) MUST defer!
+        CHECK(st.CanDeferStencilOpWhenEnabled());
+        st.DeferStencilOp(kGlStencilKeep, kGlStencilKeep, kGlReplace);
+        CHECK(st.stencilOpDirty && st.stencilOpZpass == kGlReplace && st.drvStencilOpZpass == kGlStencilKeep);
+
+        // 3. While logical wmask == 0 and func == ALWAYS: glStencilFunc(ALWAYS, 7, 0xFF) MUST defer!
+        CHECK(st.CanDeferStencilFuncWhenEnabled(kGlStencilAlways));
+        st.DeferStencilFunc(kGlStencilAlways, 7, 0xFFu);
+        CHECK(st.stencilFuncDirty && st.stencilRef == 7 && st.drvStencilRef == 0);
+
+        // 4. Active transition: glStencilMask(0xFF) while logical op == REPLACE MUST NOT defer!
+        CHECK(!st.CanDeferStencilMaskWhenEnabled());
+        //    Caller flushes batch, commits deferred Func (ref=7) & Op (REPLACE), then records Mask(0xFF)
+        uint32_t fn = 0, fm = 0, opF = 0, opZf = 0, opZp = 0; int32_t ref = 0;
+        CHECK(st.TakeDeferredStencilFunc(fn, ref, fm) && fn == kGlStencilAlways && ref == 7 && fm == 0xFFu);
+        CHECK(st.TakeDeferredStencilOp(opF, opZf, opZp) && opZp == kGlReplace);
+        st.RecordStencilMask(0xFFu);
+        CHECK(!st.HasDeferredStencilState());
+
+        // 5. While wmask == 0xFF AND op == REPLACE (active stencil writing!):
+        //    - glStencilFunc(ALWAYS, 9, 0xFF) MUST NOT defer (ref=9 would be written by REPLACE!)
+        //    - glStencilOp(KEEP, KEEP, KEEP) MUST NOT defer (wmask != 0!)
+        //    - glStencilMask(0) MUST NOT defer (op != KEEP!)
+        CHECK(!st.CanDeferStencilFuncWhenEnabled(kGlStencilAlways));
+        CHECK(!st.CanDeferStencilFuncWhenEnabled(kGlNotEqual));
+        CHECK(!st.CanDeferStencilOpWhenEnabled());
+        CHECK(!st.CanDeferStencilMaskWhenEnabled());
+
+        // 6. Changing to GL_NOTEQUAL MUST NEVER defer even when wmask == 0!
+        st.RecordStencilMask(0x00u);
+        CHECK(!st.CanDeferStencilFuncWhenEnabled(kGlNotEqual));
+
+        std::printf("[PASS] 33. OpenGL §4.1.5 Lossless Enabled-Stencil Deferral & Active-Commit Ordering verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 34: Sticky AZDO BaseVertex Batch Session & 16-Slot UIBatcher
+    // -------------------------------------------------------------------------
+    {
+        // 34A: Sticky AZDO glDrawElementsBaseVertex + OnDeleteTextures + EndStickyBatchSession + activeUnit sync regression
+        {
+            using namespace hs_sprite_batch;
+            struct StickyMock {
+                std::vector<uint8_t> vboStore;
+                std::vector<uint8_t> iboStore;
+                uint32_t nextBuf  = 100u;
+                uint32_t curArr   = 0u, curElem = 0u;
+                uint32_t vboId    = 0u, iboId   = 0u;
+                int32_t  vboSz    = 0,  iboSz   = 0;
+                uint32_t drawElemsCnt        = 0u;
+                uint32_t drawBaseVertCnt     = 0u;
+                uint32_t bindBufCnt          = 0u;
+                uint32_t enAttrCnt           = 0u;
+                uint32_t disAttrCnt          = 0u;
+                uint32_t bindTexCnt          = 0u;
+                uint32_t postRestoreCnt      = 0u;
+                uint32_t stickySyncCnt       = 0u;
+                uint32_t stickyTouchedTexCnt = 0u;
+                uint32_t stickyEnteredCnt    = 0u;
+                uint32_t activeTexCalls      = 0u;
+                uint32_t gpuActiveUnit       = 0u;
+                uint32_t gpuTex[hs_gl_cache::kMaxTexUnits] = {};
+                std::vector<int32_t> baseVerts;
+                std::vector<float>   batchActiveHistory;
+            };
+            static StickyMock sm;
+            static hs_gl_cache::ThreadState s_stickyGlCache;
+            sm = StickyMock{};
+            s_stickyGlCache.Reset();
+            s_stickyGlCache.OnMakeCurrent(reinterpret_cast<void*>(0x5555));
+
+            GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* out) {
+                for (int32_t i = 0; i < n; ++i) out[i] = ++sm.nextBuf;
+            };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+            ops.glBindBuffer = [](uint32_t target, uint32_t buf) {
+                ++sm.bindBufCnt;
+                if (target == kGlArrayBuffer) sm.curArr = buf;
+                else if (target == kGlElementArrayBuffer) sm.curElem = buf;
+            };
+            ops.glBufferData = [](uint32_t, ptrdiff_t, const void*, uint32_t) {};
+            ops.glBufferStorage = [](uint32_t target, ptrdiff_t size, const void*, uint32_t) {
+                if (target == kGlArrayBuffer) {
+                    sm.vboId = sm.curArr;
+                    sm.vboSz = static_cast<int32_t>(size);
+                    sm.vboStore.assign(static_cast<size_t>(size), 0u);
+                } else if (target == kGlElementArrayBuffer) {
+                    sm.iboId = sm.curElem;
+                    sm.iboSz = static_cast<int32_t>(size);
+                    sm.iboStore.assign(static_cast<size_t>(size), 0u);
+                }
+            };
+            ops.glGetBufferParameteriv = [](uint32_t target, uint32_t pname, int32_t* p) {
+                if (pname == kGlBufferSize && p) *p = (target == kGlArrayBuffer) ? sm.vboSz : sm.iboSz;
+            };
+            ops.glMapBufferRange = [](uint32_t target, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                if (target == kGlArrayBuffer) return sm.vboStore.data();
+                if (target == kGlElementArrayBuffer) return sm.iboStore.data();
+                return nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) -> void* { return reinterpret_cast<void*>(static_cast<uintptr_t>(0xB001u)); };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) -> uint32_t { return 0x911Au; };
+            ops.glDeleteSync = [](void*) {};
+            ops.glActiveTexture = [](uint32_t unitEnum) {
+                ++sm.activeTexCalls;
+                if (unitEnum >= kGlTexture0) {
+                    const uint32_t u = unitEnum - kGlTexture0;
+                    if (u < hs_gl_cache::kMaxTexUnits) sm.gpuActiveUnit = u;
+                }
+            };
+            ops.glBindTexture = [](uint32_t target, uint32_t tex) {
+                ++sm.bindTexCnt;
+                if (target == kGlTexture2D && sm.gpuActiveUnit < hs_gl_cache::kMaxTexUnits) {
+                    sm.gpuTex[sm.gpuActiveUnit] = tex;
+                }
+            };
+            ops.glUniform1f = [](int32_t loc, float v) {
+                if (loc == 1) sm.batchActiveHistory.push_back(v);
+            };
+            ops.glUniform1i = [](int32_t, int32_t) {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) {};
+            ops.glEnableVertexAttribArray = [](uint32_t) { ++sm.enAttrCnt; };
+            ops.glDisableVertexAttribArray = [](uint32_t) { ++sm.disAttrCnt; };
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) { ++sm.drawElemsCnt; };
+            ops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t bv) {
+                ++sm.drawBaseVertCnt;
+                sm.baseVerts.push_back(bv);
+            };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) {
+                if (pname == kGlMaxTextureImageUnits && p) *p = 24;
+            };
+            ops.onPostFlushRestore = [](uint32_t, uint32_t, uint32_t, uint32_t, void*) {
+                ++sm.postRestoreCnt;
+            };
+            ops.onStickyFlushSync = [](bool touchedTexUnits, bool enteredSticky, uint32_t, void*) {
+                ++sm.stickySyncCnt;
+                if (touchedTexUnits) {
+                    ++sm.stickyTouchedTexCnt;
+                    s_stickyGlCache.activeUnit = -1;
+                    for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) {
+                        const uint32_t tu = BatchSlotToTexUnit(s);
+                        if (tu < hs_gl_cache::kMaxTexUnits) {
+                            s_stickyGlCache.boundTex2D[tu] = hs_gl_cache::kInvalidId;
+                        }
+                    }
+                }
+                if (enteredSticky) {
+                    ++sm.stickyEnteredCnt;
+                    s_stickyGlCache.boundArrayBuf = hs_gl_cache::kInvalidId;
+                    s_stickyGlCache.boundElementBuf = hs_gl_cache::kInvalidId;
+                }
+            };
+
+            SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.ResetContext(reinterpret_cast<void*>(0x5555));
+            sb.SetPersistentRingPreferred(true);
+            sb.SetDeferHostRestore(true);
+            sb.SetEnabled(true);
+
+            BatchProgInfo prog{};
+            prog.eligible       = true;
+            prog.locBatchActive = 1;
+            prog.locMatrixW     = 2;
+            prog.locColourXform = 3;
+            prog.locPos2dUv     = 0;
+            prog.locBatchWpos   = 7;
+            prog.locBatchCMult  = 5;
+            prog.locBatchCAdd   = 6;
+            prog.samplerUnit0   = 0;
+            prog.progMaxTexSlots = 16u;
+            sb.OnUseProgram(28u, &prog);
+            sb.OnEnableDisableVertexAttribArray(0, true);
+            CHECK(s_stickyGlCache.ShouldCallActiveTexture(kGlTexture0));
+            ops.glActiveTexture(kGlTexture0);
+            sb.OnActiveTexture(kGlTexture0);
+            ops.glBindTexture(kGlTexture2D, 777u);
+            sb.OnBindTexture(kGlTexture2D, 777u);
+
+            const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float quad[16] = { 0,0,0.2f,0.2f, 1,0,0.8f,0.2f, 1,2,0.8f,0.8f, 0,2,0.2f,0.8f };
+            const uint16_t idxs[6] = { 0,1,2, 0,2,3 };
+            sb.OnBindBuffer(kGlArrayBuffer, 0);
+            sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, quad);
+            sb.OnBindBuffer(kGlElementArrayBuffer, 0);
+
+            // Flush #1 -> enters sticky session, syncs glCache.activeUnit = -1, binds 777u on slot 0 (unit 6)
+            CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, idMtx));
+            CHECK(sb.TryAbsorbColourXform(prog.locColourXform, 1, 0, idMtx));
+            CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+            sb.Flush(FlushReason::State);
+            CHECK(sb.IsStickySessionActive());
+            CHECK(sm.drawElemsCnt == 0u && sm.drawBaseVertCnt == 1u && sm.baseVerts[0] == 0);
+            CHECK(sm.batchActiveHistory.size() == 1u && sm.batchActiveHistory[0] == 1.0f);
+            CHECK(sm.disAttrCnt == 0u && sm.postRestoreCnt == 0u);
+            CHECK(sm.stickySyncCnt == 1u && sm.stickyTouchedTexCnt == 1u && sm.stickyEnteredCnt == 1u);
+            CHECK(s_stickyGlCache.activeUnit == -1);
+            CHECK(sm.gpuActiveUnit == BatchSlotToTexUnit(0u));
+            CHECK(sm.gpuTex[6] == 777u);
+            CHECK(s_stickyGlCache.boundTex2D[0] == hs_gl_cache::kInvalidId);
+
+            // Host non-deferred bind on unit 0 (simulating quality preset toggle needing glBindTexture(888u)):
+            // because glCache.activeUnit == -1 != 0, glActiveTexture(GL_TEXTURE0) MUST be emitted and gpuTex[6] == 777u stays intact!
+            const uint32_t actBeforeHost = sm.activeTexCalls;
+            sb.OnBindTexture(kGlTexture2D, 888u);
+            if (s_stickyGlCache.activeUnit != 0) {
+                ops.glActiveTexture(kGlTexture0);
+                s_stickyGlCache.activeUnit = 0;
+            }
+            ops.glBindTexture(kGlTexture2D, 888u);
+            CHECK(sm.activeTexCalls == actBeforeHost + 1u);
+            CHECK(sm.gpuActiveUnit == 0u && sm.gpuTex[0] == 888u);
+            CHECK(sm.gpuTex[6] == 777u);
+            sb.OnBindTexture(kGlTexture2D, 777u);
+
+            const uint32_t bAfter1 = sm.bindBufCnt;
+            const uint32_t eAfter1 = sm.enAttrCnt;
+            const uint32_t tAfter1 = sm.bindTexCnt;
+
+            // Flush #2 -> SAME texture 777u stays bound in sticky slot! Zero redundant VBO/attr/tex/uniform calls and skips onStickyFlushSync!
+            CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, idMtx));
+            CHECK(sb.TryAbsorbColourXform(prog.locColourXform, 1, 0, idMtx));
+            CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+            sb.Flush(FlushReason::State);
+            CHECK(sb.IsStickySessionActive());
+            CHECK(sm.drawElemsCnt == 0u && sm.drawBaseVertCnt == 2u && sm.baseVerts[1] == 4);
+            CHECK(sm.bindBufCnt == bAfter1);
+            CHECK(sm.enAttrCnt == eAfter1);
+            CHECK(sm.bindTexCnt == tAfter1);
+            CHECK(sm.stickySyncCnt == 1u);
+            CHECK(sm.gpuTex[6] == 777u);
+            CHECK(sm.batchActiveHistory.size() == 1u);
+            CHECK(sm.postRestoreCnt == 0u);
+
+            // OnDeleteTextures(777u) must clear stickySlotTex_ so Flush #3 rebinds recycled tex 777u!
+            uint32_t delTex = 777u;
+            sb.OnDeleteTextures(1, &delTex);
+            sb.OnBindTexture(kGlTexture2D, 777u);
+            CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+            sb.Flush(FlushReason::State);
+            CHECK(sm.drawBaseVertCnt == 3u && sm.baseVerts[2] == 8);
+            CHECK(sm.bindTexCnt == tAfter1 + 1u);
+            CHECK(sm.stickySyncCnt == 2u && sm.stickyTouchedTexCnt == 2u && sm.stickyEnteredCnt == 1u);
+
+            // EndStickyBatchSession -> disables batch active, attribs 5/6/7, invokes onPostFlushRestore!
+            sb.EndStickyBatchSession();
+            CHECK(!sb.IsStickySessionActive());
+            CHECK(sm.batchActiveHistory.size() == 2u && sm.batchActiveHistory[1] == 0.0f);
+            CHECK(sm.disAttrCnt == 3u);
+            CHECK(sm.postRestoreCnt == 1u);
+        }
+
+        // 34B: 16-Slot UIBatcher (Native GL >= 24 units) + 8-Slot ANGLE Fallback (< 24 units)
+        {
+            using namespace hs_ui_batch;
+            struct UiMock {
+                int32_t     maxUnits = 32;
+                int32_t     arrSz    = 0;
+                int32_t     elemSz   = 0;
+                uint32_t    nextId   = 10u;
+                uint32_t    draws    = 0u;
+                uint32_t    curUnit  = 0u;
+                std::string capturedFs;
+                std::vector<uint32_t> texUnitsBound;
+                std::vector<uint8_t>  vboStore;
+                std::vector<uint8_t>  iboStore;
+            };
+            static UiMock um;
+            auto runUiSlotTest = [&](int32_t maxU, uint32_t texCount) {
+                um = UiMock{};
+                um.maxUnits = maxU;
+                UiGlOps uops{};
+                uops.preferHighp = (maxU >= 24);
+                uops.glCreateShader = [](uint32_t) -> uint32_t { return ++um.nextId; };
+                uops.glShaderSource = [](uint32_t, int32_t, const char* const* s, const int32_t*) {
+                    if (s && s[0] && std::strstr(s[0], "u_tex") != nullptr) {
+                        um.capturedFs = s[0];
+                    }
+                };
+                uops.glCompileShader = [](uint32_t) {};
+                uops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) { if (p) *p = 1; };
+                uops.glDeleteShader = [](uint32_t) {};
+                uops.glCreateProgram = []() -> uint32_t { return ++um.nextId; };
+                uops.glAttachShader = [](uint32_t, uint32_t) {};
+                uops.glBindAttribLocation = [](uint32_t, uint32_t, const char*) {};
+                uops.glLinkProgram = [](uint32_t) {};
+                uops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) { if (p) *p = 1; };
+                uops.glDeleteProgram = [](uint32_t) {};
+                uops.glUseProgram = [](uint32_t) {};
+                uops.glGetUniformLocation = [](uint32_t, const char* nm) -> int32_t {
+                    return (nm && std::strncmp(nm, "u_tex", 5) == 0) ? (100 + std::atoi(nm + 5)) : -1;
+                };
+                uops.glUniform1i = [](int32_t, int32_t) {};
+                uops.glGenBuffers = [](int32_t n, uint32_t* out) {
+                    for (int32_t i = 0; i < n; ++i) out[i] = ++um.nextId;
+                };
+                uops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+                uops.glBindBuffer = [](uint32_t, uint32_t) {};
+                uops.glBufferData = [](uint32_t target, ptrdiff_t size, const void*, uint32_t) {
+                    if (target == kGlArrayBuffer) {
+                        um.arrSz = static_cast<int32_t>(size);
+                        um.vboStore.assign(static_cast<size_t>(size), 0u);
+                    } else if (target == kGlElementArrayBuffer) {
+                        um.elemSz = static_cast<int32_t>(size);
+                        um.iboStore.assign(static_cast<size_t>(size), 0u);
+                    }
+                };
+                uops.glBufferSubData = [](uint32_t, ptrdiff_t, ptrdiff_t, const void*) {};
+                uops.glMapBufferRange = [](uint32_t target, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                    return (target == kGlArrayBuffer) ? um.vboStore.data() : um.iboStore.data();
+                };
+                uops.glUnmapBuffer = [](uint32_t) -> uint8_t { return 1u; };
+                uops.glActiveTexture = [](uint32_t u) { um.curUnit = u - 0x84C0u; };
+                uops.glBindTexture = [](uint32_t, uint32_t) { um.texUnitsBound.push_back(um.curUnit); };
+                uops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) {};
+                uops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) {};
+                uops.glEnableVertexAttribArray = [](uint32_t) {};
+                uops.glDisableVertexAttribArray = [](uint32_t) {};
+                uops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) { ++um.draws; };
+                uops.glGetIntegerv = [](uint32_t pname, int32_t* p) {
+                    if (pname == 0x8872u && p) *p = um.maxUnits;
+                };
+                uops.glGetBufferParameteriv = [](uint32_t target, uint32_t pname, int32_t* p) {
+                    if (pname == hs_sprite_batch::kGlBufferSize && p) {
+                        *p = (target == kGlArrayBuffer) ? um.arrSz : um.elemSz;
+                    }
+                };
+
+                UiBatcher ub;
+                ub.SetOps(uops);
+                ub.SetEnabled(true);
+
+                UiProgInfo inf{};
+                inf.kind         = UiProgKind::UiBasic;
+                inf.eligible     = true;
+                inf.locPos       = 0;
+                inf.locUv        = 1;
+                inf.locDiffuse   = 2;
+                inf.locMatrixPVW = 10;
+                inf.locSampler0  = 11;
+
+                ub.OnUseProgram(50u, &inf);
+                ub.OnEnableDisableVertexAttribArray(0, true);
+                ub.OnEnableDisableVertexAttribArray(1, true);
+                ub.OnEnableDisableVertexAttribArray(2, true);
+                ub.OnActiveTexture(0x84C0u);
+                const float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+                CHECK(ub.TryAbsorbMatrix4(inf.locMatrixPVW, 1, 0, ident));
+
+                struct V { float x, y, z, u, v, r, g, b, a; };
+                V verts[4] = {
+                    {0,0,0, 0,0, 1,1,1,1}, {1,0,0, 1,0, 1,1,1,1},
+                    {0,1,0, 0,1, 1,1,1,1}, {1,1,0, 1,1, 1,1,1,1}
+                };
+                const uint16_t idx[6] = { 0,1,2, 2,1,3 };
+                ub.OnBindBuffer(kGlArrayBuffer, 0);
+                ub.OnBindBuffer(kGlElementArrayBuffer, 0);
+                ub.OnVertexAttribPointer(0, 3, 0x1406u, 0, sizeof(V), &verts[0].x);
+                ub.OnVertexAttribPointer(1, 2, 0x1406u, 0, sizeof(V), &verts[0].u);
+                ub.OnVertexAttribPointer(2, 4, 0x1406u, 0, sizeof(V), &verts[0].r);
+                for (uint32_t i = 0; i < texCount; ++i) {
+                    ub.OnBindTexture(0x0DE1u, 100u + i);
+                    CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, 0x1403u, idx));
+                }
+                ub.Flush(hs_sprite_batch::FlushReason::End);
+            };
+
+            // Native GL (maxUnits=32): 16 textures coalesce into 1 draw on units 6..13 + 16..23!
+            runUiSlotTest(32, 16u);
+            CHECK(um.draws == 1u);
+            CHECK(um.capturedFs.find("u_tex15") != std::string::npos);
+            CHECK(um.texUnitsBound.size() == 16u);
+            for (uint32_t s = 0; s < 16u; ++s) {
+                CHECK(um.texUnitsBound[s] == UiSlotToTexUnit(s));
+            }
+
+            // ANGLE fallback (maxUnits=16): 8 slots max -> 9 textures take 2 flushes, no u_tex8 in FS!
+            runUiSlotTest(16, 9u);
+            CHECK(um.draws == 2u);
+            CHECK(um.capturedFs.find("u_tex7") != std::string::npos);
+            CHECK(um.capturedFs.find("u_tex8") == std::string::npos);
+        }
+
+        std::printf("[PASS] 34. Sticky AZDO BaseVertex Session & 16-Slot UIBatcher (Native 16->1 + ANGLE 8-slot fallback) verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 35: HyperSmooth v3.5 Global Elastic Hardware Pool + GPU-Driven
+    //          Bindless/SSBO Shader Transform & Texture Immutability Fallback
+    // -------------------------------------------------------------------------
+    {
+        // 35A: ComputeElasticPlan across RTX 4060 Abundant, Tight RAM, Tight VRAM, ANGLE & Low Tier
+        {
+            using namespace hs_elastic_pool;
+            ElasticHostSnapshot snap{};
+            snap.tier               = hs_hw_tier::HardwareTier::Unleashed;
+            snap.logicalCores       = 16u;
+            snap.totalRamMb         = 32768ULL;
+            snap.availRamMb         = 20480ULL;
+            snap.vramUsedMb         = 900.0f;
+            snap.vramBudgetMb       = 7200.0f;
+            snap.isNativeGl         = true;
+            snap.hasBufferStorage   = true;
+            snap.hasSsbo            = true;
+            snap.hasBindlessTexture = true;
+            snap.hasBaseVertex      = true;
+
+            const auto epAbundant = ComputeElasticPlan(snap);
+            CHECK(epAbundant.pressureLevel == kPressureAbundant);
+            CHECK(epAbundant.maxSkeletalWorkers == 12u);
+            CHECK(epAbundant.vbPoolMaxBytes == 512u * 1024u * 1024u);
+            CHECK(epAbundant.spriteShadowCacheBytes == 512u * 1024u * 1024u);
+            CHECK(epAbundant.gcHeadroomMaxKb == 6291456);
+            CHECK(epAbundant.gpuRingMaxVertsPerFrame == 1048576u);
+            CHECK(epAbundant.gpuRingMaxIndicesPerFrame == 2097152u);
+            CHECK(epAbundant.gpuRingMaxInstsPerFrame == 65536u);
+            CHECK(epAbundant.enableGpuDrivenBindless == true);
+
+            auto ramTight = snap;
+            ramTight.availRamMb = 3000ULL;
+            const auto epRamTight = ComputeElasticPlan(ramTight);
+            CHECK(epRamTight.pressureLevel == kPressureTight);
+            CHECK(epRamTight.vbPoolMaxBytes == 64u * 1024u * 1024u);
+            CHECK(epRamTight.gpuRingMaxVertsPerFrame == 65536u);
+
+            auto vramTight = snap;
+            vramTight.vramUsedMb = 6000.0f; // > 78% of 7200MB
+            const auto epVramTight = ComputeElasticPlan(vramTight);
+            CHECK(epVramTight.pressureLevel == kPressureTight);
+            CHECK(epVramTight.gpuRingMaxInstsPerFrame == 8192u);
+
+            auto angleSnap = snap;
+            angleSnap.isNativeGl = false;
+            CHECK(ComputeElasticPlan(angleSnap).enableGpuDrivenBindless == false);
+
+            auto lowSnap = snap;
+            lowSnap.tier = hs_hw_tier::HardwareTier::Low;
+            const auto epLow = ComputeElasticPlan(lowSnap);
+            CHECK(epLow.maxSkeletalWorkers <= 4u);
+            CHECK(epLow.enableGpuDrivenBindless == false);
+        }
+
+        // 35B: SkeletalMtPool Elastic Active-Worker Scaling & Override Cap
+        {
+            struct MockSt {
+                uint32_t frameTweenEnts  = 0u;
+                uint32_t frameTweenBones = 0u;
+                uint32_t frameShedCount  = 0u;
+                uint8_t  frameShedLevel  = 0u;
+                uint32_t resets          = 0u;
+            };
+            struct MockSl { uintptr_t key = 0u; float v = 0.0f; };
+            using PoolT = hs_skeletal_mt::SkeletalMtPool<MockSt, MockSl>;
+            CHECK(PoolT::ComputeElasticActiveWorkers(16u, 12u) == 1u);
+            CHECK(PoolT::ComputeElasticActiveWorkers(100u, 12u) == 4u);
+            CHECK(PoolT::ComputeElasticActiveWorkers(400u, 12u) == 8u);
+            CHECK(PoolT::ComputeElasticActiveWorkers(1200u, 12u) == 12u);
+
+            auto evalFn = [](MockSt& st, const hs_skeletal_mt::MtAnimJob& j, int64_t, MockSl& sl, void*) -> const void* {
+                sl.key = j.entityKey;
+                sl.v = j.time * 3.0f;
+                ++st.frameTweenEnts;
+                st.frameTweenBones += 8u;
+                return &sl;
+            };
+            auto resetFn = [](MockSt& st) { ++st.resets; };
+
+            PoolT cappedPool;
+            CHECK(cappedPool.EnsureStarted(16u, evalFn, resetFn, nullptr, 6u));
+            CHECK(cappedPool.NumShards() == 6u);
+            cappedPool.Shutdown(false);
+
+            PoolT fullPool;
+            CHECK(fullPool.EnsureStarted(16u, evalFn, resetFn, nullptr, 12u));
+            CHECK(fullPool.NumShards() == 12u);
+            CHECK(fullPool.NumBuckets() == 16u);
+            constexpr uint32_t kJobs = 1200u;
+            std::vector<uint8_t> cmdMem(kJobs * 32u, 0u);
+            for (uint32_t i = 0u; i < kJobs; ++i) {
+                hs_skeletal_mt::MtAnimJob j{};
+                j.cmdPtr    = &cmdMem[i * 32u];
+                j.entityKey = 0x500000ULL + i * 64ULL;
+                j.animPtr   = reinterpret_cast<const void*>(0x600000ULL);
+                j.playMode  = 0;
+                j.time      = static_cast<float>(i) * 0.01f;
+                fullPool.StageJob(j);
+            }
+            uint32_t ents = 0u, bones = 0u, shed = 0u;
+            CHECK(fullPool.DispatchAndJoin(12345, 1u, ents, bones, shed) == kJobs);
+            CHECK(ents == kJobs);
+            CHECK(fullPool.LastActiveWorkers() == 12u);
+            for (uint32_t i = 0u; i < kJobs; ++i) {
+                const auto* res = static_cast<const MockSl*>(
+                    fullPool.LookupResult(&cmdMem[i * 32u], reinterpret_cast<const void*>(0x600000ULL), 0, static_cast<float>(i) * 0.01f));
+                CHECK(res != nullptr);
+                CHECK(res->key == 0x500000ULL + i * 64ULL);
+                CHECK(std::fabs(res->v - static_cast<float>(i) * 0.03f) < 1e-4f);
+            }
+            fullPool.EndFrame();
+            fullPool.Shutdown(false);
+        }
+
+        // 35C: GPU-Driven Shader Transform + SpriteBatcher Bindless Immutability Fallback
+        {
+            static constexpr const char* kMockAnimVs =
+                "attribute vec4 POS2D_UV;\n"
+                "uniform mat4 MatrixP;\n"
+                "uniform mat4 MatrixV;\n"
+                "uniform mat4 MatrixW;\n"
+                "uniform vec4 FLOAT_PARAMS;\n"
+                "uniform vec4 TIMEPARAMS;\n"
+                "varying vec3 PS_TEXCOORD;\n"
+                "varying vec3 PS_POS;\n"
+                "void main() {\n"
+                "#if defined( TEST )\n"
+                "#else\n"
+                "\tvec3 POSITION = vec3(POS2D_UV.xy, 0.0);\n"
+                "\tvec3 object_pos = POSITION.xyz;\n"
+                "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+                "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+                "\tgl_Position = mtxPV * world_pos;\n"
+                "#endif\n"
+                "\tPS_TEXCOORD = TEXCOORD0;\n"
+                "\tPS_POS = world_pos.xyz;\n"
+                "}\n";
+            static constexpr const char* kMockAnimFs =
+                "#if defined( GL_ES )\n"
+                "precision mediump float;\n"
+                "#endif\n"
+                "uniform sampler2D SAMPLER[6];\n"
+                "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+                "uniform mat4 COLOUR_XFORM;\n"
+                "uniform vec3 PARAMS;\n"
+                "uniform vec3 FLOAT_PARAMS;\n"
+                "varying vec3 PS_POS;\n"
+                "varying vec3 PS_TEXCOORD;\n"
+                "vec3 CalculateLightingContribution() { return vec3(1.0); }\n"
+                "void main() {\n"
+                "    vec4 colour;\n"
+                "#if defined( TRIPLE_ATLAS )\n"
+                "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+                "#else\n"
+                "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+                "#endif\n"
+                "    if (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = colour; return; }\n"
+                "    if(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+                "    gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+                "    gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * world_tint.rgb, OCEAN_BLEND_PARAMS.x);\n"
+                "}\n";
+            static constexpr const char* kMockBloomVs =
+                "#ifdef SKINNED\n"
+                "\tuniform mat4 pv;\n"
+                "#else\n"
+                "\tuniform mat4 MatrixP;\n"
+                "\tuniform mat4 MatrixV;\n"
+                "\tuniform mat4 MatrixW;\n"
+                "#endif\n"
+                "attribute vec4 POS2D_UV;\n"
+                "varying vec3 PS_TEXCOORD;\n"
+                "void main() {\n"
+                "#ifdef SKINNED\n"
+                "\tvec3 TEXCOORD0 = vec3(0.0);\n"
+                "#else\n"
+                "    vec3 POSITION = vec3(POS2D_UV.xy, 0);\n"
+                "    float samplerIndex = floor(POS2D_UV.z/2.0);\n"
+                "    vec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+                "    mat4 mtxPVW = MatrixP * MatrixV * MatrixW;\n"
+                "    gl_Position = mtxPVW * vec4( POSITION.xyz, 1.0 );\n"
+                "#endif\n"
+                "\tPS_TEXCOORD = TEXCOORD0;\n"
+                "}\n";
+            static constexpr const char* kMockBloomFs =
+                "#if defined( GL_ES )\n"
+                "precision mediump float;\n"
+                "#endif\n"
+                "#if defined( TRIPLE_ATLAS )\n"
+                "    uniform sampler2D SAMPLER[6];\n"
+                "#else\n"
+                "    uniform sampler2D SAMPLER[2];\n"
+                "#endif\n"
+                "varying vec3 PS_TEXCOORD;\n"
+                "void main() {\n"
+                "    vec4 colour;\n"
+                "#if defined( TRIPLE_ATLAS )\n"
+                "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+                "#else\n"
+                "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+                "#endif\n"
+                "    gl_FragColor.rgba = vec4( 0, 0, 0, colour.a );\n"
+                "}\n";
+
+            std::string gpuVs, gpuFs, bloomVs, bloomFs;
+            const char* tag = nullptr;
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kMockAnimVs, gpuVs, tag, true, true));
+            CHECK(gpuVs.find("#version 430 compatibility") == 0u);
+            CHECK(gpuVs.find("#extension GL_ARB_bindless_texture : require") != std::string::npos);
+            CHECK(gpuVs.find("struct HsGpuInst") != std::string::npos);
+            CHECK(gpuVs.find("hs_gpu_localX") != std::string::npos);
+            CHECK(gpuVs.find("HS_V_FOB") != std::string::npos);
+            CHECK(gpuVs.find("HS_BATCH_ACTIVE > 1.5") != std::string::npos);
+            CHECK(gpuVs.find("flat out uvec2 HS_V_BTEX") != std::string::npos);
+
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kMockAnimFs, gpuFs, tag, true, true));
+            CHECK(gpuFs.find("#version 430 compatibility") == 0u);
+            CHECK(gpuFs.find("#extension GL_ARB_bindless_texture : require") != std::string::npos);
+            CHECK(gpuFs.find("flat in uvec2 HS_V_BTEX") != std::string::npos);
+            CHECK(gpuFs.find("sampler2D(HS_V_BTEX)") != std::string::npos);
+            CHECK(gpuFs.find("HS_V_FOB") != std::string::npos);
+
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kMockBloomVs, bloomVs, tag, true, true));
+            CHECK(tag != nullptr && std::strcmp(tag, "ANIM_BLOOM_BATCH_VS") == 0);
+            CHECK(bloomVs.find("#version 430 compatibility") == 0u);
+            CHECK(bloomVs.find("#extension GL_ARB_bindless_texture : require") != std::string::npos);
+            CHECK(bloomVs.find("HS_BATCH_ACTIVE > 1.5") != std::string::npos);
+            CHECK(bloomVs.find("mat4 mtxPVW = MatrixP * MatrixV * MatrixW;") != std::string::npos);
+
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kMockBloomFs, bloomFs, tag, true, true));
+            CHECK(tag != nullptr && std::strcmp(tag, "ANIM_BLOOM_BATCH_FS") == 0);
+            CHECK(bloomFs.find("#version 430 compatibility") == 0u);
+            CHECK(bloomFs.find("#extension GL_ARB_bindless_texture : require") != std::string::npos);
+            CHECK(bloomFs.find("gl_FragColor.rgba = vec4( 0, 0, 0, colour.a );") != std::string::npos);
+
+            struct MockGpuMem {
+                uint32_t nextBuf = 0;
+                uint32_t bound[3] = {}; // 0=ARRAY, 1=ELEM, 2=SSBO
+                std::vector<uint8_t> bufs[32];
+                int32_t  sz[32]{};
+                std::vector<float> activeUniforms;
+                uint32_t u3Calls = 0u;
+                uint32_t u4Calls = 0u;
+            };
+            static MockGpuMem* g_mg = nullptr;
+            MockGpuMem mg{};
+            g_mg = &mg;
+            auto tIdx = [](uint32_t tgt) -> int {
+                if (tgt == hs_sprite_batch::kGlArrayBuffer) return 0;
+                if (tgt == hs_sprite_batch::kGlElementArrayBuffer) return 1;
+                return 2;
+            };
+
+            hs_sprite_batch::GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* ids) {
+                for (int32_t i = 0; i < n; ++i) ids[i] = ++g_mg->nextBuf;
+            };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+            ops.glBindBuffer = [](uint32_t tgt, uint32_t b) {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                g_mg->bound[idx] = b;
+            };
+            ops.glBufferData = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = g_mg->bound[idx];
+                if (id < 32u) { g_mg->sz[id] = static_cast<int32_t>(sz); g_mg->bufs[id].assign(static_cast<size_t>(sz), 0u); }
+            };
+            ops.glBufferStorage = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = g_mg->bound[idx];
+                if (id < 32u) { g_mg->sz[id] = static_cast<int32_t>(sz); g_mg->bufs[id].assign(static_cast<size_t>(sz), 0u); }
+            };
+            ops.glGetBufferParameteriv = [](uint32_t tgt, uint32_t pname, int32_t* p) {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = g_mg->bound[idx];
+                if (pname == hs_sprite_batch::kGlBufferSize && p && id < 32u) *p = g_mg->sz[id];
+            };
+            ops.glMapBufferRange = [](uint32_t tgt, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = g_mg->bound[idx];
+                return (id < 32u && !g_mg->bufs[id].empty()) ? g_mg->bufs[id].data() : nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) -> void* { return reinterpret_cast<void*>(1); };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) -> uint32_t { return 0x911Au; };
+            ops.glDeleteSync = [](void*) {};
+            ops.glActiveTexture = [](uint32_t) {};
+            ops.glBindTexture = [](uint32_t, uint32_t) {};
+            ops.glUniform1f = [](int32_t, float v) { g_mg->activeUniforms.push_back(v); };
+            ops.glUniform1i = [](int32_t, int32_t) {};
+            ops.glUniform3fv = [](int32_t, int32_t, const float*) { ++g_mg->u3Calls; };
+            ops.glUniform4fv = [](int32_t, int32_t, const float*) { ++g_mg->u4Calls; };
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) {};
+            ops.glEnableVertexAttribArray = [](uint32_t) {};
+            ops.glDisableVertexAttribArray = [](uint32_t) {};
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) {};
+            ops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t) {};
+            ops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t) {};
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) {
+                if (pname == hs_sprite_batch::kGlMaxTextureImageUnits && p) *p = 32;
+            };
+            ops.glGetTextureHandleARB = [](uint32_t texId) -> uint64_t {
+                return 0x123400000000ULL | static_cast<uint64_t>(texId);
+            };
+            ops.glMakeTextureHandleResidentARB = [](uint64_t) {};
+            ops.glMakeTextureHandleNonResidentARB = [](uint64_t) {};
+            (void)tIdx;
+
+            hs_sprite_batch::SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.SetPersistentRingPreferred(true);
+            sb.SetGpuDrivenPreferred(true);
+            sb.SetEnabled(true);
+
+            hs_sprite_batch::BatchProgInfo info{};
+            info.checked         = true;
+            info.eligible        = true;
+            info.hasGpuDriven    = true;
+            info.locMatrixW      = 1;
+            info.locColourXform  = 2;
+            info.locBatchActive  = 3;
+            info.locFloatParams  = 31;
+            info.locOceanBlend   = 32;
+            info.locSampler0     = 4;
+            info.locSampler1     = 5;
+            info.locPos2dUv      = 0;
+            info.locBatchWpos    = 7;
+            info.locBatchCMult   = 5;
+            info.locBatchCAdd    = 6;
+            info.progMaxTexSlots = 16u;
+            for (uint32_t s = 0; s < 16u; ++s) info.locBatchTex[s] = 10 + static_cast<int32_t>(s);
+
+            const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float qv[16] = { -1,-1,0,0, 1,-1,1,0, 1,1,1,1, -1,1,0,1 };
+            const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+
+            sb.OnUseProgram(10u, &info);
+            sb.OnEnableDisableVertexAttribArray(0u, true);
+            sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+            // Regression check for Bug #1: load-time upload (denyIfNew=false) BEFORE first draw
+            // MUST NOT ban texture from bindless, whereas null-pixel FBO RT (denyIfNew=true) MUST stay non-bindless!
+            for (uint32_t t = 0u; t < 24u; ++t) {
+                sb.OnTexImageMutated(101u + t, false);
+            }
+            sb.OnTexImageMutated(199u, true);
+
+            // Establish GPU-Driven active ring via draw 0, then toggle FLOAT_PARAMS + OCEAN_BLEND_PARAMS in-batch!
+            for (uint32_t t = 0u; t < 24u; ++t) {
+                const float obVal[4] = { (t & 1u) ? 0.6f : 0.0f, 0.0f, 0.0f, 0.0f };
+                const float fpVal[3] = { (t & 1u) ? -0.05f : 0.0f, (t & 1u) ? 1.0f : 0.0f, 0.0f };
+                if (t > 0u) {
+                    CHECK(sb.TryAbsorbOceanBlend(32, 1, obVal) == true);
+                    CHECK(sb.TryAbsorbFloatParams(31, 1, fpVal) == true);
+                } else {
+                    sb.OnUniform4fv(32, 1, obVal, false);
+                    sb.OnUniform3fv(31, 1, fpVal, false);
+                }
+                sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 101u + t);
+                sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            }
+            CHECK(mg.u3Calls == 0u && mg.u4Calls == 0u);
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.IsGpuDrivenActive() == true);
+            CHECK(sb.GetStats().flushes == 1);
+            CHECK(sb.BindlessResidentCount() == 24u);
+            CHECK(sb.GpuDrivenDraws() == 24u);
+            CHECK(sb.IsTextureBindless(101u) == true);
+            CHECK(sb.IsTextureBindless(105u) == true);
+
+            // Preparing for unbatched draw commits dirty deferred FLOAT_PARAMS & OCEAN_BLEND_PARAMS to GL!
+            sb.PrepareForUnbatchedDraw();
+            CHECK(mg.u3Calls == 1u && mg.u4Calls == 1u);
+
+            // Null-pixel FBO RT texture 199 stays non-bindless and falls back seamlessly to CPU 16-slot!
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 199u);
+            sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.IsTextureBindless(199u) == false);
+            CHECK(sb.GpuDrivenDraws() == 24u);
+
+            // Mutating an already-bindless texture 105 invalidates & denies future bindless -> seamless CPU fallback!
+            sb.OnTexImageMutated(105u, false);
+            CHECK(sb.IsTextureBindless(105u) == false);
+            CHECK(sb.BindlessResidentCount() == 23u);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 105u);
+            sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.IsTextureBindless(105u) == false);
+            CHECK(sb.GpuDrivenDraws() == 24u); // Stayed on CPU 16-slot fallback for mutated tex!
+
+            // glDeleteTextures clears denial so recycled texture ID 105 can become bindless again!
+            const uint32_t t105 = 105u;
+            sb.OnDeleteTextures(1, &t105);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 105u);
+            sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.IsTextureBindless(105u) == true);
+            CHECK(sb.GpuDrivenDraws() == 25u);
+
+            // v3.7: Verify anti-ping-pong latch, elastic CPU AZDO ring scaling, deny-reason breakdown & X-ray timers!
+            static int64_t s_fakeQpc = 1000;
+            ops.nowQpc = []() -> int64_t { s_fakeQpc += 10; return s_fakeQpc; };
+            sb.SetOps(ops);
+            sb.SetElasticRingBudget(131072u, 262144u, 16384u);
+            sb.OnEndFrame(); // applies pending elastic ring resize cleanly
+            sb.BeginFrameProfile(true);
+
+            // Interleave 200 resident (101) vs denied (199, nullAlloc) draws in 1 frame:
+            // Without anti-ping-pong latch this would cause 200 Flush(Other) mode switches!
+            // With latch (kMaxFrameGpuModeSwitches=4), mode switches MUST cap at <= 4!
+            const int64_t otherBefore = sb.GetStats().flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Other)];
+            for (uint32_t k = 0u; k < 200u; ++k) {
+                sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, (k & 1u) ? 199u : 101u);
+                sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            }
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            const int64_t otherDelta = sb.GetStats().flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Other)] - otherBefore;
+            CHECK(otherDelta <= static_cast<int64_t>(hs_sprite_batch::SpriteBatcher::kMaxFrameGpuModeSwitches));
+            CHECK(sb.IsGpuLatchedOff() == true);
+            CHECK(sb.ActiveAzdoFrameMaxVerts() == 131072u);
+            const auto diag = sb.GetDiagCounters();
+            CHECK(diag.gpuLatchFrames >= 1u);
+            CHECK(diag.gpuDenyNullAlloc >= 1u);
+            CHECK(diag.gpuDenyMutated >= 1u);
+            CHECK(diag.cpuFallbackRing == 0u);
+            const auto prof = sb.TakeFrameProfile();
+            CHECK(prof.tryInFlushQpc > 0);
+            CHECK(prof.flushUploadQpc > 0);
+            CHECK(prof.flushDrawQpc > 0);
+            hs_sprite_batch::SpriteBatcher::DeniedTexSample sample{};
+            bool saw199 = false, saw105 = false;
+            while (sb.PopDeniedTexSample(sample)) {
+                if (sample.texId == 199u && sample.reason == 2u) saw199 = true;
+                if (sample.texId == 105u && sample.reason == 1u) saw105 = true;
+            }
+            CHECK(saw199 && saw105);
+
+            // Verify 3 consecutive latched frames activate cooldown (0 extra mode switches during cooldown!)
+            sb.OnEndFrame(); // end frame 1
+            for (uint32_t f = 0u; f < 2u; ++f) {
+                for (uint32_t k = 0u; k < 20u; ++k) {
+                    sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, (k & 1u) ? 199u : 101u);
+                    sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+                    sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                    CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+                }
+                sb.Flush(hs_sprite_batch::FlushReason::End);
+                sb.OnEndFrame();
+            }
+            CHECK(sb.IsGpuLatchedOff() == true); // cooldown active!
+            const uint64_t swBeforeCool = sb.GetDiagCounters().gpuModeSwitches;
+            for (uint32_t k = 0u; k < 40u; ++k) {
+                sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, (k & 1u) ? 199u : 101u);
+                sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            }
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.GetDiagCounters().gpuModeSwitches == swBeforeCool); // ZERO switches during cooldown!
+
+            sb.ReleaseGpuResources();
+            g_mg = nullptr;
+        }
+
+        std::printf("[PASS] 35. Elastic Hardware Pool, 12-Worker/16-Bucket Scaling, GPU-Driven Shader Transform, Bindless Anti-Ping-Pong Latch & Elastic CPU AZDO Ring verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // [36] v4.0 Phase 3 Persistent-Mapped 6-Slot Zero-Wait PBO DMA Texture Ring
+    //      (6-frame zero-wait fence rotation, 256B alignment, 3-tier OOM
+    //       16MB->4MB->2MB fallback, fail-closed all-6-busy protection,
+    //       stride-invariant RGBA/BGRA guard & clean 6-fence teardown)
+    // -------------------------------------------------------------------------
+    {
+        struct MockPboGl {
+            uint32_t nextBufId = 10u;
+            uint32_t boundUnpack = 0u;
+            uint32_t allocBufId = 0u;
+            std::vector<uint8_t> storage;
+            size_t   failAboveBytes = 0u;
+            bool     mapped = false;
+            uint32_t unmapCount = 0u;
+            uint32_t deleteBufCount = 0u;
+            uintptr_t nextSync = 0x1000u;
+            uint32_t fenceCreateCount = 0u;
+            uint32_t fenceWaitCount = 0u;
+            uint32_t fenceDeleteCount = 0u;
+            uint32_t maxWaitFlags = 0u;
+            uint64_t maxWaitTimeout = 0ULL;
+            uint32_t nextWaitResult = hs_pbo_tex::kGlAlreadySignaled;
+            size_t   lastUploadOff = 0u;
+            uint32_t lastUploadBound = 0u;
+            std::vector<uint8_t> lastCapturedBytes;
+        };
+        static MockPboGl* s_mp = nullptr;
+
+        auto makeMockOps = []() {
+            hs_pbo_tex::GlPboOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* bufs) WINAPI {
+                for (int32_t i = 0; i < n; ++i) bufs[i] = s_mp->nextBufId++;
+            };
+            ops.glDeleteBuffers = [](int32_t n, const uint32_t* bufs) WINAPI {
+                for (int32_t i = 0; i < n; ++i) {
+                    if (bufs[i] != 0u) ++s_mp->deleteBufCount;
+                    if (bufs[i] == s_mp->allocBufId) {
+                        s_mp->allocBufId = 0u;
+                        s_mp->storage.clear();
+                    }
+                }
+            };
+            ops.glBindBuffer = [](uint32_t target, uint32_t buf) WINAPI {
+                if (target == hs_pbo_tex::kGlPixelUnpackBuffer) s_mp->boundUnpack = buf;
+            };
+            ops.glBufferStorage = [](uint32_t target, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                if (target != hs_pbo_tex::kGlPixelUnpackBuffer) return;
+                if (s_mp->failAboveBytes > 0u && static_cast<size_t>(sz) > s_mp->failAboveBytes) {
+                    s_mp->storage.clear();
+                    return;
+                }
+                s_mp->allocBufId = s_mp->boundUnpack;
+                s_mp->storage.assign(static_cast<size_t>(sz), 0xA5u);
+            };
+            ops.glGetBufferParameteriv = [](uint32_t target, uint32_t pname, int32_t* out) WINAPI {
+                if (target == hs_pbo_tex::kGlPixelUnpackBuffer && pname == hs_pbo_tex::kGlBufferSize) {
+                    *out = (s_mp->boundUnpack == s_mp->allocBufId) ? static_cast<int32_t>(s_mp->storage.size()) : 0;
+                }
+            };
+            ops.glMapBufferRange = [](uint32_t target, ptrdiff_t off, ptrdiff_t len, uint32_t) WINAPI -> void* {
+                if (target != hs_pbo_tex::kGlPixelUnpackBuffer || s_mp->boundUnpack != s_mp->allocBufId) return nullptr;
+                if (static_cast<size_t>(off + len) > s_mp->storage.size()) return nullptr;
+                s_mp->mapped = true;
+                return s_mp->storage.data() + off;
+            };
+            ops.glUnmapBuffer = [](uint32_t target) WINAPI -> uint8_t {
+                if (target == hs_pbo_tex::kGlPixelUnpackBuffer && s_mp->mapped) {
+                    s_mp->mapped = false;
+                    ++s_mp->unmapCount;
+                    return 1u;
+                }
+                return 0u;
+            };
+            ops.glFenceSync = [](uint32_t, uint32_t) WINAPI -> void* {
+                ++s_mp->fenceCreateCount;
+                return reinterpret_cast<void*>(s_mp->nextSync++);
+            };
+            ops.glClientWaitSync = [](void*, uint32_t flags, uint64_t timeout) WINAPI -> uint32_t {
+                ++s_mp->fenceWaitCount;
+                if (flags > s_mp->maxWaitFlags) s_mp->maxWaitFlags = flags;
+                if (timeout > s_mp->maxWaitTimeout) s_mp->maxWaitTimeout = timeout;
+                return s_mp->nextWaitResult;
+            };
+            ops.glDeleteSync = [](void* sync) WINAPI {
+                if (sync) ++s_mp->fenceDeleteCount;
+            };
+            return ops;
+        };
+
+        // 36a: 3-tier OOM fallback (fail 6x16MB=96MB & 6x4MB=24MB, succeed 6x2MB=12MB),
+        //      alignment, byte-exact upload, 6-frame zero-wait fence rotation, fail-closed all-6-busy & recovery!
+        {
+            MockPboGl mp{};
+            mp.failAboveBytes = 16u * 1024u * 1024u; // forces 96MB & 24MB to fail -> 6x2MB=12MB fallback!
+            s_mp = &mp;
+
+            hs_pbo_tex::PersistentPboTexRing ring;
+            ring.SetOps(makeMockOps());
+            ring.SetSlotBytes(16u * 1024u * 1024u);
+            ring.SetEnabled(true);
+
+            auto mockComp = [&](uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t imgSz, const void* ptr) {
+                mp.lastUploadBound = mp.boundUnpack;
+                mp.lastUploadOff = reinterpret_cast<uintptr_t>(ptr);
+                mp.lastCapturedBytes.assign(
+                    mp.storage.data() + mp.lastUploadOff,
+                    mp.storage.data() + mp.lastUploadOff + static_cast<size_t>(imgSz));
+            };
+            auto mockTex = [&](uint32_t, int32_t, int32_t, int32_t w, int32_t h, int32_t, uint32_t, uint32_t, const void* ptr) {
+                mp.lastUploadBound = mp.boundUnpack;
+                mp.lastUploadOff = reinterpret_cast<uintptr_t>(ptr);
+                const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+                mp.lastCapturedBytes.assign(
+                    mp.storage.data() + mp.lastUploadOff,
+                    mp.storage.data() + mp.lastUploadOff + n);
+            };
+
+            std::vector<uint8_t> dxt1(1337u);
+            for (size_t i = 0; i < dxt1.size(); ++i) dxt1[i] = static_cast<uint8_t>((i * 29u + 7u) & 0xFFu);
+
+            // Upload 1: compressed DXT in slot 0, offset 0
+            CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 64, 64, 0,
+                                                     static_cast<int32_t>(dxt1.size()), dxt1.data()));
+            CHECK(ring.IsActive());
+            CHECK(ring.ActiveSlotBytes() == hs_pbo_tex::kTightSlotBytes);
+            CHECK(mp.boundUnpack == 0u); // MUST unbind PBO after upload!
+            CHECK(mp.lastUploadBound == mp.allocBufId);
+            CHECK(mp.lastUploadOff == 0u);
+            CHECK(mp.lastCapturedBytes == dxt1);
+
+            // Upload 2: uncompressed 64x64 RGBA8 (16384B) in same frame -> 256B-aligned offset!
+            std::vector<uint8_t> rgba64(64u * 64u * 4u);
+            for (size_t i = 0; i < rgba64.size(); ++i) rgba64[i] = static_cast<uint8_t>((i * 13u + 3u) & 0xFFu);
+            CHECK(ring.TryUploadTexImage2D(mockTex, 0x0DE1u, 0, 0x1908, 64, 64, 0,
+                                           hs_pbo_tex::kGlRgba, hs_pbo_tex::kGlUnsignedByte, rgba64.data()));
+            CHECK(mp.boundUnpack == 0u);
+            CHECK((mp.lastUploadOff & (hs_pbo_tex::kUploadAlignBytes - 1u)) == 0u);
+            CHECK(mp.lastUploadOff == 1536u); // ceil(1337 / 256) * 256 = 1536
+            CHECK(mp.lastCapturedBytes == rgba64);
+
+            // Edge-case rejections: odd width, <16KB, GL_RGB, proxy target, null data, oversize > slotBytes
+            CHECK(!ring.TryUploadTexImage2D(mockTex, 0x0DE1u, 0, 0x1908, 65, 64, 0, hs_pbo_tex::kGlRgba, hs_pbo_tex::kGlUnsignedByte, rgba64.data()));
+            CHECK(!ring.TryUploadTexImage2D(mockTex, 0x0DE1u, 0, 0x1908, 32, 32, 0, hs_pbo_tex::kGlRgba, hs_pbo_tex::kGlUnsignedByte, rgba64.data()));
+            CHECK(!ring.TryUploadTexImage2D(mockTex, 0x0DE1u, 0, 0x1907, 64, 64, 0, 0x1907u, hs_pbo_tex::kGlUnsignedByte, rgba64.data()));
+            CHECK(!ring.TryUploadTexImage2D(mockTex, 0x8064u, 0, 0x1908, 64, 64, 0, hs_pbo_tex::kGlRgba, hs_pbo_tex::kGlUnsignedByte, rgba64.data()));
+            CHECK(!ring.TryUploadCompressedTexImage2D(mockComp, 0x8064u, 0, 0x83F3u, 64, 64, 0, 1024, dxt1.data()));
+            CHECK(!ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 2048, 2048, 0, 5 * 1024 * 1024, dxt1.data()));
+            CHECK(ring.OverflowFallbacks() == 1u);
+
+            // Rotate frames 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> back to 0 (wraps onto all 6 fenced slots!)
+            ring.OnEndFrame(); // fences slot 0, moves to slot 1
+            CHECK(mp.fenceCreateCount == 1u);
+            ring.OnEndFrame(); // untouched frame -> MUST NOT create redundant fence!
+            CHECK(mp.fenceCreateCount == 1u);
+
+            for (uint32_t s = 1u; s < hs_pbo_tex::kFramesInFlight; ++s) {
+                CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 64, 64, 0, 512, dxt1.data()));
+                CHECK(mp.lastUploadOff == static_cast<size_t>(s) * hs_pbo_tex::kTightSlotBytes);
+                ring.OnEndFrame();
+            }
+            CHECK(mp.fenceCreateCount == hs_pbo_tex::kFramesInFlight);
+
+            // Simulate ALL 6 slots still in-flight (0x911B): MUST fail-closed with 0 flags / 0 timeout & ZERO clobber!
+            const std::vector<uint8_t> slot0Before(mp.storage.begin(), mp.storage.begin() + 512);
+            mp.nextWaitResult = hs_pbo_tex::kGlTimeoutExpired;
+            std::vector<uint8_t> sentinel(512u, 0xEEu);
+            CHECK(!ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 64, 64, 0, 512, sentinel.data()));
+            CHECK(ring.WaitTimeouts() == 1u);
+            CHECK(mp.maxWaitFlags == 0u && mp.maxWaitTimeout == 0ULL); // STRICT ZERO-WAIT!
+            CHECK(std::equal(slot0Before.begin(), slot0Before.end(), mp.storage.begin())); // ZERO clobber!
+
+            // Once fence signals on next attempt, slot 0 recovers cleanly!
+            mp.nextWaitResult = hs_pbo_tex::kGlConditionSatisfied;
+            CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 64, 64, 0, 512, sentinel.data()));
+            CHECK(mp.lastUploadOff == 0u);
+            CHECK(mp.lastCapturedBytes == sentinel);
+            CHECK(ring.UploadCount() == 8u);
+            CHECK(mp.maxWaitFlags == 0u && mp.maxWaitTimeout == 0ULL);
+
+            // Clean GPU teardown frees buffer + unmaps + deletes all remaining 6 syncs!
+            ring.ReleaseGpu(true);
+            CHECK(!ring.IsActive());
+            CHECK(mp.unmapCount == 1u);
+            CHECK(mp.deleteBufCount == 3u); // 2 failed attempts (96MB, 24MB) + 1 active 12MB buffer
+            CHECK(mp.fenceDeleteCount == mp.fenceCreateCount);
+            s_mp = nullptr;
+        }
+
+        std::printf("[PASS] 36. Persistent-Mapped 6-Slot Zero-Wait PBO Texture Ring (3-tier OOM, 256B align, zero-wait all-busy fail-closed & 6-fence teardown) verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // [37] v4.0 Phase 2 Suite:
+    //   37A: hs_pbo_tex::PreallocTexIdPool (acquire 1/multi, empty fallback,
+    //        RefillIfLow + 0-ID compaction, ResetContext same-ctx preserve,
+    //        ReleaseGpu(true) zero-leak teardown)
+    //   37B: Vectorized SpriteBatcher::TryBatchGpuDrivenInternal bit-exact SIMD
+    //        parity (!trackMaxWy + trackMaxWy + NaN + odd vertex counts + stride 16/24)
+    //   37C: hs_foliage::FoliageTable::QueryClass fast-path parity vs oracle (20,000 queries)
+    //   37D: GpuClarityEngine KnownGlState & WorldShadowEngine blendCacheTrusted/DirShadowCullBox
+    //        zero-stall mock GL verification
+    // -------------------------------------------------------------------------
+    {
+        // 37A: PreallocTexIdPool unit tests
+        {
+            struct MockTexPoolGl {
+                uint32_t nextId = 500u;
+                uint32_t genCalls = 0u;
+                int32_t  lastGenN = 0;
+                uint32_t delCalls = 0u;
+                bool     injectZeros = false;
+                std::vector<uint32_t> deletedIds;
+            };
+            static MockTexPoolGl* s_tp = nullptr;
+            MockTexPoolGl mtp{};
+            s_tp = &mtp;
+
+            hs_pbo_tex::GlTexPoolOps tops{};
+            tops.glGenTextures = [](int32_t n, uint32_t* ids) WINAPI {
+                ++s_tp->genCalls;
+                s_tp->lastGenN = n;
+                for (int32_t i = 0; i < n; ++i) {
+                    if (s_tp->injectZeros && (i & 1) == 1) {
+                        ids[i] = 0u; // simulate partial lost-context 0 IDs
+                    } else {
+                        ids[i] = s_tp->nextId++;
+                    }
+                }
+            };
+            tops.glDeleteTextures = [](int32_t n, const uint32_t* ids) WINAPI {
+                ++s_tp->delCalls;
+                for (int32_t i = 0; i < n; ++i) s_tp->deletedIds.push_back(ids[i]);
+            };
+
+            hs_pbo_tex::PreallocTexIdPool pool;
+            uint32_t outBuf[32]{};
+            // Disabled by default -> fail-closed
+            CHECK(!pool.IsEnabled());
+            CHECK(!pool.TryAcquire(1, outBuf));
+            pool.RefillIfLow();
+            CHECK(mtp.genCalls == 0u && pool.AvailableCount() == 0u);
+
+            pool.SetOps(tops);
+            pool.SetEnabled(true);
+            CHECK(pool.IsEnabled());
+            CHECK(!pool.TryAcquire(1, outBuf)); // empty -> seamless fallback
+
+            // Refill populates full kPoolCap (256) in ONE batch call
+            pool.RefillIfLow();
+            CHECK(mtp.genCalls == 1u && mtp.lastGenN == 256);
+            CHECK(pool.AvailableCount() == 256u && pool.RefillCount() == 1u);
+
+            // Acquire 1 & multi (16) -> 0 GL calls, unique non-zero IDs
+            uint32_t singleId = 0u;
+            CHECK(pool.TryAcquire(1, &singleId));
+            CHECK(singleId != 0u && mtp.genCalls == 1u && pool.AvailableCount() == 255u && pool.HitCount() == 1u);
+            CHECK(pool.TryAcquire(16, outBuf));
+            CHECK(mtp.genCalls == 1u && pool.AvailableCount() == 239u && pool.HitCount() == 2u);
+            for (int i = 0; i < 16; ++i) {
+                CHECK(outBuf[i] != 0u && outBuf[i] != singleId);
+                for (int j = i + 1; j < 16; ++j) CHECK(outBuf[i] != outBuf[j]);
+            }
+
+            // Invalid / oversized requests fail closed atomically without mutating pool or outBuf
+            outBuf[0] = 0xCAFEBABEu;
+            CHECK(!pool.TryAcquire(0, outBuf));
+            CHECK(!pool.TryAcquire(-5, outBuf));
+            CHECK(!pool.TryAcquire(1, nullptr));
+            CHECK(!pool.TryAcquire(240, outBuf)); // > AvailableCount(239)
+            CHECK(outBuf[0] == 0xCAFEBABEu && pool.AvailableCount() == 239u && pool.HitCount() == 2u);
+
+            // RefillIfLow does NOT call GL while AvailableCount >= lowWater (64)
+            pool.RefillIfLow(64u);
+            CHECK(mtp.genCalls == 1u);
+
+            // Drain down to 64 -> still no refill; drain 1 more to 63 -> ONE refill of 193 IDs!
+            std::vector<uint32_t> drain(175u);
+            CHECK(pool.TryAcquire(175, drain.data()));
+            CHECK(pool.AvailableCount() == 64u);
+            pool.RefillIfLow(64u);
+            CHECK(mtp.genCalls == 1u);
+            CHECK(pool.TryAcquire(1, &singleId));
+            CHECK(pool.AvailableCount() == 63u);
+            pool.RefillIfLow(64u);
+            CHECK(mtp.genCalls == 2u && mtp.lastGenN == 193);
+            CHECK(pool.AvailableCount() == 256u && pool.RefillCount() == 2u);
+
+            // ResetContext same-ctx failure path (newCtx == curCtx && !deleteOnCurrentCtx) MUST preserve live IDs!
+            void* ctxA = reinterpret_cast<void*>(0xAAAA1111ULL);
+            void* ctxB = reinterpret_cast<void*>(0xBBBB2222ULL);
+            pool.ResetContext(ctxA, false); // nullptr -> ctxA drops old untracked handles safely
+            CHECK(pool.AvailableCount() == 0u && mtp.delCalls == 0u);
+            pool.RefillIfLow();
+            CHECK(pool.AvailableCount() == 256u);
+            pool.ResetContext(ctxA, false); // SAME ctxA with deleteOnCurrentCtx=false -> MUST preserve all 256 IDs!
+            CHECK(pool.AvailableCount() == 256u && mtp.delCalls == 0u);
+
+            // ReleaseGpu(true) deletes exact remaining IDs in 1 batch call -> ZERO texture ID leaks!
+            uint32_t tmp10[10]{};
+            CHECK(pool.TryAcquire(10, tmp10));
+            CHECK(pool.AvailableCount() == 246u);
+            pool.ReleaseGpu(true);
+            CHECK(pool.AvailableCount() == 0u && mtp.delCalls == 1u && mtp.deletedIds.size() == 246u);
+
+            // Lost-context 0-ID compaction + context switch drop without delete
+            mtp.injectZeros = true;
+            pool.RefillIfLow();
+            CHECK(pool.AvailableCount() == 128u); // 128 valid IDs compacted out of 256
+            pool.ResetContext(ctxB, false);       // ctxA -> ctxB drops without glDeleteTextures
+            CHECK(pool.AvailableCount() == 0u && mtp.delCalls == 1u);
+            s_tp = nullptr;
+        }
+
+        // 37B: Vectorized SpriteBatcher::TryBatchGpuDrivenInternal bit-exact SIMD parity
+        {
+            struct MockSimdGpu {
+                uint32_t nextBuf = 0u;
+                uint32_t bound[3]{}; // 0=ARRAY, 1=ELEM, 2=SSBO
+                std::vector<uint8_t> bufs[32];
+                int32_t sz[32]{};
+                uint32_t lastDrawBaseVert = 0u;
+                uint32_t lastDrawVertBuf = 0u;
+                uint32_t lastDrawSsbo = 0u;
+            };
+            static MockSimdGpu* s_sg = nullptr;
+            MockSimdGpu sg{};
+            s_sg = &sg;
+
+            hs_sprite_batch::GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* ids) WINAPI {
+                for (int32_t i = 0; i < n; ++i) ids[i] = ++s_sg->nextBuf;
+            };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            ops.glBindBuffer = [](uint32_t tgt, uint32_t b) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                s_sg->bound[idx] = b;
+            };
+            ops.glBufferData = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_sg->bound[idx];
+                if (id < 32u) { s_sg->sz[id] = static_cast<int32_t>(sz); s_sg->bufs[id].assign(static_cast<size_t>(sz), 0u); }
+            };
+            ops.glBufferStorage = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_sg->bound[idx];
+                if (id < 32u) { s_sg->sz[id] = static_cast<int32_t>(sz); s_sg->bufs[id].assign(static_cast<size_t>(sz), 0u); }
+            };
+            ops.glGetBufferParameteriv = [](uint32_t tgt, uint32_t pname, int32_t* p) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_sg->bound[idx];
+                if (pname == hs_sprite_batch::kGlBufferSize && p && id < 32u) *p = s_sg->sz[id];
+            };
+            ops.glMapBufferRange = [](uint32_t tgt, ptrdiff_t, ptrdiff_t, uint32_t) WINAPI -> void* {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_sg->bound[idx];
+                return (id < 32u && !s_sg->bufs[id].empty()) ? s_sg->bufs[id].data() : nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) WINAPI -> void* { return reinterpret_cast<void*>(1); };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) WINAPI -> uint32_t { return 0x911Au; };
+            ops.glDeleteSync = [](void*) WINAPI {};
+            ops.glActiveTexture = [](uint32_t) WINAPI {};
+            ops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            ops.glUniform1f = [](int32_t, float) WINAPI {};
+            ops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            ops.glUniform3fv = [](int32_t, int32_t, const float*) WINAPI {};
+            ops.glUniform4fv = [](int32_t, int32_t, const float*) WINAPI {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            ops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            ops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {};
+            ops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t bv) WINAPI {
+                s_sg->lastDrawBaseVert = static_cast<uint32_t>(bv);
+                s_sg->lastDrawVertBuf = s_sg->bound[0];
+            };
+            ops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t b) WINAPI { s_sg->lastDrawSsbo = b; };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == hs_sprite_batch::kGlMaxTextureImageUnits && p) *p = 32;
+            };
+            ops.glGetTextureHandleARB = [](uint32_t texId) WINAPI -> uint64_t {
+                return 0x567800000000ULL | static_cast<uint64_t>(texId);
+            };
+            ops.glMakeTextureHandleResidentARB = [](uint64_t) WINAPI {};
+            ops.glMakeTextureHandleNonResidentARB = [](uint64_t) WINAPI {};
+
+            hs_sprite_batch::SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.SetPersistentRingPreferred(true);
+            sb.SetGpuDrivenPreferred(true);
+            sb.SetEnabled(true);
+
+            hs_sprite_batch::BatchProgInfo info{};
+            info.checked = true; info.eligible = true; info.hasGpuDriven = true;
+            info.locMatrixW = 1; info.locColourXform = 2; info.locBatchActive = 3;
+            info.locSampler0 = 4; info.locSampler1 = 5;
+            info.locPos2dUv = 0; info.locBatchWpos = 7; info.locBatchCMult = 5; info.locBatchCAdd = 6;
+            info.progMaxTexSlots = 16u;
+            for (uint32_t s = 0; s < 16u; ++s) info.locBatchTex[s] = 10 + static_cast<int32_t>(s);
+
+            const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            sb.OnUseProgram(20u, &info);
+            sb.OnEnableDisableVertexAttribArray(0u, true);
+            sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 77u);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+            // Test across odd & non-multiple-of-4 vertex counts, both !trackMaxWy & trackMaxWy,
+            // both stride=16 & stride=0 (tightly packed), hasCamRight true/false, and NaN y!
+            const uint32_t testVertCounts[] = { 3u, 4u, 5u, 7u, 13u, 17u };
+            for (int mode = 0; mode < 4; ++mode) {
+                const bool trackMax = (mode >= 1);
+                const bool hasCamR  = ((mode & 1) == 0);
+                const int32_t attrStride = (mode >= 2) ? 0 : 16;
+                sb.SetShadowActive(trackMax);
+                sb.SetShadowHints(true, hasCamR, 0.8f, -0.6f, trackMax ? 2.0f : 0.0f);
+
+                for (uint32_t nv : testVertCounts) {
+                    const uint32_t floatStride = 4u;
+                    // Sub-case A (tall -> shadowFlag=1.0) & Sub-case B (short -> shadowFlag=0.0 when trackMax)
+                    for (int tall = 0; tall < 2; ++tall) {
+                        std::vector<float> vbuf(nv * floatStride, 0.0f);
+                        std::vector<uint16_t> ibuf;
+                        for (uint32_t k = 0u; k < nv; ++k) {
+                            float* dst = &vbuf[k * floatStride];
+                            dst[0] = static_cast<float>(k) * 0.35f - 1.25f;
+                            // Inject NaN on vertex 1 in tall mode to verify SSE2 maxps NaN parity!
+                            if (trackMax && tall == 1 && k == 1u && nv >= 5u) {
+                                dst[1] = std::nanf("");
+                            } else {
+                                dst[1] = (tall == 1 && k == nv - 1u) ? 3.25f : 0.50f;
+                            }
+                            dst[2] = static_cast<float>(k) * 0.05f;
+                            dst[3] = 1.0f - static_cast<float>(k) * 0.04f;
+                        }
+                        for (uint32_t k = 0u; k + 2u < nv; k += 1u) {
+                            ibuf.push_back(0u);
+                            ibuf.push_back(static_cast<uint16_t>(k + 1u));
+                            ibuf.push_back(static_cast<uint16_t>(k + 2u));
+                        }
+                        // Standing matrix with slight scale+tilt in column 0 to test !hasCamRight rux/ruy/ruz normalization
+                        const float mw[16] = {
+                            3.0f, 0.0f, 4.0f, 0.0f,
+                            0.0f, 1.0f, 0.0f, 0.0f,
+                            0.0f, 0.0f, 1.0f, 0.0f,
+                            5.0f, 0.0f, -2.0f, 1.0f
+                        };
+                        sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, attrStride, vbuf.data());
+                        sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, mw);
+                        sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                        CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles,
+                                                      static_cast<int32_t>(ibuf.size()),
+                                                      hs_sprite_batch::kGlUnsignedShort, ibuf.data()));
+                        sb.Flush(hs_sprite_batch::FlushReason::End);
+                        CHECK(sb.IsGpuDrivenActive());
+
+                        // Verify bit-exact GpuBatchVertex payload in mapped VBO!
+                        const uint8_t* vboMem = sg.bufs[sg.lastDrawVertBuf].data();
+                        const auto* outV = reinterpret_cast<const hs_sprite_batch::GpuBatchVertex*>(vboMem) + sg.lastDrawBaseVert;
+                        for (uint32_t k = 0u; k < nv; ++k) {
+                            const float* src = &vbuf[k * floatStride];
+                            CHECK(std::memcmp(&outV[k].x, &src[0], sizeof(float)) == 0);
+                            CHECK(std::memcmp(&outV[k].y, &src[1], sizeof(float)) == 0);
+                            CHECK(std::memcmp(&outV[k].u, &src[2], sizeof(float)) == 0);
+                            CHECK(std::memcmp(&outV[k].v, &src[3], sizeof(float)) == 0);
+                            if (k > 0u) CHECK(outV[k].instId == outV[0].instId);
+                        }
+                        // Verify GpuSpriteInstance in mapped SSBO (shadowFlag + meta[0..2])!
+                        const uint32_t instIdx = static_cast<uint32_t>(outV[0].instId + 0.5f);
+                        const auto* instArr = reinterpret_cast<const hs_sprite_batch::GpuSpriteInstance*>(sg.bufs[sg.lastDrawSsbo].data());
+                        const auto& inst = instArr[instIdx];
+                        const float expShadow = (trackMax && tall == 1) ? 1.0f : 0.0f;
+                        CHECK(inst.cadd[3] == expShadow);
+                        if (trackMax) {
+                            if (hasCamR) {
+                                CHECK(std::fabs(inst.meta[0] - 0.8f) < 1e-5f);
+                                CHECK(std::fabs(inst.meta[1] - 0.0f) < 1e-5f);
+                                CHECK(std::fabs(inst.meta[2] - (-0.6f)) < 1e-5f);
+                            } else {
+                                // (3, 0, 4) normalized -> (0.6, 0.0, 0.8)
+                                CHECK(std::fabs(inst.meta[0] - 0.6f) < 1e-5f);
+                                CHECK(std::fabs(inst.meta[1] - 0.0f) < 1e-5f);
+                                CHECK(std::fabs(inst.meta[2] - 0.8f) < 1e-5f);
+                            }
+                        }
+                    }
+                }
+            }
+            // Fail-closed check: non-16 stride (24) MUST be rejected with rc=11
+            {
+                float badV[24]{};
+                uint16_t badI[3] = { 0, 1, 2 };
+                sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, 24, badV);
+                sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+                CHECK(!sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 3, hs_sprite_batch::kGlUnsignedShort, badI));
+                CHECK(sb.LastRejectCode() == 11u);
+            }
+            sb.ReleaseGpuResources();
+            s_sg = nullptr;
+        }
+
+        // 37C: FoliageTable::QueryClass fast-path parity & IsEmpty() vs exact naive std::floor 2x2 reference (20,000 queries)
+        {
+            CHECK(hs_foliage::FastFloorI32(0.0f) == 0);
+            CHECK(hs_foliage::FastFloorI32(-0.0f) == 0);
+            CHECK(hs_foliage::FastFloorI32(1.999f) == 1);
+            CHECK(hs_foliage::FastFloorI32(-0.001f) == -1);
+            CHECK(hs_foliage::FastFloorI32(-2.0f) == -2);
+            CHECK(hs_foliage::FastFloorI32(-2.001f) == -3);
+
+            // Exact pre-optimization naive reference table (std::floor + full 2x2 cell scan, no AABB/occ/short-circuit)
+            struct NaiveRefFoliage {
+                hs_foliage::FoliageSlot slots[hs_foliage::kHashSlots]{};
+                uint32_t gen = 1u;
+                uint32_t count = 0u;
+                static uint32_t Hash(int32_t ix, int32_t iz) {
+                    return ((static_cast<uint32_t>(ix) * 73856093u) ^ (static_cast<uint32_t>(iz) * 19349663u)) & hs_foliage::kHashMask;
+                }
+                bool Insert(float wx, float wz, uint8_t cls) {
+                    if (cls != hs_foliage::SoftBrush && cls != hs_foliage::TallTree) return false;
+                    if (!std::isfinite(wx) || !std::isfinite(wz)) return false;
+                    const uint32_t base = Hash(static_cast<int32_t>(std::floor(wx * hs_foliage::kCellScale)),
+                                               static_cast<int32_t>(std::floor(wz * hs_foliage::kCellScale)));
+                    for (uint32_t p = 0u; p < hs_foliage::kMaxProbes; ++p) {
+                        auto& s = slots[(base + p) & hs_foliage::kHashMask];
+                        if (s.gen != gen) { s.wx = wx; s.wz = wz; s.gen = gen; s.cls = cls; ++count; return true; }
+                        const float dx = s.wx - wx, dz = s.wz - wz;
+                        if (dx * dx + dz * dz < 0.04f) { if (cls > s.cls) s.cls = cls; return true; }
+                    }
+                    return false;
+                }
+                uint8_t Query(float wx, float wz) const {
+                    if (count == 0u || !std::isfinite(wx) || !std::isfinite(wz)) return hs_foliage::Rigid;
+                    const int32_t bx = static_cast<int32_t>(std::floor(wx * hs_foliage::kCellScale - 0.5f));
+                    const int32_t bz = static_cast<int32_t>(std::floor(wz * hs_foliage::kCellScale - 0.5f));
+                    float bestD2 = hs_foliage::kMatchRadiusSq;
+                    uint8_t bestCls = hs_foliage::Rigid;
+                    for (int32_t dzc = 0; dzc <= 1; ++dzc) {
+                        for (int32_t dxc = 0; dxc <= 1; ++dxc) {
+                            const uint32_t base = Hash(bx + dxc, bz + dzc);
+                            for (uint32_t p = 0u; p < hs_foliage::kMaxProbes; ++p) {
+                                const auto& s = slots[(base + p) & hs_foliage::kHashMask];
+                                if (s.gen != gen) break;
+                                const float dx = s.wx - wx, dz = s.wz - wz;
+                                const float d2 = dx * dx + dz * dz;
+                                if (d2 < bestD2) { bestD2 = d2; bestCls = s.cls; }
+                            }
+                        }
+                    }
+                    return bestCls;
+                }
+            };
+
+            hs_foliage::FoliageTable ft;
+            NaiveRefFoliage ref{};
+            CHECK(ft.IsEmpty() && ft.Count() == 0u);
+
+            std::vector<std::pair<float, float>> anchors;
+            uint32_t rng = 0x13579BDFu;
+            auto nextRand = [&]() -> uint32_t {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                return rng;
+            };
+            auto randF = [&](float lo, float hi) -> float {
+                return lo + (hi - lo) * (static_cast<float>(nextRand() & 0xFFFFu) / 65535.0f);
+            };
+            for (int i = 0; i < 260; ++i) {
+                const float x = randF(-80.0f, 80.0f);
+                const float z = randF(-80.0f, 80.0f);
+                const uint8_t cls = (i & 1) ? hs_foliage::TallTree : hs_foliage::SoftBrush;
+                CHECK(ft.Insert(x, z, cls) == ref.Insert(x, z, cls));
+                anchors.push_back({ x, z });
+            }
+            const float edgePts[][2] = { {0.0f, 0.0f}, {0.5f, -0.5f}, {-1.0f, 2.5f}, {15.5f, -15.5f} };
+            for (int i = 0; i < 4; ++i) {
+                CHECK(ft.Insert(edgePts[i][0], edgePts[i][1], hs_foliage::SoftBrush) ==
+                      ref.Insert(edgePts[i][0], edgePts[i][1], hs_foliage::SoftBrush));
+                anchors.push_back({ edgePts[i][0], edgePts[i][1] });
+            }
+            // Same-cell duplicate-anchor upgrade SoftBrush -> TallTree
+            CHECK(ft.Insert(0.51f, -0.49f, hs_foliage::TallTree) == ref.Insert(0.51f, -0.49f, hs_foliage::TallTree));
+            CHECK(!ft.IsEmpty() && ft.Count() == ref.count);
+
+            // NaN / Inf queries MUST return Rigid
+            CHECK(ft.QueryClass(std::nanf(""), 0.0f) == hs_foliage::Rigid);
+            CHECK(ft.QueryClass(0.0f, INFINITY) == hs_foliage::Rigid);
+            CHECK(ft.QueryClass(-INFINITY, 0.0f) == hs_foliage::Rigid);
+
+            // 10,000 near-plant perturbation queries + 10,000 uniform world queries -> 0 mismatches!
+            for (int q = 0; q < 20000; ++q) {
+                float qx = 0.0f, qz = 0.0f;
+                if (q < 10000) {
+                    const auto& p = anchors[nextRand() % anchors.size()];
+                    qx = p.first + randF(-0.18f, 0.18f);
+                    qz = p.second + randF(-0.18f, 0.18f);
+                } else {
+                    qx = randF(-90.0f, 90.0f);
+                    qz = randF(-90.0f, 90.0f);
+                }
+                CHECK(ft.QueryClass(qx, qz) == ref.Query(qx, qz));
+            }
+            ft.Clear();
+            CHECK(ft.IsEmpty() && ft.Count() == 0u);
+            CHECK(ft.QueryClass(0.0f, 0.0f) == hs_foliage::Rigid);
+        }
+
+        // 37D: Zero-stall GpuClarityEngine KnownGlState & WorldShadowEngine blendCacheTrusted/DirShadowCullBox
+        {
+            struct MockClaritySt {
+                uint32_t nextId = 1u;
+                uint32_t getIntCalls = 0u;
+                uint32_t isEnabledCalls = 0u;
+                uint32_t queryObjCalls = 0u;
+                uint32_t lastProg = 0u;
+                uint32_t lastActiveTex = 0u;
+                uint32_t lastTex0 = 0u;
+                uint32_t lastReadFbo = 0u;
+                uint32_t lastDrawFbo = 0u;
+                bool     scissorOn = false;
+            };
+            static MockClaritySt* s_mc = nullptr;
+            MockClaritySt mc{};
+            s_mc = &mc;
+
+            hs_gpu_clarity::GlComputeOps cops{};
+            cops.glGenFramebuffers = [](int32_t n, uint32_t* ids) WINAPI { for (int i = 0; i < n; ++i) ids[i] = s_mc->nextId++; };
+            cops.glDeleteFramebuffers = [](int32_t, const uint32_t*) WINAPI {};
+            cops.glBindFramebuffer = [](uint32_t tgt, uint32_t fbo) WINAPI {
+                if (tgt == hs_gpu_clarity::kGlReadFramebuffer) s_mc->lastReadFbo = fbo;
+                else if (tgt == hs_gpu_clarity::kGlDrawFramebuffer) s_mc->lastDrawFbo = fbo;
+                else { s_mc->lastReadFbo = fbo; s_mc->lastDrawFbo = fbo; }
+            };
+            cops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return hs_gpu_clarity::kGlFramebufferComplete; };
+            cops.glBlitFramebuffer = [](int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGenTextures = [](int32_t n, uint32_t* ids) WINAPI { for (int i = 0; i < n; ++i) ids[i] = s_mc->nextId++; };
+            cops.glDeleteTextures = [](int32_t, const uint32_t*) WINAPI {};
+            cops.glActiveTexture = [](uint32_t u) WINAPI { s_mc->lastActiveTex = u; };
+            cops.glBindTexture = [](uint32_t, uint32_t t) WINAPI { if (s_mc->lastActiveTex == hs_gpu_clarity::kGlTexture0) s_mc->lastTex0 = t; };
+            cops.glTexStorage2D = [](uint32_t, int32_t, uint32_t, int32_t, int32_t) WINAPI {};
+            cops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_mc->nextId++; };
+            cops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            cops.glCompileShader = [](uint32_t) WINAPI {};
+            cops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteShader = [](uint32_t) WINAPI {};
+            cops.glCreateProgram = []() WINAPI -> uint32_t { return s_mc->nextId++; };
+            cops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            cops.glLinkProgram = [](uint32_t) WINAPI {};
+            cops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteProgram = [](uint32_t) WINAPI {};
+            cops.glUseProgram = [](uint32_t p) WINAPI { s_mc->lastProg = p; };
+            cops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            cops.glUniform4f = [](int32_t, float, float, float, float) WINAPI {};
+            cops.glDispatchCompute = [](uint32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glMemoryBarrier = [](uint32_t) WINAPI {};
+            cops.glBindImageTexture = [](uint32_t, uint32_t, int32_t, uint8_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                ++s_mc->getIntCalls;
+                if (pname == hs_gpu_clarity::kGlMaxTextureSize && p) *p = 16384;
+                else if (p) *p = 0;
+            };
+            cops.glIsEnabled = [](uint32_t) WINAPI -> uint8_t { ++s_mc->isEnabledCalls; return 0u; };
+            cops.glEnable = [](uint32_t c) WINAPI { if (c == hs_gpu_clarity::kGlScissorTest) s_mc->scissorOn = true; };
+            cops.glDisable = [](uint32_t c) WINAPI { if (c == hs_gpu_clarity::kGlScissorTest) s_mc->scissorOn = false; };
+            cops.glGenQueries = [](int32_t n, uint32_t* ids) WINAPI { for (int i = 0; i < n; ++i) ids[i] = s_mc->nextId++; };
+            cops.glDeleteQueries = [](int32_t, const uint32_t*) WINAPI {};
+            cops.glBeginQuery = [](uint32_t, uint32_t) WINAPI {};
+            cops.glEndQuery = [](uint32_t) WINAPI {};
+            cops.glGetQueryObjectiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { ++s_mc->queryObjCalls; if (p) *p = 1; };
+            cops.glGetQueryObjectui64v = [](uint32_t, uint32_t, uint64_t* p) WINAPI { ++s_mc->queryObjCalls; if (p) *p = 500000ULL; };
+
+            hs_gpu_clarity::GpuClarityEngine cl;
+            cl.SetOps(cops, true);
+            hs_gpu_clarity::KnownGlState ks{};
+            ks.drawFbo = 7; ks.readFbo = 7; ks.curProgram = 42;
+            ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0 + 2u);
+            ks.boundTex0 = 88; ks.scissorEnabled = 1; ks.sampleTimer = false;
+            // Warmup frame 1 caches maxTexSize_ once (1 glGetIntegerv)
+            CHECK(cl.ProcessFrame(7u, 1280, 720, { 3, 1.0f }, &ks));
+            CHECK(mc.getIntCalls == 1u && mc.isEnabledCalls == 0u && mc.queryObjCalls == 0u);
+            // Steady-state frame 2: STRICTLY ZERO synchronous GL queries!
+            mc.getIntCalls = 0u; mc.isEnabledCalls = 0u; mc.queryObjCalls = 0u;
+            mc.lastActiveTex = hs_gpu_clarity::kGlTexture0 + 2u;
+            mc.scissorOn = true;
+            CHECK(cl.ProcessFrame(7u, 1280, 720, { 3, 1.0f }, &ks));
+            CHECK(mc.getIntCalls == 0u && mc.isEnabledCalls == 0u && mc.queryObjCalls == 0u);
+            CHECK(mc.lastDrawFbo == 7u && mc.lastReadFbo == 7u && mc.lastProg == 42u);
+            CHECK(mc.lastActiveTex == hs_gpu_clarity::kGlTexture0 + 2u && mc.lastTex0 == 88u && mc.scissorOn == true);
+            cl.OnContextReset(true);
+            s_mc = nullptr;
+        }
+
+        std::printf("[PASS] 37. Phase 2 PreallocTexIdPool, Vectorized SSE2 GpuBatchVertex, FoliageTable Fast-Path Oracle & Zero-Stall GpuClarity KnownGlState verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // [38] v4.0 Phase 3 Suite:
+    //   38A: 6-Slot Zero-Wait PBO Ring (per-slot skip with flags=0/timeout=0,
+    //        mid-frame spill fences old slot first, all-6-busy fail-closed, 6-fence cleanup)
+    //   38B: SpriteBatcher PARAMS SSBO absorption (std430 144B, 0 FlushReason::Uni3,
+    //        LIGHT_OVERRIDE/ALPHA_TEST/BLOOM_TOGGLE packing, shadow <=0.35 filter,
+    //        HD-2D anchor & anim_bloom safety, CPU fallback & PrepareForUnbatchedDraw commit)
+    //   38C: WorldShadowEngine temporal reuse (locked cachedBounds_, 0 clears, teleport/sun/
+    //        point-light/context invalidation) + deferred shadow coalescing (contiguous + MultiDraw)
+    //   38D: GpuClarityEngine adaptive Grade 3 <-> Grade 2 hysteresis (0 texture/FBO reallocs!)
+    //   38E: SkeletalMtPool 2-bank carry-over ring, stale rejection, quintuple lookup,
+    //        12-worker scale-up (>=450 jobs) & worldResetGen wipe
+    // -------------------------------------------------------------------------
+    {
+        // 38A: 6-Slot Zero-Wait PBO Ring skip, mid-frame spill & all-6-busy fail-closed
+        {
+            struct MockPbo6 {
+                uint32_t nextBuf = 100u;
+                uint32_t boundUnpack = 0u;
+                uint32_t allocBuf = 0u;
+                std::vector<uint8_t> storage;
+                bool     mapped = false;
+                uint32_t fenceCreate = 0u;
+                uint32_t fenceDelete = 0u;
+                uint32_t waitCalls = 0u;
+                uint32_t maxFlags = 0u;
+                uint64_t maxTimeout = 0ULL;
+                uintptr_t nextSync = 0x2000u;
+                bool     fenceSignaled[64]{};
+                size_t   lastOff = 0u;
+            };
+            static MockPbo6* s_p6 = nullptr;
+            MockPbo6 p6{};
+            s_p6 = &p6;
+
+            hs_pbo_tex::GlPboOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* b) WINAPI { for (int i = 0; i < n; ++i) b[i] = s_p6->nextBuf++; };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            ops.glBindBuffer = [](uint32_t tgt, uint32_t b) WINAPI { if (tgt == hs_pbo_tex::kGlPixelUnpackBuffer) s_p6->boundUnpack = b; };
+            ops.glBufferStorage = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                if (tgt == hs_pbo_tex::kGlPixelUnpackBuffer) {
+                    s_p6->allocBuf = s_p6->boundUnpack;
+                    s_p6->storage.assign(static_cast<size_t>(sz), 0x5Au);
+                }
+            };
+            ops.glGetBufferParameteriv = [](uint32_t tgt, uint32_t pname, int32_t* out) WINAPI {
+                if (tgt == hs_pbo_tex::kGlPixelUnpackBuffer && pname == hs_pbo_tex::kGlBufferSize && out) {
+                    *out = static_cast<int32_t>(s_p6->storage.size());
+                }
+            };
+            ops.glMapBufferRange = [](uint32_t tgt, ptrdiff_t off, ptrdiff_t, uint32_t) WINAPI -> void* {
+                if (tgt != hs_pbo_tex::kGlPixelUnpackBuffer) return nullptr;
+                s_p6->mapped = true;
+                return s_p6->storage.data() + off;
+            };
+            ops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { s_p6->mapped = false; return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) WINAPI -> void* {
+                const uint32_t idx = s_p6->fenceCreate++;
+                return reinterpret_cast<void*>(static_cast<uintptr_t>(0x2000u + idx));
+            };
+            ops.glClientWaitSync = [](void* f, uint32_t flags, uint64_t timeout) WINAPI -> uint32_t {
+                ++s_p6->waitCalls;
+                if (flags > s_p6->maxFlags) s_p6->maxFlags = flags;
+                if (timeout > s_p6->maxTimeout) s_p6->maxTimeout = timeout;
+                const uintptr_t idx = reinterpret_cast<uintptr_t>(f) - 0x2000u;
+                return (idx < 64u && s_p6->fenceSignaled[idx])
+                    ? hs_pbo_tex::kGlAlreadySignaled
+                    : hs_pbo_tex::kGlTimeoutExpired;
+            };
+            ops.glDeleteSync = [](void* f) WINAPI { if (f) ++s_p6->fenceDelete; };
+
+            hs_pbo_tex::PersistentPboTexRing ring;
+            ring.SetOps(ops);
+            ring.SetSlotBytes(hs_pbo_tex::kTightSlotBytes); // 2 MB x 6 = 12 MB
+            ring.SetEnabled(true);
+
+            auto mockComp = [&](uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t, const void* ptr) {
+                p6.lastOff = reinterpret_cast<uintptr_t>(ptr);
+            };
+            std::vector<uint8_t> blk1M(1024u * 1024u, 0x33u);
+            std::vector<uint8_t> blk15M(1536u * 1024u, 0x77u);
+
+            // Fill and fence all 6 slots (fences 0..5 correspond to slots 0..5)
+            for (uint32_t s = 0u; s < hs_pbo_tex::kFramesInFlight; ++s) {
+                CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 512, 512, 0,
+                                                         static_cast<int32_t>(blk1M.size()), blk1M.data()));
+                CHECK(p6.lastOff == static_cast<size_t>(s) * hs_pbo_tex::kTightSlotBytes);
+                ring.OnEndFrame();
+            }
+            CHECK(p6.fenceCreate == 6u && ring.SlotSkips() == 0u);
+
+            // Mark slots 0 & 1 STILL BUSY, slot 2 & slot 3 SIGNALED!
+            // Next upload is on slot 0 -> MUST zero-wait skip slots 0 & 1 and land on slot 2!
+            p6.fenceSignaled[2] = true;
+            p6.fenceSignaled[3] = true;
+            const std::vector<uint8_t> slot0Guard(p6.storage.begin(), p6.storage.begin() + 4096);
+            const std::vector<uint8_t> slot1Guard(p6.storage.begin() + hs_pbo_tex::kTightSlotBytes,
+                                                  p6.storage.begin() + hs_pbo_tex::kTightSlotBytes + 4096);
+            CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 512, 512, 0,
+                                                     static_cast<int32_t>(blk15M.size()), blk15M.data()));
+            CHECK(p6.lastOff == 2u * hs_pbo_tex::kTightSlotBytes);
+            CHECK(ring.SlotSkips() == 1u);
+            CHECK(p6.maxFlags == 0u && p6.maxTimeout == 0ULL);
+            CHECK(std::equal(slot0Guard.begin(), slot0Guard.end(), p6.storage.begin()));
+            CHECK(std::equal(slot1Guard.begin(), slot1Guard.end(), p6.storage.begin() + hs_pbo_tex::kTightSlotBytes));
+
+            // Mid-frame spill: slot 2 has 1.5MB used (only 0.5MB free); uploading another 1.5MB MUST fence slot 2 FIRST
+            // and spill into free slot 3 (fenceCreate 6 -> 7, SlotSkips 1 -> 2)!
+            CHECK(ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 512, 512, 0,
+                                                     static_cast<int32_t>(blk15M.size()), blk15M.data()));
+            CHECK(p6.fenceCreate == 7u); // old touched slot 2 fenced BEFORE leaving it!
+            CHECK(p6.lastOff == 3u * hs_pbo_tex::kTightSlotBytes);
+            CHECK(ring.SlotSkips() == 2u);
+            ring.OnEndFrame(); // fences slot 3 (fence #7), advances to slot 4 (busy!)
+
+            // Now ALL 6 slots have unsignaled fences (0,1,4,5,6,7) -> next upload MUST fail closed with 0 overwrite!
+            const std::vector<uint8_t> fullSnapshot = p6.storage;
+            CHECK(!ring.TryUploadCompressedTexImage2D(mockComp, 0x0DE1u, 0, 0x83F3u, 512, 512, 0,
+                                                      static_cast<int32_t>(blk1M.size()), blk1M.data()));
+            CHECK(ring.WaitTimeouts() == 1u);
+            CHECK(p6.storage == fullSnapshot); // ZERO memory clobber across all 12 MB!
+            CHECK(p6.maxFlags == 0u && p6.maxTimeout == 0ULL);
+
+            ring.ReleaseGpu(true);
+            CHECK(p6.fenceDelete == p6.fenceCreate); // ALL 6 live fences + 2 cleared fences deleted cleanly!
+            s_p6 = nullptr;
+        }
+
+        // 38B: SpriteBatcher PARAMS SSBO absorption + shader transform + shadow/CPU/unbatched/bloom parity
+        {
+            static_assert(sizeof(hs_sprite_batch::GpuSpriteInstance) == 144, "GpuSpriteInstance ABI must stay 144B");
+            static_assert(alignof(hs_sprite_batch::GpuSpriteInstance) == 16, "GpuSpriteInstance must be 16B aligned");
+
+            // Shader transform verification (anim.ksh VS/FS + anim_bloom.ksh untouched)
+            static constexpr const char* kAnimVs =
+                "uniform mat4 MatrixP; uniform mat4 MatrixV; uniform mat4 MatrixW;\n"
+                "uniform vec3 FLOAT_PARAMS; uniform vec4 TIMEPARAMS;\n"
+                "attribute vec4 POS2D_UV; varying vec3 PS_TEXCOORD; varying vec3 PS_POS;\n"
+                "void main() {\n#if defined(SKINNED)\n\tvec4 world_pos=vec4(0.0); vec3 TEXCOORD0=vec3(0.0);\n#else\n"
+                "\tvec3 POSITION = vec3(POS2D_UV.xy, 0.0);\n\tvec3 object_pos = POSITION.xyz;\n"
+                "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n\tmat4 mtxPV = MatrixP * MatrixV;\n"
+                "\tgl_Position = mtxPV * world_pos;\n#endif\n\tPS_TEXCOORD = TEXCOORD0; PS_POS = world_pos.xyz;\n}\n";
+            static constexpr const char* kAnimFs =
+                "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
+                "uniform sampler2D SAMPLER[6]; uniform vec4 OCEAN_BLEND_PARAMS;\n"
+                "uniform mat4 COLOUR_XFORM; uniform vec3 PARAMS; uniform vec3 FLOAT_PARAMS;\n"
+                "#define ALPHA_TEST PARAMS.x\n#define LIGHT_OVERRIDE PARAMS.y\n#define BLOOM_TOGGLE PARAMS.z\n"
+                "varying vec3 PS_POS; varying vec3 PS_TEXCOORD;\n"
+                "vec3 CalculateLightingContribution() { return vec3(1.0); }\n"
+                "void main() {\n\tvec4 colour;\n#if defined( TRIPLE_ATLAS )\n\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#else\n\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#endif\n"
+                "\tif (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0,0,0,colour.a); return; }\n"
+                "\tif(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+                "\tif (ALPHA_TEST > 0.0) { if (colour.a >= ALPHA_TEST) { gl_FragColor = colour.rgba; } else { discard; } } else {\n"
+                "\t\tgl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+                "\t\tgl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n\t}\n}\n";
+            static constexpr const char* kBloomFs =
+                "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
+                "uniform sampler2D SAMPLER[2]; varying vec3 PS_TEXCOORD;\n"
+                "void main() {\n\tvec4 colour;\n#if defined( TRIPLE_ATLAS )\n\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#else\n\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#endif\n"
+                "\tgl_FragColor.rgba = vec4( 0, 0, 0, colour.a );\n}\n";
+
+            std::string outVs, outFs, outBloomFs;
+            const char* tag = nullptr;
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, outVs, tag, true, true));
+            CHECK(outVs.find("flat out vec4 HS_V_PARAMS;") != std::string::npos);
+            CHECK(outVs.find("uintBitsToFloat(hs_ins.flags.y)") != std::string::npos);
+
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kAnimFs, outFs, tag, true, true));
+            CHECK(outFs.find("flat in vec4 HS_V_PARAMS;") != std::string::npos);
+            CHECK(outFs.find("vec3 hs_params = (HS_BATCH_ACTIVE > 1.5 && HS_V_PARAMS.w > 0.5) ? HS_V_PARAMS.xyz : PARAMS;") != std::string::npos);
+            CHECK(outFs.find("#define ALPHA_TEST hs_params.x") != std::string::npos);
+            CHECK(outFs.find("#define LIGHT_OVERRIDE hs_params.y") != std::string::npos);
+            CHECK(outFs.find("#define BLOOM_TOGGLE hs_params.z") != std::string::npos);
+            // HD-2D anchor line MUST remain verbatim so TransformHd2dShaderSource still matches & uses hs_params.y!
+            CHECK(outFs.find("gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );") != std::string::npos);
+
+            CHECK(hs_sprite_batch::TransformAnimBatchShaderSource(kBloomFs, outBloomFs, tag, true, true));
+            CHECK(outBloomFs.find("HS_V_PARAMS") == std::string::npos);
+
+            // Runtime SSBO absorption, shadow filter, CPU fallback & PrepareForUnbatchedDraw commit check
+            struct MockParamsGpu {
+                uint32_t nextBuf = 0u;
+                uint32_t bound[3]{};
+                std::vector<uint8_t> bufs[32];
+                int32_t  sz[32]{};
+                uint32_t lastSsbo = 0u;
+                uint32_t u3Calls = 0u;
+                int32_t  lastU3Loc = -1;
+                float    lastU3Val[3]{};
+            };
+            static MockParamsGpu* s_pg = nullptr;
+            MockParamsGpu pg{};
+            s_pg = &pg;
+
+            hs_sprite_batch::GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* ids) WINAPI { for (int i = 0; i < n; ++i) ids[i] = ++s_pg->nextBuf; };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            ops.glBindBuffer = [](uint32_t tgt, uint32_t b) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                s_pg->bound[idx] = b;
+            };
+            ops.glBufferData = [](uint32_t tgt, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_pg->bound[idx];
+                if (id < 32u) { s_pg->sz[id] = static_cast<int32_t>(sz); s_pg->bufs[id].assign(static_cast<size_t>(sz), 0u); }
+            };
+            ops.glBufferStorage = ops.glBufferData;
+            ops.glGetBufferParameteriv = [](uint32_t tgt, uint32_t pname, int32_t* p) WINAPI {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_pg->bound[idx];
+                if (pname == hs_sprite_batch::kGlBufferSize && p && id < 32u) *p = s_pg->sz[id];
+            };
+            ops.glMapBufferRange = [](uint32_t tgt, ptrdiff_t, ptrdiff_t, uint32_t) WINAPI -> void* {
+                const uint32_t idx = (tgt == hs_sprite_batch::kGlArrayBuffer) ? 0u
+                    : ((tgt == hs_sprite_batch::kGlElementArrayBuffer) ? 1u : 2u);
+                const uint32_t id = s_pg->bound[idx];
+                return (id < 32u && !s_pg->bufs[id].empty()) ? s_pg->bufs[id].data() : nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) WINAPI -> void* { return reinterpret_cast<void*>(1); };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) WINAPI -> uint32_t { return 0x911Au; };
+            ops.glDeleteSync = [](void*) WINAPI {};
+            ops.glActiveTexture = [](uint32_t) WINAPI {};
+            ops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            ops.glUniform1f = [](int32_t, float) WINAPI {};
+            ops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            ops.glUniform3fv = [](int32_t loc, int32_t, const float* v) WINAPI {
+                ++s_pg->u3Calls;
+                s_pg->lastU3Loc = loc;
+                if (v) std::memcpy(s_pg->lastU3Val, v, 12u);
+            };
+            ops.glUniform4fv = [](int32_t, int32_t, const float*) WINAPI {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            ops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            ops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {};
+            ops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t) WINAPI {};
+            ops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t b) WINAPI { s_pg->lastSsbo = b; };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == hs_sprite_batch::kGlMaxTextureImageUnits && p) *p = 32;
+            };
+            ops.glGetTextureHandleARB = [](uint32_t tid) WINAPI -> uint64_t {
+                return 0x777700000000ULL | static_cast<uint64_t>(tid);
+            };
+            ops.glMakeTextureHandleResidentARB = [](uint64_t) WINAPI {};
+            ops.glMakeTextureHandleNonResidentARB = [](uint64_t) WINAPI {};
+
+            hs_sprite_batch::SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.SetPersistentRingPreferred(true);
+            sb.SetGpuDrivenPreferred(true);
+            sb.SetShadowActive(true);
+            sb.SetShadowHints(true, true, 1.0f, 0.0f, 0.0f);
+            sb.SetEnabled(true);
+
+            hs_sprite_batch::BatchProgInfo info{};
+            info.checked = true; info.eligible = true; info.hasGpuDriven = true;
+            info.hasParamsAbsorption = true;
+            info.locMatrixW = 1; info.locColourXform = 2; info.locBatchActive = 3;
+            info.locParams = 41; info.locSampler0 = 4; info.locSampler1 = 5;
+            info.locPos2dUv = 0; info.locBatchWpos = 7; info.locBatchCMult = 5; info.locBatchCAdd = 6;
+            info.progMaxTexSlots = 16u;
+            for (uint32_t s = 0u; s < 16u; ++s) info.locBatchTex[s] = 10 + static_cast<int32_t>(s);
+
+            const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float qv[16] = { -1,0,0,0, 1,0,1,0, 1,3,1,1, -1,3,0,1 };
+            const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+
+            sb.OnUseProgram(28u, &info);
+            sb.OnEnableDisableVertexAttribArray(0u, true);
+            sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 301u);
+
+            // Warm GPU ring via 1st draw with PARAMS=(0, 0, 0), then vary PARAMS across 4 draws in ONE flush!
+            const float pVals[4][3] = {
+                { 0.0f,  0.0f,   0.0f }, // normal standing -> casts shadow (lastParamsY <= 0.35)
+                { 0.0f,  0.502f, 0.0f }, // self-lit -> shadowFlag MUST be 0.0!
+                { 0.50f, 1.0f,   0.0f }, // alphaTest + fullbright -> shadowFlag MUST be 0.0!
+                { 0.0f,  0.0f,   1.0f }  // bloom toggle == 1.0
+            };
+            // Establish active GPU ring first (draw 0)
+            sb.OnUniform3fv(41, 1, pVals[0], false);
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            for (int k = 1; k < 4; ++k) {
+                CHECK(sb.TryAbsorbParams(41, 1, pVals[k]) == true);
+                sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            }
+            CHECK(pg.u3Calls == 0u); // ZERO GL glUniform3fv calls during GPU-Driven batch!
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            CHECK(sb.GetStats().flushes == 1);
+            CHECK(sb.GetStats().flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Uni3)] == 0);
+            CHECK(pg.lastSsbo != 0u);
+
+            // Inspect all 4 GpuSpriteInstance records in SSBO
+            const auto* insts = reinterpret_cast<const hs_sprite_batch::GpuSpriteInstance*>(pg.bufs[pg.lastSsbo].data());
+            float lo0 = 0.0f, lo1 = 0.0f, lo2 = 0.0f;
+            std::memcpy(&lo0, &insts[0].flags[1], sizeof(float));
+            std::memcpy(&lo1, &insts[1].flags[1], sizeof(float));
+            std::memcpy(&lo2, &insts[2].flags[1], sizeof(float));
+            CHECK(lo0 == 0.0f && lo1 == 0.502f && lo2 == 1.0f);
+            CHECK(insts[0].cadd[3] == 1.0f); // LIGHT_OVERRIDE=0.0 <= 0.35 -> casts shadow!
+            CHECK(insts[1].cadd[3] == 0.0f); // LIGHT_OVERRIDE=0.502 > 0.35 -> filtered out!
+            CHECK(insts[2].cadd[3] == 0.0f); // LIGHT_OVERRIDE=1.0 > 0.35 -> filtered out!
+            const uint32_t m2w2 = static_cast<uint32_t>(insts[2].m2[3] + 0.5f);
+            const uint32_t m2w3 = static_cast<uint32_t>(insts[3].m2[3] + 0.5f);
+            CHECK(((m2w2 >> 2u) & 1u) == 1u); // useInstParams == 1
+            CHECK(std::fabs(static_cast<float>(m2w2 >> 3u) / 65535.0f - 0.50f) < 1e-4f);
+            CHECK(((m2w3 >> 1u) & 1u) == 1u); // bloomToggle == 1
+
+            // PrepareForUnbatchedDraw MUST commit dirty PARAMS=(0, 0, 1) to GL!
+            sb.PrepareForUnbatchedDraw();
+            CHECK(pg.u3Calls == 1u && pg.lastU3Loc == 41 && pg.lastU3Val[2] == 1.0f);
+
+            // CPU 16-slot fallback (non-bindless denied tex 399) MUST commit dirty PARAMS=(0, 0.502, 0) to GL!
+            sb.OnTexImageMutated(399u, true);
+            CHECK(sb.TryAbsorbParams(41, 1, pVals[1]) == true);
+            CHECK(pg.u3Calls == 1u);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 399u);
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            CHECK(pg.u3Calls == 2u && pg.lastU3Loc == 41 && pg.lastU3Val[1] == 0.502f);
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+
+            // anim_bloom.ksh (isBloomPass=true, locParams=-1) MUST NOT absorb PARAMS
+            hs_sprite_batch::BatchProgInfo bloomInfo = info;
+            bloomInfo.isBloomPass = true; bloomInfo.locParams = -1; bloomInfo.hasParamsAbsorption = false;
+            sb.OnUseProgram(29u, &bloomInfo);
+            CHECK(sb.TryAbsorbParams(41, 1, pVals[1]) == false);
+
+            sb.ReleaseGpuResources();
+            s_pg = nullptr;
+        }
+
+        // 38C: WorldShadowEngine temporal shadow reuse + deferred shadow batch coalescing (Mock GL)
+        {
+            struct MockWs3 {
+                uint32_t nextId = 1u;
+                uint32_t clearCalls = 0u;
+                uint32_t drawBaseVertCalls = 0u;
+                uint32_t multiDrawCalls = 0u;
+                int32_t  lastMultiDrawCount = 0;
+                std::vector<int32_t> capturedCounts;
+            };
+            static MockWs3* s_ws3 = nullptr;
+            MockWs3 mw{};
+            s_ws3 = &mw;
+
+            hs_world_shadow::GlShadowOps wops{};
+            wops.glGenFramebuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_ws3->nextId++; };
+            wops.glDeleteFramebuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindFramebuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            wops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return hs_world_shadow::kGlFramebufferComplete; };
+            wops.glGenRenderbuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_ws3->nextId++; };
+            wops.glDeleteRenderbuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindRenderbuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glRenderbufferStorage = [](uint32_t, uint32_t, int32_t, int32_t) WINAPI {};
+            wops.glFramebufferRenderbuffer = [](uint32_t, uint32_t, uint32_t, uint32_t) WINAPI {};
+            wops.glGenTextures = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_ws3->nextId++; };
+            wops.glDeleteTextures = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glActiveTexture = [](uint32_t) WINAPI {};
+            wops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            wops.glTexImage2D = [](uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*) WINAPI {};
+            wops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            wops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_ws3->nextId++; };
+            wops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            wops.glCompileShader = [](uint32_t) WINAPI {};
+            wops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            wops.glDeleteShader = [](uint32_t) WINAPI {};
+            wops.glCreateProgram = []() WINAPI -> uint32_t { return s_ws3->nextId++; };
+            wops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBindAttribLocation = [](uint32_t, uint32_t, const char*) WINAPI {};
+            wops.glLinkProgram = [](uint32_t) WINAPI {};
+            wops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            wops.glDeleteProgram = [](uint32_t) WINAPI {};
+            wops.glUseProgram = [](uint32_t) WINAPI {};
+            wops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            wops.glUniform1f = [](int32_t, float) WINAPI {};
+            wops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            wops.glUniform4fv = [](int32_t, int32_t, const float*) WINAPI {};
+            wops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            wops.glGenBuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_ws3->nextId++; };
+            wops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindBuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBufferData = [](uint32_t, ptrdiff_t, const void*, uint32_t) WINAPI {};
+            wops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            wops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            wops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            wops.glDrawArrays = [](uint32_t, int32_t, int32_t) WINAPI {};
+            wops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {};
+            wops.glDrawElementsBaseVertex = [](uint32_t, int32_t cnt, uint32_t, const void*, int32_t) WINAPI {
+                ++s_ws3->drawBaseVertCalls;
+                s_ws3->capturedCounts.push_back(cnt);
+            };
+            wops.glMultiDrawElementsBaseVertex = [](uint32_t, const int32_t* cnts, uint32_t, const void* const*, int32_t dc, const int32_t*) WINAPI {
+                ++s_ws3->multiDrawCalls;
+                s_ws3->lastMultiDrawCount = dc;
+                for (int32_t i = 0; i < dc; ++i) s_ws3->capturedCounts.push_back(cnts[i]);
+            };
+            wops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t) WINAPI {};
+            wops.glViewport = [](int32_t, int32_t, int32_t, int32_t) WINAPI {};
+            wops.glClearColor = [](float, float, float, float) WINAPI {};
+            wops.glClear = [](uint32_t) WINAPI { ++s_ws3->clearCalls; };
+            wops.glEnable = [](uint32_t) WINAPI {};
+            wops.glDisable = [](uint32_t) WINAPI {};
+            wops.glBlendFunc = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBlendEquation = [](uint32_t) WINAPI {};
+            wops.glDepthFunc = [](uint32_t) WINAPI {};
+            wops.glDepthMask = [](uint8_t) WINAPI {};
+            wops.glColorMask = [](uint8_t, uint8_t, uint8_t, uint8_t) WINAPI {};
+            wops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == 0x8872u && p) *p = 32;
+                else if (pname == 0x0D33u && p) *p = 16384;
+                else if (p) *p = 0;
+            };
+
+            hs_world_shadow::WorldShadowEngine ws;
+            ws.SetOps(wops, true);
+            hs_gl_cache::ThreadState glc;
+            glc.caps[0] = 1; glc.caps[1] = 0; glc.caps[2] = 0; glc.caps[3] = 0; glc.caps[4] = 0;
+            glc.blendSrc = hs_world_shadow::kGlSrcAlpha; glc.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+            glc.blendEq = hs_world_shadow::kGlFuncAdd; glc.depthFunc = hs_world_shadow::kGlLess;
+            glc.colorMask = 15; glc.depthMask = 0;
+
+            const float pv[16] = { 1.0f/20.0f,0,0,0, 0,0,0,0, 0,1.0f/20.0f,0,0, 0,0,0,1 };
+            const int32_t vp[4] = { 0, 0, 256, 256 };
+            hs_world_shadow::ShadowConfig cfg{};
+            cfg.dirWx = 0.0f; cfg.dirWz = 1.0f; cfg.stretch = 1.5f; cfg.projOn = 1.0f;
+            cfg.density = 0.6f; cfg.soft = 0.8f; cfg.hdMode = true; cfg.temporalStride = 2u;
+            cfg.hasLuaCam = true; cfg.luaCamX = 10.0f; cfg.luaCamZ = 20.0f;
+            hs_world_shadow::ShadowPassState saved{};
+            saved.dstFbo = 5u; saved.dstProg = 0u; memcpy(saved.vp, vp, sizeof(vp));
+            saved.glCacheTrusted = true; saved.blendCacheTrusted = true;
+
+            // Frame 1: renders fresh, coalesces 6 GPU batches (4 contiguous baseVertex=0 + 2 distinct baseVertex) -> 1 MultiDraw!
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(cfg, saved, glc));
+            for (uint32_t k = 0u; k < 4u; ++k) {
+                CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 0, static_cast<uintptr_t>(k * 12u), nullptr, 5u));
+            }
+            CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 100, 48u, nullptr, 5u));
+            CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 200, 60u, nullptr, 5u));
+            ws.FlushDeferredBatchedShadows(cfg, saved, glc);
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameDeferredBatches() == 6u);
+            CHECK(ws.LastFrameShadowDraws() == 1u);
+            CHECK(ws.LastFrameCoalescedDraws() == 5u);
+            CHECK(mw.multiDrawCalls == 1u && mw.lastMultiDrawCount == 3); // 4 contiguous -> 24, plus 6, plus 6!
+            CHECK(mw.capturedCounts.size() == 3u && mw.capturedCounts[0] == 24 && mw.capturedCounts[1] == 6 && mw.capturedCounts[2] == 6);
+            float cachedB1[4]{};
+            ws.GetCachedBounds(cachedB1);
+            CHECK(cachedB1[3] == 1.0f && std::fabs(cachedB1[0] - 10.0f) < 0.1f && std::fabs(cachedB1[1] - 20.0f) < 0.1f);
+
+            // Frame 2: camera walks +2.0 wu (< 4.8 wu) with temporalStride=2 -> REUSES cached shadow map (0 clears, 0 draws, locked cachedBounds_!)
+            const uint32_t clearsBefore = mw.clearCalls;
+            cfg.luaCamX = 12.0f; cfg.luaCamZ = 20.0f;
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(cfg, saved, glc));
+            CHECK(!ws.BeganWriteThisFrame());
+            CHECK(!ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 0, 0u, nullptr, 5u));
+            float recvB[4]{}, recvT[4]{};
+            ws.GetEntityReceiveUniforms(cfg, recvB, recvT);
+            CHECK(recvB[0] == cachedB1[0] && recvB[1] == cachedB1[1]); // LOCKED to Frame 1 cachedBounds_ (ZERO swimming!)
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameReused() == true);
+            CHECK(ws.ShadowReuseSkips() == 1ULL);
+            CHECK(ws.LastFrameShadowDraws() == 0u);
+            CHECK(mw.clearCalls == clearsBefore); // ZERO FBO clear!
+
+            // Frame 3: streak reached stride-1 (1) -> renders fresh immediately & updates cachedBounds_!
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(cfg, saved, glc));
+            CHECK(ws.BeganWriteThisFrame());
+            CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 0, 0u, nullptr, 5u));
+            ws.FlushDeferredBatchedShadows(cfg, saved, glc);
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameReused() == false);
+
+            // Frame 4: camera teleports +10.0 wu (>= 4.8 wu) with temporalStride=3 -> MUST invalidate immediately!
+            cfg.temporalStride = 3u;
+            cfg.luaCamX = 22.0f;
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(cfg, saved, glc));
+            CHECK(ws.BeganWriteThisFrame());
+            CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, 0, 0u, nullptr, 5u));
+            ws.FlushDeferredBatchedShadows(cfg, saved, glc);
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameReused() == false && ws.ShadowReuseSkips() == 1ULL);
+
+            // Frame 5: sun vector change invalidates immediately!
+            cfg.dirWx = 0.05f; cfg.dirWz = 0.998f;
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(cfg, saved, glc));
+            CHECK(ws.BeganWriteThisFrame());
+            ws.OnEndFrame();
+            ws.ResetContext(true);
+            s_ws3 = nullptr;
+        }
+
+        // 38D: GpuClarityEngine adaptive Grade 3 <-> Grade 2 smooth hysteresis with 0 texture/FBO reallocations!
+        {
+            struct MockClAdapt {
+                uint32_t nextId = 1u;
+                uint32_t genTex = 0u;
+                uint32_t delTex = 0u;
+                uint32_t texStor = 0u;
+                uint32_t genFbo = 0u;
+                uint32_t delFbo = 0u;
+            };
+            static MockClAdapt* s_ca = nullptr;
+            MockClAdapt ca{};
+            s_ca = &ca;
+
+            hs_gpu_clarity::GlComputeOps cops{};
+            cops.glGenFramebuffers = [](int32_t n, uint32_t* p) WINAPI { s_ca->genFbo += static_cast<uint32_t>(n); for (int i = 0; i < n; ++i) p[i] = s_ca->nextId++; };
+            cops.glDeleteFramebuffers = [](int32_t n, const uint32_t*) WINAPI { s_ca->delFbo += static_cast<uint32_t>(n); };
+            cops.glBindFramebuffer = [](uint32_t, uint32_t) WINAPI {};
+            cops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return hs_gpu_clarity::kGlFramebufferComplete; };
+            cops.glBlitFramebuffer = [](int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGenTextures = [](int32_t n, uint32_t* p) WINAPI { s_ca->genTex += static_cast<uint32_t>(n); for (int i = 0; i < n; ++i) p[i] = s_ca->nextId++; };
+            cops.glDeleteTextures = [](int32_t n, const uint32_t*) WINAPI { s_ca->delTex += static_cast<uint32_t>(n); };
+            cops.glActiveTexture = [](uint32_t) WINAPI {};
+            cops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            cops.glTexStorage2D = [](uint32_t, int32_t, uint32_t, int32_t, int32_t) WINAPI { ++s_ca->texStor; };
+            cops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_ca->nextId++; };
+            cops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            cops.glCompileShader = [](uint32_t) WINAPI {};
+            cops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteShader = [](uint32_t) WINAPI {};
+            cops.glCreateProgram = []() WINAPI -> uint32_t { return s_ca->nextId++; };
+            cops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            cops.glLinkProgram = [](uint32_t) WINAPI {};
+            cops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteProgram = [](uint32_t) WINAPI {};
+            cops.glUseProgram = [](uint32_t) WINAPI {};
+            cops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            cops.glUniform4f = [](int32_t, float, float, float, float) WINAPI {};
+            cops.glDispatchCompute = [](uint32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glMemoryBarrier = [](uint32_t) WINAPI {};
+            cops.glBindImageTexture = [](uint32_t, uint32_t, int32_t, uint8_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == hs_gpu_clarity::kGlMaxTextureSize && p) *p = 16384;
+                else if (p) *p = 0;
+            };
+            cops.glIsEnabled = [](uint32_t) WINAPI -> uint8_t { return 0u; };
+            cops.glEnable = [](uint32_t) WINAPI {};
+            cops.glDisable = [](uint32_t) WINAPI {};
+
+            hs_gpu_clarity::GpuClarityEngine cl;
+            cl.SetOps(cops, true);
+            hs_gpu_clarity::KnownGlState ks{};
+            ks.drawFbo = 1; ks.readFbo = 1; ks.curProgram = 0;
+            ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+            ks.boundTex0 = 0; ks.scissorEnabled = 0; ks.sampleTimer = false;
+
+            // Default allowAdaptiveGrade=false MUST NEVER step down even under 9.0ms load!
+            hs_gpu_clarity::ClarityConfig cfgNoAdapt{ 3, 1.0f, false, 9.0f, 5.5f };
+            for (int f = 0; f < 60; ++f) {
+                CHECK(cl.ProcessFrame(1u, 1280, 720, cfgNoAdapt, &ks));
+                CHECK(cl.EffectiveGrade() == 3);
+            }
+            CHECK(cl.AdaptiveGradeSteps() == 0ULL);
+
+            // Reset alloc counters after warmup
+            ca.genTex = ca.delTex = ca.texStor = ca.genFbo = ca.delFbo = 0u;
+
+            // Enable adaptive: 44 frames > 5.5ms + 1 frame <= 5.5ms -> MUST NOT flicker!
+            hs_gpu_clarity::ClarityConfig cfgHigh{ 3, 1.0f, true, 7.2f, 5.5f };
+            hs_gpu_clarity::ClarityConfig cfgMid{  3, 1.0f, true, 4.8f, 5.5f };
+            hs_gpu_clarity::ClarityConfig cfgLow{  3, 1.0f, true, 3.2f, 5.5f };
+            for (int f = 0; f < 44; ++f) {
+                CHECK(cl.ProcessFrame(1u, 1280, 720, cfgHigh, &ks));
+                CHECK(cl.EffectiveGrade() == 3);
+            }
+            CHECK(cl.ProcessFrame(1u, 1280, 720, cfgMid, &ks));
+            CHECK(cl.EffectiveGrade() == 3 && cl.AdaptiveGradeSteps() == 0ULL);
+
+            // 45 consecutive frames > 5.5ms -> smooth step 3 -> 2 with ZERO GL allocs/deletes!
+            for (int f = 0; f < 45; ++f) {
+                CHECK(cl.ProcessFrame(1u, 1280, 720, cfgHigh, &ks));
+            }
+            CHECK(cl.EffectiveGrade() == 2 && cl.AdaptiveGradeSteps() == 1ULL);
+            CHECK(ca.genTex == 0u && ca.delTex == 0u && ca.texStor == 0u && ca.genFbo == 0u && ca.delFbo == 0u);
+
+            // Deadband (4.8ms in [4.0, 5.5]) + 119 low frames -> stays Grade 2
+            for (int f = 0; f < 119; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, cfgLow, &ks));
+            CHECK(cl.EffectiveGrade() == 2);
+            CHECK(cl.ProcessFrame(1u, 1280, 720, cfgMid, &ks));
+            CHECK(cl.EffectiveGrade() == 2);
+
+            // 120 consecutive frames < 4.0ms -> smooth step 2 -> 3 with ZERO GL allocs/deletes!
+            for (int f = 0; f < 120; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, cfgLow, &ks));
+            CHECK(cl.EffectiveGrade() == 3 && cl.AdaptiveGradeSteps() == 2ULL);
+            CHECK(ca.genTex == 0u && ca.delTex == 0u && ca.texStor == 0u && ca.genFbo == 0u && ca.delFbo == 0u);
+
+            cl.OnContextReset(true);
+            s_ca = nullptr;
+        }
+
+        // 38E: SkeletalMtPool 2-Bank Carry-Over Ring, Quintuple Lookup, 12-Worker Scale-Up & Reset Wipe
+        {
+            struct MockSt3 {
+                uint32_t frameTweenEnts  = 0u;
+                uint32_t frameTweenBones = 0u;
+                uint32_t frameShedCount  = 0u;
+                uint8_t  frameShedLevel  = 0u;
+                uint32_t resets          = 0u;
+            };
+            struct MockSl3 { uintptr_t key = 0u; float v = 0.0f; };
+            using Pool3 = hs_skeletal_mt::SkeletalMtPool<MockSt3, MockSl3>;
+
+            // Elastic worker scale-up at 450 jobs -> full 12/12 workers (preserves 16->1, 100->4, 400->8)
+            CHECK(Pool3::ComputeElasticActiveWorkers(450u, 12u) == 12u);
+            CHECK(Pool3::ComputeElasticActiveWorkers(600u, 12u) == 12u);
+
+            auto evalFn = [](MockSt3& st, const hs_skeletal_mt::MtAnimJob& j, int64_t, MockSl3& sl, void*) -> const void* {
+                sl.key = j.entityKey;
+                sl.v = j.time * 5.0f + 1.0f;
+                ++st.frameTweenEnts;
+                st.frameTweenBones += 4u;
+                return &sl;
+            };
+            auto resetFn = [](MockSt3& st) { ++st.resets; };
+
+            Pool3 pool;
+            CHECK(pool.EnsureStarted(16u, evalFn, resetFn, nullptr, 12u));
+
+            constexpr uint32_t kF1Jobs = 480u;
+            std::vector<uint8_t> cmdMem1(kF1Jobs * 32u, 0u);
+            std::vector<uint8_t> cmdMem2(64u * 32u, 0u);
+            const void* animA = reinterpret_cast<const void*>(0x880000ULL);
+            for (uint32_t i = 0u; i < kF1Jobs; ++i) {
+                hs_skeletal_mt::MtAnimJob j{};
+                j.cmdPtr    = &cmdMem1[i * 32u];
+                j.entityKey = 0x900000ULL + i * 16ULL;
+                j.animPtr   = animA;
+                j.playMode  = 1;
+                j.time      = static_cast<float>(i) * 0.01f;
+                pool.StageJob(j);
+            }
+            uint32_t ents = 0u, bones = 0u, shed = 0u;
+            CHECK(pool.DispatchAndJoin(1000, 1u, ents, bones, shed) == kF1Jobs);
+            CHECK(pool.LastActiveWorkers() == 12u); // Full 12-worker scale-up at 480 jobs!
+            CHECK(pool.HasActiveResults());
+
+            // Frame 1 consumes first 240 jobs, leaves jobs [240..479] unconsumed (simulating pre-staged Frame N+1!)
+            for (uint32_t i = 0u; i < 240u; ++i) {
+                const auto* r = static_cast<const MockSl3*>(
+                    pool.LookupResult(&cmdMem1[i * 32u], animA, 1, static_cast<float>(i) * 0.01f, 0x900000ULL + i * 16ULL));
+                CHECK(r != nullptr && r->key == 0x900000ULL + i * 16ULL);
+            }
+            // Wrong entityKey MUST fail closed!
+            CHECK(pool.LookupResult(&cmdMem1[0], animA, 1, 0.0f, 0xDEADBEEFULL) == nullptr);
+            CHECK(pool.PrevBankHits() == 0ULL);
+            pool.EndFrame();
+            CHECK(!pool.HasActiveResults());
+
+            // Frame 2 dispatches 64 new jobs into the opposite bank -> unconsumed Frame-1 carry-overs [240..479] MUST still hit!
+            for (uint32_t i = 0u; i < 64u; ++i) {
+                hs_skeletal_mt::MtAnimJob j{};
+                j.cmdPtr    = &cmdMem2[i * 32u];
+                j.entityKey = 0xA00000ULL + i * 16ULL;
+                j.animPtr   = animA;
+                j.playMode  = 1;
+                j.time      = 9.0f + static_cast<float>(i) * 0.01f;
+                pool.StageJob(j);
+            }
+            CHECK(pool.DispatchAndJoin(2000, 1u, ents, bones, shed) == 64u);
+            // Already-consumed Frame-1 slot [0] MUST NOT be re-served as stale on Frame 2!
+            CHECK(pool.LookupResult(&cmdMem1[0], animA, 1, 0.0f, 0x900000ULL) == nullptr);
+            // Unconsumed carry-over slots [240..479] MUST hit prev bank with intact SlotT values!
+            for (uint32_t i = 240u; i < kF1Jobs; ++i) {
+                const auto* r = static_cast<const MockSl3*>(
+                    pool.LookupResult(&cmdMem1[i * 32u], animA, 1, static_cast<float>(i) * 0.01f, 0x900000ULL + i * 16ULL));
+                CHECK(r != nullptr && r->key == 0x900000ULL + i * 16ULL);
+                CHECK(std::fabs(r->v - (static_cast<float>(i) * 0.05f + 1.0f)) < 1e-4f);
+            }
+            CHECK(pool.PrevBankHits() == 240ULL);
+            pool.EndFrame();
+
+            // Frame 3: 0 staged jobs -> Frame-2's 64 unconsumed jobs stay reachable for strictly 1 frame!
+            CHECK(pool.DispatchAndJoin(3000, 1u, ents, bones, shed) == 0u);
+            CHECK(pool.HasActiveResults());
+            const auto* carry2 = static_cast<const MockSl3*>(
+                pool.LookupResult(&cmdMem2[0], animA, 1, 9.0f, 0xA00000ULL));
+            CHECK(carry2 != nullptr && carry2->key == 0xA00000ULL);
+            pool.EndFrame();
+
+            // Frame 4: 0 staged jobs again -> carry-over expires after 1 frame!
+            CHECK(pool.DispatchAndJoin(4000, 1u, ents, bones, shed) == 0u);
+            CHECK(!pool.HasActiveResults());
+            CHECK(pool.LookupResult(&cmdMem2[32], animA, 1, 9.01f, 0xA00010ULL) == nullptr);
+
+            // worldResetGen bump wipes both banks immediately!
+            for (uint32_t i = 0u; i < 40u; ++i) {
+                hs_skeletal_mt::MtAnimJob j{};
+                j.cmdPtr = &cmdMem2[i * 32u]; j.entityKey = 0xB00000ULL + i; j.animPtr = animA; j.playMode = 0; j.time = 1.0f;
+                pool.StageJob(j);
+            }
+            CHECK(pool.DispatchAndJoin(5000, 1u, ents, bones, shed) == 40u);
+            pool.EndFrame();
+            CHECK(pool.DispatchAndJoin(6000, 2u /*worldResetGen bump*/, ents, bones, shed) == 0u);
+            CHECK(!pool.HasActiveResults());
+            CHECK(pool.LookupResult(&cmdMem2[0], animA, 0, 1.0f, 0xB00000ULL) == nullptr);
+
+            pool.Shutdown(false);
+        }
+
+        std::printf("[PASS] 38. Phase 3 6-Slot Zero-Wait PBO, PARAMS SSBO Absorption, WorldShadow Reuse+Coalescing, GpuClarity Zero-Realloc Hysteresis & 2-Bank SkeletalMtPool verified!\n");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 39: DST HyperSmooth v4.0 Phase 4 — Klei Renderer CPU Fast-Path
+    //          (FastApplyShaderUniforms + FastDrawPrimitives + FastDrawIndexed),
+    //          GpuClarity Full 3<->2<->1<->0 Zero-Realloc Ladder, WorldShadow
+    //          1-Tap Entity Receive + 2048 Deferred Cap, and SpriteBatcher
+    //          800-Flush State Elision + FLOAT_PARAMS.z Absorption!
+    // -------------------------------------------------------------------------
+    {
+        // 39A: FastApplyShaderUniforms — all 12 valid uniform types, stamp skip,
+        //      stack depth 1..8, 4+ pointer fingerprint & epoch invalidation,
+        //      transactional zero-partial-mutation fail-closed, missing hash & invalid types
+        {
+            struct ULogEntry {
+                int kind; // 0=1f,1=1fv,2=2fv,3=3fv,4=4fv,5=m2,6=m3,7=m4
+                int32_t loc;
+                int32_t cnt;
+                uint8_t transp;
+                float v0;
+            };
+            struct MockUOps {
+                std::vector<ULogEntry> log;
+                uint32_t origCalls = 0u;
+            };
+            static MockUOps* s_u = nullptr;
+            MockUOps mu{};
+            s_u = &mu;
+
+            hs_klei_fastpath::GlUniformDispatchOps uops{};
+            uops.glUniform1f = [](int32_t loc, float v0) WINAPI { s_u->log.push_back({ 0, loc, 1, 0u, v0 }); };
+            uops.glUniform1fv = [](int32_t loc, int32_t c, const float* p) WINAPI { s_u->log.push_back({ 1, loc, c, 0u, p[0] }); };
+            uops.glUniform2fv = [](int32_t loc, int32_t c, const float* p) WINAPI { s_u->log.push_back({ 2, loc, c, 0u, p[0] }); };
+            uops.glUniform3fv = [](int32_t loc, int32_t c, const float* p) WINAPI { s_u->log.push_back({ 3, loc, c, 0u, p[0] }); };
+            uops.glUniform4fv = [](int32_t loc, int32_t c, const float* p) WINAPI { s_u->log.push_back({ 4, loc, c, 0u, p[0] }); };
+            uops.glUniformMatrix2fv = [](int32_t loc, int32_t c, uint8_t tr, const float* p) WINAPI { s_u->log.push_back({ 5, loc, c, tr, p[0] }); };
+            uops.glUniformMatrix3fv = [](int32_t loc, int32_t c, uint8_t tr, const float* p) WINAPI { s_u->log.push_back({ 6, loc, c, tr, p[0] }); };
+            uops.glUniformMatrix4fv = [](int32_t loc, int32_t c, uint8_t tr, const float* p) WINAPI { s_u->log.push_back({ 7, loc, c, tr, p[0] }); };
+
+            auto origApply = [](void*, void*, void*, void*) { ++s_u->origCalls; };
+
+            // All 12 valid Klei uniform types + extra type-2 clamped-to-1 case = 13 groups
+            const int32_t kTypes[13] = { 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 10, 15, 20 };
+            alignas(16) uint8_t shaderPart[0x60]{};
+            alignas(16) uint8_t uniformTable[0x20]{};
+            uint32_t paramIdxs[13];
+            uint32_t paramIdxsAlt[13];
+            for (uint32_t i = 0u; i < 13u; ++i) { paramIdxs[i] = i; paramIdxsAlt[i] = i; }
+
+            std::vector<uint8_t> groups(13u * 0x48u, 0u);
+            std::vector<uint8_t> groupsAlt(13u * 0x48u, 0u);
+            std::vector<uint8_t> bindings(13u * 0x18u, 0u);
+            uint8_t dummyArr[3u * 0x18u]{}; // 3 elements (72 bytes) for types 2/3/4 array count!
+
+            for (uint32_t i = 0u; i < 13u; ++i) {
+                uint8_t* gp = &groups[i * 0x48u];
+                std::memcpy(gp + 0x00u, &kTypes[i], 4u);
+                // Group 2: empty arrBegin==arrEnd (clamps to elemCount=1!); Groups 3,4,5: 3 elements!
+                uint8_t* ab = (i == 2u) ? dummyArr : dummyArr;
+                uint8_t* ae = (i == 2u) ? dummyArr : (dummyArr + 3u * 0x18u);
+                std::memcpy(gp + 0x10u, &ab, 8u);
+                std::memcpy(gp + 0x18u, &ae, 8u);
+                uint8_t* bb = &bindings[i * 0x18u];
+                uint8_t* be = bb + 0x18u;
+                std::memcpy(gp + 0x30u, &bb, 8u);
+                std::memcpy(gp + 0x38u, &be, 8u);
+
+                uint32_t hash = 100u + i * 7u; // shares buckets intentionally (7 buckets -> collisions!)
+                uint32_t initStamp = 0u;
+                int32_t loc = 10 + static_cast<int32_t>(i);
+                std::memcpy(bb + 0x00u, &hash, 4u);
+                std::memcpy(bb + 0x10u, &initStamp, 4u);
+                std::memcpy(bb + 0x14u, &loc, 4u);
+            }
+            std::memcpy(groupsAlt.data(), groups.data(), groups.size());
+
+            // ConstantStore with 7 buckets + non-null end sentinel + chained hash collisions
+            constexpr uint32_t kNumBuckets = 7u;
+            uint8_t endSentinelObj[16]{};
+            uint8_t* buckets[kNumBuckets + 1u]{};
+            uint8_t* bucketsAlt[kNumBuckets + 1u]{};
+            buckets[kNumBuckets] = endSentinelObj;
+            struct MockNode { uint32_t key; uint32_t slotIdx; uint8_t* next; };
+            MockNode nodes[13]{};
+            for (uint32_t i = 0u; i < 13u; ++i) {
+                const uint32_t h = 100u + i * 7u;
+                const uint32_t bi = h % kNumBuckets;
+                nodes[i].key = h;
+                nodes[i].slotIdx = i;
+                nodes[i].next = buckets[bi] ? buckets[bi] : endSentinelObj;
+                buckets[bi] = reinterpret_cast<uint8_t*>(&nodes[i]);
+            }
+            std::memcpy(bucketsAlt, buckets, sizeof(buckets));
+
+            std::vector<uint8_t> slots(13u * 0x90u, 0u);
+            std::vector<uint8_t> slotsAlt(13u * 0x90u, 0u);
+            alignas(16) float valBufs[13][16]{};
+            auto setSlotTop = [&](std::vector<uint8_t>& slBuf, uint32_t slotIdx, uint32_t depth, uint32_t stamp, const float* dataPtr) {
+                uint8_t* sp = &slBuf[slotIdx * 0x90u];
+                std::memcpy(sp + 0x88u, &depth, 4u);
+                if (depth >= 1u && depth <= 8u) {
+                    uint8_t* ent = sp + 0x08u + static_cast<size_t>(depth - 1u) * 16u;
+                    std::memcpy(ent + 0x00u, &stamp, 4u);
+                    std::memcpy(ent + 0x08u, &dataPtr, 8u);
+                }
+            };
+            for (uint32_t i = 0u; i < 13u; ++i) {
+                valBufs[i][0] = 1.5f + static_cast<float>(i);
+                // Exercise stack depth 1..8 across slots!
+                setSlotTop(slots, i, (i % 8u) + 1u, 10u + i, valBufs[i]);
+            }
+            std::memcpy(slotsAlt.data(), slots.data(), slots.size());
+
+            std::vector<uint8_t> constStore(0x8400u, 0u);
+            void* pBuckets = buckets;
+            uint8_t* pSlots = slots.data();
+            std::memcpy(&constStore[0x8010u], &pBuckets, 8u);
+            std::memcpy(&constStore[0x8018u], &kNumBuckets, 4u);
+            std::memcpy(&constStore[0x8388u], &pSlots, 8u);
+
+            uint8_t* pIdxB = reinterpret_cast<uint8_t*>(paramIdxs);
+            uint8_t* pIdxE = reinterpret_cast<uint8_t*>(paramIdxs + 13);
+            std::memcpy(shaderPart + 0x40u, &pIdxB, 8u);
+            std::memcpy(shaderPart + 0x48u, &pIdxE, 8u);
+            uint8_t* pGrp = groups.data();
+            std::memcpy(uniformTable + 0x08u, &pGrp, 8u);
+
+            hs_klei_fastpath::KleiRenderFastPath kfp;
+            kfp.SetUniformOps(uops);
+            kfp.SetEnabled(true);
+
+            // 1. First call compiles plan & emits all 13 uniforms in exact order with exact transpose/elemCount!
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(mu.origCalls == 0u);
+            CHECK(kfp.UniformPlanCompiles() == 1ULL);
+            CHECK(mu.log.size() == 13u);
+            CHECK(mu.log[0].kind == 0 && mu.log[0].loc == 10 && mu.log[0].v0 == 1.5f);                     // type 0 -> 1f
+            CHECK(mu.log[1].kind == 0 && mu.log[1].loc == 11 && mu.log[1].v0 == 2.5f);                     // type 1 -> 1f
+            CHECK(mu.log[2].kind == 2 && mu.log[2].loc == 12 && mu.log[2].cnt == 1);                       // type 2 clamped -> 2fv(1)
+            CHECK(mu.log[3].kind == 2 && mu.log[3].loc == 13 && mu.log[3].cnt == 3);                       // type 2 array  -> 2fv(3)
+            CHECK(mu.log[4].kind == 3 && mu.log[4].loc == 14 && mu.log[4].cnt == 3);                       // type 3 array  -> 3fv(3)
+            CHECK(mu.log[5].kind == 4 && mu.log[5].loc == 15 && mu.log[5].cnt == 3);                       // type 4 array  -> 4fv(3)
+            CHECK(mu.log[6].kind == 1 && mu.log[6].loc == 16 && mu.log[6].cnt == 1);                       // type 5        -> 1fv(1)
+            CHECK(mu.log[7].kind == 2 && mu.log[7].loc == 17 && mu.log[7].cnt == 2);                       // type 6        -> 2fv(2)
+            CHECK(mu.log[8].kind == 3 && mu.log[8].loc == 18 && mu.log[8].cnt == 3);                       // type 7        -> 3fv(3)
+            CHECK(mu.log[9].kind == 4 && mu.log[9].loc == 19 && mu.log[9].cnt == 4);                       // type 8        -> 4fv(4)
+            CHECK(mu.log[10].kind == 5 && mu.log[10].loc == 20 && mu.log[10].cnt == 1 && mu.log[10].transp == 1u); // type 10 -> mat2(T=1)
+            CHECK(mu.log[11].kind == 6 && mu.log[11].loc == 21 && mu.log[11].cnt == 1 && mu.log[11].transp == 1u); // type 15 -> mat3(T=1)
+            CHECK(mu.log[12].kind == 7 && mu.log[12].loc == 22 && mu.log[12].cnt == 1 && mu.log[12].transp == 0u); // type 20 -> mat4(T=0)
+
+            // 2. Repeat draw with unchanged stamps -> 0 redundant GL calls, plan hit!
+            mu.log.clear();
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(mu.log.empty() && mu.origCalls == 0u);
+            CHECK(kfp.UniformPlanHits() == 1ULL && kfp.UniformSkipped() == 13ULL);
+
+            // 3. Bump ONLY slot 12 (Matrix4) -> emits strictly 1 call!
+            setSlotTop(slots, 12u, 4u, 99u, valBufs[12]);
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(mu.log.size() == 1u && mu.log[0].kind == 7 && mu.log[0].loc == 22 && mu.log[0].transp == 0u);
+            CHECK(kfp.UniformPlanHits() == 2ULL && kfp.UniformSkipped() == 25ULL);
+
+            // 4. Transactional fail-closed: slot 0 dirty + slot 5 empty/bad depth (0, 9) or null dataPtr
+            //    MUST NOT mutate bind[0].lastStamp or emit GL before falling back to origFn!
+            mu.log.clear();
+            uint32_t stamp0Before = 0u;
+            std::memcpy(&stamp0Before, &bindings[0 * 0x18u + 0x10u], 4u);
+            setSlotTop(slots, 0u, 1u, 555u, valBufs[0]);
+            setSlotTop(slots, 5u, 0u, 0u, nullptr); // empty stack
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            uint32_t stamp0After = 0u;
+            std::memcpy(&stamp0After, &bindings[0 * 0x18u + 0x10u], 4u);
+            CHECK(mu.log.empty() && mu.origCalls == 1u && stamp0After == stamp0Before);
+
+            setSlotTop(slots, 5u, 9u, 777u, valBufs[5]); // depth > 8
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            std::memcpy(&stamp0After, &bindings[0 * 0x18u + 0x10u], 4u);
+            CHECK(mu.log.empty() && mu.origCalls == 2u && stamp0After == stamp0Before);
+
+            setSlotTop(slots, 5u, 2u, 888u, nullptr); // null dataPtr on dirty slot
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            std::memcpy(&stamp0After, &bindings[0 * 0x18u + 0x10u], 4u);
+            CHECK(mu.log.empty() && mu.origCalls == 3u && stamp0After == stamp0Before);
+
+            // Restore slot 5 & slot 0 cleanly
+            setSlotTop(slots, 5u, 6u, 15u, valBufs[5]);
+            setSlotTop(slots, 0u, 1u, stamp0Before, valBufs[0]);
+
+            // 5. 4-Pointer Fingerprint Invalidation (idxBegin, groupsBase, buckets, slotsBase) + Epoch Bump!
+            uint64_t compPrev = kfp.UniformPlanCompiles();
+            pIdxB = reinterpret_cast<uint8_t*>(paramIdxsAlt);
+            pIdxE = reinterpret_cast<uint8_t*>(paramIdxsAlt + 13);
+            std::memcpy(shaderPart + 0x40u, &pIdxB, 8u);
+            std::memcpy(shaderPart + 0x48u, &pIdxE, 8u);
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(kfp.UniformPlanCompiles() == compPrev + 1ULL);
+
+            pGrp = groupsAlt.data();
+            std::memcpy(uniformTable + 0x08u, &pGrp, 8u);
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(kfp.UniformPlanCompiles() == compPrev + 2ULL);
+
+            pBuckets = bucketsAlt;
+            std::memcpy(&constStore[0x8010u], &pBuckets, 8u);
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(kfp.UniformPlanCompiles() == compPrev + 3ULL);
+
+            pSlots = slotsAlt.data();
+            std::memcpy(&constStore[0x8388u], &pSlots, 8u);
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 1ULL, origApply);
+            CHECK(kfp.UniformPlanCompiles() == compPrev + 4ULL);
+
+            // Epoch invalidation forces clean recompile
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 2ULL, origApply);
+            CHECK(kfp.UniformPlanCompiles() == compPrev + 5ULL);
+
+            // 6. Missing hash & unsupported types (9, 11, 21) -> fail-closed to origFn!
+            const uint32_t badHash = 0xDEADBEEFu;
+            std::memcpy(&bindings[0], &badHash, 4u);
+            const uint32_t origBeforeMissing = mu.origCalls;
+            kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 3ULL, origApply);
+            CHECK(mu.origCalls == origBeforeMissing + 1u);
+            const uint32_t goodHash0 = 100u;
+            std::memcpy(&bindings[0], &goodHash0, 4u);
+
+            const int32_t badTypes[3] = { 9, 11, 21 };
+            for (int ti = 0; ti < 3; ++ti) {
+                std::memcpy(&groupsAlt[0], &badTypes[ti], 4u);
+                const uint32_t oc = mu.origCalls;
+                kfp.FastApplyShaderUniforms(shaderPart, uniformTable, constStore.data(), nullptr, 4ULL + static_cast<uint64_t>(ti), origApply);
+                CHECK(mu.origCalls == oc + 1u);
+            }
+            s_u = nullptr;
+        }
+
+        // 39B: FastDrawPrimitives & FastDrawIndexed — 0 locks on consecutive same-handle draws,
+        //      epoch invalidation, VB/Decl/Effect miss (1 Effect lock, never duplicate!),
+        //      IBO unbind/bind order, and count==0 / invalid primType / effectHandle==-1 fail-closed!
+        {
+            struct MockDrawEnv {
+                uint32_t flushCalls      = 0u;
+                uint32_t pushCalls       = 0u;
+                uint32_t popCalls        = 0u;
+                uint32_t bindVbCalls     = 0u;
+                uint32_t effApplyCalls   = 0u;
+                uint32_t vbPoolLocks     = 0u;
+                uint32_t effPoolLocks    = 0u;
+                uint32_t iboPoolLocks    = 0u;
+                uint32_t glBindBufCalls  = 0u;
+                uint32_t lastBindTarget  = 0u;
+                uint32_t lastBindBuf     = 0xFFFFFFFFu;
+                uint32_t glDrawArrCalls  = 0u;
+                uint32_t lastDrawMode    = 0xFFFFFFFFu;
+                int32_t  lastDrawFirst   = -1;
+                int32_t  lastDrawCount   = -1;
+                uint32_t glDrawElCalls   = 0u;
+                int32_t  lastElCount     = -1;
+                uint32_t origPrimCalls   = 0u;
+                uint32_t origIdxCalls    = 0u;
+                std::vector<int> orderLog; // 1=BindIbo, 2=EffApply, 3=UnbindIbo
+                void* vbPoolTag  = reinterpret_cast<void*>(0x11110000ULL);
+                void* effPoolTag = reinterpret_cast<void*>(0x22220000ULL);
+                void* iboPoolTag = reinterpret_cast<void*>(0x33330000ULL);
+                alignas(16) uint8_t eff1[0x100]{};
+                alignas(16) uint8_t eff2[0x100]{};
+                alignas(16) uint8_t ibo1[0x20]{};
+                alignas(16) uint8_t vb1[0x20]{};
+            };
+            static MockDrawEnv* s_d = nullptr;
+            MockDrawEnv md{};
+            s_d = &md;
+
+            void* rVtable[4]   = { nullptr, nullptr, reinterpret_cast<void*>(+[](void*) { ++s_d->flushCalls; }), nullptr };
+            void* effVtable[4] = { nullptr, nullptr, reinterpret_cast<void*>(+[](void*, void*, void*) {
+                ++s_d->effApplyCalls;
+                s_d->orderLog.push_back(2);
+            }), nullptr };
+
+            auto setupEff = [&](uint8_t* e, uint32_t progId, uint32_t mask) {
+                void* vt = effVtable;
+                std::memcpy(e + 0x00u, &vt, 8u);
+                std::memcpy(e + 0xECu, &progId, 4u);
+                std::memcpy(e + 0xF0u, &mask, 4u);
+            };
+            setupEff(md.eff1, 28u, 0x05u);
+            setupEff(md.eff2, 29u, 0x05u); // same attribMask so BindVBAndDecl is a provable no-op!
+            uint32_t iboCnt = 18u, iboGl = 777u;
+            std::memcpy(md.ibo1 + 0x08u, &iboCnt, 4u);
+            std::memcpy(md.ibo1 + 0x10u, &iboGl, 4u);
+
+            alignas(16) uint8_t hwR[0x1D0]{};
+            void* rvt = rVtable;
+            std::memcpy(hwR + 0x00u, &rvt, 8u);
+            int32_t v0 = 1, vNeg = -1;
+            uint32_t mask0 = 0x05u;
+            std::memcpy(hwR + 0x10u, &v0, 4u);    // boundVb = 1
+            std::memcpy(hwR + 0x14u, &v0, 4u);    // wantVb = 1
+            std::memcpy(hwR + 0x18u, &v0, 4u);    // boundDecl = 1
+            std::memcpy(hwR + 0x1Cu, &v0, 4u);    // wantDecl = 1
+            std::memcpy(hwR + 0x20u, &vNeg, 4u);  // boundIbo = -1
+            std::memcpy(hwR + 0x24u, &v0, 4u);    // wantIbo = 1
+            std::memcpy(hwR + 0x2Cu, &v0, 4u);    // wantEffect = 1
+            std::memcpy(hwR + 0x30u, &mask0, 4u); // lastEffectMask = 0x05
+            std::memcpy(hwR + 0x1A8u, &md.vbPoolTag, 8u);
+            std::memcpy(hwR + 0x1B0u, &md.iboPoolTag, 8u);
+            std::memcpy(hwR + 0x1B8u, &md.effPoolTag, 8u);
+
+            auto mockPoolGet = [](void* pool, int32_t h) -> void* {
+                if (h < 0) return nullptr;
+                if (pool == s_d->vbPoolTag)  { ++s_d->vbPoolLocks; return s_d->vb1; }
+                if (pool == s_d->effPoolTag) { ++s_d->effPoolLocks; return (h == 1) ? s_d->eff1 : ((h == 2) ? s_d->eff2 : nullptr); }
+                if (pool == s_d->iboPoolTag) { ++s_d->iboPoolLocks; return (h == 1) ? s_d->ibo1 : nullptr; }
+                return nullptr;
+            };
+            hs_klei_fastpath::KleiRendererHelpers helpers{};
+            helpers.fnPushMatrixW = [](void*, uint32_t, const void*) { ++s_d->pushCalls; };
+            helpers.fnPopConstant = [](void*, uint32_t) { ++s_d->popCalls; };
+            helpers.fnResourcePoolGet = mockPoolGet;
+            helpers.fnBindVBAndDecl = [](void* rVoid) -> void* {
+                ++s_d->bindVbCalls;
+                auto* r = static_cast<uint8_t*>(rVoid);
+                int32_t wantVb = 0, wantDecl = 0, wantEff = 0;
+                void *vbPool = nullptr, *effPool = nullptr;
+                std::memcpy(&wantVb, r + 0x14u, 4u);
+                std::memcpy(&wantDecl, r + 0x1Cu, 4u);
+                std::memcpy(&wantEff, r + 0x2Cu, 4u);
+                std::memcpy(&vbPool, r + 0x1A8u, 8u);
+                std::memcpy(&effPool, r + 0x1B8u, 8u);
+                void* vb  = (vbPool == s_d->vbPoolTag && wantVb >= 0) ? (++s_d->vbPoolLocks, static_cast<void*>(s_d->vb1)) : nullptr;
+                void* eff = (effPool == s_d->effPoolTag && wantEff >= 0)
+                    ? (++s_d->effPoolLocks, static_cast<void*>((wantEff == 1) ? s_d->eff1 : ((wantEff == 2) ? s_d->eff2 : nullptr)))
+                    : nullptr;
+                std::memcpy(r + 0x10u, &wantVb, 4u);
+                std::memcpy(r + 0x18u, &wantDecl, 4u);
+                if (eff) {
+                    uint32_t m = 0u;
+                    std::memcpy(&m, static_cast<uint8_t*>(eff) + 0xF0u, 4u);
+                    std::memcpy(r + 0x30u, &m, 4u);
+                }
+                return vb;
+            };
+            helpers.primTable = hs_klei_fastpath::kDefaultPrimTable;
+
+            hs_klei_fastpath::GlDrawDispatchOps dops{};
+            dops.glBindBuffer = [](uint32_t tgt, uint32_t buf) WINAPI {
+                ++s_d->glBindBufCalls;
+                s_d->lastBindTarget = tgt;
+                s_d->lastBindBuf = buf;
+                s_d->orderLog.push_back(buf == 0u ? 3 : 1);
+            };
+            dops.glDrawArrays = [](uint32_t mode, int32_t first, int32_t count) WINAPI {
+                ++s_d->glDrawArrCalls;
+                s_d->lastDrawMode = mode;
+                s_d->lastDrawFirst = first;
+                s_d->lastDrawCount = count;
+            };
+            dops.glDrawElements = [](uint32_t mode, int32_t count, uint32_t, const void*) WINAPI {
+                ++s_d->glDrawElCalls;
+                s_d->lastDrawMode = mode;
+                s_d->lastElCount = count;
+            };
+
+            auto origPrim = [](void*, const void*, uint32_t, uint32_t, int32_t) { ++s_d->origPrimCalls; };
+            auto origIdx  = [](void*, const void*, int32_t) { ++s_d->origIdxCalls; };
+            const float matW[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+            hs_klei_fastpath::KleiRenderFastPath kfp;
+            kfp.SetHelpers(helpers);
+            kfp.SetDrawOps(dops);
+            kfp.SetEnabled(true);
+
+            // 1. Cold draw populates cache (1 Effect lock, 0 BindVBAndDecl since VB/Decl/Mask match!)
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6 /*GL_TRIANGLES*/, 1ULL, origPrim);
+            CHECK(md.effPoolLocks == 1u && md.vbPoolLocks == 0u && md.bindVbCalls == 0u);
+            CHECK(md.glDrawArrCalls == 1u && md.lastDrawMode == 4u && md.lastDrawCount == 6);
+            CHECK(md.pushCalls == 1u && md.popCalls == 1u);
+
+            // 2. 10 consecutive same-handle draws -> strictly ZERO ResourcePool::Get locks!
+            for (int k = 0; k < 10; ++k) {
+                kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 1ULL, origPrim);
+            }
+            CHECK(md.effPoolLocks == 1u && md.vbPoolLocks == 0u && md.iboPoolLocks == 0u);
+            CHECK(kfp.DrawFastHits() == 10ULL && kfp.LocksSaved() >= 30ULL);
+
+            // 3. Epoch invalidation forces fresh lookup (still only 1 Effect lock, never duplicate!)
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 2ULL, origPrim);
+            CHECK(md.effPoolLocks == 2u && md.vbPoolLocks == 0u && kfp.DrawSlowMisses() == 2ULL);
+
+            // 4. VB handle change miss path while Effect cached -> BindVBAndDecl runs once, ONLY 1 Effect lock!
+            int32_t vb2 = 2;
+            std::memcpy(hwR + 0x14u, &vb2, 4u);
+            const uint32_t effBeforeVb = md.effPoolLocks;
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 2ULL, origPrim);
+            CHECK(md.bindVbCalls == 1u && md.effPoolLocks == effBeforeVb + 1u); // NEVER duplicate Effect lock!
+
+            // 5. Effect handle change miss path (eff1 -> eff2, same attribMask) -> ONLY 1 Effect lock, 0 BindVB!
+            int32_t effH2 = 2;
+            std::memcpy(hwR + 0x2Cu, &effH2, 4u);
+            const uint32_t effBeforeChg = md.effPoolLocks;
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 2ULL, origPrim);
+            CHECK(md.bindVbCalls == 1u && md.effPoolLocks == effBeforeChg + 1u);
+
+            // 6. IBO unbind when curIbo != -1 -> glBindBuffer(0x8893, 0) AFTER Effect::Apply & curIbo = -1!
+            int32_t activeIbo = 5;
+            std::memcpy(hwR + 0x20u, &activeIbo, 4u);
+            md.orderLog.clear();
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 2ULL, origPrim);
+            int32_t afterIbo = 0;
+            std::memcpy(&afterIbo, hwR + 0x20u, 4u);
+            CHECK(afterIbo == -1 && md.lastBindTarget == 0x8893u && md.lastBindBuf == 0u);
+            CHECK(md.orderLog.size() == 2u && md.orderLog[0] == 2 && md.orderLog[1] == 3); // Apply then Unbind!
+
+            // 7. Fail-closed checks: count==0, primType<0, primType>=7, effectHandle==-1
+            const uint32_t drawsBeforeFb = md.glDrawArrCalls;
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 0u, 6, 2ULL, origPrim);
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, -1, 2ULL, origPrim);
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 7, 2ULL, origPrim);
+            CHECK(md.origPrimCalls == 3u && md.glDrawArrCalls == drawsBeforeFb && kfp.DrawFallbacks() == 3ULL);
+            std::memcpy(hwR + 0x2Cu, &vNeg, 4u); // wantEffect = -1
+            kfp.FastDrawPrimitives(hwR, matW, 0u, 6u, 6, 2ULL, origPrim);
+            CHECK(md.glDrawArrCalls == drawsBeforeFb && kfp.DrawFallbacks() == 4ULL && md.pushCalls == md.popCalls);
+
+            // 8. FastDrawIndexed: binds IBO BEFORE Effect::Apply, 0 locks on repeat, epoch invalidates, numElements==0 fail-closed
+            std::memcpy(hwR + 0x2Cu, &effH2, 4u);
+            std::memcpy(hwR + 0x20u, &vNeg, 4u);
+            md.orderLog.clear();
+            kfp.FastDrawIndexed(hwR, matW, 6, 2ULL, origIdx);
+            CHECK(md.glDrawElCalls == 1u && md.lastElCount == 18 && md.iboPoolLocks == 1u);
+            CHECK(md.orderLog.size() == 2u && md.orderLog[0] == 1 && md.orderLog[1] == 2); // BindIbo BEFORE Apply!
+            const uint32_t effLocksIdx = md.effPoolLocks;
+            kfp.FastDrawIndexed(hwR, matW, 6, 2ULL, origIdx);
+            CHECK(md.glDrawElCalls == 2u && md.iboPoolLocks == 1u && md.effPoolLocks == effLocksIdx);
+            CHECK(kfp.DrawIndexedFastHits() == 1ULL);
+            // numElements == 0 -> fail-closed to origIdx
+            uint32_t zeroCnt = 0u;
+            std::memcpy(md.ibo1 + 0x08u, &zeroCnt, 4u);
+            kfp.FastDrawIndexed(hwR, matW, 6, 2ULL, origIdx);
+            CHECK(md.origIdxCalls == 1u && md.glDrawElCalls == 2u);
+            s_d = nullptr;
+        }
+
+        // 39C: GpuClarityEngine full adaptive ladder 3->2->1->0->1->2->3 (0 GL allocs/deletes)
+        //      + WorldShadowEngine fastEntityReceive1Tap==true -> outBounds[3]==0.65f & 800 deferred batches
+        {
+            struct MockClP4 {
+                uint32_t nextId = 1u;
+                uint32_t genTex = 0u, delTex = 0u, texStor = 0u, genFbo = 0u, delFbo = 0u;
+                uint32_t dispatches = 0u, blits = 0u;
+                float    lastTuneY = -1.0f;
+            };
+            static MockClP4* s_c4 = nullptr;
+            MockClP4 c4{};
+            s_c4 = &c4;
+
+            hs_gpu_clarity::GlComputeOps cops{};
+            cops.glGenFramebuffers = [](int32_t n, uint32_t* p) WINAPI { s_c4->genFbo += static_cast<uint32_t>(n); for (int i = 0; i < n; ++i) p[i] = s_c4->nextId++; };
+            cops.glDeleteFramebuffers = [](int32_t n, const uint32_t*) WINAPI { s_c4->delFbo += static_cast<uint32_t>(n); };
+            cops.glBindFramebuffer = [](uint32_t, uint32_t) WINAPI {};
+            cops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return hs_gpu_clarity::kGlFramebufferComplete; };
+            cops.glBlitFramebuffer = [](int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t) WINAPI { ++s_c4->blits; };
+            cops.glGenTextures = [](int32_t n, uint32_t* p) WINAPI { s_c4->genTex += static_cast<uint32_t>(n); for (int i = 0; i < n; ++i) p[i] = s_c4->nextId++; };
+            cops.glDeleteTextures = [](int32_t n, const uint32_t*) WINAPI { s_c4->delTex += static_cast<uint32_t>(n); };
+            cops.glActiveTexture = [](uint32_t) WINAPI {};
+            cops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            cops.glTexStorage2D = [](uint32_t, int32_t, uint32_t, int32_t, int32_t) WINAPI { ++s_c4->texStor; };
+            cops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_c4->nextId++; };
+            cops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            cops.glCompileShader = [](uint32_t) WINAPI {};
+            cops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteShader = [](uint32_t) WINAPI {};
+            cops.glCreateProgram = []() WINAPI -> uint32_t { return s_c4->nextId++; };
+            cops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            cops.glLinkProgram = [](uint32_t) WINAPI {};
+            cops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteProgram = [](uint32_t) WINAPI {};
+            cops.glUseProgram = [](uint32_t) WINAPI {};
+            cops.glGetUniformLocation = [](uint32_t, const char* nm) WINAPI -> int32_t { return (nm && std::strcmp(nm, "uTune") == 0) ? 2 : 1; };
+            cops.glUniform4f = [](int32_t loc, float, float y, float, float) WINAPI { if (loc == 2) s_c4->lastTuneY = y; };
+            cops.glDispatchCompute = [](uint32_t, uint32_t, uint32_t) WINAPI { ++s_c4->dispatches; };
+            cops.glMemoryBarrier = [](uint32_t) WINAPI {};
+            cops.glBindImageTexture = [](uint32_t, uint32_t, int32_t, uint8_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == hs_gpu_clarity::kGlMaxTextureSize && p) *p = 16384;
+                else if (p) *p = 0;
+            };
+            cops.glIsEnabled = [](uint32_t) WINAPI -> uint8_t { return 0u; };
+            cops.glEnable = [](uint32_t) WINAPI {};
+            cops.glDisable = [](uint32_t) WINAPI {};
+
+            hs_gpu_clarity::GpuClarityEngine cl;
+            cl.SetOps(cops, true);
+            hs_gpu_clarity::KnownGlState ks{};
+            ks.drawFbo = 1; ks.readFbo = 1; ks.curProgram = 0;
+            ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+            ks.boundTex0 = 0; ks.scissorEnabled = 0; ks.sampleTimer = false;
+
+            // Warmup Grade 3
+            CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 3.0f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 3);
+            c4.genTex = c4.delTex = c4.texStor = c4.genFbo = c4.delFbo = 0u;
+
+            // 3 -> 2 (45 frames @ 6.2ms > 5.5ms, stays Grade 2 since 6.2 < 6.5!)
+            for (int f = 0; f < 45; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 6.2f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 2 && !cl.IsAdaptiveBypassed());
+            for (int f = 0; f < 50; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 6.2f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 2); // Does NOT step 2->1 below 6.5ms!
+
+            // 2 -> 1 (45 frames @ 7.0ms > 6.5ms; Grade 1 runs strictly 1 compute dispatch with localClarity=0.0!)
+            for (int f = 0; f < 45; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 7.0f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 1 && !cl.IsAdaptiveBypassed());
+            c4.dispatches = 0u; c4.lastTuneY = -1.0f;
+            CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 7.0f, 5.5f }, &ks));
+            CHECK(c4.dispatches == 1u && c4.lastTuneY == 0.0f);
+
+            // 1 -> 0 (60 frames @ 8.0ms > 7.5ms; Grade 0 bypasses with 0 dispatches & 0 blits!)
+            for (int f = 0; f < 59; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 8.0f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 1);
+            c4.dispatches = 0u; c4.blits = 0u;
+            CHECK(!cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 8.0f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 0 && cl.IsAdaptiveBypassed() && !cl.IsActive());
+            CHECK(c4.dispatches == 0u && c4.blits == 0u);
+
+            // Recover 0 -> 1 (120 frames @ 5.5ms < 6.0ms)
+            for (int f = 0; f < 119; ++f) CHECK(!cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 5.5f, 5.5f }, &ks));
+            CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 5.5f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 1 && !cl.IsAdaptiveBypassed());
+
+            // Recover 1 -> 2 (120 frames @ 4.5ms < 5.0ms)
+            for (int f = 0; f < 120; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 4.5f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 2);
+
+            // Recover 2 -> 3 (120 frames @ 3.5ms < 4.0ms)
+            for (int f = 0; f < 120; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 3, 1.0f, true, 3.5f, 5.5f }, &ks));
+            CHECK(cl.EffectiveGrade() == 3 && cl.AdaptiveGradeSteps() == 6ULL);
+            CHECK(c4.genTex == 0u && c4.delTex == 0u && c4.texStor == 0u && c4.genFbo == 0u && c4.delFbo == 0u);
+            cl.OnContextReset(true);
+            s_c4 = nullptr;
+
+            // WorldShadowEngine fastEntityReceive1Tap == true -> outBounds[3] == 0.65f + 800 deferred batches
+            struct MockWs4 { uint32_t nextId = 1u; uint32_t multiDrawCalls = 0u; int32_t lastMdCount = 0; };
+            static MockWs4* s_w4 = nullptr;
+            MockWs4 w4{};
+            s_w4 = &w4;
+            hs_world_shadow::GlShadowOps wops{};
+            wops.glGenFramebuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_w4->nextId++; };
+            wops.glDeleteFramebuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindFramebuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            wops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return hs_world_shadow::kGlFramebufferComplete; };
+            wops.glGenRenderbuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_w4->nextId++; };
+            wops.glDeleteRenderbuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindRenderbuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glRenderbufferStorage = [](uint32_t, uint32_t, int32_t, int32_t) WINAPI {};
+            wops.glFramebufferRenderbuffer = [](uint32_t, uint32_t, uint32_t, uint32_t) WINAPI {};
+            wops.glGenTextures = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_w4->nextId++; };
+            wops.glDeleteTextures = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glActiveTexture = [](uint32_t) WINAPI {};
+            wops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            wops.glTexImage2D = [](uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*) WINAPI {};
+            wops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            wops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_w4->nextId++; };
+            wops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            wops.glCompileShader = [](uint32_t) WINAPI {};
+            wops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            wops.glDeleteShader = [](uint32_t) WINAPI {};
+            wops.glCreateProgram = []() WINAPI -> uint32_t { return s_w4->nextId++; };
+            wops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBindAttribLocation = [](uint32_t, uint32_t, const char*) WINAPI {};
+            wops.glLinkProgram = [](uint32_t) WINAPI {};
+            wops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            wops.glDeleteProgram = [](uint32_t) WINAPI {};
+            wops.glUseProgram = [](uint32_t) WINAPI {};
+            wops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            wops.glUniform1f = [](int32_t, float) WINAPI {};
+            wops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            wops.glUniform4fv = [](int32_t, int32_t, const float*) WINAPI {};
+            wops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            wops.glGenBuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_w4->nextId++; };
+            wops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            wops.glBindBuffer = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBufferData = [](uint32_t, ptrdiff_t, const void*, uint32_t) WINAPI {};
+            wops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            wops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            wops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            wops.glDrawArrays = [](uint32_t, int32_t, int32_t) WINAPI {};
+            wops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {};
+            wops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t) WINAPI {};
+            wops.glMultiDrawElementsBaseVertex = [](uint32_t, const int32_t*, uint32_t, const void* const*, int32_t dc, const int32_t*) WINAPI {
+                ++s_w4->multiDrawCalls;
+                s_w4->lastMdCount = dc;
+            };
+            wops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t) WINAPI {};
+            wops.glViewport = [](int32_t, int32_t, int32_t, int32_t) WINAPI {};
+            wops.glClearColor = [](float, float, float, float) WINAPI {};
+            wops.glClear = [](uint32_t) WINAPI {};
+            wops.glEnable = [](uint32_t) WINAPI {};
+            wops.glDisable = [](uint32_t) WINAPI {};
+            wops.glBlendFunc = [](uint32_t, uint32_t) WINAPI {};
+            wops.glBlendEquation = [](uint32_t) WINAPI {};
+            wops.glDepthFunc = [](uint32_t) WINAPI {};
+            wops.glDepthMask = [](uint8_t) WINAPI {};
+            wops.glColorMask = [](uint8_t, uint8_t, uint8_t, uint8_t) WINAPI {};
+            wops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == 0x8872u && p) *p = 32;
+                else if (pname == 0x0D33u && p) *p = 16384;
+                else if (p) *p = 0;
+            };
+
+            hs_world_shadow::WorldShadowEngine ws;
+            ws.SetOps(wops, true);
+            hs_gl_cache::ThreadState glc;
+            glc.caps[0] = 1; glc.caps[1] = 0; glc.caps[2] = 0; glc.caps[3] = 0; glc.caps[4] = 0;
+            glc.blendSrc = hs_world_shadow::kGlSrcAlpha; glc.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+            glc.blendEq = hs_world_shadow::kGlFuncAdd; glc.depthFunc = hs_world_shadow::kGlLess;
+            glc.colorMask = 15; glc.depthMask = 0;
+
+            const float pv[16] = { 1.0f/20.0f,0,0,0, 0,0,0,0, 0,1.0f/20.0f,0,0, 0,0,0,1 };
+            const int32_t vp[4] = { 0, 0, 256, 256 };
+            hs_world_shadow::ShadowConfig sc{};
+            sc.dirWx = 0.0f; sc.dirWz = 1.0f; sc.stretch = 1.5f; sc.projOn = 1.0f;
+            sc.density = 0.65f; sc.soft = 0.8f; sc.hdMode = true; sc.temporalStride = 2u;
+            sc.hasLuaCam = true; sc.luaCamX = 0.0f; sc.luaCamZ = 0.0f;
+            CHECK(sc.fastEntityReceive1Tap == false);
+            hs_world_shadow::ShadowPassState saved{};
+            saved.dstFbo = 5u; memcpy(saved.vp, vp, sizeof(vp));
+            saved.glCacheTrusted = true; saved.blendCacheTrusted = true;
+
+            // Frame 1: record 800 deferred batches (> old 512 cap!) -> 1 MultiDraw call!
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(sc, saved, glc));
+            for (uint32_t k = 0u; k < 800u; ++k) {
+                CHECK(ws.RecordBatchedShadowGpu(11u, 12u, 13u, 6u, static_cast<int32_t>(k * 4u),
+                                                static_cast<uintptr_t>(k * 12u), nullptr, 5u));
+            }
+            ws.FlushDeferredBatchedShadows(sc, saved, glc);
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameDeferredBatches() == 800u && w4.multiDrawCalls == 1u && w4.lastMdCount == 800);
+
+            // Frame 2: default 5-tap -> outBounds[3] == 1.0f; toggle fastEntityReceive1Tap=true -> 0.65f!
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(sc, saved, glc));
+            CHECK(ws.LastFrameReused() == false); // checked after OnEndFrame
+            float b5[4]{}, t5[4]{};
+            ws.GetEntityReceiveUniforms(sc, b5, t5);
+            CHECK(std::fabs(b5[3] - 1.0f) < 1e-5f && !ws.IsFastEntityReceive1Tap());
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameReused() == true);
+
+            const uint32_t genBefore = ws.FrameRecvGen();
+            sc.fastEntityReceive1Tap = true;
+            sc.temporalStride = 3u;
+            ws.OnGroundOrOceanDraw(5u, vp); ws.OnMatrixPV(pv);
+            CHECK(ws.OnBeforeFirstStandingEntity(sc, saved, glc));
+            CHECK(ws.FrameRecvGen() > genBefore);
+            float b1[4]{}, t1[4]{};
+            ws.GetEntityReceiveUniforms(sc, b1, t1);
+            CHECK(b1[3] > 0.5f && b1[3] < 0.75f && std::fabs(b1[3] - 0.65f) < 1e-5f);
+            CHECK(ws.IsFastEntityReceive1Tap());
+            ws.OnEndFrame();
+            CHECK(ws.LastFrameReused() == true); // Toggling 1-tap preserves temporal reuse!
+            ws.ResetContext(true);
+            s_w4 = nullptr;
+        }
+
+        // 39D: SpriteBatcher 800-flush consecutive state-elision parity + FLOAT_PARAMS.z SSBO
+        //      absorption + complete state restoration across ALL exit paths!
+        {
+            struct MockSb4 {
+                uint32_t nextId = 100u;
+                std::unordered_map<uint32_t, std::vector<uint8_t>> bufs;
+                uint32_t curArr = 0u, curElem = 0u, curSsbo = 0u;
+                uint32_t bindBufCalls = 0u, bindSsboCalls = 0u, drawBaseCalls = 0u;
+                uint32_t u1fCalls = 0u, enAttCalls = 0u, disAttCalls = 0u, attPtrCalls = 0u;
+                uint32_t u3Calls = 0u, postRestoreCalls = 0u;
+                float    lastBatchActive = -1.0f;
+                float    lastU3Val[3]{};
+                uint32_t lastSsboId = 0u;
+                uint32_t restoredArr = 0u, restoredElem = 0u;
+            };
+            static MockSb4* s_s4 = nullptr;
+            MockSb4 ms{};
+            s_s4 = &ms;
+
+            hs_sprite_batch::GlBatchOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_s4->nextId++; };
+            ops.glDeleteBuffers = [](int32_t n, const uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) s_s4->bufs.erase(p[i]); };
+            ops.glBindBuffer = [](uint32_t t, uint32_t b) WINAPI {
+                ++s_s4->bindBufCalls;
+                if (t == hs_sprite_batch::kGlArrayBuffer) s_s4->curArr = b;
+                else if (t == hs_sprite_batch::kGlElementArrayBuffer) s_s4->curElem = b;
+                else if (t == hs_sprite_batch::kGlShaderStorageBuffer) s_s4->curSsbo = b;
+            };
+            ops.glBufferData = [](uint32_t t, ptrdiff_t sz, const void* d, uint32_t) WINAPI {
+                uint32_t id = (t == hs_sprite_batch::kGlArrayBuffer) ? s_s4->curArr
+                            : (t == hs_sprite_batch::kGlElementArrayBuffer ? s_s4->curElem : s_s4->curSsbo);
+                auto& v = s_s4->bufs[id];
+                v.resize(static_cast<size_t>(sz));
+                if (d && sz > 0) std::memcpy(v.data(), d, static_cast<size_t>(sz));
+            };
+            ops.glBufferStorage = [](uint32_t t, ptrdiff_t sz, const void*, uint32_t) WINAPI {
+                uint32_t id = (t == hs_sprite_batch::kGlArrayBuffer) ? s_s4->curArr
+                            : (t == hs_sprite_batch::kGlElementArrayBuffer ? s_s4->curElem : s_s4->curSsbo);
+                s_s4->bufs[id].assign(static_cast<size_t>(sz), 0u);
+            };
+            ops.glGetBufferParameteriv = [](uint32_t t, uint32_t pname, int32_t* p) WINAPI {
+                uint32_t id = (t == hs_sprite_batch::kGlArrayBuffer) ? s_s4->curArr
+                            : (t == hs_sprite_batch::kGlElementArrayBuffer ? s_s4->curElem : s_s4->curSsbo);
+                auto it = s_s4->bufs.find(id);
+                if (pname == hs_sprite_batch::kGlBufferSize && p && it != s_s4->bufs.end()) {
+                    *p = static_cast<int32_t>(it->second.size());
+                }
+            };
+            ops.glMapBufferRange = [](uint32_t t, ptrdiff_t, ptrdiff_t, uint32_t) WINAPI -> void* {
+                uint32_t id = (t == hs_sprite_batch::kGlArrayBuffer) ? s_s4->curArr
+                            : (t == hs_sprite_batch::kGlElementArrayBuffer ? s_s4->curElem : s_s4->curSsbo);
+                auto it = s_s4->bufs.find(id);
+                return (it != s_s4->bufs.end() && !it->second.empty()) ? it->second.data() : nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { return 1u; };
+            ops.glFenceSync = [](uint32_t, uint32_t) WINAPI -> void* { return reinterpret_cast<void*>(0x1234ULL); };
+            ops.glClientWaitSync = [](void*, uint32_t, uint64_t) WINAPI -> uint32_t { return 0x911Au; };
+            ops.glDeleteSync = [](void*) WINAPI {};
+            ops.glActiveTexture = [](uint32_t) WINAPI {};
+            ops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            ops.glUniform1f = [](int32_t, float v) WINAPI { ++s_s4->u1fCalls; s_s4->lastBatchActive = v; };
+            ops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            ops.glUniform3fv = [](int32_t, int32_t, const float* v) WINAPI { ++s_s4->u3Calls; std::memcpy(s_s4->lastU3Val, v, 12u); };
+            ops.glUniform4fv = [](int32_t, int32_t, const float*) WINAPI {};
+            ops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            ops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI { ++s_s4->attPtrCalls; };
+            ops.glEnableVertexAttribArray = [](uint32_t) WINAPI { ++s_s4->enAttCalls; };
+            ops.glDisableVertexAttribArray = [](uint32_t) WINAPI { ++s_s4->disAttCalls; };
+            ops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI {};
+            ops.glDrawElementsBaseVertex = [](uint32_t, int32_t, uint32_t, const void*, int32_t) WINAPI { ++s_s4->drawBaseCalls; };
+            ops.glBindBufferBase = [](uint32_t, uint32_t, uint32_t buf) WINAPI { ++s_s4->bindSsboCalls; s_s4->lastSsboId = buf; };
+            ops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (pname == hs_sprite_batch::kGlMaxTextureImageUnits && p) *p = 32;
+            };
+            ops.glGetTextureHandleARB = [](uint32_t tid) WINAPI -> uint64_t { return 0x888800000000ULL | static_cast<uint64_t>(tid); };
+            ops.glMakeTextureHandleResidentARB = [](uint64_t) WINAPI {};
+            ops.glMakeTextureHandleNonResidentARB = [](uint64_t) WINAPI {};
+            ops.onPostFlushRestore = [](uint32_t, uint32_t arr, uint32_t elem, uint32_t, void*) {
+                ++s_s4->postRestoreCalls;
+                s_s4->restoredArr = arr;
+                s_s4->restoredElem = elem;
+            };
+
+            hs_sprite_batch::SpriteBatcher sb;
+            sb.SetOps(ops);
+            sb.SetPersistentRingPreferred(true);
+            sb.SetGpuDrivenPreferred(true);
+            sb.SetDeferHostRestore(true);
+            sb.SetEnabled(true);
+
+            hs_sprite_batch::BatchProgInfo info{};
+            info.checked = true; info.eligible = true; info.hasGpuDriven = true;
+            info.hasParamsAbsorption = true;
+            info.locMatrixW = 1; info.locColourXform = 2; info.locBatchActive = 3;
+            info.locFloatParams = 40; info.locParams = 41;
+            info.locSampler0 = 4; info.locSampler1 = 5;
+            info.locPos2dUv = 0; info.locBatchWpos = 7; info.locBatchCMult = 5; info.locBatchCAdd = 6;
+            info.progMaxTexSlots = 16u;
+            for (uint32_t s = 0u; s < 16u; ++s) info.locBatchTex[s] = 10 + static_cast<int32_t>(s);
+
+            const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            const float qv[16] = { -1,0,0,0, 1,0,1,0, 1,3,1,1, -1,3,0,1 };
+            const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+
+            sb.OnUseProgram(28u, &info);
+            sb.OnEnableDisableVertexAttribArray(0u, true);
+            sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 301u);
+
+            // Warm ring via 1 draw so GPU-Driven ring is ready before measuring 800 consecutive flushes
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::State);
+            sb.PrepareForUnbatchedDraw(); // reset sticky & boundSsboId_ cleanly!
+
+            // Reset counters and execute 800 consecutive stencil-separated flushes + FLOAT_PARAMS.z > 0 absorption!
+            ms.bindBufCalls = ms.bindSsboCalls = ms.drawBaseCalls = 0u;
+            ms.u1fCalls = ms.enAttCalls = ms.disAttCalls = ms.attPtrCalls = ms.u3Calls = ms.postRestoreCalls = 0u;
+            const float fpBob[3] = { -0.05f, 1.0f, 1.0f };
+            const float pAlpha[3] = { 0.50f, 0.0f, 0.0f };
+            CHECK(sb.TryAbsorbFloatParams(40, 1, fpBob) == true);
+            CHECK(sb.TryAbsorbParams(41, 1, pAlpha) == true);
+            for (int f = 0; f < 800; ++f) {
+                sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+                sb.Flush(hs_sprite_batch::FlushReason::State);
+            }
+            CHECK(ms.drawBaseCalls == 800u);
+            CHECK(ms.bindSsboCalls == 1u);
+            CHECK(ms.bindBufCalls == 2u); // 1 VBO + 1 IBO across ALL 800 flushes!
+            CHECK(ms.u1fCalls == 1u && ms.lastBatchActive == 2.0f);
+            CHECK(ms.enAttCalls == 1u && ms.disAttCalls == 0u && ms.attPtrCalls == 2u);
+            CHECK(ms.u3Calls == 0u); // FLOAT_PARAMS.z & PARAMS absorbed with 0 GL calls!
+            CHECK(sb.IsStickySessionActive());
+
+            // Verify bit 20 (fpBob) + bits 3..19 (ALPHA_TEST=0.5) packed cleanly in SSBO instance!
+            const auto* insts = reinterpret_cast<const hs_sprite_batch::GpuSpriteInstance*>(ms.bufs[ms.lastSsboId].data());
+            const uint32_t m2w = static_cast<uint32_t>(insts[1].m2[3] + 0.5f);
+            CHECK((m2w & 0x100000u) != 0u); // bit 20 fpBob == 1
+            CHECK((m2w & 1u) != 0u);        // bit 0 fpClip == 1
+            CHECK(std::fabs(static_cast<float>((m2w >> 3u) & 0x1FFFFu) / 65535.0f - 0.50f) < 1e-4f);
+
+            // Exit path 1: PrepareForUnbatchedDraw() ends sticky, restores locBatchActive=0, commits dirty uniforms, clears boundSsboId_!
+            sb.PrepareForUnbatchedDraw();
+            CHECK(!sb.IsStickySessionActive() && ms.lastBatchActive == 0.0f && ms.disAttCalls == 1u && ms.postRestoreCalls == 1u);
+            CHECK(ms.u3Calls == 2u); // committed dirty FLOAT_PARAMS + PARAMS!
+
+            // Next flush MUST re-bind SSBO after PrepareForUnbatchedDraw()!
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::State);
+            CHECK(ms.bindSsboCalls == 2u && sb.IsStickySessionActive());
+
+            // Exit path 2: OnUseProgram() ends sticky & clears boundSsboId_
+            sb.OnUseProgram(99u, nullptr);
+            CHECK(!sb.IsStickySessionActive() && ms.lastBatchActive == 0.0f);
+            sb.OnUseProgram(28u, &info);
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi));
+            sb.Flush(hs_sprite_batch::FlushReason::State);
+            CHECK(ms.bindSsboCalls == 3u);
+
+            // Exit path 3: OnEndFrame() ends sticky & clears boundSsboId_
+            sb.OnEndFrame();
+            CHECK(!sb.IsStickySessionActive() && ms.lastBatchActive == 0.0f);
+
+            // Non-sticky mode + OnBindBuffer restoration check + CPU fallback fail-closed on FLOAT_PARAMS.z > 0
+            sb.SetDeferHostRestore(false);
+            ms.bufs[666u].resize(sizeof(qi));
+            std::memcpy(ms.bufs[666u].data(), qi, sizeof(qi));
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnVertexAttribPointer(0u, 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 555u);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 666u);
+            const uint32_t ssboBeforeNonSticky = ms.bindSsboCalls;
+            for (int f = 0; f < 4; ++f) {
+                sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+                sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+                CHECK(sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, nullptr));
+                sb.Flush(hs_sprite_batch::FlushReason::State);
+                CHECK(ms.curArr == 555u && ms.curElem == 666u && ms.lastBatchActive == 0.0f);
+            }
+            CHECK(ms.bindSsboCalls == ssboBeforeNonSticky + 1u); // SSBO bound ONCE across 4 non-sticky flushes!
+
+            // Denied texture with FLOAT_PARAMS.z > 0 MUST fail closed (LastRejectCode == 5)
+            sb.OnTexImageMutated(404u, true);
+            sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, 404u);
+            sb.TryAbsorbMatrixW(1, 1, 0, idMtx);
+            sb.TryAbsorbColourXform(2, 1, 0, idMtx);
+            CHECK(!sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, nullptr));
+            CHECK(sb.LastRejectCode() == 5u);
+
+            sb.SetEnabled(false);
+            CHECK(!sb.IsStickySessionActive());
+            sb.ResetContext(nullptr, true);
+            CHECK(!sb.IsStickySessionActive());
+            s_s4 = nullptr;
+        }
+
+        std::printf("[PASS] 39. Phase 4 KleiRenderFastPath (ApplyShaderUniforms+DrawPrimitives+DrawIndexed), GpuClarity 3<->2<->1<->0 Zero-Realloc, WorldShadow 1-Tap+2048 & SpriteBatcher 800-Flush+FloatParamsZ verified!\n");
+    }
+
+    // Test 40: Phase 4.5 — VbPool 6-Frame Retirement + Mode-4 Orphan Upload (Unit + Live RTX 4060) & dinput8.cpp Audits
+    {
+        using hs_vb_pool::VbPool;
+        static_assert(hs_vb_pool::kMinRetireAgeFrames == 6u, "VbPool kMinRetireAgeFrames must be 6");
+        CHECK(hs_vb_pool::kMinRetireAgeFrames == 6u);
+
+        struct BdCall { ptrdiff_t size; bool dataNonNull; uint32_t usage; };
+        struct SubCall { ptrdiff_t offset; ptrdiff_t size; uint8_t firstByte; };
+        struct Mock40 {
+            uint32_t nextId = 1u;
+            int mapCalls = 0;
+            int unmapCalls = 0;
+            std::vector<BdCall> bdCalls;
+            std::vector<SubCall> subCalls;
+        };
+        static Mock40* s_mk40 = nullptr;
+
+        auto wireMock40 = [](VbPool& pool, Mock40& mk) {
+            s_mk40 = &mk;
+            hs_vb_pool::GlBufferOps ops{};
+            ops.glGenBuffers = [](int32_t n, uint32_t* b) {
+                for (int32_t i = 0; i < n; ++i) b[i] = s_mk40->nextId++;
+            };
+            ops.glBindBuffer = [](uint32_t, uint32_t) {};
+            ops.glBufferData = [](uint32_t, ptrdiff_t s, const void* d, uint32_t u) {
+                s_mk40->bdCalls.push_back(BdCall{s, d != nullptr, u});
+            };
+            ops.glBufferSubData = [](uint32_t, ptrdiff_t off, ptrdiff_t s, const void* d) {
+                const uint8_t fb = d ? *static_cast<const uint8_t*>(d) : 0u;
+                s_mk40->subCalls.push_back(SubCall{off, s, fb});
+            };
+            ops.glDeleteBuffers = [](int32_t, const uint32_t*) {};
+            ops.glMapBufferRange = [](uint32_t, ptrdiff_t, ptrdiff_t, uint32_t) -> void* {
+                ++s_mk40->mapCalls;
+                return nullptr;
+            };
+            ops.glUnmapBuffer = [](uint32_t) -> uint8_t {
+                ++s_mk40->unmapCalls;
+                return 0u;
+            };
+            pool.SetOps(ops);
+        };
+
+        // 40A-1: Age 5 misses, Age 6 hits; Mode 4 orphan+upload when useMapRange=false
+        {
+            Mock40 mk{};
+            VbPool pool;
+            wireMock40(pool, mk);
+            uint8_t pA[300]{};
+            uint8_t pB[512]{};
+            pA[0] = 0xA5u;
+            pB[0] = 0x5Au;
+
+            uint32_t idBnd = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, pA, false, idBnd));
+            CHECK(pool.TryRecycle(idBnd));
+            for (int f = 0; f < 5; ++f) pool.OnEndFrame();
+            uint32_t idMiss5 = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, pA, false, idMiss5));
+            CHECK(idMiss5 != idBnd && pool.GetStats().hits == 0);
+            pool.OnEndFrame(); // Age 6 for idBnd
+            uint32_t idHit6 = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, pA, false, idHit6));
+            CHECK(idHit6 == idBnd && pool.GetStats().hits == 1);
+            CHECK(pool.TryRecycle(idMiss5) && pool.TryRecycle(idHit6));
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries());
+        }
+
+        {
+            Mock40 mk{};
+            VbPool pool;
+            wireMock40(pool, mk);
+            uint8_t p300[300]{};
+            uint8_t p512[512]{};
+            p300[0] = 0x3Cu;
+            p512[0] = 0xC3u;
+
+            uint32_t id1 = 0, hit1 = 0, hit2 = 0;
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, p300, false, id1));
+            CHECK(pool.TryRecycle(id1));
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) pool.OnEndFrame();
+
+            // Clear logs before measuring hit1 (size < cap) and hit2 (size == cap)
+            mk.bdCalls.clear();
+            mk.subCalls.clear();
+            mk.mapCalls = 0;
+            mk.unmapCalls = 0;
+
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 300, p300, false, hit1));
+            CHECK(hit1 == id1);
+            CHECK(mk.mapCalls == 0 && mk.unmapCalls == 0);
+            CHECK(mk.bdCalls.size() == 1 && mk.bdCalls[0].size == 512 && mk.bdCalls[0].dataNonNull == false &&
+                  mk.bdCalls[0].usage == hs_vb_pool::kGlStreamDraw);
+            CHECK(mk.subCalls.size() == 1 && mk.subCalls[0].offset == 0 && mk.subCalls[0].size == 300 &&
+                  mk.subCalls[0].firstByte == 0x3Cu);
+            auto st1 = pool.GetStats();
+            CHECK(st1.hits == 1 && st1.subDataUploads == 1 && st1.mapUploads == 0);
+
+            CHECK(pool.TryRecycle(hit1));
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) pool.OnEndFrame();
+            mk.bdCalls.clear();
+            mk.subCalls.clear();
+
+            CHECK(pool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 512, p512, false, hit2));
+            CHECK(hit2 == id1);
+            CHECK(mk.mapCalls == 0 && mk.unmapCalls == 0);
+            CHECK(mk.bdCalls.size() == 1 && mk.bdCalls[0].size == 512 && mk.bdCalls[0].dataNonNull == true &&
+                  mk.bdCalls[0].usage == hs_vb_pool::kGlStreamDraw);
+            CHECK(mk.subCalls.empty());
+            auto st2 = pool.GetStats();
+            CHECK(st2.hits == 2 && st2.subDataUploads == 2 && st2.mapUploads == 0);
+
+            CHECK(pool.TryRecycle(hit2));
+            pool.ResetAndRelease(true);
+            CHECK(!pool.HasEntries());
+            s_mk40 = nullptr;
+        }
+
+        // 40A-2: Live RTX 4060 ES2 GPU test — 200 retired-pool useMapRange=false uploads (size=300 & size=512) < 5.0 ms
+        double liveElapsedMs = 0.0;
+        {
+            hs_native_gl::WglRuntime rt{};
+            HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_test_vb45", WS_POPUP, 0, 0, 32, 32, nullptr, nullptr, nullptr, nullptr);
+            CHECK(hwnd != nullptr);
+            HDC hdc = nullptr;
+            HGLRC rc = nullptr;
+            CHECK(hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) && rt.pWglMakeCurrent(hdc, rc));
+            void* procs[76]{};
+            hs_native_gl::OptionalGlProcs opt{};
+            CHECK(hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) == 76);
+            auto findP = [&](const char* name) -> void* {
+                for (size_t i = 0; i < 76; ++i) if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+                return nullptr;
+            };
+            auto pErr = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glGetError"));
+            hs_vb_pool::GlBufferOps gops{};
+            gops.glGenBuffers     = reinterpret_cast<hs_vb_pool::GlBufferOps::GenBuffers_t>(findP("glGenBuffers"));
+            gops.glBindBuffer     = reinterpret_cast<hs_vb_pool::GlBufferOps::BindBuffer_t>(findP("glBindBuffer"));
+            gops.glBufferData     = reinterpret_cast<hs_vb_pool::GlBufferOps::BufferData_t>(findP("glBufferData"));
+            gops.glBufferSubData  = reinterpret_cast<hs_vb_pool::GlBufferOps::BufferSubData_t>(opt.glBufferSubData);
+            gops.glDeleteBuffers  = reinterpret_cast<hs_vb_pool::GlBufferOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+            gops.glMapBufferRange = reinterpret_cast<hs_vb_pool::GlBufferOps::MapBufferRange_t>(opt.glMapBufferRange);
+            gops.glUnmapBuffer    = reinterpret_cast<hs_vb_pool::GlBufferOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+
+            VbPool livePool;
+            livePool.SetOps(gops);
+            uint8_t vtx[512]{};
+            for (int i = 0; i < 512; ++i) vtx[i] = static_cast<uint8_t>(i & 0xFF);
+
+            constexpr int kBatch = 200;
+            for (int i = 0; i < kBatch; ++i) {
+                uint32_t sid = 0;
+                CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, 512, vtx, false, sid));
+                CHECK(livePool.TryRecycle(sid));
+            }
+            for (uint64_t f = 0; f < hs_vb_pool::kMinRetireAgeFrames; ++f) livePool.OnEndFrame();
+            CHECK(livePool.GetStats().pooledCount == kBatch && pErr() == 0);
+
+            std::vector<uint32_t> activeIds(kBatch, 0u);
+            LARGE_INTEGER freq{}, t0{}, t1{};
+            CHECK(QueryPerformanceFrequency(&freq) && freq.QuadPart > 0);
+            QueryPerformanceCounter(&t0);
+            for (int i = 0; i < kBatch; ++i) {
+                const size_t sz = (i & 1) ? 512u : 300u;
+                CHECK(livePool.AcquireAndUpload(hs_vb_pool::kGlArrayBuffer, hs_vb_pool::kGlStreamDraw, sz, vtx, false, activeIds[i]));
+                CHECK(activeIds[i] != 0u);
+            }
+            QueryPerformanceCounter(&t1);
+            liveElapsedMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(freq.QuadPart);
+
+            const auto stLive = livePool.GetStats();
+            CHECK(pErr() == 0);
+            CHECK(stLive.hits == kBatch && stLive.subDataUploads == kBatch && stLive.mapUploads == 0);
+            CHECK(liveElapsedMs < 5.0);
+
+            for (int i = 0; i < kBatch; ++i) CHECK(livePool.TryRecycle(activeIds[i]));
+            livePool.ResetAndRelease(true);
+            CHECK(!livePool.HasEntries() && pErr() == 0);
+
+            rt.pWglMakeCurrent(nullptr, nullptr);
+            rt.pWglDeleteContext(rc);
+            ReleaseDC(hwnd, hdc);
+            DestroyWindow(hwnd);
+        }
+
+        // 40B: Source-level audit of native_plugin\dinput8.cpp
+        {
+            std::vector<std::string> candidates;
+            {
+                std::string selfPath = __FILE__;
+                const size_t slash = selfPath.find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    candidates.push_back(selfPath.substr(0, slash) + "/../native_plugin/dinput8.cpp");
+                }
+            }
+            candidates.push_back("native_plugin/dinput8.cpp");
+            candidates.push_back("../native_plugin/dinput8.cpp");
+
+            std::string cppSrc;
+            for (const auto& p : candidates) {
+                std::FILE* fp = std::fopen(p.c_str(), "rb");
+                if (fp) {
+                    std::fseek(fp, 0, SEEK_END);
+                    const long len = std::ftell(fp);
+                    std::fseek(fp, 0, SEEK_SET);
+                    if (len > 0) {
+                        cppSrc.resize(static_cast<size_t>(len));
+                        const size_t got = std::fread(cppSrc.data(), 1, cppSrc.size(), fp);
+                        cppSrc.resize(got);
+                    }
+                    std::fclose(fp);
+                    if (!cppSrc.empty()) break;
+                }
+            }
+            CHECK(!cppSrc.empty());
+
+            auto sliceFunc = [&](const char* startAnchor, const char* endAnchor) -> std::string {
+                const size_t a = cppSrc.find(startAnchor);
+                CHECK(a != std::string::npos);
+                const size_t b = cppSrc.find(endAnchor, a + 1);
+                CHECK(b != std::string::npos && b > a);
+                return cppSrc.substr(a, b - a);
+            };
+
+            // (a) HookHWBufferInit passes false for useMapRange
+            const std::string fnHwBuf = sliceFunc("static uint8_t HookHWBufferInit(", "static void PrepareVbPoolHook(");
+            const size_t callPos = fnHwBuf.find("g_vbPool.AcquireAndUpload(");
+            CHECK(callPos != std::string::npos);
+            const size_t semiPos = fnHwBuf.find(");", callPos);
+            CHECK(semiPos != std::string::npos);
+            const std::string callExpr = fnHwBuf.substr(callPos, semiPos - callPos + 2);
+            CHECK(callExpr.find(", false, bufId)") != std::string::npos);
+            CHECK(callExpr.find("g_nativeGlActive") == std::string::npos);
+
+            // (b) HookPeekMessageW does NOT contain PM_NOREMOVE or WM_MOUSEMOVE coalescing
+            const std::string fnPeek = sliceFunc("static BOOL WINAPI HookPeekMessageW(", "static BOOL WINAPI HookMiniDumpWriteDump(");
+            CHECK(fnPeek.find("PM_NOREMOVE") == std::string::npos);
+            CHECK(fnPeek.find("WM_MOUSEMOVE") == std::string::npos);
+            CHECK(fnPeek.find("0x0219u") != std::string::npos);
+            CHECK(cppSrc.find("g_mouseMoveCoalesced") == std::string::npos);
+
+            // (c) FastSmoothCollectGarbage clamps 0.00080f, handles curFps == 0 via 6000.0, and logs [DIAG][GC_SPIKE]
+            const std::string fnGc = sliceFunc("extern \"C\" void FastSmoothCollectGarbage(", "void PrepareSmoothLuaGcHook(");
+            CHECK(fnGc.find("0.00080f") != std::string::npos);
+            CHECK(fnGc.find("0.00160f") == std::string::npos);
+            CHECK(fnGc.find("6000.0") != std::string::npos);
+            CHECK(fnGc.find("[DIAG][GC_SPIKE]") != std::string::npos);
+
+            // (d) [DIAG][LUA_SPIKE], [DIAG][STENCIL_SRC], and [SB_XRAY] vb=(...) telemetry present
+            const std::string fnLuaUpd = sliceFunc("static uint64_t HookClientLuaUpdate(", "static void SampleClientNetTelemetry(");
+            CHECK(fnLuaUpd.find("[DIAG][LUA_SPIKE]") != std::string::npos);
+            const std::string fnStencil = sliceFunc("static void WINAPI HookGlStencilFunc(", "static void WINAPI HookGlStencilMask(");
+            CHECK(fnStencil.find("[DIAG][STENCIL_SRC]") != std::string::npos);
+            CHECK(cppSrc.find("vb=(%llu %.2fms)") != std::string::npos);
+        }
+
+        std::printf("[PASS] 40. Phase 4.5 VbPool 6f-Retire + Mode-4 Orphan (Live RTX %.3fms/200), HookPeekMessageW, GC 0.80ms Clamp & Diag Probes verified!\n",
+                    liveElapsedMs);
+    }
+
+    // =========================================================================
+    // 41. Phase 5: 4-Slot Mode-4 Orphan UiBatcher + SpriteBatcher + Klei 64-Slot
+    //     DrawPrimCache/VertexDecl::Apply + Clarity 360f/2.0ms Hysteresis + FBO/Stencil/UseProg Source Audit
+    // =========================================================================
+    {
+        // (1) UiBatcher with preferOrphanSubData = true: 4-slot Mode-4 orphan+glBufferSubData (0 glMapBufferRange!)
+        {
+            using namespace hs_ui_batch;
+            struct MockUi5 {
+                uint32_t nextId = 10u;
+                uint32_t mapCalls = 0u;
+                uint32_t subDataCalls = 0u;
+                uint32_t orphanNullCalls = 0u;
+                uint32_t drawCalls = 0u;
+                uint32_t boundArr = 0u;
+                uint32_t boundEl = 0u;
+                std::unordered_map<uint32_t, std::vector<uint8_t>> bufs;
+            };
+            static MockUi5* s_u5 = nullptr;
+            MockUi5 mu5{};
+            s_u5 = &mu5;
+
+            UiGlOps uops{};
+            uops.preferOrphanSubData = true;
+            uops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_u5->nextId++; };
+            uops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            uops.glCompileShader = [](uint32_t) WINAPI {};
+            uops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            uops.glDeleteShader = [](uint32_t) WINAPI {};
+            uops.glCreateProgram = []() WINAPI -> uint32_t { return s_u5->nextId++; };
+            uops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            uops.glBindAttribLocation = [](uint32_t, uint32_t, const char*) WINAPI {};
+            uops.glLinkProgram = [](uint32_t) WINAPI {};
+            uops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            uops.glDeleteProgram = [](uint32_t) WINAPI {};
+            uops.glUseProgram = [](uint32_t) WINAPI {};
+            uops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            uops.glGenBuffers = [](int32_t n, uint32_t* ids) WINAPI {
+                for (int i = 0; i < n; ++i) ids[i] = s_u5->nextId++;
+            };
+            uops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            uops.glBindBuffer = [](uint32_t tgt, uint32_t buf) WINAPI {
+                if (tgt == kGlArrayBuffer) s_u5->boundArr = buf;
+                else if (tgt == kGlElementArrayBuffer) s_u5->boundEl = buf;
+            };
+            uops.glBufferData = [](uint32_t tgt, ptrdiff_t sz, const void* dat, uint32_t) WINAPI {
+                const uint32_t id = (tgt == kGlArrayBuffer) ? s_u5->boundArr : s_u5->boundEl;
+                auto& b = s_u5->bufs[id];
+                b.resize(static_cast<size_t>(sz));
+                if (dat && sz > 0) std::memcpy(b.data(), dat, static_cast<size_t>(sz));
+                else ++s_u5->orphanNullCalls;
+            };
+            uops.glBufferSubData = [](uint32_t tgt, ptrdiff_t off, ptrdiff_t sz, const void* dat) WINAPI {
+                ++s_u5->subDataCalls;
+                const uint32_t id = (tgt == kGlArrayBuffer) ? s_u5->boundArr : s_u5->boundEl;
+                auto& b = s_u5->bufs[id];
+                if (dat && sz > 0 && static_cast<size_t>(off + sz) <= b.size()) {
+                    std::memcpy(b.data() + off, dat, static_cast<size_t>(sz));
+                }
+            };
+            uops.glMapBufferRange = [](uint32_t, ptrdiff_t, ptrdiff_t, uint32_t) WINAPI -> void* {
+                ++s_u5->mapCalls;
+                return nullptr;
+            };
+            uops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { return 1; };
+            uops.glActiveTexture = [](uint32_t) WINAPI {};
+            uops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            uops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            uops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            uops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            uops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            uops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            uops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI { ++s_u5->drawCalls; };
+            uops.glGetIntegerv = [](uint32_t pname, int32_t* out) WINAPI {
+                if (out) *out = (pname == hs_sprite_batch::kGlMaxTextureImageUnits) ? 16 : 0;
+            };
+            uops.glGetBufferParameteriv = [](uint32_t tgt, uint32_t pname, int32_t* out) WINAPI {
+                if (!out) return;
+                const uint32_t id = (tgt == kGlArrayBuffer) ? s_u5->boundArr : s_u5->boundEl;
+                auto it = s_u5->bufs.find(id);
+                *out = (pname == hs_sprite_batch::kGlBufferSize && it != s_u5->bufs.end())
+                    ? static_cast<int32_t>(it->second.size())
+                    : 0;
+            };
+
+            UiProgInfo inf{};
+            inf.kind = UiProgKind::UiBasic;
+            inf.eligible = true;
+            inf.locPos = 0; inf.locUv = 1; inf.locDiffuse = 2;
+            inf.locMatrixPVW = 10; inf.locSampler0 = 20;
+
+            struct V { float x, y, z, u, v, r, g, b, a; };
+            const V verts[4] = {
+                {0,0,0, 0,0, 1,1,1,1}, {1,0,0, 1,0, 1,1,1,1},
+                {0,1,0, 0,1, 1,1,1,1}, {1,1,0, 1,1, 1,1,1,1},
+            };
+            const uint16_t idxs[6] = { 0,1,2, 2,1,3 };
+            const float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+            UiBatcher ub;
+            ub.SetOps(uops);
+            ub.SetEnabled(true);
+            for (int f = 0; f < 8; ++f) {
+                ub.OnUseProgram(1u, &inf);
+                ub.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+                ub.OnBindTexture(hs_sprite_batch::kGlTexture2D, 100u + static_cast<uint32_t>(f));
+                CHECK(ub.TryAbsorbMatrix4(inf.locMatrixPVW, 1, 0, ident));
+                ub.OnBindBuffer(kGlArrayBuffer, 0u);
+                ub.OnBindBuffer(kGlElementArrayBuffer, 0u);
+                ub.OnEnableDisableVertexAttribArray(0u, true);
+                ub.OnEnableDisableVertexAttribArray(1u, true);
+                ub.OnEnableDisableVertexAttribArray(2u, true);
+                ub.OnVertexAttribPointer(0u, 3, kGlFloat, 0, sizeof(V), &verts[0].x);
+                ub.OnVertexAttribPointer(1u, 2, kGlFloat, 0, sizeof(V), &verts[0].u);
+                ub.OnVertexAttribPointer(2u, 4, kGlFloat, 0, sizeof(V), &verts[0].r);
+                CHECK(ub.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, idxs));
+                ub.Flush(hs_sprite_batch::FlushReason::End);
+            }
+            CHECK(mu5.drawCalls == 8u);
+            CHECK(mu5.mapCalls == 0u);
+            CHECK(mu5.subDataCalls == 16u);
+            CHECK(mu5.orphanNullCalls >= 24u); // 8 initial slot allocs + 8*2 per-flush orphans
+            ub.ResetContextState(true);
+            s_u5 = nullptr;
+        }
+
+        // (2) SpriteBatcher standard ring UploadRingSlice -> 0 glMapBufferRange when glBufferSubData exists
+        {
+            using namespace hs_sprite_batch;
+            struct MockSb5 {
+                uint32_t nextId = 1u;
+                uint32_t boundVbo = 0u, boundIbo = 0u, activeUnit = 0u;
+                uint32_t mapCalls = 0u, subDataCalls = 0u, drawCalls = 0u;
+                std::unordered_map<uint32_t, std::vector<uint8_t>> gpuBufs;
+            };
+            static MockSb5* s_sb5 = nullptr;
+            MockSb5 ms5{};
+            s_sb5 = &ms5;
+
+            GlBatchOps sops{};
+            sops.preferOrphanSubData = true;
+            sops.glGenBuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_sb5->nextId++; };
+            sops.glDeleteBuffers = [](int32_t, const uint32_t*) WINAPI {};
+            sops.glBindBuffer = [](uint32_t t, uint32_t b) WINAPI {
+                if (t == kGlArrayBuffer) s_sb5->boundVbo = b;
+                else if (t == kGlElementArrayBuffer) s_sb5->boundIbo = b;
+            };
+            sops.glBufferData = [](uint32_t t, ptrdiff_t sz, const void* d, uint32_t) WINAPI {
+                const uint32_t id = (t == kGlArrayBuffer) ? s_sb5->boundVbo : s_sb5->boundIbo;
+                auto& b = s_sb5->gpuBufs[id];
+                b.resize(static_cast<size_t>(sz));
+                if (d && sz > 0) std::memcpy(b.data(), d, static_cast<size_t>(sz));
+            };
+            sops.glBufferSubData = [](uint32_t t, ptrdiff_t off, ptrdiff_t sz, const void* d) WINAPI {
+                ++s_sb5->subDataCalls;
+                const uint32_t id = (t == kGlArrayBuffer) ? s_sb5->boundVbo : s_sb5->boundIbo;
+                auto& b = s_sb5->gpuBufs[id];
+                if (d && sz > 0 && static_cast<size_t>(off + sz) <= b.size()) std::memcpy(b.data() + off, d, static_cast<size_t>(sz));
+            };
+            sops.glMapBufferRange = [](uint32_t, ptrdiff_t, ptrdiff_t, uint32_t) WINAPI -> void* {
+                ++s_sb5->mapCalls;
+                return nullptr;
+            };
+            sops.glUnmapBuffer = [](uint32_t) WINAPI -> uint8_t { return 1; };
+            sops.glActiveTexture = [](uint32_t u) WINAPI { if (u >= kGlTexture0 && u < kGlTexture0 + 16u) s_sb5->activeUnit = u - kGlTexture0; };
+            sops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            sops.glUniform1f = [](int32_t, float) WINAPI {};
+            sops.glUniform1i = [](int32_t, int32_t) WINAPI {};
+            sops.glUniformMatrix4fv = [](int32_t, int32_t, uint8_t, const float*) WINAPI {};
+            sops.glVertexAttribPointer = [](uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*) WINAPI {};
+            sops.glEnableVertexAttribArray = [](uint32_t) WINAPI {};
+            sops.glDisableVertexAttribArray = [](uint32_t) WINAPI {};
+            sops.glGetIntegerv = [](uint32_t pname, int32_t* out) WINAPI {
+                if (out && pname == kGlMaxTextureImageUnits) *out = 16;
+            };
+            sops.glGetBufferParameteriv = [](uint32_t t, uint32_t pname, int32_t* out) WINAPI {
+                if (!out) return;
+                const uint32_t id = (t == kGlArrayBuffer) ? s_sb5->boundVbo : s_sb5->boundIbo;
+                auto it = s_sb5->gpuBufs.find(id);
+                *out = (pname == 0x8764u && it != s_sb5->gpuBufs.end()) ? static_cast<int32_t>(it->second.size()) : 0;
+            };
+            sops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI { ++s_sb5->drawCalls; };
+
+            BatchProgInfo prog{};
+            prog.checked = true; prog.eligible = true;
+            prog.locBatchActive = 10; prog.locMatrixW = 11; prog.locFloatParams = 12;
+            prog.locPos2dUv = 0; prog.locBatchWpos = 7;
+            prog.locSampler0 = 20; prog.locSampler1 = 21; prog.locSampler5 = 25;
+            for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) prog.locBatchTex[s] = static_cast<int32_t>(30 + s);
+
+            SpriteBatcher sb;
+            sb.SetOps(sops);
+            sb.SetPersistentRingPreferred(false);
+            sb.SetGpuDrivenPreferred(false);
+            sb.SetEnabled(true);
+            sb.OnUseProgram(1, &prog);
+            sb.OnEnableDisableVertexAttribArray(0, true);
+            const float quadV[16] = { 0,0,0,0, 1,0,1,0, 1,1,1,1, 0,1,0,1 };
+            const uint16_t quadI[6] = { 0,1,2, 0,2,3 };
+            sb.OnBindBuffer(kGlArrayBuffer, 0);
+            sb.OnVertexAttribPointer(0, 4, kGlFloat, 0, 16, quadV);
+            sb.OnBindBuffer(kGlElementArrayBuffer, 0);
+            const float mtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 10,20,30,1 };
+            for (int f = 0; f < 4; ++f) {
+                sb.OnActiveTexture(kGlTexture0);
+                sb.OnBindTexture(kGlTexture2D, 100u + static_cast<uint32_t>(f));
+                CHECK(sb.TryAbsorbMatrixW(prog.locMatrixW, 1, 0, mtx));
+                CHECK(sb.TryBatchDrawElements(kGlTriangles, 6, kGlUnsignedShort, quadI));
+                sb.Flush(FlushReason::End);
+            }
+            CHECK(ms5.drawCalls == 4u && ms5.mapCalls == 0u && ms5.subDataCalls == 8u);
+            sb.ReleaseGpuResources();
+            s_sb5 = nullptr;
+        }
+
+        // (3) KleiRenderFastPath 64-entry DrawPrimCache + TryResolveVertexDeclApply + lock-free VB/Decl switching
+        {
+            // (a) Verify TryResolveVertexDeclApply decoder against exact BindVBAndDecl (+0x6D..+0xB5) opcodes
+            uint8_t fakeText[512]{};
+            uint8_t* const pBind = fakeText + 0x40u;
+            uint8_t* const pDeclApplyExpected = fakeText + 0x180u;
+            const uint8_t bSetBoundVb[]    = { 0x89, 0x43, 0x10 };
+            const uint8_t bLoadVbGlId[]    = { 0x8B, 0x57, 0x10 };
+            const uint8_t bArrayBufConst[] = { 0xB9, 0x92, 0x88, 0x00, 0x00 };
+            const uint8_t bLoadEffMask[]   = { 0x44, 0x8B, 0x86, 0xF0, 0x00, 0x00, 0x00 };
+            const uint8_t bLoadAttribC[]   = { 0x48, 0x8D, 0x53, 0x34 };
+            const uint8_t bSetBoundDecl[]  = { 0x44, 0x89, 0x5B, 0x18 };
+            const uint8_t bSetLastMask[]   = { 0x89, 0x43, 0x30 };
+            std::memcpy(pBind + 0x6Du, bSetBoundVb, sizeof(bSetBoundVb));
+            std::memcpy(pBind + 0x70u, bLoadVbGlId, sizeof(bLoadVbGlId));
+            std::memcpy(pBind + 0x73u, bArrayBufConst, sizeof(bArrayBufConst));
+            std::memcpy(pBind + 0x8Du, bLoadEffMask, sizeof(bLoadEffMask));
+            std::memcpy(pBind + 0x94u, bLoadAttribC, sizeof(bLoadAttribC));
+            pBind[0x9Bu] = 0xE8u;
+            const int32_t rel = static_cast<int32_t>(pDeclApplyExpected - (pBind + 0x9Bu + 5u));
+            std::memcpy(pBind + 0x9Cu, &rel, 4u);
+            std::memcpy(pBind + 0xA4u, bSetBoundDecl, sizeof(bSetBoundDecl));
+            std::memcpy(pBind + 0xB3u, bSetLastMask, sizeof(bSetLastMask));
+            CHECK(reinterpret_cast<uint8_t*>(hs_klei_fastpath::TryResolveVertexDeclApply(pBind, fakeText, sizeof(fakeText))) == pDeclApplyExpected);
+            pBind[0x94u] = 0x90u; // Corrupt opcode -> fail-closed nullptr
+            CHECK(hs_klei_fastpath::TryResolveVertexDeclApply(pBind, fakeText, sizeof(fakeText)) == nullptr);
+
+            // (b) 2 alternating VBs/Decls/Effects/IBOs -> 0 ResourcePoolGet locks after warmup!
+            struct MockK5 {
+                uint32_t poolLocks = 0u;
+                uint32_t bindVbSlowCalls = 0u;
+                uint32_t declApplyCalls = 0u;
+                uint32_t arrBindCalls = 0u;
+                uint32_t lastArrBuf = 0u;
+                uint32_t elDrawCalls = 0u;
+                void*    lastDeclPtr = nullptr;
+                void*    lastAttribCache = nullptr;
+                uint32_t lastDeclMask = 0u;
+                void* vbPoolTag   = reinterpret_cast<void*>(0x10010000ULL);
+                void* declPoolTag = reinterpret_cast<void*>(0x10020000ULL);
+                void* iboPoolTag  = reinterpret_cast<void*>(0x10030000ULL);
+                void* effPoolTag  = reinterpret_cast<void*>(0x10040000ULL);
+                alignas(16) uint8_t eff1[0x100]{}, eff2[0x100]{};
+                alignas(16) uint8_t vb1[0x20]{},  vb2[0x20]{};
+                alignas(16) uint8_t ibo1[0x20]{}, ibo2[0x20]{};
+                uint64_t decl1 = 0xD1ULL, decl2 = 0xD2ULL;
+            };
+            static MockK5* s_k5 = nullptr;
+            MockK5 mk5{};
+            s_k5 = &mk5;
+            void* rVt[4]   = { nullptr, nullptr, reinterpret_cast<void*>(+[](void*) {}), nullptr };
+            void* effVt[4] = { nullptr, nullptr, reinterpret_cast<void*>(+[](void*, void*, void*) {}), nullptr };
+            auto initEff = [&](uint8_t* e, uint32_t pid, uint32_t mask) {
+                void* vt = effVt;
+                std::memcpy(e + 0x00u, &vt, 8u);
+                std::memcpy(e + 0xECu, &pid, 4u);
+                std::memcpy(e + 0xF0u, &mask, 4u);
+            };
+            initEff(mk5.eff1, 11u, 0x05u);
+            initEff(mk5.eff2, 12u, 0x07u);
+            uint32_t vbGl1 = 501u, vbGl2 = 502u, iboCnt = 12u, iboGl1 = 601u, iboGl2 = 602u;
+            std::memcpy(mk5.vb1  + 0x10u, &vbGl1,  4u);
+            std::memcpy(mk5.vb2  + 0x10u, &vbGl2,  4u);
+            std::memcpy(mk5.ibo1 + 0x08u, &iboCnt, 4u); std::memcpy(mk5.ibo1 + 0x10u, &iboGl1, 4u);
+            std::memcpy(mk5.ibo2 + 0x08u, &iboCnt, 4u); std::memcpy(mk5.ibo2 + 0x10u, &iboGl2, 4u);
+
+            alignas(16) uint8_t hwR[0x1D0]{};
+            void* rvtPtr = rVt;
+            std::memcpy(hwR + 0x00u, &rvtPtr, 8u);
+            int32_t initNeg = -1;
+            uint32_t initZero = 0u;
+            std::memcpy(hwR + 0x10u, &initNeg, 4u);
+            std::memcpy(hwR + 0x18u, &initNeg, 4u);
+            std::memcpy(hwR + 0x20u, &initNeg, 4u);
+            std::memcpy(hwR + 0x30u, &initZero, 4u);
+            std::memcpy(hwR + 0x1A0u, &mk5.declPoolTag, 8u);
+            std::memcpy(hwR + 0x1A8u, &mk5.vbPoolTag,   8u);
+            std::memcpy(hwR + 0x1B0u, &mk5.iboPoolTag,  8u);
+            std::memcpy(hwR + 0x1B8u, &mk5.effPoolTag,  8u);
+
+            hs_klei_fastpath::KleiRendererHelpers h{};
+            h.fnPushMatrixW = [](void*, uint32_t, const void*) {};
+            h.fnPopConstant = [](void*, uint32_t) {};
+            h.fnBindVBAndDecl = [](void*) -> void* { ++s_k5->bindVbSlowCalls; return nullptr; };
+            h.fnVertexDeclApply = [](void* dp, void* ac, uint32_t mask) {
+                ++s_k5->declApplyCalls;
+                s_k5->lastDeclPtr     = dp;
+                s_k5->lastAttribCache = ac;
+                s_k5->lastDeclMask    = mask;
+            };
+            h.fnResourcePoolGet = [](void* pool, int32_t id) -> void* {
+                ++s_k5->poolLocks;
+                if (pool == s_k5->vbPoolTag)   return (id == 1)  ? s_k5->vb1   : ((id == 2)  ? s_k5->vb2   : nullptr);
+                if (pool == s_k5->declPoolTag) return (id == 10) ? &s_k5->decl1 : ((id == 11) ? &s_k5->decl2 : nullptr);
+                if (pool == s_k5->iboPoolTag)  return (id == 1)  ? s_k5->ibo1  : ((id == 2)  ? s_k5->ibo2  : nullptr);
+                if (pool == s_k5->effPoolTag)  return (id == 1)  ? s_k5->eff1  : ((id == 2)  ? s_k5->eff2  : nullptr);
+                return nullptr;
+            };
+            h.primTable = hs_klei_fastpath::kDefaultPrimTable;
+
+            hs_klei_fastpath::GlDrawDispatchOps dops{};
+            dops.glBindBuffer = [](uint32_t tgt, uint32_t buf) WINAPI {
+                if (tgt == hs_klei_fastpath::kGlArrayBuffer) {
+                    ++s_k5->arrBindCalls;
+                    s_k5->lastArrBuf = buf;
+                }
+            };
+            dops.glDrawElements = [](uint32_t, int32_t, uint32_t, const void*) WINAPI { ++s_k5->elDrawCalls; };
+            auto origIdx5 = [](void*, const void*, int32_t) { CHECK(false); };
+            const float matW[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+
+            hs_klei_fastpath::KleiRenderFastPath kfp5;
+            kfp5.SetHelpers(h);
+            kfp5.SetDrawOps(dops);
+            kfp5.SetEnabled(true);
+
+            auto setWant = [&](int32_t vb, int32_t decl, int32_t ibo, int32_t eff) {
+                std::memcpy(hwR + 0x14u, &vb,   4u);
+                std::memcpy(hwR + 0x1Cu, &decl, 4u);
+                std::memcpy(hwR + 0x24u, &ibo,  4u);
+                std::memcpy(hwR + 0x2Cu, &eff,  4u);
+            };
+            // Warmup pair (handles 1/10 & 2/11 -> populates 64-entry tables)
+            setWant(1, 10, 1, 1); kfp5.FastDrawIndexed(hwR, matW, 6, 1ULL, origIdx5);
+            setWant(2, 11, 2, 2); kfp5.FastDrawIndexed(hwR, matW, 6, 1ULL, origIdx5);
+            CHECK(mk5.poolLocks == 8u && mk5.bindVbSlowCalls == 0u && mk5.declApplyCalls == 2u);
+
+            // 20 alternating switches -> 0 poolLocks & 0 fnBindVBAndDecl!
+            mk5.poolLocks = 0u;
+            mk5.declApplyCalls = 0u;
+            mk5.arrBindCalls = 0u;
+            for (int it = 0; it < 20; ++it) {
+                if ((it & 1) == 0) setWant(1, 10, 1, 1);
+                else               setWant(2, 11, 2, 2);
+                kfp5.FastDrawIndexed(hwR, matW, 6, 1ULL, origIdx5);
+            }
+            CHECK(mk5.poolLocks == 0u);
+            CHECK(mk5.bindVbSlowCalls == 0u);
+            CHECK(mk5.declApplyCalls == 20u);
+            CHECK(mk5.lastAttribCache == hwR + hs_klei_fastpath::kOffRendererAttribCache);
+            CHECK(mk5.arrBindCalls == 20u);
+            CHECK(mk5.elDrawCalls == 22u);
+            s_k5 = nullptr;
+        }
+
+        // (4) GpuClarityEngine hysteresis with production adaptiveUpFrames=360u, adaptiveUpMarginMs=2.0f
+        {
+            struct MockC5 { uint32_t nextId = 1u; };
+            static MockC5* s_c5 = nullptr;
+            MockC5 c5{}; s_c5 = &c5;
+            hs_gpu_clarity::GlComputeOps cops{};
+            cops.glGenTextures = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_c5->nextId++; };
+            cops.glDeleteTextures = [](int32_t, const uint32_t*) WINAPI {};
+            cops.glGenFramebuffers = [](int32_t n, uint32_t* p) WINAPI { for (int i = 0; i < n; ++i) p[i] = s_c5->nextId++; };
+            cops.glDeleteFramebuffers = [](int32_t, const uint32_t*) WINAPI {};
+            cops.glBindFramebuffer = [](uint32_t, uint32_t) WINAPI {};
+            cops.glFramebufferTexture2D = [](uint32_t, uint32_t, uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCheckFramebufferStatus = [](uint32_t) WINAPI -> uint32_t { return 0x8CD5u; };
+            cops.glBlitFramebuffer = [](int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glBindTexture = [](uint32_t, uint32_t) WINAPI {};
+            cops.glActiveTexture = [](uint32_t) WINAPI {};
+            cops.glTexStorage2D = [](uint32_t, int32_t, uint32_t, int32_t, int32_t) WINAPI {};
+            cops.glTexParameteri = [](uint32_t, uint32_t, int32_t) WINAPI {};
+            cops.glCreateShader = [](uint32_t) WINAPI -> uint32_t { return s_c5->nextId++; };
+            cops.glShaderSource = [](uint32_t, int32_t, const char* const*, const int32_t*) WINAPI {};
+            cops.glCompileShader = [](uint32_t) WINAPI {};
+            cops.glGetShaderiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteShader = [](uint32_t) WINAPI {};
+            cops.glCreateProgram = []() WINAPI -> uint32_t { return s_c5->nextId++; };
+            cops.glAttachShader = [](uint32_t, uint32_t) WINAPI {};
+            cops.glLinkProgram = [](uint32_t) WINAPI {};
+            cops.glGetProgramiv = [](uint32_t, uint32_t, int32_t* p) WINAPI { if (p) *p = 1; };
+            cops.glDeleteProgram = [](uint32_t) WINAPI {};
+            cops.glUseProgram = [](uint32_t) WINAPI {};
+            cops.glGetUniformLocation = [](uint32_t, const char*) WINAPI -> int32_t { return 1; };
+            cops.glUniform4f = [](int32_t, float, float, float, float) WINAPI {};
+            cops.glDispatchCompute = [](uint32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glMemoryBarrier = [](uint32_t) WINAPI {};
+            cops.glBindImageTexture = [](uint32_t, uint32_t, int32_t, uint8_t, int32_t, uint32_t, uint32_t) WINAPI {};
+            cops.glGetIntegerv = [](uint32_t pname, int32_t* p) WINAPI {
+                if (p) *p = (pname == hs_gpu_clarity::kGlMaxTextureSize) ? 16384 : 0;
+            };
+            cops.glIsEnabled = [](uint32_t) WINAPI -> uint8_t { return 0u; };
+            cops.glEnable = [](uint32_t) WINAPI {};
+            cops.glDisable = [](uint32_t) WINAPI {};
+
+            hs_gpu_clarity::GpuClarityEngine cl;
+            cl.SetOps(cops, true);
+            hs_gpu_clarity::KnownGlState ks{};
+            ks.drawFbo = 1; ks.readFbo = 1; ks.curProgram = 0;
+            ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+            ks.boundTex0 = 0; ks.scissorEnabled = 0; ks.sampleTimer = false;
+
+            const hs_gpu_clarity::ClarityConfig prodWarm{ 2, 1.0f, true, 3.0f, 5.5f, 360u, 2.0f };
+            CHECK(cl.ProcessFrame(1u, 1280, 720, prodWarm, &ks));
+            CHECK(cl.EffectiveGrade() == 2);
+            // Step down 2 -> 1 (45 frames @ 7.0ms > 6.5ms)
+            for (int f = 0; f < 45; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 7.0f, 5.5f, 360u, 2.0f }, &ks));
+            CHECK(cl.EffectiveGrade() == 1);
+            // Step down 1 -> 0 (60 frames @ 8.0ms > 7.5ms)
+            for (int f = 0; f < 59; ++f) CHECK(cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 8.0f, 5.5f, 360u, 2.0f }, &ks));
+            CHECK(!cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 8.0f, 5.5f, 360u, 2.0f }, &ks));
+            CHECK(cl.EffectiveGrade() == 0);
+            // Deadband check: 5.7ms would recover under 1.5ms margin (recover=6.0ms), MUST stay 0 under 2.0ms margin (recover=5.5ms)!
+            for (int f = 0; f < 400; ++f) CHECK(!cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 5.7f, 5.5f, 360u, 2.0f }, &ks));
+            CHECK(cl.EffectiveGrade() == 0);
+            // At 5.2ms (< 5.5ms): must stay 0 for 359 frames (NOT bounce at 120!) and recover at frame 360
+            for (int f = 0; f < 359; ++f) {
+                CHECK(!cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 5.2f, 5.5f, 360u, 2.0f }, &ks));
+                CHECK(cl.EffectiveGrade() == 0);
+            }
+            CHECK(cl.ProcessFrame(1u, 1280, 720, { 2, 1.0f, true, 5.2f, 5.5f, 360u, 2.0f }, &ks));
+            CHECK(cl.EffectiveGrade() == 1);
+            cl.OnContextReset(true);
+            s_c5 = nullptr;
+        }
+
+        // (5) Source-level contract checks on native_plugin/dinput8.cpp
+        {
+            std::vector<std::string> candidates;
+            {
+                std::string selfPath = __FILE__;
+                const size_t slash = selfPath.find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    candidates.push_back(selfPath.substr(0, slash) + "/../native_plugin/dinput8.cpp");
+                }
+            }
+            candidates.push_back("native_plugin/dinput8.cpp");
+            candidates.push_back("../native_plugin/dinput8.cpp");
+            std::string cppSrc;
+            for (const auto& p : candidates) {
+                std::FILE* fp = std::fopen(p.c_str(), "rb");
+                if (fp) {
+                    std::fseek(fp, 0, SEEK_END);
+                    const long len = std::ftell(fp);
+                    std::fseek(fp, 0, SEEK_SET);
+                    if (len > 0) {
+                        cppSrc.resize(static_cast<size_t>(len));
+                        const size_t got = std::fread(cppSrc.data(), 1, cppSrc.size(), fp);
+                        cppSrc.resize(got);
+                    }
+                    std::fclose(fp);
+                    if (!cppSrc.empty()) break;
+                }
+            }
+            CHECK(!cppSrc.empty());
+            const size_t sbSyncPos = cppSrc.find("SyncSpriteBatcherSlow(");
+            const size_t uiSyncPos = cppSrc.find("SyncUiBatcher()");
+            CHECK(sbSyncPos != std::string::npos && uiSyncPos != std::string::npos && uiSyncPos > sbSyncPos);
+            CHECK(cppSrc.find("ops.preferOrphanSubData        = true;", sbSyncPos) < uiSyncPos);
+            CHECK(cppSrc.find("ops.preferOrphanSubData        = true;", uiSyncPos) != std::string::npos);
+            CHECK(cppSrc.find("cfg.adaptiveUpFrames   = 360u;") != std::string::npos);
+            CHECK(cppSrc.find("cfg.adaptiveUpMarginMs = 2.0f;") != std::string::npos);
+            CHECK(cppSrc.find("HookGlCheckFramebufferStatus") != std::string::npos);
+            CHECK(cppSrc.find("&HookGlCheckFramebufferStatus") != std::string::npos);
+            CHECK(cppSrc.find("g_fboCompleteCacheHooksReady") != std::string::npos);
+            CHECK(cppSrc.find("IsStencilDirectBypassActive") != std::string::npos);
+            CHECK(cppSrc.find("IsColorWriteFullyMasked") != std::string::npos);
+            CHECK(cppSrc.find("tl_useProgCache") != std::string::npos);
+            CHECK(cppSrc.find("s_luaHookProbes") != std::string::npos);
+            CHECK(cppSrc.find("[DIAG][WLUA_SAMPLE]") != std::string::npos);
+            CHECK(cppSrc.find("[DIAG][PBO_TOP]") != std::string::npos);
+            CHECK(cppSrc.find("fboSkip=%llu stByp=%llu") != std::string::npos);
+            CHECK(cppSrc.find("DummyDeclUnused_") == std::string::npos);
+        }
+
+        std::printf("[PASS] 41. Phase 5 Mode-4 UiBatcher + SpriteBatcher + Klei 64-Slot VertexDecl::Apply + Clarity Hysteresis + FBO/Stencil/UseProg verified!\n");
+    }
+
+    std::printf("ALL 41 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH, STENCIL-CACHE, PLL-WORLD-POS, FLUID-SKELETAL, COMBAT-IMPACT, LOOK-MATCH, HW-TIER, LAZY-STENCIL, AZDO-BUMP, F16C, 16-SLOT-BATCH, MT-SKELETAL, SPEC-STENCIL, STICKY-AZDO-16UI, ELASTIC-POOL, GPU-DRIVEN-BINDLESS, PBO-TEX-RING, PHASE2-SIMD-TEXPOOL, PHASE3-ADAPTIVE-ZEROWAIT, PHASE4-KLEI-FASTPATH-GPU-LADDER, PHASE4.5-VBPOOL-ORPHAN-INPUT-GC-DIAG, PHASE5-ZERO-MAP-FBO-STENCIL-DECL-CACHE & ASTAR TESTS PASSED!\n");
     return 0;
 }

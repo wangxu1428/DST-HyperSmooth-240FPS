@@ -280,6 +280,27 @@ struct OptionalGlProcs {
     void* glBlendFuncSeparate     = nullptr;
     void* glBlendEquationSeparate = nullptr;
     void* glBlitFramebuffer       = nullptr;
+    // v3.0 Unleashed: OpenGL 4.3+ Compute / SSBO / Image Load-Store / Instanced Rendering
+    void* glDispatchCompute       = nullptr;
+    void* glMemoryBarrier         = nullptr;
+    void* glBindBufferBase        = nullptr;
+    void* glBindImageTexture       = nullptr;
+    void* glDrawArraysInstanced    = nullptr;
+    void* glDrawElementsInstanced  = nullptr;
+    void* glDrawElementsBaseVertex = nullptr;
+    void* glVertexAttribDivisor    = nullptr;
+    void* glGetTextureHandleARB          = nullptr;
+    void* glMakeTextureHandleResidentARB = nullptr;
+    void* glMakeTextureHandleNonResidentARB = nullptr;
+    void* glTexStorage2D          = nullptr;
+    void* glIsEnabled             = nullptr;
+    void* glGenQueries            = nullptr;
+    void* glDeleteQueries         = nullptr;
+    void* glBeginQuery            = nullptr;
+    void* glEndQuery              = nullptr;
+    void* glGetQueryObjectiv      = nullptr;
+    void* glGetQueryObjectui64v   = nullptr;
+    void* glUniform4f             = nullptr;
 };
 
 struct ProbeResult {
@@ -288,6 +309,14 @@ struct ProbeResult {
     bool        hasBufferStorage  = false;
     bool        hasMapBufferRange = false;
     bool        hasSwapControl    = false;
+    bool        hasComputeShader  = false;
+    bool        hasSsbo           = false;
+    bool        hasImageLoadStore = false;
+    bool        hasInstancedDraw  = false;
+    bool        hasBaseVertex     = false;
+    bool        hasBindlessTexture = false;
+    int         glMajor           = 0;
+    int         glMinor           = 0;
     int         resolvedProcs     = 0;
     std::string vendor;
     std::string renderer;
@@ -442,13 +471,20 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     //     causing an invisible input-lock freeze AND per-frame GL_INVALID_OPERATION (0x502) errors!
     //   - Desktop OpenGL Compatibility Profile gives 100% native Steam Overlay rendering & 0x0 GL errors.
     if (rt.pWglCreateContextAttribsArb && ContainsExtensionToken(wglExts, "WGL_ARB_create_context_profile")) {
-        const int attribs41[] = {
-            kWglContextMajorVersionArb, 4,
-            kWglContextMinorVersionArb, 1,
-            kWglContextProfileMaskArb,  kWglContextCompatibilityProfileBitArb,
-            0
-        };
-        es2Rc = rt.pWglCreateContextAttribsArb(hdc, nullptr, attribs41);
+        // v3.0 Unleashed: Prefer highest Desktop Compatibility Profile (4.6 -> 4.3 -> 4.1)
+        // so modern GPUs unlock Compute Shaders, SSBOs, Image Load/Store & Instanced Rendering
+        // while keeping 100% GLES2 + Steam Overlay compatibility!
+        const int kVersions[][2] = { {4, 6}, {4, 3}, {4, 1} };
+        for (const auto& ver : kVersions) {
+            const int attribs[] = {
+                kWglContextMajorVersionArb, ver[0],
+                kWglContextMinorVersionArb, ver[1],
+                kWglContextProfileMaskArb,  kWglContextCompatibilityProfileBitArb,
+                0
+            };
+            es2Rc = rt.pWglCreateContextAttribsArb(hdc, nullptr, attribs);
+            if (es2Rc) break;
+        }
     }
     if (es2Rc && rt.pWglMakeCurrent(hdc, es2Rc)) {
         rt.pWglDeleteContext(tmpRc);
@@ -533,6 +569,8 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
         return out;
     }
 
+    out.glMajor = glMaj;
+    out.glMinor = glMin;
     out.hasAniso = ContainsExtensionToken(sExts, "GL_EXT_texture_filter_anisotropic") ||
                    ContainsExtensionToken(sExts, "GL_ARB_texture_filter_anisotropic");
     out.hasMapBufferRange = ContainsExtensionToken(sExts, "GL_ARB_map_buffer_range") ||
@@ -541,6 +579,25 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     out.hasBufferStorage = ContainsExtensionToken(sExts, "GL_ARB_buffer_storage") ||
                            ContainsExtensionToken(sExts, "GL_EXT_buffer_storage") ||
                            (glMaj > 4 || (glMaj == 4 && glMin >= 4));
+    const bool isGl43 = (glMaj > 4 || (glMaj == 4 && glMin >= 3));
+    out.hasComputeShader = (isGl43 || ContainsExtensionToken(sExts, "GL_ARB_compute_shader")) &&
+                           (rt.ResolveGlProc("glDispatchCompute") != nullptr) &&
+                           (rt.ResolveGlProc("glMemoryBarrier") != nullptr);
+    out.hasSsbo = (isGl43 || ContainsExtensionToken(sExts, "GL_ARB_shader_storage_buffer_object")) &&
+                  (rt.ResolveGlProc("glBindBufferBase") != nullptr);
+    out.hasImageLoadStore = (glMaj > 4 || (glMaj == 4 && glMin >= 2) ||
+                             ContainsExtensionToken(sExts, "GL_ARB_shader_image_load_store")) &&
+                            (rt.ResolveGlProc("glBindImageTexture") != nullptr);
+    out.hasInstancedDraw = (glMaj > 3 || (glMaj == 3 && glMin >= 3) ||
+                            ContainsExtensionToken(sExts, "GL_ARB_draw_instanced")) &&
+                           (rt.ResolveGlProc("glDrawArraysInstanced") != nullptr);
+    out.hasBaseVertex    = (glMaj > 3 || (glMaj == 3 && glMin >= 2) ||
+                            ContainsExtensionToken(sExts, "GL_ARB_draw_elements_base_vertex")) &&
+                           (rt.ResolveGlProc("glDrawElementsBaseVertex") != nullptr);
+    out.hasBindlessTexture = ContainsExtensionToken(sExts, "GL_ARB_bindless_texture") &&
+                             (rt.ResolveGlProc("glGetTextureHandleARB") != nullptr) &&
+                             (rt.ResolveGlProc("glMakeTextureHandleResidentARB") != nullptr) &&
+                             (rt.ResolveGlProc("glMakeTextureHandleNonResidentARB") != nullptr);
 
     int okCount = 0;
     const char* firstMissing = nullptr;
@@ -588,13 +645,17 @@ inline bool CreateGameEs2Context(WglRuntime& rt, HWND hwnd, HDC& inOutHdc, HGLRC
     }
 
     if (rt.pWglCreateContextAttribsArb) {
-        const int attribs41[] = {
-            kWglContextMajorVersionArb, 4,
-            kWglContextMinorVersionArb, 1,
-            kWglContextProfileMaskArb,  kWglContextCompatibilityProfileBitArb,
-            0
-        };
-        outRc = rt.pWglCreateContextAttribsArb(inOutHdc, shareRc, attribs41);
+        const int kVersions[][2] = { {4, 6}, {4, 3}, {4, 1} };
+        for (const auto& ver : kVersions) {
+            const int attribs[] = {
+                kWglContextMajorVersionArb, ver[0],
+                kWglContextMinorVersionArb, ver[1],
+                kWglContextProfileMaskArb,  kWglContextCompatibilityProfileBitArb,
+                0
+            };
+            outRc = rt.pWglCreateContextAttribsArb(inOutHdc, shareRc, attribs);
+            if (outRc) break;
+        }
     }
     if (!outRc) {
         // Fallback to legacy wglCreateContext (creates max Desktop Compatibility Profile)
@@ -626,6 +687,26 @@ inline int ResolveLiveGlesTable(WglRuntime& rt, void* outProcs[76], OptionalGlPr
     outOpt.glBlendFuncSeparate     = rt.ResolveGlProc("glBlendFuncSeparate");
     outOpt.glBlendEquationSeparate = rt.ResolveGlProc("glBlendEquationSeparate");
     outOpt.glBlitFramebuffer       = rt.ResolveGlProc("glBlitFramebuffer");
+    outOpt.glDispatchCompute       = rt.ResolveGlProc("glDispatchCompute");
+    outOpt.glMemoryBarrier         = rt.ResolveGlProc("glMemoryBarrier");
+    outOpt.glBindBufferBase        = rt.ResolveGlProc("glBindBufferBase");
+    outOpt.glBindImageTexture       = rt.ResolveGlProc("glBindImageTexture");
+    outOpt.glDrawArraysInstanced    = rt.ResolveGlProc("glDrawArraysInstanced");
+    outOpt.glDrawElementsInstanced  = rt.ResolveGlProc("glDrawElementsInstanced");
+    outOpt.glDrawElementsBaseVertex = rt.ResolveGlProc("glDrawElementsBaseVertex");
+    outOpt.glVertexAttribDivisor    = rt.ResolveGlProc("glVertexAttribDivisor");
+    outOpt.glGetTextureHandleARB             = rt.ResolveGlProc("glGetTextureHandleARB");
+    outOpt.glMakeTextureHandleResidentARB    = rt.ResolveGlProc("glMakeTextureHandleResidentARB");
+    outOpt.glMakeTextureHandleNonResidentARB = rt.ResolveGlProc("glMakeTextureHandleNonResidentARB");
+    outOpt.glTexStorage2D          = rt.ResolveGlProc("glTexStorage2D");
+    outOpt.glIsEnabled             = rt.ResolveGlProc("glIsEnabled");
+    outOpt.glGenQueries            = rt.ResolveGlProc("glGenQueries");
+    outOpt.glDeleteQueries         = rt.ResolveGlProc("glDeleteQueries");
+    outOpt.glBeginQuery            = rt.ResolveGlProc("glBeginQuery");
+    outOpt.glEndQuery              = rt.ResolveGlProc("glEndQuery");
+    outOpt.glGetQueryObjectiv      = rt.ResolveGlProc("glGetQueryObjectiv");
+    outOpt.glGetQueryObjectui64v   = rt.ResolveGlProc("glGetQueryObjectui64v");
+    outOpt.glUniform4f             = rt.ResolveGlProc("glUniform4f");
     return count;
 }
 

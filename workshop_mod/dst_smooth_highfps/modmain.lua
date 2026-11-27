@@ -99,6 +99,9 @@ if HS_CFG.SHOW_1PCT_LOW == nil then HS_CFG.SHOW_1PCT_LOW = true end
 HS_CFG.AUTO_60HZ_SIM = GetModConfigData("auto_60hz_sim")
 if HS_CFG.AUTO_60HZ_SIM == nil then HS_CFG.AUTO_60HZ_SIM = true end
 HS_CFG.clip_cursor = false
+HS_CFG.hardware_tier = 1 -- 0=low, 1=balanced, 2=unleashed
+HS_CFG.clarity_grade = 0 -- 0=vanilla, 1=clarity(1080p), 2=ultra_hd(1x compute), 3=blu_ray(2x virtual-4K compute)
+HS_CFG.clarity_strength = 1.00 -- [0.20, 1.50] compute clarity engine intensity multiplier
 HS_CFG.foliage_cache = { accum = 999.0, last_cnt = 0 }
 HS_CFG.FOLIAGE_CANT_TAGS = {
     "FX", "DECOR", "INLIMBO", "NOCLICK", "structure", "wall",
@@ -227,7 +230,7 @@ local TUNE_BOUNDS = {
     ar_l_over      = { min = 0.000, max = 0.080, default = 0.001, prec = 3 },
     ar_d_over      = { min = 0.000, max = 0.080, default = 0.001, prec = 3 },
     dither         = { min = 0.00,  max = 2.00,  default = 1.00 },
-    mip_bias       = { min = -0.80, max = 0.00,  default = -0.45 },
+    mip_bias       = { min = -1.20, max = 0.00,  default = -0.45 },
     -- Glow Pyramid & Atmospheric FX
     bloom_str      = { min = 0.00,  max = 2.50,  default = 0.70 },
     bloom_thresh   = { min = 0.00,  max = 0.80,  default = 0.04 },
@@ -1524,6 +1527,19 @@ local function PushHd2dEnvToNative(dt_step, precomputed_lst)
             else
                 local gd = ClampTuneValue("ground_detail", tn.ground_detail)
                 local sd = ClampTuneValue("sprite_detail", tn.sprite_detail)
+                local eff_cg = HS_CFG.clarity_grade or 0
+                if eff_cg >= 3 then
+                    sd = math.max(sd, 1.30)
+                    gd = math.max(gd, 1.20)
+                elseif eff_cg == 2 then
+                    sd = math.max(sd, 1.05)
+                    gd = math.max(gd, 0.95)
+                elseif eff_cg == 1 then
+                    sd = math.max(sd, 0.80)
+                    gd = math.max(gd, 0.70)
+                end
+                if sd > 1.50 then sd = 1.50 end
+                if gd > 1.50 then gd = 1.50 end
                 pcall(fnDet, gd, sd * 0.85, sd, 0.0)
             end
         end
@@ -1912,8 +1928,23 @@ local function ApplyVisualPostProcess()
     local bloom_compress = ClampTuneValue("bloom_compress", tn.bloom_compress)
 
     -- 2. 100% parameter-driven BCAS Pro Sharpening + Ink Deconv + Bilateral + AURA
-    local bcas_val      = fl.cas and (ClampTuneValue("sharp", tn.sharp) * 5.20) or 0.0
-    local deconv_val    = fl.cas and (ClampTuneValue("ink", tn.ink) * 1.25) or 0.0
+    local sharp_t = ClampTuneValue("sharp", tn.sharp)
+    local ink_t   = ClampTuneValue("ink", tn.ink)
+    if fl.cas and current_visual_preset ~= 3 then
+        local eff_cg = HS_CFG.clarity_grade or 0
+        if eff_cg == 1 then
+            sharp_t = math.max(sharp_t, 1.00)
+            ink_t   = math.max(ink_t,   1.00)
+        elseif eff_cg == 2 then
+            sharp_t = math.max(sharp_t, 0.95)
+            ink_t   = math.max(ink_t,   0.95)
+        elseif eff_cg >= 3 then
+            sharp_t = math.max(sharp_t, 0.90)
+            ink_t   = math.max(ink_t,   0.90)
+        end
+    end
+    local bcas_val      = fl.cas and (sharp_t * 5.20) or 0.0
+    local deconv_val    = fl.cas and (ink_t   * 1.25) or 0.0
     local dither_val    = fl.cas and ClampTuneValue("dither", tn.dither) or 0.0
     local anti_ring     = ClampTuneValue("anti_ring", tn.anti_ring)
     local dark_prot     = ClampTuneValue("dark_prot", tn.dark_prot)
@@ -2113,8 +2144,8 @@ local function HasNativePlugin()
     return type(rawget(GLOBAL, "HyperSmooth_SetFps")) == "function"
 end
 
--- Minimum required native bin64/dinput8.dll semantic version (decoupled from Lua hotfix suffix e.g. 2.9.6.1)
-local EXPECTED_DLL_VERSION = "2.9.6"
+-- Minimum required native bin64/dinput8.dll semantic version (decoupled from beta/hotfix suffix e.g. 2.9.7-beta1)
+local EXPECTED_DLL_VERSION = "2.9.7"
 
 local function ParseSemVer(str)
     if type(str) ~= "string" then return nil, nil end
@@ -2307,11 +2338,29 @@ SyncToNativePlugin = function(save_persist)
     if type(fnLowLat) == "function" then
         pcall(fnLowLat, current_low_latency)
     end
+    local fnTier = rawget(GLOBAL, "HyperSmooth_SetHardwareTier")
+    if type(fnTier) == "function" then
+        pcall(fnTier, HS_CFG.hardware_tier)
+    end
     local fnVis = rawget(GLOBAL, "HyperSmooth_SetVisual")
+    local eff_cg = (current_visual_preset == 0) and 0 or (HS_CFG.clarity_grade or 0)
+    local eff_cs = math.max(0.20, math.min(1.50, tonumber(HS_CFG.clarity_strength) or 1.00))
     if type(fnVis) == "function" then
         local fl = GetActiveVisualFlags()
         local tn = GetActiveVisTune()
-        pcall(fnVis, fl.af16 and 16 or 1, fl.full_lm, fl.mip_sharp and ClampTuneValue("mip_bias", tn.mip_bias) or 0.0)
+        local eff_mip = 0.0
+        if fl.mip_sharp then
+            if current_visual_preset ~= 3 and eff_cg >= 1 then
+                eff_mip = (eff_cg >= 3) and -0.95 or ((eff_cg == 2) and -0.75 or -0.60)
+            else
+                eff_mip = ClampTuneValue("mip_bias", tn.mip_bias)
+            end
+        end
+        pcall(fnVis, fl.af16 and 16 or 1, fl.full_lm, eff_mip)
+    end
+    local fnClar = rawget(GLOBAL, "HyperSmooth_SetClarityGrade")
+    if type(fnClar) == "function" then
+        pcall(fnClar, eff_cg, eff_cg >= 2, eff_cs)
     end
     PushHd2dEnvToNative(0)
     ApplyVisualPostProcess()
@@ -2323,7 +2372,7 @@ SyncToNativePlugin = function(save_persist)
     if save_persist ~= false and TheSim and TheSim.SetPersistentString then
         local parts = {
             string.format(
-                "fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;ll=%d;hm=%d;cc=%d;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d;mll=%d;mhm=%d",
+                "fps=%d;skeletal=%d;hud=%d;vp=%d;vm=%d;ll=%d;hm=%d;cc=%d;ht=%d;cg=%d;cs=%.2f;mf=%d;ms=%d;mh=%d;mvp=%d;mvm=%d;mll=%d;mhm=%d",
                 current_target_fps,
                 current_skeletal_tween and 1 or 0,
                 current_show_fps_hud and 1 or 0,
@@ -2332,6 +2381,9 @@ SyncToNativePlugin = function(save_persist)
                 current_low_latency and 1 or 0,
                 EncodeHudMode(current_hud_mode),
                 HS_CFG.clip_cursor and 1 or 0,
+                HS_CFG.hardware_tier,
+                HS_CFG.clarity_grade or 0,
+                eff_cs,
                 HS_CFG.TARGET_FPS,
                 HS_CFG.SKELETAL_TWEEN and 1 or 0,
                 HS_CFG.SHOW_FPS_HUD and 1 or 0,
@@ -2370,6 +2422,9 @@ if TheSim and TheSim.GetPersistentString then
             local sll = tonumber(str:match("ll=(%d+)"))
             local shm = tonumber(str:match("hm=(%d+)"))
             local scc = tonumber(str:match(";cc=(%d+)"))
+            local sht = tonumber(str:match(";ht=(%d+)"))
+            local scg = tonumber(str:match(";cg=(%d+)"))
+            local scs = tonumber(str:match(";cs=([%d%.]+)"))
             local mf = tonumber(str:match("mf=(%d+)"))
             local ms = tonumber(str:match("ms=(%d+)"))
             local mh = tonumber(str:match("mh=(%d+)"))
@@ -2395,11 +2450,20 @@ if TheSim and TheSim.GetPersistentString then
             if scc ~= nil then
                 HS_CFG.clip_cursor = (scc ~= 0)
             end
+            if sht ~= nil and sht >= 0 and sht <= 2 then
+                HS_CFG.hardware_tier = math.floor(sht)
+            end
             if svp ~= nil and svp >= 0 and svp <= 3 and mvp == HS_CFG.VISUAL_PRESET and mvm == HS_CFG.CFG_VIS_MASK then
                 current_visual_preset = svp
                 if svm ~= nil then
                     DecodeCustomVisMask(svm)
                 end
+            end
+            if scg ~= nil and scg >= 0 and scg <= 3 and (mvp == nil or mvp == HS_CFG.VISUAL_PRESET) then
+                HS_CFG.clarity_grade = (current_visual_preset == 0) and 0 or math.floor(scg)
+            end
+            if scs ~= nil then
+                HS_CFG.clarity_strength = math.max(0.20, math.min(1.50, scs))
             end
             -- Backward-compatible migration for legacy 7-key short format (ts/ti/te/tt/tsa/tf/tv)
             local legacy_map = {
@@ -4529,6 +4593,11 @@ function HS_SHARE.ApplyBuiltinPreset(id_or_idx)
         current_visual_preset = entry.preset_id
         HS_SHARE.current_scheme_name = ui_zh and entry.zh or entry.en
         HS_CFG.active_builtin_id = entry.id
+        if entry.preset_id == 0 then
+            HS_CFG.clarity_grade = 0
+        elseif (HS_CFG.clarity_grade or 0) == 0 then
+            HS_CFG.clarity_grade = (entry.preset_id >= 2) and 2 or 1
+        end
     else
         for i = 1, #HS_SHARE.FLAG_KEYS_ORDER do
             local fk = HS_SHARE.FLAG_KEYS_ORDER[i]
@@ -4541,6 +4610,9 @@ function HS_SHARE.ApplyBuiltinPreset(id_or_idx)
         current_visual_preset = 3
         HS_SHARE.current_scheme_name = ui_zh and entry.zh or entry.en
         HS_CFG.active_builtin_id = entry.id
+        if (HS_CFG.clarity_grade or 0) == 0 then
+            HS_CFG.clarity_grade = 2
+        end
     end
 
     visual_bench_timer = 12.0
@@ -6083,7 +6155,7 @@ if HS_CFG.SMOOTH_UI_240HZ then
         rawset(GLOBAL, "_HS_DEPLOY_WRAPPED", true)
         local last_tick = -1
         local last_x, last_z, last_range = 0, 0, -1
-        local last_recipe, last_placer, last_key = nil, nil, nil
+        local last_recipe, last_placer, last_key, last_active_item = nil, nil, nil, nil
         local last_t = -1.0
         rawset(GLOBAL, "TriggerDeployHelpers", function(x, y, z, range, recipe, placerinst, ...)
             if deployhelper_custom_mod_detected then
@@ -6095,9 +6167,12 @@ if HS_CFG.SMOOTH_UI_240HZ then
                 local GetTimeRealSeconds = rawget(GLOBAL, "GetTimeRealSeconds")
                 local now = (type(GetTimeRealSeconds) == "function") and (GetTimeRealSeconds() or 0.0) or 0.0
                 local dkey = (placerinst ~= nil) and placerinst.deployhelper_key or nil
+                local player = rawget(GLOBAL, "ThePlayer")
+                local inv_rep = player and player.replica and player.replica.inventory or nil
+                local active_item = (inv_rep and type(inv_rep.GetActiveItem) == "function") and inv_rep:GetActiveItem() or nil
                 if tick == last_tick
                     and range == last_range and recipe == last_recipe and placerinst == last_placer
-                    and dkey == last_key
+                    and dkey == last_key and active_item == last_active_item
                     and ((x - last_x) * (x - last_x) + (z - last_z) * (z - last_z)) < 0.0625
                     and (now - last_t) >= 0.0 and (now - last_t) < 0.012 then
                     latency_stats.deploy_skip = latency_stats.deploy_skip + 1
@@ -6106,7 +6181,7 @@ if HS_CFG.SMOOTH_UI_240HZ then
                 end
                 last_tick = tick
                 last_x, last_z, last_range = x, z, range
-                last_recipe, last_placer, last_key = recipe, placerinst, dkey
+                last_recipe, last_placer, last_key, last_active_item = recipe, placerinst, dkey, active_item
                 last_t = now
             end
             return orig_fn(x, y, z, range, recipe, placerinst, ...)
@@ -6317,7 +6392,19 @@ if HS_CFG.SMOOTH_UI_240HZ then
             return
         end
         self.OnWallUpdate = function(cmp, dt)
-            local step = (dt and dt > 0 and dt < 0.25) and (dt * 30.0) or 1.0
+            local step
+            if type(dt) == "number" then
+                if dt <= 0 then
+                    step = 0.0
+                else
+                    -- Cap per-frame decay at 1.0 (vanilla's exact 1-per-frame decrement) so a single
+                    -- container/chest pickup frame hitch (e.g. dt = 67ms..250ms) can NEVER drain
+                    -- delay=2 in a single frame and flicker the range circle off!
+                    step = math.min(dt * 30.0, 1.0)
+                end
+            else
+                step = 1.0
+            end
             if cmp.delay ~= nil and cmp.delay > step then
                 cmp.delay = cmp.delay - step
             else
@@ -6348,7 +6435,10 @@ if HS_CFG.REDUCE_240HZ_CHURN then
         self.OnWallUpdate = function(cmp, dt)
             local player = GLOBAL.ThePlayer
             if not player then
-                cmp.inst.AnimState:OverrideMultColour(1, 1, 1, 1)
+                if cmp._hs_last_df_a ~= 1.0 then
+                    cmp.inst.AnimState:OverrideMultColour(1, 1, 1, 1)
+                    cmp._hs_last_df_a = 1.0
+                end
                 return
             end
             local cam = GLOBAL.TheCamera
@@ -6357,14 +6447,19 @@ if HS_CFG.REDUCE_240HZ_CHURN then
             local down = cam:GetDownVec()
             local mody = (x - camx) * down.x + (y - camy) * down.y + (z - camz) * down.z
             local extrapercent = cmp.extrafn and cmp.extrafn(cmp.inst, dt) or 1
+            local alpha = extrapercent
             if mody > cmp.range then
                 mody = mody - cmp.range
                 mody = math.min(mody, cmp.fadedist) * 1.7
-                local percent = (1 - (mody / cmp.fadedist)) * extrapercent
-                cmp.inst.AnimState:OverrideMultColour(1, 1, 1, percent)
-            else
-                cmp.inst.AnimState:OverrideMultColour(1, 1, 1, extrapercent)
+                alpha = (1 - (mody / cmp.fadedist)) * extrapercent
             end
+            if alpha >= 0.996 then alpha = 1.0 end
+            local prev = cmp._hs_last_df_a
+            if prev ~= nil and ((alpha == 1.0 and prev == 1.0) or (alpha < 1.0 and prev < 1.0 and math.abs(alpha - prev) < 0.004)) then
+                return
+            end
+            cmp.inst.AnimState:OverrideMultColour(1, 1, 1, alpha)
+            cmp._hs_last_df_a = alpha
         end
     end)
 
@@ -6594,6 +6689,301 @@ if HS_CFG.REDUCE_240HZ_CHURN then
         return counts
     end
 
+    local function HsInstallCraftHasFastPath(owner, inv_rep)
+        local inv_cmp = owner.components ~= nil and owner.components.inventory or nil
+        local orig_rep_has = inv_rep.Has
+        local orig_cmp_has = inv_cmp ~= nil and inv_cmp.Has or nil
+
+        local counts = TryBuildCraftingSnapshot(owner, inv_rep)
+        if counts ~= nil then
+            local fast_has = function(self_inv, prefab, amount, checkallcontainers)
+                if checkallcontainers then
+                    latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                    local c = counts[prefab] or 0
+                    return c >= amount, c
+                end
+                if self_inv == inv_cmp and orig_cmp_has ~= nil then
+                    return orig_cmp_has(self_inv, prefab, amount, checkallcontainers)
+                end
+                return orig_rep_has(self_inv, prefab, amount, checkallcontainers)
+            end
+            inv_rep.Has = fast_has
+            if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                inv_cmp.Has = fast_has
+            end
+        else
+            -- Third-party mod wrapped Has() (e.g. Craft From Nearby Chests):
+            -- use mathematically exact per-rebuild memoization calling the mod's own Has()!
+            local memo = {}
+            local function make_memo(orig_fn)
+                return function(self_inv, prefab, amount, checkallcontainers)
+                    if checkallcontainers and prefab ~= nil and type(amount) == "number" then
+                        local e = memo[prefab]
+                        if e ~= nil then
+                            if amount <= e.min then
+                                latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                                return true, e.min
+                            elseif e.exact then
+                                latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
+                                return false, e.min
+                            end
+                        end
+                        local enough, found = orig_fn(self_inv, prefab, amount, checkallcontainers)
+                        local cnt = type(found) == "number" and found or (enough and amount or 0)
+                        if e == nil then
+                            memo[prefab] = { min = cnt, exact = not enough }
+                        else
+                            if cnt > e.min then e.min = cnt end
+                            if not enough then e.exact = true end
+                        end
+                        return enough, found
+                    end
+                    return orig_fn(self_inv, prefab, amount, checkallcontainers)
+                end
+            end
+            inv_rep.Has = make_memo(orig_rep_has)
+            if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                inv_cmp.Has = make_memo(orig_cmp_has)
+            end
+        end
+
+        return function()
+            inv_rep.Has = orig_rep_has
+            if inv_cmp ~= nil and orig_cmp_has ~= nil then
+                inv_cmp.Has = orig_cmp_has
+            end
+        end
+    end
+
+    local function HsCreateRebuildContext(owner)
+        local builder = owner ~= nil and owner.replica ~= nil and owner.replica.builder or nil
+        if builder == nil or type(builder.GetTechTrees) ~= "function" then
+            return nil
+        end
+        return {
+            builder = builder,
+            freecrafting = builder:IsFreeBuildMode(),
+            tech_trees = builder:GetTechTrees(),
+            tech_trees_no_temp = builder:GetTechTreesNoTemp(),
+            cached_tech_trees = {},
+            cached_tech_trees_temp = {},
+            cached_should_hint_trees = {},
+            craftinglimits = builder:GetAllRecipeCraftingLimits(),
+        }
+    end
+
+    local function HsEvalSingleRecipe(hud, recipe, ctx, gen)
+        local fn_valid = rawget(GLOBAL, "IsRecipeValid")
+        if type(recipe) ~= "table" or recipe.name == nil or (type(fn_valid) == "function" and not fn_valid(recipe.name)) then
+            return
+        end
+        local builder = ctx.builder
+        local has_unlocked_skin = false
+        local needs_unlocked_skin = recipe.unlocks_from_skin ~= nil
+        if needs_unlocked_skin and hud.owner ~= nil and hud.owner.isplayer then
+            local prefab_skins_tbl = rawget(GLOBAL, "PREFAB_SKINS")
+            local prefabskins = prefab_skins_tbl ~= nil and prefab_skins_tbl[recipe.product] or nil
+            local the_inv = rawget(GLOBAL, "TheInventory")
+            if prefabskins ~= nil and the_inv ~= nil then
+                for _, skin in ipairs(prefabskins) do
+                    if the_inv:CheckOwnership(skin) then
+                        has_unlocked_skin = true
+                        break
+                    end
+                end
+            end
+        end
+        local knows_recipe = builder:KnowsRecipe(recipe, nil, ctx.cached_tech_trees)
+        local should_hint_recipe = ctx.cached_should_hint_trees[recipe.level]
+        if should_hint_recipe == nil then
+            local fn_hint = rawget(GLOBAL, "ShouldHintRecipe")
+            should_hint_recipe = type(fn_hint) == "function" and fn_hint(recipe.level, ctx.tech_trees) or false
+            ctx.cached_should_hint_trees[recipe.level] = should_hint_recipe
+        end
+
+        if hud.valid_recipes[recipe.name] == nil then
+            hud.valid_recipes[recipe.name] = { recipe = recipe, meta = {} }
+        end
+        local entry = hud.valid_recipes[recipe.name]
+        entry._hs_gen = gen
+        local meta = entry.meta
+        meta.limitedamount = ctx.craftinglimits ~= nil and ctx.craftinglimits[recipe.name] or nil
+        meta.hide_due_to_missing_skin = nil
+
+        if needs_unlocked_skin and not has_unlocked_skin then
+            meta.hide_due_to_missing_skin = true
+            meta.can_build = false
+            meta.build_state = "hide"
+        elseif knows_recipe or should_hint_recipe or recipe.force_hint or recipe.always_allow_buffered_placer or ctx.freecrafting then
+            local is_build_tag_restricted = not builder:CanLearn(recipe.name)
+            local fn_proto = rawget(GLOBAL, "CanPrototypeRecipe")
+            if builder:IsBuildBuffered(recipe.name) and not is_build_tag_restricted then
+                meta.can_build = true
+                meta.build_state = "buffered"
+            elseif ctx.freecrafting then
+                meta.can_build = true
+                meta.build_state = "freecrafting"
+            elseif is_build_tag_restricted then
+                meta.can_build = false
+                meta.build_state = "hide"
+            elseif knows_recipe then
+                meta.can_build = builder:HasIngredients(recipe)
+                if not recipe.nounlock and not builder:KnowsRecipe(recipe, true, ctx.cached_tech_trees_temp)
+                    and type(fn_proto) == "function" and fn_proto(recipe.level, ctx.tech_trees_no_temp) then
+                    meta.build_state = "prototype"
+                else
+                    meta.build_state = meta.can_build and "has_ingredients" or "no_ingredients"
+                end
+            elseif type(fn_proto) == "function" and fn_proto(recipe.level, ctx.tech_trees) then
+                meta.can_build = builder:HasIngredients(recipe)
+                meta.build_state = recipe.nounlock and (meta.can_build and "has_ingredients" or "no_ingredients") or "prototype"
+            elseif recipe.force_hint then
+                meta.can_build = false
+                meta.build_state = "hint"
+            elseif recipe.nounlock then
+                meta.can_build = false
+                meta.build_state = "hide"
+            elseif should_hint_recipe then
+                meta.can_build = false
+                meta.build_state = "hint"
+            else
+                meta.can_build = false
+                meta.build_state = "hide"
+            end
+        else
+            meta.can_build = false
+            meta.build_state = "hide"
+        end
+    end
+
+    local function HsCollectPinnedRecipeNames(hud)
+        local seen = {}
+        local list = {}
+        local pb = hud.pinbar
+        if type(pb) == "table" and type(pb.pin_slots) == "table" then
+            for _, pin in ipairs(pb.pin_slots) do
+                local rname = type(pin) == "table" and pin.recipe_name or nil
+                if rname ~= nil and not seen[rname] then
+                    seen[rname] = true
+                    list[#list + 1] = rname
+                end
+            end
+        end
+        local prof = rawget(GLOBAL, "TheCraftingMenuProfile")
+        if type(prof) == "table" and type(prof.GetPinnedRecipes) == "function" then
+            local ok_p, pinned = pcall(prof.GetPinnedRecipes, prof)
+            if ok_p and type(pinned) == "table" then
+                for _, pin_entry in pairs(pinned) do
+                    local rname = type(pin_entry) == "table" and pin_entry.recipe_name
+                        or (type(pin_entry) == "string" and pin_entry or nil)
+                    if rname ~= nil and not seen[rname] then
+                        seen[rname] = true
+                        list[#list + 1] = rname
+                    end
+                end
+            end
+        end
+        return list
+    end
+
+    local function HsEvalPinnedAndSlice(hud, budget_sec, max_fallback_cnt)
+        local owner = hud.owner
+        local inv_rep = owner ~= nil and owner.replica ~= nil and owner.replica.inventory or nil
+        local all_recipes = rawget(GLOBAL, "AllRecipes")
+        if inv_rep == nil or type(inv_rep.Has) ~= "function" or type(all_recipes) ~= "table" then
+            return false, true
+        end
+        local ctx = HsCreateRebuildContext(owner)
+        if ctx == nil then
+            return false, true
+        end
+        local os_lib = rawget(GLOBAL, "os")
+        local fn_clock = (type(os_lib) == "table" and type(os_lib.clock) == "function") and os_lib.clock or nil
+        local start_t = fn_clock ~= nil and fn_clock() or nil
+        local max_cnt = max_fallback_cnt or 24
+        local restore_has = HsInstallCraftHasFastPath(owner, inv_rep)
+        local done = false
+        local ok, err = pcall(function()
+            local gen = hud._hs_rebuild_gen or 1
+            local pinned = HsCollectPinnedRecipeNames(hud)
+            for i = 1, #pinned do
+                local rname = pinned[i]
+                local entry = hud.valid_recipes and hud.valid_recipes[rname] or nil
+                if entry == nil or entry._hs_gen ~= gen then
+                    local r = all_recipes[rname]
+                    if r ~= nil then
+                        HsEvalSingleRecipe(hud, r, ctx, gen)
+                    end
+                end
+            end
+            local keys = hud._hs_sweep_keys
+            if keys == nil then
+                keys = {}
+                for _, r in pairs(all_recipes) do
+                    if type(r) == "table" and r.name ~= nil then
+                        keys[#keys + 1] = r.name
+                    end
+                end
+                hud._hs_sweep_keys = keys
+            end
+            local idx = hud._hs_sweep_idx or 1
+            local n_keys = #keys
+            local cnt = 0
+            while idx <= n_keys do
+                if cnt >= max_cnt then
+                    break
+                end
+                if start_t ~= nil and (fn_clock() - start_t) >= budget_sec then
+                    break
+                end
+                local rname = keys[idx]
+                local entry = hud.valid_recipes and hud.valid_recipes[rname] or nil
+                if entry == nil or entry._hs_gen ~= gen then
+                    local r = all_recipes[rname]
+                    if r ~= nil then
+                        HsEvalSingleRecipe(hud, r, ctx, gen)
+                        cnt = cnt + 1
+                    end
+                end
+                idx = idx + 1
+            end
+            if idx > n_keys then
+                hud._hs_sweep_idx = nil
+                hud._hs_deferred_full_rebuild = false
+                done = true
+            else
+                hud._hs_sweep_idx = idx
+            end
+        end)
+        restore_has()
+        if not ok then
+            return false, true
+        end
+        return true, done
+    end
+
+    local function HsEnsureSingleRecipeFresh(hud, recipe_name)
+        if not hud._hs_deferred_full_rebuild or recipe_name == nil then
+            return
+        end
+        local gen = hud._hs_rebuild_gen or 0
+        local entry = hud.valid_recipes and hud.valid_recipes[recipe_name] or nil
+        if entry ~= nil and entry._hs_gen == gen then
+            return
+        end
+        local all_recipes = rawget(GLOBAL, "AllRecipes")
+        local r = type(all_recipes) == "table" and all_recipes[recipe_name] or nil
+        local owner = hud.owner
+        local inv_rep = owner ~= nil and owner.replica ~= nil and owner.replica.inventory or nil
+        local ctx = HsCreateRebuildContext(owner)
+        if r == nil or inv_rep == nil or type(inv_rep.Has) ~= "function" or ctx == nil then
+            return
+        end
+        local restore_has = HsInstallCraftHasFastPath(owner, inv_rep)
+        pcall(HsEvalSingleRecipe, hud, r, ctx, gen)
+        restore_has()
+    end
+
     AddClassPostConstruct("widgets/redux/craftingmenu_hud", function(hud)
         if type(hud) ~= "table" or type(hud.RebuildRecipes) ~= "function" then
             return
@@ -6607,77 +6997,113 @@ if HS_CFG.REDUCE_240HZ_CHURN then
             end
 
             latency_stats.craft_rebuilds = latency_stats.craft_rebuilds + 1
-            local inv_cmp = owner.components ~= nil and owner.components.inventory or nil
-            local orig_rep_has = inv_rep.Has
-            local orig_cmp_has = inv_cmp ~= nil and inv_cmp.Has or nil
 
-            local counts = TryBuildCraftingSnapshot(owner, inv_rep)
-            if counts ~= nil then
-                local fast_has = function(self_inv, prefab, amount, checkallcontainers)
-                    if checkallcontainers then
-                        latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
-                        local c = counts[prefab] or 0
-                        return c >= amount, c
+            local is_closed = (type(self.IsCraftingOpen) == "function") and (not self:IsCraftingOpen())
+            if self._hs_recipes_initialized and not self._hs_force_full_rebuild and is_closed
+                and type(self.valid_recipes) == "table" and type(rawget(GLOBAL, "AllRecipes")) == "table" then
+                self._hs_rebuild_gen = (self._hs_rebuild_gen or 0) + 1
+                self._hs_sweep_idx = 1
+                self._hs_deferred_full_rebuild = true
+                local ok_s, done = HsEvalPinnedAndSlice(self, 0.0006, 20)
+                if ok_s then
+                    if not done then
+                        latency_stats.craft_ui_deferred = latency_stats.craft_ui_deferred + 1
                     end
-                    if self_inv == inv_cmp and orig_cmp_has ~= nil then
-                        return orig_cmp_has(self_inv, prefab, amount, checkallcontainers)
-                    end
-                    return orig_rep_has(self_inv, prefab, amount, checkallcontainers)
+                    return
                 end
-                inv_rep.Has = fast_has
-                if inv_cmp ~= nil and orig_cmp_has ~= nil then
-                    inv_cmp.Has = fast_has
-                end
-            else
-                -- Third-party mod wrapped Has() (e.g. Craft From Nearby Chests):
-                -- use mathematically exact per-rebuild memoization calling the mod's own Has()!
-                local memo = {}
-                local function make_memo(orig_fn)
-                    return function(self_inv, prefab, amount, checkallcontainers)
-                        if checkallcontainers and prefab ~= nil and type(amount) == "number" then
-                            local e = memo[prefab]
-                            if e ~= nil then
-                                if amount <= e.min then
-                                    latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
-                                    return true, e.min
-                                elseif e.exact then
-                                    latency_stats.craft_has_saved = latency_stats.craft_has_saved + 1
-                                    return false, e.min
-                                end
-                            end
-                            local enough, found = orig_fn(self_inv, prefab, amount, checkallcontainers)
-                            local cnt = type(found) == "number" and found or (enough and amount or 0)
-                            if e == nil then
-                                memo[prefab] = { min = cnt, exact = not enough }
-                            else
-                                if cnt > e.min then e.min = cnt end
-                                if not enough then e.exact = true end
-                            end
-                            return enough, found
-                        end
-                        return orig_fn(self_inv, prefab, amount, checkallcontainers)
-                    end
-                end
-                inv_rep.Has = make_memo(orig_rep_has)
-                if inv_cmp ~= nil and orig_cmp_has ~= nil then
-                    inv_cmp.Has = make_memo(orig_cmp_has)
-                end
+                self._hs_deferred_full_rebuild = false
+                self._hs_sweep_idx = nil
             end
 
+            self._hs_deferred_full_rebuild = false
+            self._hs_sweep_idx = nil
+            self._hs_sweep_keys = nil
+            local restore_has = HsInstallCraftHasFastPath(owner, inv_rep)
             local ok, r1, r2, r3 = pcall(orig_RebuildRecipes, self, ...)
-            inv_rep.Has = orig_rep_has
-            if inv_cmp ~= nil and orig_cmp_has ~= nil then
-                inv_cmp.Has = orig_cmp_has
-            end
+            restore_has()
             if not ok then
                 GLOBAL.error(r1, 0)
             end
+            self._hs_recipes_initialized = true
+            local gen = (self._hs_rebuild_gen or 0) + 1
+            self._hs_rebuild_gen = gen
+            if type(self.valid_recipes) == "table" then
+                for _, entry in pairs(self.valid_recipes) do
+                    if type(entry) == "table" then
+                        entry._hs_gen = gen
+                    end
+                end
+            end
             return r1, r2, r3
+        end
+
+        if type(hud.OnUpdate) == "function" then
+            local orig_OnUpdate = hud.OnUpdate
+            hud.OnUpdate = function(self, dt, ...)
+                orig_OnUpdate(self, dt, ...)
+                if self._hs_deferred_full_rebuild and self._hs_sweep_idx ~= nil
+                    and type(self.IsCraftingOpen) == "function" and not self:IsCraftingOpen() then
+                    local ok_s, done = HsEvalPinnedAndSlice(self, 0.0008, 24)
+                    if not ok_s then
+                        self._hs_deferred_full_rebuild = false
+                        self._hs_sweep_idx = nil
+                        self._hs_force_full_rebuild = true
+                        pcall(self.RebuildRecipes, self)
+                        self._hs_force_full_rebuild = false
+                    elseif done then
+                        if self.pinbar ~= nil and type(self.pinbar.Refresh) == "function" then
+                            pcall(self.pinbar.Refresh, self.pinbar)
+                        end
+                        if self.craftingmenu ~= nil and type(self.craftingmenu.UpdateFilterButtons) == "function" then
+                            local ok_u, rebuild_details = pcall(self.craftingmenu.UpdateFilterButtons, self.craftingmenu)
+                            if ok_u and rebuild_details then
+                                self.craftingmenu._hs_deferred_rebuild = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if type(hud.GetRecipeState) == "function" then
+            local orig_GetRecipeState = hud.GetRecipeState
+            hud.GetRecipeState = function(self, recipe_name, ...)
+                HsEnsureSingleRecipeFresh(self, recipe_name)
+                return orig_GetRecipeState(self, recipe_name, ...)
+            end
+        end
+
+        if type(hud.PopulateRecipeDetailPanel) == "function" then
+            local orig_Populate = hud.PopulateRecipeDetailPanel
+            hud.PopulateRecipeDetailPanel = function(self, recipe_name, skin_name, ...)
+                HsEnsureSingleRecipeFresh(self, recipe_name)
+                return orig_Populate(self, recipe_name, skin_name, ...)
+            end
+        end
+
+        if type(hud.pinbar) == "table" and type(hud.pinbar.RefreshPinnedRecipes) == "function" then
+            local pb = hud.pinbar
+            local orig_RefreshPinned = pb.RefreshPinnedRecipes
+            pb.RefreshPinnedRecipes = function(pb_self, ...)
+                if hud._hs_deferred_full_rebuild then
+                    HsEvalPinnedAndSlice(hud, 0.0005, 16)
+                end
+                return orig_RefreshPinned(pb_self, ...)
+            end
         end
 
         if type(hud.Open) == "function" then
             local orig_Open = hud.Open
             hud.Open = function(self, search, ...)
+                if self._hs_deferred_full_rebuild then
+                    self._hs_force_full_rebuild = true
+                    pcall(self.RebuildRecipes, self)
+                    self._hs_force_full_rebuild = false
+                    if self.craftingmenu ~= nil then
+                        self.craftingmenu._hs_deferred_refresh = true
+                        self.craftingmenu._hs_deferred_rebuild = true
+                    end
+                end
                 local cm = self.craftingmenu
                 if cm ~= nil and cm._hs_deferred_refresh then
                     local need_rebuild = cm._hs_deferred_rebuild
@@ -6715,11 +7141,15 @@ if HS_CFG.REDUCE_240HZ_CHURN then
                 and type(self.UpdateFilterButtons) == "function" then
                 -- Keep open_menu_button prototype lightbulb & ding sound 100% live,
                 -- but defer hidden ApplyFilters / recipe_grid / details_root until Open()!
-                local rebuild_details_list = self:UpdateFilterButtons()
-                self._hs_deferred_refresh = true
-                if rebuild_details_list then
+                if not self.crafting_hud._hs_deferred_full_rebuild then
+                    local rebuild_details_list = self:UpdateFilterButtons()
+                    if rebuild_details_list then
+                        self._hs_deferred_rebuild = true
+                    end
+                else
                     self._hs_deferred_rebuild = true
                 end
+                self._hs_deferred_refresh = true
                 latency_stats.craft_ui_deferred = latency_stats.craft_ui_deferred + 1
                 return
             end
@@ -7414,6 +7844,8 @@ if type(AddComponentPostInit) == "function" then
                 if (GLOBAL.IsPaused and GLOBAL.IsPaused()) or self.handler == nil then return end
                 local inst = self.inst
                 if inst == nil or inst ~= GLOBAL.ThePlayer or (inst.IsValid and not inst:IsValid()) then return end
+                local aq = inst.components and inst.components.actionqueuer or nil
+                if aq ~= nil and aq.selection_thread ~= nil then return end
                 if not (self.IsEnabled and self:IsEnabled()) then return end
                 if inst.IsActionsVisible and not inst:IsActionsVisible() then return end
                 if self.placer_recipe ~= nil then return end
@@ -7478,16 +7910,12 @@ if type(AddComponentPostInit) == "function" then
 end
 
 --------------------------------------------------------------------------------
--- 9d. Solo / Non-Caves Local Host Auto-Save Freeze Killer (C++ FastDataDumper Bridge)
---     Activates ONLY when hosting Master inside dontstarve_steam_x64.exe AND
+-- 9d. Client & Local Host Auto-Save Freeze Killer (C++ FastDataDumper Bridge)
+--     Activates on BOTH solo hosts and dedicated-server clients whenever
 --     HyperCore Server's HyperCore_FastDump is not present (zero double-hooking!).
 --     100% vanilla save format with automatic fallback on any edge case.
 --------------------------------------------------------------------------------
 AddSimPostInit(function()
-    local w = GLOBAL.TheWorld
-    if not (w ~= nil and w.ismastersim) then
-        return
-    end
     if type(rawget(GLOBAL, "HyperCore_FastDump")) == "function" then
         return
     end
@@ -7501,7 +7929,7 @@ AddSimPostInit(function()
     end
     rawset(GLOBAL, "_HS_FastDumperBridged", true)
     rawset(GLOBAL, "DataDumper", function(value, varname, fastmode, ident)
-        if fastmode and ident == nil then
+        if fastmode ~= false and ident == nil then
             local dumped, err = native_dump(value, varname)
             if dumped ~= nil then
                 latency_stats.host_fastdumps = latency_stats.host_fastdumps + 1
@@ -7715,10 +8143,34 @@ do
 end
 
 --------------------------------------------------------------------------------
--- 9g. On-Demand Lua Instruction Hotspot Profiler: c_hsprof(sec)
+-- 9g. On-Demand Lua Instruction Hotspot Profiler: c_hsprof(sec) + Live Culprit State
 --------------------------------------------------------------------------------
+local HS_PROF_STATE = { running = false, elapsed = 0, total = 0, top_mods = {}, top_lines = {} }
+
 do
     local prof_active = false
+    local function ClassifyProfSource(src)
+        if type(src) ~= "string" then return "Vanilla/Core" end
+        local wid = string.match(src, "workshop%-(%d+)")
+        if wid then
+            local key = "workshop-" .. wid
+            local kmi = rawget(GLOBAL, "KnownModIndex")
+            if type(kmi) == "table" and type(kmi.GetModInfo) == "function" then
+                local ok_i, info = pcall(kmi.GetModInfo, kmi, key)
+                if ok_i and type(info) == "table" and type(info.name) == "string" and #info.name > 0 then
+                    local nm = info.name
+                    if #nm > 24 then nm = string.sub(nm, 1, 24) .. ".." end
+                    return nm .. " (" .. wid .. ")"
+                end
+            end
+            return key
+        end
+        if string.find(src, "dst_smooth_highfps", 1, true) or string.find(src, "hs_panel", 1, true) then
+            return "HyperShade"
+        end
+        return "Vanilla/Core"
+    end
+
     rawset(GLOBAL, "c_hsprof", function(seconds)
         local dbg = rawget(GLOBAL, "debug")
         local ui_zh = ResolveUiIsZh()
@@ -7748,25 +8200,60 @@ do
         local start_t = get_time()
         local stop_t = start_t + dur
         local counts = {}
+        local mod_counts = {}
         local total = 0
         prof_active = true
+        HS_PROF_STATE.running = true
+        HS_PROF_STATE.elapsed = 0
+        HS_PROF_STATE.total = 0
+        HS_PROF_STATE.top_mods = {}
+        HS_PROF_STATE.top_lines = {}
+        if type(HS_PanelNotifySync) == "function" then HS_PanelNotifySync() end
 
         local function FinishProf()
             if not prof_active then return end
             prof_active = false
             dbg.sethook()
+            local elapsed_s = math.max(0.01, get_time() - start_t)
             local rows = {}
             for k, v in pairs(counts) do
                 rows[#rows + 1] = { k = k, v = v }
             end
             table.sort(rows, function(a, b) return a.v > b.v end)
+
+            local mrows = {}
+            for mk, mv in pairs(mod_counts) do
+                mrows[#mrows + 1] = { name = mk, count = mv, pct = total > 0 and (100.0 * mv / total) or 0.0 }
+            end
+            table.sort(mrows, function(a, b) return a.count > b.count end)
+            local top_m = {}
+            for i = 1, math.min(5, #mrows) do
+                top_m[i] = mrows[i]
+            end
+            local top_l = {}
+            for i = 1, math.min(5, #rows) do
+                top_l[i] = {
+                    line = rows[i].k,
+                    count = rows[i].v,
+                    pct = total > 0 and (100.0 * rows[i].v / total) or 0.0,
+                }
+            end
+            HS_PROF_STATE.running = false
+            HS_PROF_STATE.elapsed = elapsed_s
+            HS_PROF_STATE.total = total
+            HS_PROF_STATE.top_mods = top_m
+            HS_PROF_STATE.top_lines = top_l
+            if type(HS_PanelNotifySync) == "function" then HS_PanelNotifySync() end
+
             if GLOBAL.print then
                 local fin_zh = ResolveUiIsZh()
                 GLOBAL.print(fin_zh
-                    and string.format("=== HyperSmooth Lua 热点采样 (耗时%.1fs, 样本=%d) ===",
-                        math.max(0.01, get_time() - start_t), total)
-                    or string.format("=== HyperSmooth Lua Hotspot Profile (%.1fs, samples=%d) ===",
-                        math.max(0.01, get_time() - start_t), total))
+                    and string.format("=== HyperSmooth Lua 热点采样 (耗时%.1fs, 样本=%d) ===", elapsed_s, total)
+                    or string.format("=== HyperSmooth Lua Hotspot Profile (%.1fs, samples=%d) ===", elapsed_s, total))
+                local mlimit = math.min(5, #mrows)
+                for i = 1, mlimit do
+                    GLOBAL.print(string.format("  [Mod #%d] %5.1f%% (%5d) %s", i, mrows[i].pct, mrows[i].count, mrows[i].name))
+                end
                 local limit = math.min(15, #rows)
                 for i = 1, limit do
                     local pct = total > 0 and (100.0 * rows[i].v / total) or 0.0
@@ -7787,6 +8274,8 @@ do
                 local name = info.name or "?"
                 local key = string.format("%s:%d (%s)", src, line, name)
                 counts[key] = (counts[key] or 0) + 1
+                local mlabel = ClassifyProfSource(src)
+                mod_counts[mlabel] = (mod_counts[mlabel] or 0) + 1
                 total = total + 1
             end
         end, "", 2000)
@@ -8279,24 +8768,93 @@ local HOTKEY_ACTIONS = {
     end,
 }
 
+local function ApplyClarityGrade(grade, save_persist)
+    local g = tonumber(grade)
+    if type(grade) == "string" then
+        local lo = string.lower(grade)
+        if lo == "vanilla" or lo == "off" or lo == "0" then g = 0
+        elseif lo == "hd" or lo == "clarity" or lo == "1" then g = 1
+        elseif lo == "uhd" or lo == "ultrahd" or lo == "2k" or lo == "2" then g = 2
+        elseif lo == "bluray" or lo == "bd" or lo == "4k" or lo == "3" then g = 3 end
+    end
+    if type(g) ~= "number" then return false end
+    g = math.floor(g)
+    if g < 0 then g = 0 elseif g > 3 then g = 3 end
+    HS_CFG.clarity_grade = g
+    if g == 0 then
+        if current_visual_preset == 1 or current_visual_preset == 2 then
+            SnapshotFlagsToCustom()
+        end
+        if current_visual_preset ~= 0 then
+            custom_vis_flags.af16 = false
+            custom_vis_flags.full_lm = false
+            custom_vis_flags.mip_sharp = false
+            vis_tune.mip_bias = 0.00
+            current_visual_preset = HasAnyCustomActive() and 3 or 0
+        end
+    else
+        if current_visual_preset == 0 then
+            current_visual_preset = 1
+            HS_CFG.active_builtin_id = "eyecare_hd"
+            HS_SHARE.current_scheme_name = ""
+        elseif current_visual_preset == 3 then
+            custom_vis_flags.af16 = true
+            custom_vis_flags.full_lm = true
+            custom_vis_flags.mip_sharp = true
+            custom_vis_flags.cas = true
+            EnsureFlagTuneOnToggle("cas", true)
+            vis_tune.mip_bias = (g >= 3) and -0.95 or ((g == 2) and -0.75 or -0.60)
+        end
+    end
+    visual_bench_timer = 12.0
+    SyncToNativePlugin(save_persist ~= false)
+    hud_dirty_now = true
+    return true
+end
+
 -- Mod-environment API bridge consumed by hs_panel.lua (Sleek In-Game Live Customizer Side-Panel)
 HS_PanelApi = {
     SetPreset = function(preset_id)
         if type(preset_id) ~= "number" or preset_id < 0 or preset_id > 3 then return end
         current_visual_preset = preset_id
         if preset_id == 0 then
+            HS_CFG.clarity_grade = 0
             HS_CFG.active_builtin_id = "vanilla"
             HS_SHARE.current_scheme_name = ""
         elseif preset_id == 1 then
+            if (HS_CFG.clarity_grade or 0) == 0 then HS_CFG.clarity_grade = 1 end
             HS_CFG.active_builtin_id = "eyecare_hd"
             HS_SHARE.current_scheme_name = ""
         elseif preset_id == 2 then
+            if (HS_CFG.clarity_grade or 0) < 2 then HS_CFG.clarity_grade = 2 end
             HS_CFG.active_builtin_id = "storybook"
             HS_SHARE.current_scheme_name = ""
         end
         visual_bench_timer = 12.0
         SyncToNativePlugin(true)
         hud_dirty_now = true
+    end,
+    SetClarityGrade = function(grade)
+        if not ApplyClarityGrade(grade, true) then return false end
+        local g = HS_CFG.clarity_grade or 0
+        local ui_zh = ResolveUiIsZh()
+        local labels_zh = { [0] = "原版", [1] = "清晰 (1080p精修)", [2] = "超清 (2K GPU重构)", [3] = "蓝光 (4K母带超采)" }
+        local labels_en = { [0] = "Vanilla", [1] = "HD Clarity", [2] = "UltraHD Compute", [3] = "BluRay 4K" }
+        toast_msg = ui_zh
+            and ("画质清晰度 -> " .. (labels_zh[g] or tostring(g)))
+            or ("Clarity Grade -> " .. (labels_en[g] or tostring(g)))
+        toast_timer = 2.8
+        return true
+    end,
+    SetClarityStrength = function(val)
+        local v = tonumber(val)
+        if type(v) ~= "number" then return false end
+        if v < 0.20 then v = 0.20 elseif v > 1.50 then v = 1.50 end
+        HS_CFG.clarity_strength = math.floor(v * 100 + 0.5) / 100
+        visual_bench_timer = 12.0
+        SyncToNativePlugin(true)
+        hud_dirty_now = true
+        return true
     end,
     GetBuiltinPresets = function()
         return HS_SHARE.BUILTIN_GALLERY or {}
@@ -8602,6 +9160,39 @@ HS_PanelApi = {
         hud_dirty_now = true
     end,
     CycleHudMode = CycleHudStateWithToast,
+    SetHardwareTier = function(tier)
+        local t = tonumber(tier)
+        if type(tier) == "string" then
+            local lo = string.lower(tier)
+            if lo == "low" or lo == "0" then t = 0
+            elseif lo == "unleashed" or lo == "high" or lo == "2" then t = 2
+            elseif lo == "balanced" or lo == "1" then t = 1 end
+        end
+        if type(t) ~= "number" then return false end
+        t = math.floor(t)
+        if t < 0 then t = 0 elseif t > 2 then t = 2 end
+        HS_CFG.hardware_tier = t
+        SyncToNativePlugin(true)
+        local ui_zh = ResolveUiIsZh()
+        local labels_zh = { [0] = "省电低配", [1] = "均衡标准", [2] = "高端全解放" }
+        local labels_en = { [0] = "Low Spec", [1] = "Balanced", [2] = "Unleashed" }
+        toast_msg = ui_zh
+            and ("硬件性能档位 -> " .. (labels_zh[t] or tostring(t)))
+            or ("Hardware Tier -> " .. (labels_en[t] or tostring(t)))
+        toast_timer = 2.8
+        hud_dirty_now = true
+        return true
+    end,
+    StartModProfiler = function(sec)
+        local fnProf = rawget(GLOBAL, "c_hsprof")
+        if type(fnProf) == "function" then
+            return fnProf(tonumber(sec) or 3)
+        end
+        return false
+    end,
+    GetModProfilerState = function()
+        return HS_PROF_STATE
+    end,
     GetSnapshot = function()
         local has_dll = HasNativePlugin()
         local avg_fps, low1_fps = last_hud_avg_fps, last_hud_low1_fps
@@ -8686,6 +9277,59 @@ HS_PanelApi = {
         end
 
         local dll_status, dll_ver, expected_dll_ver = GetDllVersionStatus()
+        local hw_info = {
+            tier            = HS_CFG.hardware_tier,
+            cores           = 0,
+            ram_mb          = 0,
+            gl_major        = 0,
+            gl_minor        = 0,
+            persistent_ring = false,
+            vb_max_mb       = 0,
+            sc_max_mb       = 0,
+            vb_used_kb      = 0,
+            sc_used_kb      = 0,
+            anim_shed       = 0,
+        }
+        local fnHw = rawget(GLOBAL, "HyperSmooth_GetHardwareInfo")
+        if type(fnHw) == "function" then
+            local okH, ht, hc, hram, hmaj, hmin, hpr, hvb, hsc, hvbu, hscu, hshed = pcall(fnHw)
+            if okH then
+                hw_info.tier            = type(ht) == "number" and ht or HS_CFG.hardware_tier
+                hw_info.cores           = type(hc) == "number" and hc or 0
+                hw_info.ram_mb          = type(hram) == "number" and hram or 0
+                hw_info.gl_major        = type(hmaj) == "number" and hmaj or 0
+                hw_info.gl_minor        = type(hmin) == "number" and hmin or 0
+                hw_info.persistent_ring = hpr == true
+                hw_info.vb_max_mb       = type(hvb) == "number" and hvb or 0
+                hw_info.sc_max_mb       = type(hsc) == "number" and hsc or 0
+                hw_info.vb_used_kb      = type(hvbu) == "number" and hvbu or 0
+                hw_info.sc_used_kb      = type(hscu) == "number" and hscu or 0
+                hw_info.anim_shed       = type(hshed) == "number" and hshed or 0
+            end
+        end
+
+        local clarity_stats = {
+            grade      = (current_visual_preset == 0) and 0 or (HS_CFG.clarity_grade or 0),
+            supported  = false,
+            active     = false,
+            gpu_ms     = 0.0,
+            hdr_lm     = false,
+            shadow_res = 0,
+            vram_mb    = 0.0,
+        }
+        local fnClarSt = rawget(GLOBAL, "HyperSmooth_GetClarityStats")
+        if type(fnClarSt) == "function" then
+            local okC, cg, csup, cact, cgms, chdr, csh, cvram = pcall(fnClarSt)
+            if okC then
+                clarity_stats.grade      = type(cg) == "number" and cg or clarity_stats.grade
+                clarity_stats.supported  = csup == true
+                clarity_stats.active     = cact == true
+                clarity_stats.gpu_ms     = type(cgms) == "number" and cgms or 0.0
+                clarity_stats.hdr_lm     = chdr == true
+                clarity_stats.shadow_res = type(csh) == "number" and csh or 0
+                clarity_stats.vram_mb    = type(cvram) == "number" and cvram or 0.0
+            end
+        end
 
         return {
             preset            = current_visual_preset,
@@ -8743,9 +9387,96 @@ HS_PanelApi = {
             map_skip          = latency_stats.map_skip,
             placer_skip       = latency_stats.placer_skip,
             deploy_skip       = latency_stats.deploy_skip,
+            hardware_tier     = HS_CFG.hardware_tier,
+            hw_info           = hw_info,
+            clarity_grade     = (current_visual_preset == 0) and 0 or (HS_CFG.clarity_grade or 0),
+            clarity_strength  = HS_CFG.clarity_strength or 1.00,
+            clarity_stats     = clarity_stats,
+            prof_state        = HS_PROF_STATE,
         }
     end,
 }
+
+rawset(GLOBAL, "c_hsclarity", function(grade, strength)
+    local ui_zh = ResolveUiIsZh()
+    if grade == nil and strength == nil then
+        local snap = HS_PanelApi.GetSnapshot()
+        local cs = snap.clarity_stats or {}
+        local g = snap.clarity_grade or 0
+        local names_zh = { [0] = "原版 (0)", [1] = "清晰 (1)", [2] = "超清 (2)", [3] = "蓝光 (3)" }
+        local names_en = { [0] = "Vanilla (0)", [1] = "HD Clarity (1)", [2] = "UltraHD (2)", [3] = "BluRay 4K (3)" }
+        GLOBAL.print(string.format(
+            ui_zh
+                and "[HyperSmooth 清晰度] 当前=%s | 强度=%.0f%% | GPU计算=%s(就绪=%s) %.2fms | 16F HDR光照=%s | 阴影=%d | 额外显存=%.1fMB | 用法: c_hsclarity(0|1|2|3, [0.20..1.50])"
+                or "[HyperSmooth Clarity] current=%s | Str=%.0f%% | GPU Compute=%s(ready=%s) %.2fms | 16F HDR LM=%s | Shadow=%d | ExtraVRAM=%.1fMB | usage: c_hsclarity(0|1|2|3, [0.20..1.50])",
+            ui_zh and (names_zh[g] or tostring(g)) or (names_en[g] or tostring(g)),
+            (snap.clarity_strength or 1.00) * 100.0,
+            (cs.active == true) and "ON" or "OFF",
+            (cs.supported == true) and "YES" or "NO",
+            cs.gpu_ms or 0.0,
+            (cs.hdr_lm == true) and "RGBA16F" or "RGBA8",
+            cs.shadow_res or 0,
+            cs.vram_mb or 0.0))
+        return g
+    end
+    if type(strength) == "number" then
+        HS_PanelApi.SetClarityStrength(strength)
+    end
+    if grade == nil then
+        return HS_CFG.clarity_grade or 0
+    end
+    local ok = HS_PanelApi.SetClarityGrade(grade)
+    if ok then
+        local g = HS_CFG.clarity_grade or 0
+        local names_zh = { [0] = "原版 (0)", [1] = "清晰 (1·1080p精修)", [2] = "超清 (2·2K GPU重构)", [3] = "蓝光 (3·4K母带超采)" }
+        local names_en = { [0] = "Vanilla (0)", [1] = "HD Clarity (1)", [2] = "UltraHD Compute (2)", [3] = "BluRay 4K (3)" }
+        GLOBAL.print(string.format(
+            ui_zh
+                and "[HyperSmooth 清晰度] 已切换为 -> %s (重构强度 %.0f%%)"
+                or "[HyperSmooth Clarity] Switched to -> %s (Strength %.0f%%)",
+            ui_zh and (names_zh[g] or tostring(g)) or (names_en[g] or tostring(g)),
+            (HS_CFG.clarity_strength or 1.00) * 100.0))
+    else
+        GLOBAL.print(ui_zh
+            and "[HyperSmooth 清晰度] 无效参数，请传 0(原版) / 1(清晰) / 2(超清) / 3(蓝光)"
+            or "[HyperSmooth Clarity] Invalid argument; use 0 (vanilla), 1 (hd), 2 (ultrahd), or 3 (bluray)")
+    end
+    return ok
+end)
+
+rawset(GLOBAL, "c_hstier", function(tier)
+    local ui_zh = ResolveUiIsZh()
+    if tier == nil then
+        local snap = HS_PanelApi.GetSnapshot()
+        local hw = snap.hw_info or {}
+        local t = snap.hardware_tier or 1
+        local names_zh = { [0] = "省电低配 (0)", [1] = "均衡标准 (1)", [2] = "高端全解放 (2)" }
+        local names_en = { [0] = "Low (0)", [1] = "Balanced (1)", [2] = "Unleashed (2)" }
+        GLOBAL.print(string.format(
+            ui_zh
+                and "[HyperSmooth 硬件档位] 当前=%s | CPU=%d核 | 内存=%.1fGB | OpenGL=%d.%d | AZDO持久环形缓冲=%s | VBPool=%dMB ShadowCache=%dMB | 用法: c_hstier(0|1|2)"
+                or "[HyperSmooth HW Tier] current=%s | CPU=%d cores | RAM=%.1fGB | GL=%d.%d | AZDO=%s | VBPool=%dMB ShadowCache=%dMB | usage: c_hstier(0|1|2)",
+            ui_zh and (names_zh[t] or tostring(t)) or (names_en[t] or tostring(t)),
+            hw.cores or 0, (hw.ram_mb or 0) / 1024.0, hw.gl_major or 0, hw.gl_minor or 0,
+            (hw.persistent_ring == true) and "ON" or "OFF",
+            hw.vb_max_mb or 0, hw.sc_max_mb or 0))
+        return t
+    end
+    local ok = HS_PanelApi.SetHardwareTier(tier)
+    if ok then
+        local names_zh = { [0] = "省电低配 (0)", [1] = "均衡标准 (1)", [2] = "高端全解放 (2)" }
+        local names_en = { [0] = "Low (0)", [1] = "Balanced (1)", [2] = "Unleashed (2)" }
+        local t = HS_CFG.hardware_tier
+        GLOBAL.print(ui_zh
+            and ("[HyperSmooth 硬件档位] 已切换为 -> " .. (names_zh[t] or tostring(t)))
+            or ("[HyperSmooth HW Tier] Switched to -> " .. (names_en[t] or tostring(t))))
+    else
+        GLOBAL.print(ui_zh
+            and "[HyperSmooth 硬件档位] 无效参数，请传 0(低配) / 1(均衡) / 2(高端解放)"
+            or "[HyperSmooth HW Tier] Invalid argument; use 0 (low), 1 (balanced), or 2 (unleashed)")
+    end
+    return ok
+end)
 
 -- v2.9.5 Panel redesign: plain-language "bundle" switches for Simple mode + persisted UI mode
 HS_UI = { mode = "simple" }

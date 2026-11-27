@@ -10,6 +10,12 @@ name = L("HyperShade · 饥荒超帧与视觉引擎（原 HyperSmooth）", "DST 
 description = L([[
 纯客户端 240 帧骨骼/位移/影子/粒子/动态光源/镜头全场景补帧、Native OpenGL 硬件加速（完整兼容 Steam 社区界面）、世界空间独立 ShadowMask FBO 流体阴影与 360° 多光源篝火/提灯动态投影 + 沿岸实景平面水面倒影 + 真·白名单植被风动与穿行拨草、原生崩溃侦探与双屏防甩出鼠标锁、全参数实时画质光影工坊、视觉风格闭环（任意截图吸色拟合自有管线参数 → HS1 分享码）与 HS_EXT_V1 标准 Shader 扩展管线（全自动识别官方中英文语言并支持局内热切换）。
 
+【v2.9.7-beta1 测试版热更新】
+1. v4.0 Phase 1–5 原生渲染与流送引擎：新增同上下文 3 帧持久一致 PBO 异步贴图上传环、双线程无锁卡顿栈采样、无阻塞 `glGetError`/`glGenTextures` 预分配池、SSE2 向量化与 65520 顶点上限精灵合批、Mode-4 零阻塞环形上传、Klei 64 槽 `VertexDecl::Apply` 硬件直连与 `UiBatcher` 零回读优化，大幅降低大基地转动视角与跑图卡顿。
+2. GPU Compute 清晰度分级 & 三档硬件性能档位：支持原版 / 1080P 清晰 / UltraHD 计算锐化 / BluRay 虚拟 4K 四档切换（附 360 帧 / 2.0ms 滞回防抖与实时 GPU 遥测），配合低配 / 均衡 / 狂暴三档硬件策略一键调度。
+3. 行为学（ActionQueuer）兼容与 Lua 热路径减负：框选操作期间自动避让低延迟点击刷新，消除行为学框选引发的输入与键盘异常；体积光雾（hs_vollight）改为三相交错流式扫描、`distancefade` 零分配防闪烁、隐藏制作栏延迟重构、`FastDataDumper` 客户端/本地建房加速，并升级 `c_hsprof()` 支持按模组耗时归因。
+4. DNH 伴侣支持与 DLL 升级提示：已声明 `dnh_github` 托管元数据；完整体验本版本 Phase 1–5 原生引擎加速与 Compute 清晰度请同步更新 `bin64/dinput8.dll` 至 `v2.9.7-beta1`（旧版 `2.9.6` DLL 会自动降级运行但无新增原生优化）。
+
 【v2.9.6 紧急热修】
 1. 修复部分显卡环境下贴图槽位越界导致的整屏异常发红（类似强行戴鼹鼠帽），并修复鼹鼠帽/夜视/启迪冠升级月亮滤镜与画质预设冲突串色的问题。
 2. 修复全局帧率偏低回退：默认关闭实验性 DXGI 翻转模式、恢复现代 A 卡（OpenGL 4.5+）走原生 OpenGL、消除原版纯净档位每帧冗余同步与着色彩蛋开销。
@@ -33,6 +39,12 @@ description = L([[
 ]], [[
 Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Overlay compatibility), World-Space ShadowMask FBO fluid shadows with 360-deg Top-3 campfire/lantern dynamic point shadows, coastal-only true planar water reflections, strict tag-whitelisted GPU foliage wind-sway & player parting wake, zero-heap Crash Detective + safe Dual-Monitor Cursor Lock, real-time Visual & Lighting Studio with 6 built-in curated presets, Visual Closed-Loop (any reference screenshot -> HyperShade owned capability whitelist -> transactional HS1 share code), and the HS_EXT_V1 Shader Extension Platform.
 
+[v2.9.7-beta1 Beta Hotfix]
+1. v4.0 Phase 1-5 Native Rendering & Streaming Engine: 3-frame in-context persistent-coherent PBO async texture upload ring, lockless dual-thread hitch stack sampler, non-blocking glGetError & PreallocTexIdPool, SSE2-vectorized SpriteBatcher with 65520-vertex ceiling, Mode-4 non-blocking ring uploads, direct Klei 64-slot VertexDecl::Apply fastpath, and zero-readback UiBatcher optimization to slash mega-base camera rotation and movement hitches.
+2. GPU Compute Clarity Grades & 3 Hardware Performance Tiers: Vanilla / 1080p Clarity / UltraHD Compute / BluRay Virtual-4K grades (with 360-frame / 2.0ms hysteresis and live GPU telemetry) paired with Low / Balanced / Unleashed hardware tiers.
+3. ActionQueuer Compatibility & Lua Hot-Path Savings: Automatically defers low-latency click refresh during ActionQueuer box selection (fixing input/keyboard glitches), 3-phase staggered hs_vollight spatial streaming, zero-alloc distancefade, deferred hidden crafting rebuilds, client/host FastDataDumper acceleration, and per-mod attribution in c_hsprof().
+4. DNH Companion Support: Declared dnh_github metadata; update bin64/dinput8.dll to v2.9.7-beta1 for full Phase 1-5 native acceleration and GPU Compute Clarity (older 2.9.6 DLL degrades safely without the new native features).
+
 [v2.9.6 Hotfix]
 1. Fixed abnormal red-screen tint (texture unit bounds guard for ShadowMask/WaterRefl) and preserved special vision / upgraded Enlightened Crown lunacy ColourCube filters.
 2. Fixed baseline FPS regression: DXGI flip-present now defaults to off, modern AMD GPUs (OpenGL 4.5+) stay on Native OpenGL, and Preset 0 steady-state per-frame sync overhead is eliminated.
@@ -55,7 +67,9 @@ Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Over
    - 1-click "Presets" gallery panel (Vanilla Pure / Eye-Care HD / Cinematic Storybook / Crisp Daylight / Cozy Firelight / Misty Canopy — 100% original HyperShade looks, editable & 1-click Undo); Vanilla Pure strictly keeps stock 0.25x BloomSampler & Magiluminescence brightness with zero added visual effects.
 ]])
 author = "Hakimi Tech Lab"
-version = "2.9.6.1"
+version = "2.9.7-beta1"
+dnh_github = "wangxu1428/DST-HyperSmooth-240FPS"
+dnh_github_asset = "dinput8.dll"
 
 api_version = 10
 dst_compatible = true

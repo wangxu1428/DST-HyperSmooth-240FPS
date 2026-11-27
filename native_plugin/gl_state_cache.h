@@ -7,7 +7,7 @@
 
 namespace hs_gl_cache {
 
-static constexpr uint32_t kMaxTexUnits          = 16;
+static constexpr uint32_t kMaxTexUnits          = 24;
 static constexpr uint32_t kMaxVertexAttribs     = 16;
 static constexpr uint32_t kMaxUniProgs          = 64;
 static constexpr uint32_t kMaxUniLocs           = 64;
@@ -26,6 +26,7 @@ enum UniformTag : uint8_t {
     UNI_4FV  = 5,
     UNI_MAT3 = 6,
     UNI_MAT4 = 7,
+    UNI_MAT2 = 8,
 };
 
 struct UniformSlot {
@@ -51,6 +52,15 @@ static constexpr uint32_t kGlCullFace           = 0x0B44u;
 static constexpr uint32_t kGlScissorTest        = 0x0C11u;
 static constexpr uint32_t kGlStencilTest        = 0x0B90u;
 static constexpr uint32_t kGlPolygonOffsetFill  = 0x8037u;
+static constexpr uint32_t kGlStencilAlways      = 0x0207u;
+static constexpr uint32_t kGlStencilKeep        = 0x1E00u;
+static constexpr uint32_t kGlStencilFuncPname   = 0x0B92u;
+static constexpr uint32_t kGlStencilValueMaskPname = 0x0B93u;
+static constexpr uint32_t kGlStencilFailPname   = 0x0B94u;
+static constexpr uint32_t kGlStencilPassDepthFailPname = 0x0B95u;
+static constexpr uint32_t kGlStencilPassDepthPassPname = 0x0B96u;
+static constexpr uint32_t kGlStencilRefPname    = 0x0B97u;
+static constexpr uint32_t kGlStencilWritemaskPname = 0x0B98u;
 static constexpr size_t   kNumCaps              = 6;
 
 inline int CapToIndex(uint32_t cap) {
@@ -89,12 +99,25 @@ struct ThreadState {
     int32_t  stencilRef      = 0;
     uint32_t stencilFuncMask = 0;
     bool     stencilFuncValid = false;
+    uint32_t drvStencilFunc  = kInvalidId;
+    int32_t  drvStencilRef   = 0;
+    uint32_t drvStencilFuncMask = 0;
+    bool     drvStencilFuncValid = false;
+    bool     stencilFuncDirty = false;
     uint32_t stencilWriteMask = 0;
     bool     stencilWriteMaskValid = false;
+    uint32_t drvStencilWriteMask = 0;
+    bool     drvStencilWriteMaskValid = false;
+    bool     stencilWriteMaskDirty = false;
     uint32_t stencilOpFail   = kInvalidId;
     uint32_t stencilOpZfail  = kInvalidId;
     uint32_t stencilOpZpass  = kInvalidId;
     bool     stencilOpValid  = false;
+    uint32_t drvStencilOpFail  = kInvalidId;
+    uint32_t drvStencilOpZfail = kInvalidId;
+    uint32_t drvStencilOpZpass = kInvalidId;
+    bool     drvStencilOpValid = false;
+    bool     stencilOpDirty    = false;
     float    polyOffFactor   = 0.0f;
     float    polyOffUnits    = 0.0f;
     bool     polyOffValid    = false;
@@ -106,6 +129,8 @@ struct ThreadState {
     int32_t  sc[4]           = {};
     int8_t   caps[kNumCaps] = { -1, -1, -1, -1, -1, -1 };
     uint32_t boundTex2D[kMaxTexUnits] = {
+        kInvalidId, kInvalidId, kInvalidId, kInvalidId,
+        kInvalidId, kInvalidId, kInvalidId, kInvalidId,
         kInvalidId, kInvalidId, kInvalidId, kInvalidId,
         kInvalidId, kInvalidId, kInvalidId, kInvalidId,
         kInvalidId, kInvalidId, kInvalidId, kInvalidId,
@@ -186,12 +211,25 @@ struct ThreadState {
         stencilRef            = 0;
         stencilFuncMask       = 0;
         stencilFuncValid      = false;
+        drvStencilFunc        = kInvalidId;
+        drvStencilRef         = 0;
+        drvStencilFuncMask    = 0;
+        drvStencilFuncValid   = false;
+        stencilFuncDirty      = false;
         stencilWriteMask      = 0;
         stencilWriteMaskValid = false;
+        drvStencilWriteMask   = 0;
+        drvStencilWriteMaskValid = false;
+        stencilWriteMaskDirty = false;
         stencilOpFail         = kInvalidId;
         stencilOpZfail        = kInvalidId;
         stencilOpZpass        = kInvalidId;
         stencilOpValid        = false;
+        drvStencilOpFail      = kInvalidId;
+        drvStencilOpZfail     = kInvalidId;
+        drvStencilOpZpass     = kInvalidId;
+        drvStencilOpValid     = false;
+        stencilOpDirty        = false;
         polyOffFactor         = 0.0f;
         polyOffUnits          = 0.0f;
         polyOffValid          = false;
@@ -455,6 +493,34 @@ struct ThreadState {
         return true;
     }
 
+    bool IsStencilTestKnownDisabled() const noexcept {
+        return caps[4] == 0;
+    }
+    bool HasDeferredStencilState() const noexcept {
+        return stencilFuncDirty || stencilWriteMaskDirty || stencilOpDirty;
+    }
+    // OpenGL ES 2.0 / 4.6 Spec §4.1.5 exact no-op proofs while GL_STENCIL_TEST == ENABLED:
+    //   1. If stencilOp can never write (all KEEP, or func==ALWAYS with zfail==KEEP && zpass==KEEP),
+    //      changing glStencilMask has ZERO effect on any draw call (only affects glClear(STENCIL)).
+    bool CanDeferStencilMaskWhenEnabled() const noexcept {
+        if (!stencilOpValid) return false;
+        if (stencilOpZfail != kGlStencilKeep || stencilOpZpass != kGlStencilKeep) return false;
+        return (stencilOpFail == kGlStencilKeep) ||
+               (stencilFuncValid && stencilFunc == kGlStencilAlways);
+    }
+    //   2. If logical glStencilMask == 0, NO stencil bit can ever be modified regardless of stencilOp.
+    bool CanDeferStencilOpWhenEnabled() const noexcept {
+        return stencilWriteMaskValid && stencilWriteMask == 0u;
+    }
+    //   3. If old and new stencilFunc are both GL_ALWAYS AND stencil writes are provably disabled
+    //      (wmask == 0 OR zfail/zpass == KEEP), changing ref/fmask has ZERO effect on any draw call.
+    bool CanDeferStencilFuncWhenEnabled(uint32_t newFunc) const noexcept {
+        if (newFunc != kGlStencilAlways || !stencilFuncValid || stencilFunc != kGlStencilAlways) {
+            return false;
+        }
+        return CanDeferStencilOpWhenEnabled() || CanDeferStencilMaskWhenEnabled();
+    }
+
     bool IsStencilFuncRedundant(uint32_t func, int32_t ref, uint32_t mask) {
         ++batchCalls;
         if (stencilFuncValid && stencilFunc == func && stencilRef == ref && stencilFuncMask == mask) {
@@ -463,11 +529,36 @@ struct ThreadState {
         }
         return false;
     }
-    void RecordStencilFunc(uint32_t func, int32_t ref, uint32_t mask) noexcept {
+    void DeferStencilFunc(uint32_t func, int32_t ref, uint32_t mask) noexcept {
         stencilFuncValid = true;
         stencilFunc      = func;
         stencilRef       = ref;
         stencilFuncMask  = mask;
+        stencilFuncDirty = (!drvStencilFuncValid || drvStencilFunc != func ||
+                            drvStencilRef != ref || drvStencilFuncMask != mask);
+    }
+    void RecordStencilFunc(uint32_t func, int32_t ref, uint32_t mask) noexcept {
+        stencilFuncValid    = true;
+        stencilFunc         = func;
+        stencilRef          = ref;
+        stencilFuncMask     = mask;
+        drvStencilFuncValid = true;
+        drvStencilFunc      = func;
+        drvStencilRef       = ref;
+        drvStencilFuncMask  = mask;
+        stencilFuncDirty    = false;
+    }
+    bool TakeDeferredStencilFunc(uint32_t& outFunc, int32_t& outRef, uint32_t& outMask) noexcept {
+        if (!stencilFuncDirty || !stencilFuncValid) return false;
+        outFunc             = stencilFunc;
+        outRef              = stencilRef;
+        outMask             = stencilFuncMask;
+        drvStencilFuncValid = true;
+        drvStencilFunc      = stencilFunc;
+        drvStencilRef       = stencilRef;
+        drvStencilFuncMask  = stencilFuncMask;
+        stencilFuncDirty    = false;
+        return true;
     }
     bool ShouldCallStencilFunc(uint32_t func, int32_t ref, uint32_t mask) {
         if (IsStencilFuncRedundant(func, ref, mask)) return false;
@@ -483,9 +574,25 @@ struct ThreadState {
         }
         return false;
     }
-    void RecordStencilMask(uint32_t mask) noexcept {
+    void DeferStencilMask(uint32_t mask) noexcept {
         stencilWriteMaskValid = true;
         stencilWriteMask      = mask;
+        stencilWriteMaskDirty = (!drvStencilWriteMaskValid || drvStencilWriteMask != mask);
+    }
+    void RecordStencilMask(uint32_t mask) noexcept {
+        stencilWriteMaskValid    = true;
+        stencilWriteMask         = mask;
+        drvStencilWriteMaskValid = true;
+        drvStencilWriteMask      = mask;
+        stencilWriteMaskDirty    = false;
+    }
+    bool TakeDeferredStencilMask(uint32_t& outMask) noexcept {
+        if (!stencilWriteMaskDirty || !stencilWriteMaskValid) return false;
+        outMask                  = stencilWriteMask;
+        drvStencilWriteMaskValid = true;
+        drvStencilWriteMask      = stencilWriteMask;
+        stencilWriteMaskDirty    = false;
+        return true;
     }
     bool ShouldCallStencilMask(uint32_t mask) {
         if (IsStencilMaskRedundant(mask)) return false;
@@ -501,11 +608,36 @@ struct ThreadState {
         }
         return false;
     }
-    void RecordStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) noexcept {
+    void DeferStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) noexcept {
         stencilOpValid = true;
         stencilOpFail  = fail;
         stencilOpZfail = zfail;
         stencilOpZpass = zpass;
+        stencilOpDirty = (!drvStencilOpValid || drvStencilOpFail != fail ||
+                          drvStencilOpZfail != zfail || drvStencilOpZpass != zpass);
+    }
+    void RecordStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) noexcept {
+        stencilOpValid    = true;
+        stencilOpFail     = fail;
+        stencilOpZfail    = zfail;
+        stencilOpZpass    = zpass;
+        drvStencilOpValid = true;
+        drvStencilOpFail  = fail;
+        drvStencilOpZfail = zfail;
+        drvStencilOpZpass = zpass;
+        stencilOpDirty    = false;
+    }
+    bool TakeDeferredStencilOp(uint32_t& outFail, uint32_t& outZfail, uint32_t& outZpass) noexcept {
+        if (!stencilOpDirty || !stencilOpValid) return false;
+        outFail           = stencilOpFail;
+        outZfail          = stencilOpZfail;
+        outZpass          = stencilOpZpass;
+        drvStencilOpValid = true;
+        drvStencilOpFail  = stencilOpFail;
+        drvStencilOpZfail = stencilOpZfail;
+        drvStencilOpZpass = stencilOpZpass;
+        stencilOpDirty    = false;
+        return true;
     }
     bool ShouldCallStencilOp(uint32_t fail, uint32_t zfail, uint32_t zpass) {
         if (IsStencilOpRedundant(fail, zfail, zpass)) return false;
@@ -613,8 +745,22 @@ struct ThreadState {
                            uint8_t tag, const void* data, size_t byteLen) {
         ++batchUniCalls;
         if (curProgram == 0u || curProgram == kInvalidId ||
-            loc < 0 || loc >= static_cast<int32_t>(kMaxUniLocs) ||
-            count != 1 || transpose != 0 || !data || byteLen == 0 || byteLen > 64) {
+            loc < 0 || loc >= static_cast<int32_t>(kMaxUniLocs)) {
+            return true;
+        }
+        if (count != 1) {
+            if (count > 1) {
+                if (UniformProgBucket* b = FindUniBucket(curProgram)) {
+                    const int32_t maxLoc = static_cast<int32_t>(kMaxUniLocs);
+                    const int32_t end = (count > maxLoc - loc) ? maxLoc : (loc + count);
+                    for (int32_t i = loc; i < end; ++i) {
+                        b->slots[i].tag = UNI_NONE;
+                    }
+                }
+            }
+            return true;
+        }
+        if (transpose != 0 || !data || byteLen == 0 || byteLen > 64) {
             return true;
         }
         UniformProgBucket* b = FindOrAllocUniBucket(curProgram);

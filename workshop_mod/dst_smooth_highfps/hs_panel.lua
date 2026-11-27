@@ -36,6 +36,7 @@ if not ok_te then TextEdit = nil end
 local panel_root = nil
 local panel_visible = false
 local panel_refresh_fn = nil
+local panel_release_focus_fn = nil
 local panel_telemetry_fn = nil
 local panel_ui_mode = "simple"
 
@@ -77,25 +78,54 @@ local function CreateLiveCustomizerPanel(hud)
     end
     root:Hide()
 
-    local W, H = 400, 666
+    local W, H = 436, 684
     -- Position inner child container inside SCALEMODE_PROPORTIONAL anchor so offsets use
     -- resolution-independent virtual 720p units instead of unscaled raw screen pixels.
     local panel = root:AddChild(Widget("HyperSmoothLivePanelBody"))
-    panel:SetPosition(-244, -10, 0)
+    panel:SetPosition(-244, -4, 0)
 
     -- All shared widget registries live in tables to stay far below Lua 5.1's 200-local / 60-upvalue limits.
     local UI = { zh_now = is_zh, info = nil, pro_chrome = {} }
     local pages = {}
     local ApplyMode = nil
+    UI.panel = panel
+    UI.pages = pages
+    UI.text_edits = {}
+    UI.hw_groups = {}
+    UI.clarity_groups = {}
+    UI.clarity_meta = nil
+    UI.clarity_str_lbl = nil
+    UI.clarity_str_val = nil
+    UI.clarity_str_fill = nil
+    UI.clarity_str_minus = nil
+    UI.clarity_str_plus = nil
+    UI.clarity_str_track_x0 = nil
+    UI.slot_lbls = {}
+    UI.L = {
+        W = W, H = H,
+        full_w = W - 24,            -- 412 ([-206, +206])
+        pro_cx = -6,                -- Pro viewport row/header center X
+        pro_w = W - 38,             -- 398 ([-205, +193], leaves room for right scrollbar)
+        sb_x = 202,                 -- Right-edge scrollbar center X ([+195, +209])
+        pro_view_top = 176,         -- 5px below category tabs bottom (+181)
+        pro_view_bot = -246,        -- 422px viewport; 5px above Reset Button top (-251)
+        pro_view_bot_no_rst = -269, -- Used on tabs without a page reset button (System)
+        reset_y = -261, reset_h = 20, -- [-271, -251]
+        desc_y = -306, desc_h = 58,   -- [-335, -277] (6px below reset, 7px above bottom)
+    }
 
     -- ------------------------------------------------------------------------
     -- Tiny widget factory helpers (only methods present on every DST widget build)
     -- ------------------------------------------------------------------------
-    local function NewImage(parent, x, y, w, h, r, g, b, a)
+    local function NewImage(parent, x, y, w, h, r, g, b, a, clickable)
         local im = parent:AddChild(Image("images/global.xml", "square.tex"))
         im:ScaleToSize(w, h)
         im:SetPosition(x, y, 0)
         im:SetTint(r, g, b, a)
+        -- Decorative images must never swallow clicks or focus unless explicitly requested (panel backdrop).
+        if not clickable and type(im.SetClickable) == "function" then
+            im:SetClickable(false)
+        end
         return im
     end
 
@@ -240,16 +270,16 @@ local function CreateLiveCustomizerPanel(hud)
     -- Frame: deep-navy glass body, amber hairline, header band
     -- ------------------------------------------------------------------------
     NewImage(panel, 0, 0, W + 4, H + 4, 0.95, 0.74, 0.36, 0.50)
-    NewImage(panel, 0, 0, W, H, 0.046, 0.054, 0.074, 0.95)
-    NewImage(panel, 0, H * 0.5 - 24, W, 48, 0.078, 0.092, 0.130, 0.99)
-    NewImage(panel, 0, H * 0.5 - 48, W, 2, 0.95, 0.74, 0.36, 0.85)
+    UI.panel_bg = NewImage(panel, 0, 0, W, H, 0.046, 0.054, 0.074, 0.95, true)
+    NewImage(panel, 0, H * 0.5 - 23, W, 46, 0.078, 0.092, 0.130, 0.99)
+    NewImage(panel, 0, H * 0.5 - 46, W, 2, 0.95, 0.74, 0.36, 0.85)
 
-    UI.title = NewText(panel, 22, "HyperShade", -W * 0.5 + 112, H * 0.5 - 17, 210, 28, G.ANCHOR_LEFT, 0.98, 0.80, 0.42, 1.0)
-    UI.subtitle = NewText(panel, 12, "", -W * 0.5 + 102, H * 0.5 - 37, 200, 16, G.ANCHOR_LEFT, 0.62, 0.70, 0.80, 0.95)
+    UI.title = NewText(panel, 22, "HyperShade", -W * 0.5 + 114, H * 0.5 - 16, 206, 28, G.ANCHOR_LEFT, 0.98, 0.80, 0.42, 1.0)
+    UI.subtitle = NewText(panel, 12, "", -W * 0.5 + 114, H * 0.5 - 35, 206, 16, G.ANCHOR_LEFT, 0.62, 0.70, 0.80, 0.95)
 
     -- Feedback QQ group (always visible in both modes); click = copy group number to clipboard
     UI.QQ_GROUP = "978808336"
-    UI.qq_btn = NewButton(panel, W * 0.5 - 104, H * 0.5 - 37, 196, 18, "", 13, function()
+    UI.qq_btn = NewButton(panel, W * 0.5 - 106, H * 0.5 - 35, 200, 18, "", 13, function()
         local fnClip = rawget(G, "HyperSmooth_SetClipboard")
         local copied = false
         if type(fnClip) == "function" then
@@ -263,7 +293,7 @@ local function CreateLiveCustomizerPanel(hud)
     end)
     UI.qq_btn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
 
-    local close_btn = NewButton(panel, W * 0.5 - 24, H * 0.5 - 22, 32, 24, "X", 18, function()
+    local close_btn = NewButton(panel, W * 0.5 - 22, H * 0.5 - 17, 32, 22, "X", 18, function()
         if type(HS_TogglePanel) == "function" then
             HS_TogglePanel(false)
         end
@@ -275,14 +305,14 @@ local function CreateLiveCustomizerPanel(hud)
     -- Mode switch: [Simple] [Pro] [Preset Gallery]
     -- ------------------------------------------------------------------------
     local mode_defs = {
-        { id = "simple", x = -126, zh = "简易模式", en = "Simple" },
+        { id = "simple", x = -140, zh = "简易模式", en = "Simple" },
         { id = "pro",    x =    0, zh = "专业模式", en = "Pro" },
     }
     UI.mode_btns = {}
     for i = 1, #mode_defs do
         local md = mode_defs[i]
-        local mbg = NewImage(panel, md.x, H * 0.5 - 62, 120, 22, 0.12, 0.14, 0.19, 0.95)
-        local mbtn = NewButton(panel, md.x, H * 0.5 - 62, 120, 22, is_zh and md.zh or md.en, 14, function()
+        local mbg = NewImage(panel, md.x, H * 0.5 - 61, 132, 22, 0.12, 0.14, 0.19, 0.95)
+        local mbtn = NewButton(panel, md.x, H * 0.5 - 61, 132, 22, is_zh and md.zh or md.en, 14, function()
             if panel_ui_mode ~= md.id then
                 panel_ui_mode = md.id
                 if type(api.SetUiMode) == "function" then pcall(api.SetUiMode, md.id) end
@@ -296,8 +326,8 @@ local function CreateLiveCustomizerPanel(hud)
     UI.preset_card = { visible = false, cards = {} }
     do
         local pc = UI.preset_card
-        pc.top_bg = NewImage(panel, 126, H * 0.5 - 62, 120, 22, 0.16, 0.22, 0.28, 0.95)
-        pc.top_btn = NewButton(panel, 126, H * 0.5 - 62, 120, 22, is_zh and "预设面板" or "Presets", 14, function()
+        pc.top_bg = NewImage(panel, 140, H * 0.5 - 61, 132, 22, 0.16, 0.22, 0.28, 0.95)
+        pc.top_btn = NewButton(panel, 140, H * 0.5 - 61, 132, 22, is_zh and "预设面板" or "Presets", 14, function()
             if UI.TogglePresetCard then UI.TogglePresetCard() end
         end)
         pc.top_btn:SetTextColour(0.76, 0.94, 1.0, 1.0)
@@ -307,9 +337,9 @@ local function CreateLiveCustomizerPanel(hud)
     -- ------------------------------------------------------------------------
     -- Status strip (2 short lines): live FPS / ping + native engine connection
     -- ------------------------------------------------------------------------
-    UI.st_bg = NewImage(panel, 0, H * 0.5 - 91, W - 22, 32, 0.035, 0.045, 0.065, 0.80)
-    UI.st1 = NewText(panel, 14, "", 0, H * 0.5 - 83, W - 26, 18, nil, 0.52, 1.0, 0.70, 0.96)
-    UI.st2 = NewText(panel, 13, "", 0, H * 0.5 - 99, W - 26, 16, nil, 0.70, 0.82, 0.94, 0.92)
+    UI.st_bg = NewImage(panel, 0, H * 0.5 - 90, UI.L.full_w, 30, 0.035, 0.045, 0.065, 0.80)
+    UI.st1 = NewText(panel, 14, "", 0, H * 0.5 - 83, UI.L.full_w - 6, 18, nil, 0.52, 1.0, 0.70, 0.96)
+    UI.st2 = NewText(panel, 13, "", 0, H * 0.5 - 98, UI.L.full_w - 6, 16, nil, 0.70, 0.82, 0.94, 0.92)
 
     -- ------------------------------------------------------------------------
     -- Pro-only chrome: compact preset pills + 7 category tabs
@@ -319,10 +349,10 @@ local function CreateLiveCustomizerPanel(hud)
     local preset_desc_zh = { [0] = "不改动画面", [1] = "清晰·不变色", [2] = "光影全开", [3] = "我的参数" }
     local preset_desc_en = { [0] = "No changes", [1] = "Crisp, true color", [2] = "Full lighting", [3] = "My own tuning" }
     local preset_btns = {}
-    local pp_w, pp_gap = 90, 6
-    local preset_y = 209
+    local pp_w, pp_gap = 98, 6
+    local preset_y = 221
     for pid = 0, 3 do
-        local px = -189 + pp_w * 0.5 + pid * (pp_w + pp_gap) + 3
+        local px = -156 + pid * (pp_w + pp_gap)
         local pbg = NewImage(panel, px, preset_y, pp_w, 22, 0.14, 0.14, 0.18, 0.90)
         local pb = NewButton(panel, px, preset_y, pp_w, 22, is_zh and preset_labels_zh[pid] or preset_labels_en[pid], 15, function()
             api.SetPreset(pid)
@@ -350,19 +380,21 @@ local function CreateLiveCustomizerPanel(hud)
         { id = 8, zh = "扩展", en = "Ext" },
     }
     local tab_btns = {}
-    local tw_w, tw_gap = 52, 2.5
+    local tw_w, tw_gap = 56, 3
     for i = 1, #tab_defs do
         local td = tab_defs[i]
-        local tx = -189 + tw_w * 0.5 + (i - 1) * (tw_w + tw_gap)
-        local tbg = NewImage(panel, tx, 180, tw_w, 24, 0.14, 0.16, 0.22, 0.90)
-        local tbtn = NewButton(panel, tx, 180, tw_w, 24, is_zh and td.zh or td.en, 14, function()
+        local tx = -205 + tw_w * 0.5 + (i - 1) * (tw_w + tw_gap)
+        local tbg = NewImage(panel, tx, 193, tw_w, 24, 0.14, 0.16, 0.22, 0.90)
+        local tbar = NewImage(panel, tx, 182, tw_w - 6, 2, 0.95, 0.74, 0.36, 0.0)
+        local tbtn = NewButton(panel, tx, 193, tw_w, 24, is_zh and td.zh or td.en, 14, function()
             active_tab = td.id
             if ApplyMode then ApplyMode() end
             DoRefresh()
         end)
         tbtn:SetTextFocusColour(1.0, 0.96, 0.74, 1.0)
-        tab_btns[i] = { id = td.id, zh = td.zh, en = td.en, bg = tbg, btn = tbtn }
+        tab_btns[i] = { id = td.id, zh = td.zh, en = td.en, bg = tbg, bar = tbar, btn = tbtn }
         UI.pro_chrome[#UI.pro_chrome + 1] = tbg
+        UI.pro_chrome[#UI.pro_chrome + 1] = tbar
         UI.pro_chrome[#UI.pro_chrome + 1] = tbtn
     end
 
@@ -376,7 +408,7 @@ local function CreateLiveCustomizerPanel(hud)
         local head = zh_now and info.zh or info.en
         local body = zh_now and info.dzh or info.den
         UI.desc_title:SetString(head or "")
-        UI.desc_body:SetString(WrapText(body or "", 29.0, 2))
+        UI.desc_body:SetString(WrapText(body or "", 32.5, 3))
     end
     local function BindInfo(w, info)
         if w ~= nil and info ~= nil then
@@ -390,8 +422,8 @@ local function CreateLiveCustomizerPanel(hud)
     -- ------------------------------------------------------------------------
     local section_banners = {}
     local function AddSectionBanner(parent, ry, zh_s, en_s, tint)
-        local sbg = NewImage(parent, 0, ry, W - 22, 20, tint[1], tint[2], tint[3], tint[4])
-        local stxt = NewText(parent, 13, is_zh and zh_s or en_s, 0, ry, W - 28, 18, nil, 0.88, 0.94, 1.0, 0.96)
+        local sbg = NewImage(parent, 0, ry, UI.L.full_w, 20, tint[1], tint[2], tint[3], tint[4])
+        local stxt = NewText(parent, 13, is_zh and zh_s or en_s, 0, ry, UI.L.full_w - 8, 18, nil, 0.88, 0.94, 1.0, 0.96)
         section_banners[#section_banners + 1] = { txt = stxt, zh = zh_s, en = en_s }
         return sbg, stxt
     end
@@ -403,7 +435,7 @@ local function CreateLiveCustomizerPanel(hud)
     --   * amber tick on the rail marks the default value; knob magnets to it
     --   * click the value to reset to default
     -- ------------------------------------------------------------------------
-    local TRACK_X0, TRACK_W = 10, 96
+    local TRACK_X0, TRACK_W = 4, 104
     local function NowSec()
         local fn = rawget(G, "GetTimeRealSeconds")
         if type(fn) == "function" then
@@ -486,36 +518,49 @@ local function CreateLiveCustomizerPanel(hud)
 
     local all_steppers = {}
     UI.steppers = all_steppers
-    local function AddStepperRow(parent, ry, row_h, def)
-        local rbg = NewImage(parent, 0, ry, W - 22, row_h, 0.095, 0.108, 0.145, 0.90)
-        local mark = NewImage(parent, -W * 0.5 + 12.5, ry, 3, row_h, 0.95, 0.74, 0.36, 0.0)
-        local rlbl = NewText(parent, 14, is_zh and def.zh or def.en, -101, ry, 160, row_h - 2, G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
-        local info_btn = NewButton(parent, -101, ry, 160, row_h, nil, nil, function() ShowInfo(def) end)
+    local function AddStepperRow(parent, ry, row_h, def, cx, rw)
+        cx = cx or 0
+        rw = rw or UI.L.full_w
+        local left = cx - rw * 0.5
+        local right = cx + rw * 0.5
+        local val_x = right - 29
+        local plus_x = right - 70
+        local track_x1 = right - 88
+        local track_x0 = track_x1 - TRACK_W
+        local tc = track_x0 + TRACK_W * 0.5
+        local minus_x = track_x0 - 18
+        local lbl_x0 = left + 6
+        local lbl_w = (minus_x - 15) - lbl_x0
+        local lbl_x = lbl_x0 + lbl_w * 0.5
         local bh = row_h - 4
-        local tc = TRACK_X0 + TRACK_W * 0.5
+
+        local rbg = NewImage(parent, cx, ry, rw, row_h, 0.095, 0.108, 0.145, 0.90)
+        local mark = NewImage(parent, left + 1.5, ry, 3, row_h, 0.95, 0.74, 0.36, 0.0)
+        local rlbl = NewText(parent, 14, is_zh and def.zh or def.en, lbl_x, ry, lbl_w, row_h - 2, G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
+        local info_btn = NewButton(parent, lbl_x, ry, lbl_w, row_h, nil, nil, function() ShowInfo(def) end)
 
         -- [-] (press = step, hold = auto-repeat)
-        NewImage(parent, -8, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
-        local minus_btn = NewButton(parent, -8, ry, 22, bh, "-", 18, nil, FONT_NUM)
+        NewImage(parent, minus_x, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        local minus_btn = NewButton(parent, minus_x, ry, 22, bh, "-", 18, nil, FONT_NUM)
         minus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
 
         -- rail + fill + default tick + knob
         NewImage(parent, tc, ry, TRACK_W + 8, 8, 0.12, 0.14, 0.19, 1.0)
         NewImage(parent, tc, ry, TRACK_W, 4, 0.025, 0.032, 0.05, 1.0)
-        local fill = NewImage(parent, TRACK_X0 + 0.5, ry, 1, 4, 0.20, 0.72, 0.64, 0.95)
-        local tick = NewImage(parent, TRACK_X0, ry, 2, 12, 0.95, 0.74, 0.36, 0.0)
-        local knob_edge = NewImage(parent, TRACK_X0, ry, 10, 18, 0.20, 0.72, 0.64, 1.0)
-        local knob = NewImage(parent, TRACK_X0, ry, 6, 14, 0.95, 0.99, 1.0, 1.0)
+        local fill = NewImage(parent, track_x0 + 0.5, ry, 1, 4, 0.20, 0.72, 0.64, 0.95)
+        local tick = NewImage(parent, track_x0, ry, 2, 12, 0.95, 0.74, 0.36, 0.0)
+        local knob_edge = NewImage(parent, track_x0, ry, 10, 18, 0.20, 0.72, 0.64, 1.0)
+        local knob = NewImage(parent, track_x0, ry, 6, 14, 0.95, 0.99, 1.0, 1.0)
         local ref = NewImage(parent, tc + TRACK_W * 0.5, ry, 1, 1, 0.0, 0.0, 0.0, 0.0)
         local hit = NewButton(parent, tc, ry, TRACK_W + 14, row_h, nil, nil, nil, nil, true)
 
         -- [+]
-        NewImage(parent, 120, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
-        local plus_btn = NewButton(parent, 120, ry, 22, bh, "+", 18, nil, FONT_NUM)
+        NewImage(parent, plus_x, ry, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        local plus_btn = NewButton(parent, plus_x, ry, 22, bh, "+", 18, nil, FONT_NUM)
         plus_btn:SetTextColour(1.0, 0.88, 0.65, 1.0)
 
         -- value readout (click = reset to default)
-        local val_btn = NewButton(parent, 160, ry, 52, bh, "", 13, function()
+        local val_btn = NewButton(parent, val_x, ry, 54, bh, "", 13, function()
             if type(api.ResetTuneField) == "function" then
                 api.ResetTuneField(def.key)
                 DoRefresh()
@@ -529,7 +574,7 @@ local function CreateLiveCustomizerPanel(hud)
             key = def.key, flag = def.flag, native_ws = def.native_ws, skeletal_only = def.skeletal_only,
             hitfeel_only = def.hitfeel_only, fmt = def.fmt, scale = def.scale, zh = def.zh, en = def.en,
             bg = rbg, lbl = rlbl, val_btn = val_btn, fill = fill, mark = mark, tick = tick,
-            knob = knob, knob_edge = knob_edge, hit = hit, ref = ref, ry = ry, bh = bh,
+            knob = knob, knob_edge = knob_edge, hit = hit, ref = ref, ry = ry, bh = bh, track_x0 = track_x0,
             minus = minus_btn, plus = plus_btn,
             active = true, hot = false,
         }
@@ -587,6 +632,7 @@ local function CreateLiveCustomizerPanel(hud)
 
     -- Toggle row: label (+ optional short description) | sliding switch
     local toggle_widgets = {}
+    UI.toggle_widgets = toggle_widgets
     local function DoToggle(def)
         local s = def.src
         if s == "tune" then
@@ -607,20 +653,27 @@ local function CreateLiveCustomizerPanel(hud)
         DoRefresh()
         ShowInfo(def)
     end
-    local function AddToggleRow(parent, ry, row_h, def)
+    local function AddToggleRow(parent, ry, row_h, def, cx, rw)
+        cx = cx or 0
+        rw = rw or UI.L.full_w
+        local left = cx - rw * 0.5
+        local right = cx + rw * 0.5
         local big = (def.big == true)
-        local rbg = NewImage(parent, 0, ry, W - 22, row_h, 0.095, 0.108, 0.145, 0.90)
-        local rbtn = NewButton(parent, 0, ry, W - 22, row_h, nil, nil, function() DoToggle(def) end)
-        local rlbl = NewText(parent, big and 15 or 14, is_zh and def.zh or def.en, -35, ry + (big and 8 or 0), 292, big and 20 or (row_h - 2), G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
+        local lbl_w = rw - (def.src == "hud" and 94 or 58)
+        local lbl_x = left + 10 + lbl_w * 0.5
+
+        local rbg = NewImage(parent, cx, ry, rw, row_h, 0.095, 0.108, 0.145, 0.90)
+        local rbtn = NewButton(parent, cx, ry, rw, row_h, nil, nil, function() DoToggle(def) end)
+        local rlbl = NewText(parent, big and 15 or 14, is_zh and def.zh or def.en, lbl_x, ry + (big and 8 or 0), lbl_w, big and 20 or (row_h - 2), G.ANCHOR_LEFT, 0.90, 0.93, 0.96, 1.0)
         local dlbl = nil
         if big then
-            dlbl = NewText(parent, 12, is_zh and def.hzh or def.hen, -35, ry - 9, 292, 16, G.ANCHOR_LEFT, 0.58, 0.66, 0.76, 0.95)
+            dlbl = NewText(parent, 12, is_zh and def.hzh or def.hen, lbl_x, ry - 9, lbl_w, 16, G.ANCHOR_LEFT, 0.58, 0.66, 0.76, 0.95)
         end
         local entry = { def = def, bg = rbg, lbl = rlbl, dlbl = dlbl }
         if def.src == "hud" then
-            entry.val = NewText(parent, 14, "", 143, ry, 74, 20, G.ANCHOR_RIGHT, 0.55, 0.58, 0.64, 0.88)
+            entry.val = NewText(parent, 14, "", right - 46, ry, 78, 20, G.ANCHOR_RIGHT, 0.55, 0.58, 0.64, 0.88)
         else
-            entry.sw = MakeSwitch(parent, 160, ry)
+            entry.sw = MakeSwitch(parent, right - 26, ry)
         end
         BindInfo(rbtn, def)
         toggle_widgets[#toggle_widgets + 1] = entry
@@ -629,8 +682,8 @@ local function CreateLiveCustomizerPanel(hud)
 
     local tab_reset_btns = {}
     local function AddGroupResetButton(parent, ry, zh_lbl, en_lbl, keys)
-        NewImage(parent, 0, ry, W - 22, 20, 0.20, 0.16, 0.12, 0.90)
-        local rbtn = NewButton(parent, 0, ry, W - 22, 20, is_zh and zh_lbl or en_lbl, 13, function()
+        NewImage(parent, 0, ry, UI.L.full_w, UI.L.reset_h, 0.20, 0.16, 0.12, 0.90)
+        local rbtn = NewButton(parent, 0, ry, UI.L.full_w, UI.L.reset_h, is_zh and zh_lbl or en_lbl, 13, function()
             if type(api.ResetTuneGroup) == "function" then
                 api.ResetTuneGroup(keys)
                 DoRefresh()
@@ -643,13 +696,23 @@ local function CreateLiveCustomizerPanel(hud)
 
     -- Slot row: "我的方案" + 3 x [Save][Load]
     local slot_widgets = {}
-    local function MakeSlotRow(parent, ry)
-        NewText(parent, 13, is_zh and "我的方案" or "My Looks", -153, ry, 68, 20, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.95)
+    local function MakeSlotRow(parent, ry, cx, rw)
+        cx = cx or 0
+        rw = rw or UI.L.full_w
+        local left = cx - rw * 0.5
+        local right = cx + rw * 0.5
+        local sb_w = (rw >= 406) and 48 or 46
+        local sb_gap = 3
+        local grp_w = 2 * sb_w + sb_gap
+        local grp_gap = (rw >= 406) and 14 or 10
+        local gx0 = right - (3 * grp_w + 2 * grp_gap)
+        local lbl_w = math.max(58, gx0 - left - 6)
+        local slbl = NewText(parent, 13, is_zh and "我的方案" or "My Looks", left + lbl_w * 0.5 + 2, ry, lbl_w, 20, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.95)
+        UI.slot_lbls[#UI.slot_lbls + 1] = slbl
         UI.slot_lbl_cnt = (UI.slot_lbl_cnt or 0) + 1
-        local sb_w, sb_gap = 42, 3
         for sidx = 1, 3 do
             local idx_c = sidx
-            local gx = -110 + (sidx - 1) * (2 * sb_w + sb_gap + 12)
+            local gx = gx0 + (sidx - 1) * (grp_w + grp_gap)
             local sx_save = gx + sb_w * 0.5
             local sx_load = sx_save + sb_w + sb_gap
             NewImage(parent, sx_save, ry, sb_w, 24, 0.24, 0.19, 0.12, 0.92)
@@ -673,7 +736,7 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     -- ------------------------------------------------------------------------
-    -- Accordion pages (Pro): one section open at a time, rows created once and re-laid out
+    -- Accordion pages (Pro): bounded viewport + smooth virtual scroll + auto-hide overflow
     -- ------------------------------------------------------------------------
     local ROWS = {}
     local function S(key, step, fmt, scale, gate, zh, en, dzh, den)
@@ -695,35 +758,154 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     local function MakeSectionHeader(parent, sd, onclick)
+        local cx = UI.L.pro_cx
+        local rw = UI.L.pro_w
+        local left = cx - rw * 0.5
+        local right = cx + rw * 0.5
         local hroot = parent:AddChild(Widget("HS_SecHdr"))
         local hdr = { root = hroot }
-        hdr.bg = NewImage(hroot, 0, 0, W - 22, 24, 0.13, 0.16, 0.22, 0.96)
-        hdr.accent = NewImage(hroot, -W * 0.5 + 12, 0, 4, 24, 0.95, 0.74, 0.36, 0.95)
-        hdr.lbl = NewText(hroot, 14, "", -22, 0, 300, 22, G.ANCHOR_LEFT, 0.96, 0.92, 0.80, 1.0)
-        hdr.badge = NewText(hroot, 12, "", 160, 0, 54, 20, G.ANCHOR_RIGHT, 0.60, 0.68, 0.78, 0.95)
-        hdr.btn = NewButton(hroot, 0, 0, W - 22, 24, nil, nil, onclick)
+        hdr.bg = NewImage(hroot, cx, 0, rw, 24, 0.13, 0.16, 0.22, 0.96)
+        hdr.accent = NewImage(hroot, left + 2, 0, 4, 24, 0.95, 0.74, 0.36, 0.95)
+        hdr.lbl = NewText(hroot, 14, "", left + 12 + (rw - 72) * 0.5, 0, rw - 72, 22, G.ANCHOR_LEFT, 0.96, 0.92, 0.80, 1.0)
+        hdr.badge = NewText(hroot, 12, "", right - 34, 0, 54, 20, G.ANCHOR_RIGHT, 0.60, 0.68, 0.78, 0.95)
+        hdr.btn = NewButton(hroot, cx, 0, rw, 24, nil, nil, onclick)
+        BindInfo(hdr.btn, {
+            zh = sd.zh, en = sd.en,
+            dzh = "点击展开或收起该分组；超过一屏时可上下滚动右侧滚轮/滚动条。",
+            den = "Click to expand/collapse; scroll wheel or right scrollbar when a section exceeds view height.",
+        })
         return hdr
     end
 
+    UI.MakeScrollbar = function(parent, view_top, view_bot, on_step)
+        local sb_x = UI.L.sb_x
+        local sb_root = parent:AddChild(Widget("HS_Scrollbar"))
+        sb_root:Hide()
+        local track_top = view_top - 18
+        local track_bot = view_bot + 18
+        local track_h = math.max(24, track_top - track_bot)
+        NewImage(sb_root, sb_x, (track_top + track_bot) * 0.5, 6, track_h, 0.08, 0.10, 0.14, 0.92)
+        local thumb = NewImage(sb_root, sb_x, track_top - 20, 6, 40, 0.95, 0.74, 0.36, 0.88)
+
+        NewImage(sb_root, sb_x, view_top - 8, 14, 16, 0.16, 0.19, 0.26, 0.95)
+        local up_btn = NewButton(sb_root, sb_x, view_top - 8, 14, 16, "^", 12, function()
+            if on_step then on_step(-52) end
+        end, FONT_NUM)
+        up_btn:SetTextColour(0.95, 0.84, 0.58, 1.0)
+
+        NewImage(sb_root, sb_x, view_bot + 8, 14, 16, 0.16, 0.19, 0.26, 0.95)
+        local dn_btn = NewButton(sb_root, sb_x, view_bot + 8, 14, 16, "v", 12, function()
+            if on_step then on_step(52) end
+        end, FONT_NUM)
+        dn_btn:SetTextColour(0.95, 0.84, 0.58, 1.0)
+
+        return {
+            root = sb_root, thumb = thumb, up_btn = up_btn, dn_btn = dn_btn,
+            track_top = track_top, track_bot = track_bot, track_h = track_h, sb_x = sb_x,
+        }
+    end
+
     local function LayoutPage(page)
-        local y = 164
+        local view_top = page.view_top or UI.L.pro_view_top
+        local view_bot = page.view_bot or UI.L.pro_view_bot
+        local view_h = math.max(40, view_top - view_bot)
+
+        -- Pass 1: measure total virtual height downward from 0
+        local cur_y = 0
         for si = 1, #page.secs do
             local sec = page.secs[si]
             local open = (page.open == si)
-            sec.hdr.root:SetPosition(0, y - 12, 0)
-            y = y - 26
+            sec.hdr._v_top = cur_y
+            cur_y = cur_y + 26
+            if open and #sec.rows > 0 then
+                for ri = 1, #sec.rows do
+                    local r = sec.rows[ri]
+                    r._v_top = cur_y
+                    cur_y = cur_y + r.h + 2
+                end
+                if si < #page.secs then
+                    cur_y = cur_y + 4
+                end
+            end
+        end
+
+        local total_h = cur_y
+        page.content_h = total_h
+        page.max_scroll = math.max(0, total_h - view_h)
+        local scroll = tonumber(page.scroll) or 0
+        if scroll < 0 then scroll = 0 elseif scroll > page.max_scroll then scroll = page.max_scroll end
+        page.scroll = scroll
+
+        -- Pass 2: position & strictly cull anything outside [view_bot, view_top]
+        for si = 1, #page.secs do
+            local sec = page.secs[si]
+            local open = (page.open == si)
+            local h_top = view_top - sec.hdr._v_top + scroll
+            local h_bot = h_top - 24
+            sec.hdr._y_top = h_top
+            sec.hdr._y_bot = h_bot
+            if h_top <= view_top + 1.0 and h_bot >= view_bot - 1.0 then
+                sec.hdr.root:SetPosition(0, (h_top + h_bot) * 0.5, 0)
+                sec.hdr.root:Show()
+            else
+                sec.hdr.root:Hide()
+            end
             for ri = 1, #sec.rows do
                 local r = sec.rows[ri]
                 if open then
-                    r.root:SetPosition(0, y - (r.h + 2) * 0.5, 0)
-                    r.root:Show()
-                    y = y - (r.h + 2)
+                    local r_top = view_top - r._v_top + scroll
+                    local r_bot = r_top - r.h
+                    r._y_top = r_top
+                    r._y_bot = r_bot
+                    if r_top <= view_top + 1.0 and r_bot >= view_bot - 1.0 then
+                        r.root:SetPosition(0, (r_top + r_bot) * 0.5, 0)
+                        r.root:Show()
+                    else
+                        r.root:Hide()
+                    end
                 else
+                    r._y_top = nil
+                    r._y_bot = nil
                     r.root:Hide()
                 end
             end
-            if open then y = y - 4 end
         end
+
+        if page.sb then
+            if page.max_scroll > 0.5 then
+                local sb = page.sb
+                sb.root:Show()
+                local th = math.max(24, math.min(sb.track_h, sb.track_h * (view_h / math.max(view_h, total_h))))
+                local frac = scroll / page.max_scroll
+                local ty = (sb.track_top - th * 0.5) - frac * (sb.track_h - th)
+                sb.thumb:ScaleToSize(6, th)
+                sb.thumb:SetPosition(sb.sb_x, ty, 0)
+                if scroll <= 0.5 then
+                    sb.up_btn:SetTextColour(0.45, 0.48, 0.55, 0.65)
+                else
+                    sb.up_btn:SetTextColour(0.95, 0.84, 0.58, 1.0)
+                end
+                if scroll >= page.max_scroll - 0.5 then
+                    sb.dn_btn:SetTextColour(0.45, 0.48, 0.55, 0.65)
+                else
+                    sb.dn_btn:SetTextColour(0.95, 0.84, 0.58, 1.0)
+                end
+            else
+                page.sb.root:Hide()
+            end
+        end
+    end
+    UI.LayoutPage = LayoutPage
+
+    UI.ScrollPage = function(page, delta)
+        if not page or (page.max_scroll or 0) <= 0.5 then return false end
+        local old_s = page.scroll or 0
+        local new_s = old_s + (delta or 0)
+        if new_s < 0 then new_s = 0 elseif new_s > page.max_scroll then new_s = page.max_scroll end
+        if math.abs(new_s - old_s) < 0.5 then return false end
+        page.scroll = new_s
+        LayoutPage(page)
+        return true
     end
 
     local function BuildRow(rc, rs)
@@ -736,16 +918,27 @@ local function CreateLiveCustomizerPanel(hud)
             return 24
         end
         if def.kind == "step" then
-            AddStepperRow(rc, 0, 24, def)
+            AddStepperRow(rc, 0, 24, def, UI.L.pro_cx, UI.L.pro_w)
         else
-            AddToggleRow(rc, 0, 24, def)
+            AddToggleRow(rc, 0, 24, def, UI.L.pro_cx, UI.L.pro_w)
         end
         return 24
     end
 
     local function BuildProPage(tid, secs, reset_zh, reset_en)
         local root_t = tab_roots[tid]
-        local page = { secs = {}, open = 1 }
+        if root_t == nil then
+            root_t = panel:AddChild(Widget("HS_Tab_" .. tostring(tid)))
+            root_t:Hide()
+            tab_roots[tid] = root_t
+        end
+        local view_bot = (reset_zh ~= nil) and UI.L.pro_view_bot or UI.L.pro_view_bot_no_rst
+        local page = {
+            secs = {}, open = 1, scroll = 0, max_scroll = 0,
+            view_top = UI.L.pro_view_top, view_bot = view_bot,
+            reset_y = (reset_zh ~= nil) and UI.L.reset_y or nil,
+            reset_h = (reset_zh ~= nil) and UI.L.reset_h or nil,
+        }
         local reset_keys = {}
         for si = 1, #secs do
             local sd = secs[si]
@@ -762,6 +955,7 @@ local function CreateLiveCustomizerPanel(hud)
             end
             sec.hdr = MakeSectionHeader(root_t, sd, function()
                 page.open = (page.open == si) and 0 or si
+                page.scroll = 0
                 LayoutPage(page)
                 DoRefresh()
             end)
@@ -773,13 +967,47 @@ local function CreateLiveCustomizerPanel(hud)
             end
             page.secs[si] = sec
         end
+        page.sb = UI.MakeScrollbar(root_t, page.view_top, page.view_bot, function(d)
+            if UI.ScrollPage(page, d) then DoRefresh() end
+        end)
         LayoutPage(page)
         if reset_zh then
-            AddGroupResetButton(root_t, -261, reset_zh, reset_en, reset_keys)
+            AddGroupResetButton(root_t, UI.L.reset_y, reset_zh, reset_en, reset_keys)
         end
         pages[tid] = page
+        return page
     end
     UI.BuildProPage = BuildProPage
+
+    -- Route mouse-wheel events when hovering/focused on a scrollable Pro tab
+    do
+        -- Resolve inherited Widget:OnControl via metatable (__index), NOT rawget(), so child button clicks forward properly.
+        local orig_oc = panel.OnControl
+        if type(orig_oc) ~= "function" and type(Widget) == "table" then
+            orig_oc = Widget.OnControl
+        end
+        panel.OnControl = function(self, control, down, ...)
+            if not panel_visible then return false end
+            if type(orig_oc) == "function" and orig_oc(self, control, down, ...) then
+                return true
+            end
+            if down and panel_visible and panel_ui_mode == "pro" and (self.focus or root.focus) then
+                local cur_page = pages[active_tab]
+                if cur_page and (cur_page.max_scroll or 0) > 0.5 then
+                    local c_up = rawget(G, "CONTROL_SCROLLBACK")
+                    local c_dn = rawget(G, "CONTROL_SCROLLFWD")
+                    if c_up ~= nil and control == c_up then
+                        UI.ScrollPage(cur_page, -52)
+                        return true
+                    elseif c_dn ~= nil and control == c_dn then
+                        UI.ScrollPage(cur_page, 52)
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+    end
 
     -- ------------------------------------------------------------------------
     -- Plain-language option catalogue (name + one-sentence explanation, ZH/EN)
@@ -929,19 +1157,19 @@ local function CreateLiveCustomizerPanel(hud)
     E("hudmode", "hud", "左上角性能显示", "Performance Overlay", "点击切换：简洁 / 详细 / 隐藏。", "Click to cycle: Compact / Detailed / Hidden.")
 
     -- ========================================================================
-    -- HOME (Simple mode): style cards, 6 plain-language feature cards, 4 quick sliders
+    -- HOME (Simple mode): style cards, 6 feature toggles, 4 sliders, HW tier strip
     -- ========================================================================
     local tab1 = tab_roots[1]
     do
-        local _, btxt = AddSectionBanner(tab1, 208, "① 先选一个画面风格", "1. Pick a look", { 0.16, 0.14, 0.10, 0.88 })
+        local _, btxt = AddSectionBanner(tab1, 221, "① 先选一个画面风格", "1. Pick a look", { 0.16, 0.14, 0.10, 0.88 })
         if btxt then
-            btxt:SetRegionSize(276, 18)
+            btxt:SetRegionSize(296, 18)
             btxt:SetHAlign(G.ANCHOR_LEFT)
-            btxt:SetPosition(-46, 208, 0)
+            btxt:SetPosition(-50, 221, 0)
         end
         local pc = UI.preset_card
-        pc.home_open_bg = NewImage(tab1, 142, 208, 86, 18, 0.24, 0.30, 0.36, 0.95)
-        pc.home_open_btn = NewButton(tab1, 142, 208, 86, 18, is_zh and "6套预设 >>" or "6 Presets >>", 12, function()
+        pc.home_open_bg = NewImage(tab1, 158, 221, 92, 18, 0.24, 0.30, 0.36, 0.95)
+        pc.home_open_btn = NewButton(tab1, 158, 221, 92, 18, is_zh and "6套预设 >>" or "6 Presets >>", 12, function()
             if UI.TogglePresetCard then UI.TogglePresetCard() end
         end)
         pc.home_open_btn:SetTextColour(1.0, 0.90, 0.62, 1.0)
@@ -949,19 +1177,19 @@ local function CreateLiveCustomizerPanel(hud)
     end
     local home_cards = {}
     for pid = 0, 3 do
-        local cx = -144 + pid * 96
-        local cborder = NewImage(tab1, cx, 172, 92, 48, 0.95, 0.74, 0.36, 0.0)
-        local cbg = NewImage(tab1, cx, 172, 88, 44, 0.10, 0.115, 0.15, 0.96)
-        local cname = NewText(tab1, 15, "", cx, 181, 86, 20, nil, 0.90, 0.93, 0.96, 1.0)
-        local cdesc = NewText(tab1, 12, "", cx, 163, 86, 16, nil, 0.58, 0.66, 0.76, 0.95)
-        NewButton(tab1, cx, 172, 88, 44, nil, nil, function()
+        local cx = -156 + pid * 104
+        local cborder = NewImage(tab1, cx, 183, 102, 50, 0.95, 0.74, 0.36, 0.0)
+        local cbg = NewImage(tab1, cx, 183, 98, 46, 0.10, 0.115, 0.15, 0.96)
+        local cname = NewText(tab1, 15, "", cx, 192, 94, 20, nil, 0.90, 0.93, 0.96, 1.0)
+        local cdesc = NewText(tab1, 12, "", cx, 174, 94, 16, nil, 0.58, 0.66, 0.76, 0.95)
+        NewButton(tab1, cx, 183, 98, 46, nil, nil, function()
             api.SetPreset(pid)
             DoRefresh()
         end)
         home_cards[#home_cards + 1] = { id = pid, border = cborder, bg = cbg, name = cname, desc = cdesc }
     end
 
-    AddSectionBanner(tab1, 130, "② 常用功能（点一下开 / 关）", "2. Main features (click to toggle)", { 0.10, 0.18, 0.20, 0.88 })
+    AddSectionBanner(tab1, 144, "② 常用功能（点一下开 / 关）", "2. Main features (click to toggle)", { 0.10, 0.18, 0.20, 0.88 })
     local home_defs = {
         { src = "bundle", key = "smooth", zh = "240 帧超顺滑", en = "Ultra-Smooth 240 FPS",
           hzh = "角色、怪物、镜头动作从 30 帧变丝滑", hen = "Characters, mobs & camera glide smoothly",
@@ -984,37 +1212,100 @@ local function CreateLiveCustomizerPanel(hud)
     }
     for i = 1, #home_defs do
         home_defs[i].big = true
-        AddToggleRow(tab1, 100 - (i - 1) * 38, 34, home_defs[i])
+        AddToggleRow(tab1, 116 - (i - 1) * 33, 31, home_defs[i], 0, UI.L.full_w)
     end
 
-    AddSectionBanner(tab1, -124, "③ 快速调节（点右侧数值可复位）", "3. Quick tuning (click value to reset)", { 0.14, 0.14, 0.20, 0.88 })
+    AddSectionBanner(tab1, -79, "③ 快速调节（点右侧数值可复位）", "3. Quick tuning (click value to reset)", { 0.14, 0.14, 0.20, 0.88 })
     local home_slider_keys = { "sharp", "bloom_str", "shadow_density", "temp" }
     for i = 1, #home_slider_keys do
-        AddStepperRow(tab1, -148 - (i - 1) * 29, 26, ROWS[home_slider_keys[i]])
+        AddStepperRow(tab1, -104 - (i - 1) * 26, 24, ROWS[home_slider_keys[i]], 0, UI.L.full_w)
     end
 
-    MakeSlotRow(tab1, -268)
+    -- GPU Compute Clarity Grade Quick Strip (synced with Pro Tab 2)
+    do
+        local cl = NewText(tab1, 13, is_zh and "画质清晰" or "Clarity", -172, -211, 66, 20, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.95)
+        local cdefs = {
+            { id = 0, zh = "原版", en = "Vanilla",
+              dzh = "原版纯净分辨率与过滤，GPU 计算开销 0.00ms。",
+              den = "Stock filtering and resolution; 0.00ms GPU compute." },
+            { id = 1, zh = "清晰", en = "HD",
+              dzh = "16×AF + 全分辨率光照 + 负LOD防糊 + BCAS 锐化（核显也能稳）。",
+              den = "16x AF + 1.0x LightMap + negative LOD + BCAS (runs fast on any GPU)." },
+            { id = 2, zh = "超清", en = "UltraHD",
+              dzh = "开启 16位半浮点 HDR 光照 + OpenGL 计算着色器 2D 定向抗锯齿与墨线精修。",
+              den = "16F HDR LightMap + OpenGL Compute 2D edge-directed AA & ink polish." },
+            { id = 3, zh = "蓝光", en = "BluRay",
+              dzh = "虚拟 4K 2× 超分重建 + 4×4 Lanczos 超采样回屏 + 4096 超清阴影（释放 RTX 算力）。",
+              den = "Virtual-4K 2x reconstruction + 4x4 Lanczos resolve + 4096 ShadowMask." },
+        }
+        local cbgs, cbtns = {}, {}
+        for i = 1, 4 do
+            local d = cdefs[i]
+            local bx = -94 + (i - 1) * 86
+            local bg = NewImage(tab1, bx, -211, 82, 22, 0.12, 0.13, 0.18, 0.92)
+            local btn = NewButton(tab1, bx, -211, 82, 22, is_zh and d.zh or d.en, 13, function()
+                if type(api.SetClarityGrade) == "function" then
+                    api.SetClarityGrade(d.id)
+                    DoRefresh()
+                end
+            end)
+            btn:SetTextColour(0.84, 0.88, 0.94, 1.0)
+            btn:SetTextFocusColour(1.0, 0.98, 0.78, 1.0)
+            cbgs[d.id] = bg
+            cbtns[d.id] = { btn = btn, zh = d.zh, en = d.en }
+        end
+        UI.clarity_groups[#UI.clarity_groups + 1] = { lbl = cl, lbl_zh = "画质清晰", lbl_en = "Clarity", bgs = cbgs, btns = cbtns }
+    end
+
+    -- Hardware Performance Tier Quick Strip (synced with Pro Tab 7)
+    do
+        local hl = NewText(tab1, 13, is_zh and "硬件档位" or "PC Tier", -172, -242, 66, 20, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.95)
+        local defs = {
+            { id = 0, zh = "省电低配", en = "Low Spec" },
+            { id = 1, zh = "均衡标准", en = "Balanced" },
+            { id = 2, zh = "高端解放", en = "Unleashed" },
+        }
+        local bgs, btns = {}, {}
+        for i = 1, 3 do
+            local d = defs[i]
+            local bx = -82 + (i - 1) * 114
+            local bg = NewImage(tab1, bx, -242, 108, 22, 0.12, 0.13, 0.18, 0.92)
+            local btn = NewButton(tab1, bx, -242, 108, 22, is_zh and d.zh or d.en, 13, function()
+                if type(api.SetHardwareTier) == "function" then
+                    api.SetHardwareTier(d.id)
+                    DoRefresh()
+                end
+            end)
+            btn:SetTextColour(0.84, 0.88, 0.94, 1.0)
+            btn:SetTextFocusColour(1.0, 0.98, 0.78, 1.0)
+            bgs[d.id] = bg
+            btns[d.id] = { btn = btn, zh = d.zh, en = d.en }
+        end
+        UI.hw_groups[#UI.hw_groups + 1] = { lbl = hl, lbl_zh = "硬件档位", lbl_en = "PC Tier", bgs = bgs, btns = btns }
+    end
+
+    MakeSlotRow(tab1, -275, 0, UI.L.full_w)
 
     -- Bottom bar: restore vanilla | share | go Pro
     local function HomeBottomButton(x, w, tint)
-        local bgw = NewImage(tab1, x, -307, w, 30, tint[1], tint[2], tint[3], tint[4])
+        local bgw = NewImage(tab1, x, -312, w, 30, tint[1], tint[2], tint[3], tint[4])
         return bgw
     end
-    HomeBottomButton(-126, 122, { 0.30, 0.22, 0.12, 0.94 })
-    local home_reset_btn = NewButton(tab1, -126, -307, 122, 30, is_zh and "恢复原版纯净" or "Restore Vanilla", 15, function()
+    HomeBottomButton(-140, 132, { 0.30, 0.22, 0.12, 0.94 })
+    local home_reset_btn = NewButton(tab1, -140, -312, 132, 30, is_zh and "恢复原版纯净" or "Restore Vanilla", 15, function()
         api.SetPreset(0)
         DoRefresh()
     end)
     home_reset_btn:SetTextColour(1.0, 0.88, 0.58, 1.0)
     home_reset_btn:SetTextFocusColour(1.0, 0.96, 0.78, 1.0)
 
-    HomeBottomButton(0, 122, { 0.24, 0.20, 0.11, 0.94 })
-    local share_open_btn = NewButton(tab1, 0, -307, 122, 30, is_zh and "分享 / 导入方案码" or "Share / Import", 15)
+    HomeBottomButton(0, 132, { 0.24, 0.20, 0.11, 0.94 })
+    local share_open_btn = NewButton(tab1, 0, -312, 132, 30, is_zh and "分享 / 导入方案码" or "Share / Import", 15)
     share_open_btn:SetTextColour(1.0, 0.90, 0.62, 1.0)
     share_open_btn:SetTextFocusColour(1.0, 0.98, 0.80, 1.0)
 
-    HomeBottomButton(126, 122, { 0.12, 0.24, 0.30, 0.94 })
-    local home_pro_btn = NewButton(tab1, 126, -307, 122, 30, is_zh and "专业调参 >>" or "Pro Tuning >>", 15, function()
+    HomeBottomButton(140, 132, { 0.12, 0.24, 0.30, 0.94 })
+    local home_pro_btn = NewButton(tab1, 140, -312, 132, 30, is_zh and "专业调参 >>" or "Pro Tuning >>", 15, function()
         panel_ui_mode = "pro"
         if type(api.SetUiMode) == "function" then pcall(api.SetUiMode, "pro") end
         if ApplyMode then ApplyMode() end
@@ -1033,6 +1324,43 @@ local function CreateLiveCustomizerPanel(hud)
     share_card:SetPosition(-(W * 0.5 + SW * 0.5 + 10), -10, 0)
     share_card:Hide()
     local share_card_visible = false
+    do
+        local orig_sc_oc = share_card.OnControl or (type(Widget) == "table" and Widget.OnControl)
+        share_card.OnControl = function(self, control, down, ...)
+            if not panel_visible or not share_card_visible then return false end
+            if type(orig_sc_oc) == "function" then
+                return orig_sc_oc(self, control, down, ...)
+            end
+            return false
+        end
+    end
+    UI.ReleaseTextFocus = function()
+        local had_focus = false
+        local fe = rawget(G, "TheFrontEnd")
+        if type(UI.text_edits) == "table" then
+            for i = 1, #UI.text_edits do
+                local ed = UI.text_edits[i]
+                if ed then
+                    if ed.editing or ed.focus or (fe and fe.textProcessorWidget == ed) then
+                        had_focus = true
+                    end
+                    if ed.SetEditing then pcall(ed.SetEditing, ed, false) end
+                    if fe and fe.textProcessorWidget == ed and fe.SetForceProcessTextInput then
+                        pcall(fe.SetForceProcessTextInput, fe, false, ed)
+                    end
+                end
+            end
+        end
+        if (root and root.focus) or (share_card and share_card.focus) or (panel and panel.focus) then
+            had_focus = true
+        end
+        if root and root.ClearFocus then
+            pcall(root.ClearFocus, root)
+        end
+        if had_focus and fe and fe.ClearFocus then
+            pcall(fe.ClearFocus, fe)
+        end
+    end
 
     local sc_border = share_card:AddChild(Image("images/global.xml", "square.tex"))
     sc_border:ScaleToSize(SW + 4, SH + 4)
@@ -1057,6 +1385,7 @@ local function CreateLiveCustomizerPanel(hud)
     sc_close:SetTextColour(0.95, 0.55, 0.55, 1.0)
     sc_close:SetOnClick(function()
         share_card_visible = false
+        if UI.ReleaseTextFocus then UI.ReleaseTextFocus() end
         share_card:Hide()
     end)
 
@@ -1098,6 +1427,8 @@ local function CreateLiveCustomizerPanel(hud)
             end)
             if ok_e and ed then
                 parent:AddChild(ed)
+                if ed.SetForceEdit then ed:SetForceEdit(true) end
+                UI.text_edits[#UI.text_edits + 1] = ed
                 ed:SetPosition(px, py, 0)
                 if ed.SetRegionSize then ed:SetRegionSize(ew - 10, eh - 2) end
                 if ed.SetHAlign then ed:SetHAlign(G.ANCHOR_LEFT) end
@@ -1420,6 +1751,16 @@ local function CreateLiveCustomizerPanel(hud)
         lc.fr_btn:SetFont(FONT_BODY)
         lc.fr_btn:SetTextColour(0.84, 0.92, 1.0, 1.0)
         lc.fr_btn:SetOnClick(function() TriggerLookMatch("same_frame") end)
+
+        -- Prevent non-interactive share-card backdrops/labels from eating clicks or TextEdit focus.
+        for _, dw in ipairs({
+            sc_border, sc_top_div, sc_title, sc_cur_lbl, sc_saved_bg, sc_saved_txt, sc_sub_lbl,
+            sc_code_bg, sc_code_txt, sc_status_bg, sc_status_txt, sc_copy_bg, sc_json_bg,
+            sc_div, sc_imp_lbl, sc_chk_bg, sc_go_bg, sc_undo_bg, sc_hint,
+            lc.div, lc.title, lc.sub, lc.cb_bg, lc.fr_bg,
+        }) do
+            if dw and type(dw.SetClickable) == "function" then dw:SetClickable(false) end
+        end
     end
 
     local function RefreshShareCardHeader(snap, zh_now)
@@ -1475,6 +1816,7 @@ local function CreateLiveCustomizerPanel(hud)
             share_card:Show()
             share_card:MoveToFront()
         else
+            if UI.ReleaseTextFocus then UI.ReleaseTextFocus() end
             share_card:Hide()
         end
     end
@@ -1494,7 +1836,7 @@ local function CreateLiveCustomizerPanel(hud)
         pc.root:Hide()
 
         NewImage(pc.root, 0, 0, PW + 4, PH + 4, 0.76, 0.62, 0.34, 0.72)
-        NewImage(pc.root, 0, 0, PW, PH, 0.062, 0.072, 0.098, 0.97)
+        NewImage(pc.root, 0, 0, PW, PH, 0.062, 0.072, 0.098, 0.97, true)
         NewImage(pc.root, 0, PH * 0.5 - 22, PW, 44, 0.088, 0.104, 0.145, 0.99)
         NewImage(pc.root, 0, PH * 0.5 - 44, PW, 2, 0.95, 0.74, 0.36, 0.75)
 
@@ -1666,6 +2008,7 @@ local function CreateLiveCustomizerPanel(hud)
             if pc.visible then
                 if share_card_visible then
                     share_card_visible = false
+                    if UI.ReleaseTextFocus then UI.ReleaseTextFocus() end
                     share_card:Hide()
                 end
                 pc.SetStatus("info", IsChineseLocale()
@@ -1696,11 +2039,15 @@ local function CreateLiveCustomizerPanel(hud)
     }
     local mood_btns = {}
     local function BuildMoodRow(rc)
+        local cx = UI.L.pro_cx
+        local rw = UI.L.pro_w
+        local bw, gap = 95, 6
+        local x0 = cx - rw * 0.5 + bw * 0.5
         for i = 1, #mood_defs do
             local md = mood_defs[i]
-            local mx = -144 + (i - 1) * 96
-            NewImage(rc, mx, 0, 90, 26, 0.18, 0.16, 0.22, 0.92)
-            local mbtn = NewButton(rc, mx, 0, 90, 26, is_zh and md.zh or md.en, 14, function()
+            local mx = x0 + (i - 1) * (bw + gap)
+            NewImage(rc, mx, 0, bw, 26, 0.18, 0.16, 0.22, 0.92)
+            local mbtn = NewButton(rc, mx, 0, bw, 26, is_zh and md.zh or md.en, 14, function()
                 if type(api.ApplyColorMood) == "function" then
                     api.ApplyColorMood(md.id)
                     DoRefresh()
@@ -1713,8 +2060,8 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     local function BuildHitTestRow(rc)
-        NewImage(rc, 0, 0, W - 22, 26, 0.28, 0.17, 0.12, 0.94)
-        local b = NewButton(rc, 0, 0, W - 22, 26,
+        NewImage(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26, 0.28, 0.17, 0.12, 0.94)
+        local b = NewButton(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26,
             is_zh and "原地演示打击效果（点一次换一种）" or "Test Hit-Feel (click to cycle styles)", 14, function()
             if type(api.PreviewHitFeel) == "function" then
                 api.PreviewHitFeel()
@@ -1727,12 +2074,12 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     local function BuildSlotsRow(rc)
-        MakeSlotRow(rc, 0)
+        MakeSlotRow(rc, 0, UI.L.pro_cx, UI.L.pro_w)
     end
 
     local function BuildShareRow(rc)
-        NewImage(rc, 0, 0, W - 22, 26, 0.24, 0.20, 0.11, 0.94)
-        local b = NewButton(rc, 0, 0, W - 22, 26,
+        NewImage(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26, 0.24, 0.20, 0.11, 0.94)
+        local b = NewButton(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26,
             is_zh and "分享 / 导入方案码 (HS1 / JSON)" or "Share / Import Preset Code (HS1 / JSON)", 14, function()
             if UI.ToggleShareCard then UI.ToggleShareCard() end
         end)
@@ -1742,8 +2089,8 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     local function BuildRestoreRow(rc)
-        NewImage(rc, 0, 0, W - 22, 26, 0.30, 0.22, 0.12, 0.94)
-        local b = NewButton(rc, 0, 0, W - 22, 26,
+        NewImage(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26, 0.30, 0.22, 0.12, 0.94)
+        local b = NewButton(rc, UI.L.pro_cx, 0, UI.L.pro_w, 26,
             is_zh and "一键恢复原版纯净（不影响 240 帧与低延迟）" or "Restore Vanilla Look (keeps 240Hz & low-latency)", 14, function()
             api.SetPreset(0)
             DoRefresh()
@@ -1754,14 +2101,188 @@ local function CreateLiveCustomizerPanel(hud)
     end
 
     local function BuildDiagRow(rc)
-        NewImage(rc, 0, 0, W - 22, 48, 0.040, 0.050, 0.075, 0.92)
-        UI.diag1 = NewText(rc, 12, "", 0, 15, W - 34, 16, G.ANCHOR_LEFT, 0.62, 0.90, 0.74, 0.96)
-        UI.diag2 = NewText(rc, 12, "", 0, 0, W - 34, 16, G.ANCHOR_LEFT, 0.70, 0.80, 0.92, 0.92)
-        UI.diag3 = NewText(rc, 12, "", 0, -15, W - 34, 16, G.ANCHOR_LEFT, 0.62, 0.68, 0.78, 0.90)
+        NewImage(rc, UI.L.pro_cx, 0, UI.L.pro_w, 48, 0.040, 0.050, 0.075, 0.92)
+        UI.diag1 = NewText(rc, 12, "", UI.L.pro_cx, 15, UI.L.pro_w - 14, 16, G.ANCHOR_LEFT, 0.62, 0.90, 0.74, 0.96)
+        UI.diag2 = NewText(rc, 12, "", UI.L.pro_cx, 0, UI.L.pro_w - 14, 16, G.ANCHOR_LEFT, 0.70, 0.80, 0.92, 0.92)
+        UI.diag3 = NewText(rc, 12, "", UI.L.pro_cx, -15, UI.L.pro_w - 14, 16, G.ANCHOR_LEFT, 0.62, 0.68, 0.78, 0.90)
+    end
+
+    UI.BuildHwTierRow = function(rc)
+        UI.hw_bgs = {}
+        UI.hw_btns = {}
+        local defs = {
+            { id = 0, zh = "省电低配", en = "Low Spec",
+              dzh = "适合核显或笔记本省电模式：使用紧凑缓冲区与温和帧率节电策略。",
+              den = "Best for integrated GPU or laptop battery mode: compact buffers & power saving." },
+            { id = 1, zh = "均衡标准", en = "Balanced",
+              dzh = "默认推荐档位：兼顾 240Hz 流畅度、低延迟操作与主流硬件显存/CPU 占用。",
+              den = "Default balanced tier: smooth 240Hz & low latency with moderate VRAM/CPU usage." },
+            { id = 2, zh = "高端解放", en = "Unleashed",
+              dzh = "独显/多核台式机全力解放：绕过 Win11 节能节流、启用 AZDO 持久环与超大缓冲池。",
+              den = "Full hardware liberation for desktop/dGPU: bypasses Win11 EcoQoS + AZDO persistent ring + large pools." },
+        }
+        local cx = UI.L.pro_cx
+        local rw = UI.L.pro_w
+        local bw, gap = 128, 7
+        local x0 = cx - rw * 0.5 + bw * 0.5
+        for i = 1, 3 do
+            local d = defs[i]
+            local bx = x0 + (i - 1) * (bw + gap)
+            local bg = NewImage(rc, bx, 10, bw, 24, 0.12, 0.13, 0.18, 0.92)
+            local btn = NewButton(rc, bx, 10, bw, 24, is_zh and d.zh or d.en, 13, function()
+                if type(api.SetHardwareTier) == "function" then
+                    api.SetHardwareTier(d.id)
+                    DoRefresh()
+                end
+            end)
+            btn:SetTextColour(0.84, 0.88, 0.94, 1.0)
+            btn:SetTextFocusColour(1.0, 0.98, 0.78, 1.0)
+            BindInfo(btn, { zh = d.zh, en = d.en, dzh = d.dzh, den = d.den })
+            UI.hw_bgs[d.id] = bg
+            UI.hw_btns[d.id] = { btn = btn, zh = d.zh, en = d.en }
+        end
+        UI.hw_groups[#UI.hw_groups + 1] = { bgs = UI.hw_bgs, btns = UI.hw_btns }
+        NewImage(rc, cx, -13, rw, 18, 0.055, 0.070, 0.105, 0.88)
+        UI.hw_meta = NewText(rc, 11, "", cx, -13, rw - 12, 16, G.ANCHOR_LEFT, 0.72, 0.86, 0.96, 0.95)
+    end
+
+    UI.BuildModProfRow = function(rc)
+        local cx = UI.L.pro_cx
+        local rw = UI.L.pro_w
+        UI.prof_bg = NewImage(rc, cx, 13, rw, 24, 0.16, 0.24, 0.30, 0.95)
+        UI.prof_btn = NewButton(rc, cx, 13, rw, 24,
+            is_zh and "3秒定位卡顿 Mod (谁在吃帧率)" or "3s FPS Culprit Scan", 13, function()
+            if type(api.StartModProfiler) == "function" then
+                api.StartModProfiler(3)
+                DoRefresh()
+            end
+        end)
+        UI.prof_btn:SetTextColour(0.76, 0.96, 1.0, 1.0)
+        UI.prof_btn:SetTextFocusColour(1.0, 1.0, 0.85, 1.0)
+        BindInfo(UI.prof_btn, {
+            zh = "3秒定位卡顿 Mod", en = "3s FPS Culprit Scan",
+            dzh = "点击后统计 3 秒内各个 Mod 的 Lua 指令开销，直观列出最吃帧率的模组与代码行。",
+            den = "Samples 3 seconds of Lua instruction hotspots and ranks which Mod slows FPS most.",
+        })
+        NewImage(rc, cx, -13, rw, 26, 0.045, 0.055, 0.085, 0.90)
+        UI.prof_txt = NewText(rc, 11, "", cx, -13, rw - 12, 24, G.ANCHOR_LEFT, 0.78, 0.86, 0.94, 0.94)
+    end
+
+    local function BuildClarityGradeRow(rc)
+        local defs = {
+            { id = 0, zh = "原版", en = "Vanilla",
+              dzh = "原版纯净分辨率与过滤，GPU 计算开销 0.00ms。",
+              den = "Stock filtering and resolution; 0.00ms GPU compute." },
+            { id = 1, zh = "清晰", en = "HD",
+              dzh = "16×AF + 1.0×全分辨率光照 + 负LOD防糊 + BCAS 锐化（全显卡通用）。",
+              den = "16x AF + 1.0x LightMap + negative LOD + BCAS (runs fast on all GPUs)." },
+            { id = 2, zh = "超清", en = "UltraHD",
+              dzh = "开启 16位半浮点 HDR 光照 + OpenGL 4.3 计算着色器 2D 定向抗锯齿与墨线精修。",
+              den = "16F HDR LightMap + OpenGL 4.3 Compute 2D edge-directed AA & ink polish." },
+            { id = 3, zh = "蓝光", en = "BluRay",
+              dzh = "虚拟 4K 2× 超分重建 + 4×4 Lanczos 超采样回屏 + 4096 阴影（吃独显算力）。",
+              den = "Virtual-4K 2x reconstruction + 4x4 Lanczos resolve + 4096 ShadowMask." },
+        }
+        local cx = UI.L.pro_cx
+        local bgs, btns = {}, {}
+        for i = 1, 4 do
+            local d = defs[i]
+            local bx = cx - 150 + (i - 1) * 100
+            local bg = NewImage(rc, bx, 0, 96, 26, 0.12, 0.13, 0.18, 0.92)
+            local btn = NewButton(rc, bx, 0, 96, 26, is_zh and d.zh or d.en, 13, function()
+                if type(api.SetClarityGrade) == "function" then
+                    api.SetClarityGrade(d.id)
+                    DoRefresh()
+                end
+            end)
+            btn:SetTextColour(0.84, 0.88, 0.94, 1.0)
+            btn:SetTextFocusColour(1.0, 0.98, 0.78, 1.0)
+            BindInfo(btn, { zh = d.zh, en = d.en, dzh = d.dzh, den = d.den })
+            bgs[d.id] = bg
+            btns[d.id] = { btn = btn, zh = d.zh, en = d.en }
+        end
+        UI.clarity_groups[#UI.clarity_groups + 1] = { bgs = bgs, btns = btns }
+    end
+    local function BuildClarityTelemetryRow(rc)
+        NewImage(rc, UI.L.pro_cx, 0, UI.L.pro_w, 20, 0.05, 0.075, 0.11, 0.90)
+        UI.clarity_meta = NewText(rc, 11, "", UI.L.pro_cx, 0, UI.L.pro_w - 10, 18, nil, 0.70, 0.88, 0.96, 0.95, FONT_NUM)
+    end
+    local function BuildClarityStrengthRow(rc)
+        local cx = UI.L.pro_cx
+        local rw = UI.L.pro_w
+        local left = cx - rw * 0.5
+        local right = cx + rw * 0.5
+        local row_h = 24
+        local bh = row_h - 4
+        local val_x = right - 29
+        local plus_x = right - 70
+        local track_x1 = right - 88
+        local track_x0 = track_x1 - TRACK_W
+        local tc = track_x0 + TRACK_W * 0.5
+        local minus_x = track_x0 - 18
+        local lbl_x0 = left + 6
+        local lbl_w = (minus_x - 15) - lbl_x0
+        local lbl_x = lbl_x0 + lbl_w * 0.5
+        local str_def = {
+            zh = "计算重构强度",
+            en = "Compute Strength",
+            dzh = "控制超清/蓝光 GPU 计算管线的矢量推线、局部微反差与锐化强度（20%~150%，默认 100%）。",
+            den = "Master intensity for UltraHD/BluRay GPU compute ink tightening, local clarity & CAS (20%-150%).",
+        }
+        NewImage(rc, cx, 0, rw, row_h, 0.085, 0.105, 0.145, 0.92)
+        UI.clarity_str_lbl = NewText(rc, 13, is_zh and str_def.zh or str_def.en, lbl_x, 0, lbl_w, row_h - 2, G.ANCHOR_LEFT, 0.88, 0.94, 0.98, 1.0)
+        local info_btn = NewButton(rc, lbl_x, 0, lbl_w, row_h, nil, nil, function() ShowInfo(str_def) end)
+        BindInfo(info_btn, str_def)
+
+        local function StepStr(delta)
+            local sn = api.GetSnapshot()
+            local cur = (sn and tonumber(sn.clarity_strength)) or 1.00
+            if type(api.SetClarityStrength) == "function" then
+                api.SetClarityStrength(cur + delta)
+                DoRefresh()
+            end
+            ShowInfo(str_def)
+        end
+
+        NewImage(rc, minus_x, 0, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        UI.clarity_str_minus = NewButton(rc, minus_x, 0, 22, bh, "-", 18, function()
+            PressFX(UI.clarity_str_minus)
+            StepStr(-0.10)
+        end, FONT_NUM)
+        UI.clarity_str_minus:SetTextColour(1.0, 0.88, 0.65, 1.0)
+        BindInfo(UI.clarity_str_minus, str_def)
+
+        NewImage(rc, tc, 0, TRACK_W + 8, 8, 0.12, 0.14, 0.19, 1.0)
+        NewImage(rc, tc, 0, TRACK_W, 4, 0.025, 0.032, 0.05, 1.0)
+        UI.clarity_str_fill = NewImage(rc, track_x0 + 0.5, 0, 1, 4, 0.24, 0.78, 0.92, 0.96)
+        UI.clarity_str_track_x0 = track_x0
+
+        NewImage(rc, plus_x, 0, 22, bh, 0.20, 0.22, 0.29, 0.95)
+        UI.clarity_str_plus = NewButton(rc, plus_x, 0, 22, bh, "+", 18, function()
+            PressFX(UI.clarity_str_plus)
+            StepStr(0.10)
+        end, FONT_NUM)
+        UI.clarity_str_plus:SetTextColour(1.0, 0.88, 0.65, 1.0)
+        BindInfo(UI.clarity_str_plus, str_def)
+
+        UI.clarity_str_val = NewButton(rc, val_x, 0, 54, bh, "100%", 13, function()
+            if type(api.SetClarityStrength) == "function" then
+                api.SetClarityStrength(1.00)
+                DoRefresh()
+            end
+            ShowInfo(str_def)
+        end, FONT_NUM)
+        UI.clarity_str_val:SetTextColour(0.45, 1.0, 0.72, 1.0)
+        UI.clarity_str_val:SetTextFocusColour(1.0, 0.96, 0.68, 1.0)
+        BindInfo(UI.clarity_str_val, str_def)
     end
 
     -- 清晰 (Clarity)
     BuildProPage(2, {
+        { zh = "GPU 算力清晰度阶梯（原版 / 清晰 / 超清 / 蓝光）", en = "GPU Clarity Tiers (Vanilla / HD / UltraHD / BluRay)", rows = {
+            { custom = true, h = 28, build = BuildClarityGradeRow },
+            { custom = true, h = 22, build = BuildClarityTelemetryRow },
+            { custom = true, h = 24, build = BuildClarityStrengthRow } } },
         { zh = "常用：锐化与贴图", en = "Essentials: Sharpness & Textures", rows = {
             { id = "flag_cas" }, { id = "sharp" }, { id = "ink" }, { id = "flag_af16" },
             { id = "flag_mip_sharp" }, { id = "mip_bias" }, { id = "flag_full_lm" } } },
@@ -1809,10 +2330,11 @@ local function CreateLiveCustomizerPanel(hud)
             { id = "shadow_density" }, { id = "vol_cloud_shade" }, { id = "vol_canopy_shade" },
             { id = "shadow_point_lights" }, { id = "shadow_night" },
             { id = "shadow_length" }, { id = "shadow_soft" }, { id = "shadow_hd" } } },
-        { zh = "动态长影（高级）", en = "Long Shadows (Advanced)", rows = {
+        { zh = "动态长影 · 光源与天气", en = "Long Shadows · Lights & Weather", rows = {
             { id = "shadow_point_strength" }, { id = "shadow_dusk_point" }, { id = "shadow_flash_lights" },
             { id = "shadow_weather" }, { id = "shadow_moon_blue" }, { id = "shadow_min_height" },
-            { id = "shadow_entity_recv" }, { id = "shadow_oval_keep" },
+            { id = "shadow_entity_recv" }, { id = "shadow_oval_keep" } } },
+        { zh = "动态长影 · 色彩与动态", en = "Long Shadows · Tint & Motion", rows = {
             { id = "shadow_fade" }, { id = "shadow_sway" }, { id = "shadow_smooth" },
             { id = "shadow_tint_r" }, { id = "shadow_tint_g" }, { id = "shadow_tint_b" },
             { id = "shadow_skip_nightmare" } } },
@@ -1844,13 +2366,16 @@ local function CreateLiveCustomizerPanel(hud)
 
     -- 系统 (System)
     BuildProPage(7, {
+        { zh = "硬件性能档位（按电脑配置自选）", en = "Hardware Tier (By PC Specs)", rows = {
+            { custom = true, h = 48, build = UI.BuildHwTierRow } } },
         { zh = "输入与显示", en = "Input & Display", rows = {
             { id = "eng_lowlat" }, { id = "eng_clipcursor" }, { id = "eng_hudmode" } } },
         { zh = "我的方案与分享", en = "My Looks & Sharing", rows = {
             { custom = true, h = 28, build = BuildSlotsRow },
             { custom = true, h = 26, build = BuildShareRow },
             { custom = true, h = 26, build = BuildRestoreRow } } },
-        { zh = "运行诊断（给开发者/反馈用）", en = "Diagnostics (for bug reports)", rows = {
+        { zh = "运行诊断与卡顿定位", en = "Diagnostics & FPS Culprit Scan", rows = {
+            { custom = true, h = 54, build = UI.BuildModProfRow },
             { custom = true, h = 48, build = BuildDiagRow } } },
     }, nil, nil)
 
@@ -1865,80 +2390,33 @@ local function CreateLiveCustomizerPanel(hud)
     local EXT_ROWS_PER_PAGE = 8
 
     -- Top summary + Master Bypass toggle
-    local ext_sum_bg = tab8:AddChild(Image("images/global.xml", "square.tex"))
-    ext_sum_bg:ScaleToSize(262, 24)
-    ext_sum_bg:SetPosition(-58, 152, 0)
-    ext_sum_bg:SetTint(0.10, 0.16, 0.24, 0.90)
+    local ext_sum_bg = NewImage(tab8, -61, 161, 290, 24, 0.10, 0.16, 0.24, 0.90)
+    local ext_sum_txt = NewText(tab8, 13, "", -61, 161, 280, 20, G.ANCHOR_LEFT, 0.76, 0.92, 1.0, 0.98)
 
-    local ext_sum_txt = tab8:AddChild(Text(FONT_BODY, 13, ""))
-    ext_sum_txt:SetRegionSize(254, 20)
-    ext_sum_txt:SetHAlign(G.ANCHOR_LEFT)
-    ext_sum_txt:SetPosition(-58, 152, 0)
-    ext_sum_txt:SetColour(0.76, 0.92, 1.0, 0.98)
-
-    local ext_byp_bg = tab8:AddChild(Image("images/global.xml", "square.tex"))
-    ext_byp_bg:ScaleToSize(110, 24)
-    ext_byp_bg:SetPosition(134, 152, 0)
-    ext_byp_bg:SetTint(0.14, 0.30, 0.20, 0.94)
-
-    local ext_byp_btn = tab8:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_byp_btn.scale_on_focus = false
-    ext_byp_btn.move_on_click = false
-    ext_byp_btn:ForceImageSize(110, 24)
-    ext_byp_btn:SetPosition(134, 152, 0)
-    ext_byp_btn:SetText(is_zh and "扩展:运行中" or "Ext: Active")
-    ext_byp_btn:SetTextSize(13)
-    ext_byp_btn:SetFont(FONT_BODY)
-    ext_byp_btn:SetTextColour(0.68, 1.0, 0.80, 1.0)
-    ext_byp_btn:SetOnClick(function()
+    local ext_byp_bg = NewImage(tab8, 148, 161, 116, 24, 0.14, 0.30, 0.20, 0.94)
+    local ext_byp_btn = NewButton(tab8, 148, 161, 116, 24, is_zh and "扩展:运行中" or "Ext: Active", 13, function()
         if type(api.GetExtSnapshot) ~= "function" or type(api.SetExtMasterBypass) ~= "function" then return end
         local cur = api.GetExtSnapshot()
         api.SetExtMasterBypass(not (cur.master_bypass == true))
         if panel_refresh_fn then panel_refresh_fn() end
     end)
+    ext_byp_btn:SetTextColour(0.68, 1.0, 0.80, 1.0)
 
     -- Core baseline GPU comparison line
-    local ext_core_bg = tab8:AddChild(Image("images/global.xml", "square.tex"))
-    ext_core_bg:ScaleToSize(W - 22, 18)
-    ext_core_bg:SetPosition(0, 128, 0)
-    ext_core_bg:SetTint(0.08, 0.10, 0.14, 0.84)
-
-    local ext_core_txt = tab8:AddChild(Text(FONT_NUM, 12, ""))
-    ext_core_txt:SetRegionSize(W - 30, 16)
-    ext_core_txt:SetPosition(0, 128, 0)
-    ext_core_txt:SetColour(0.68, 0.78, 0.88, 0.94)
+    local ext_core_bg = NewImage(tab8, 0, 136, UI.L.full_w, 18, 0.08, 0.10, 0.14, 0.84)
+    local ext_core_txt = NewText(tab8, 12, "", 0, 136, UI.L.full_w - 10, 16, nil, 0.68, 0.78, 0.88, 0.94, FONT_NUM)
 
     -- Empty-state friendly card (shown when 0 third-party plugins registered)
     local ext_empty_root = tab8:AddChild(Widget("HS_ExtEmpty"))
-    local ext_empty_bg = ext_empty_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_empty_bg:ScaleToSize(W - 22, 150)
-    ext_empty_bg:SetPosition(0, 20, 0)
-    ext_empty_bg:SetTint(0.10, 0.12, 0.17, 0.86)
-
-    local ext_empty_txt = ext_empty_root:AddChild(Text(FONT_BODY, 14, ""))
-    ext_empty_txt:SetRegionSize(W - 42, 132)
-    ext_empty_txt:SetPosition(0, 20, 0)
-    ext_empty_txt:SetColour(0.80, 0.86, 0.94, 0.94)
+    local ext_empty_bg = NewImage(ext_empty_root, 0, 10, UI.L.full_w, 156, 0.10, 0.12, 0.17, 0.86)
+    local ext_empty_txt = NewText(ext_empty_root, 14, "", 0, 10, UI.L.full_w - 22, 138, nil, 0.80, 0.86, 0.94, 0.94)
 
     -- Active Plugin Browser & Controls container
     local ext_body_root = tab8:AddChild(Widget("HS_ExtBody"))
 
     -- Selector strip: [<]  [1/N] Name v1.0  [>]
-    local ext_prev_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_prev_bg:ScaleToSize(30, 24)
-    ext_prev_bg:SetPosition(-174, 100, 0)
-    ext_prev_bg:SetTint(0.16, 0.18, 0.24, 0.94)
-
-    local ext_prev_btn = ext_body_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_prev_btn.scale_on_focus = false
-    ext_prev_btn.move_on_click = false
-    ext_prev_btn:ForceImageSize(30, 24)
-    ext_prev_btn:SetPosition(-174, 100, 0)
-    ext_prev_btn:SetText("<")
-    ext_prev_btn:SetTextSize(16)
-    ext_prev_btn:SetFont(FONT_NUM)
-    ext_prev_btn:SetTextColour(0.92, 0.94, 1.0, 1.0)
-    ext_prev_btn:SetOnClick(function()
+    local ext_prev_bg = NewImage(ext_body_root, -190, 109, 32, 24, 0.16, 0.18, 0.24, 0.94)
+    local ext_prev_btn = NewButton(ext_body_root, -190, 109, 32, 24, "<", 16, function()
         if type(api.GetExtSnapshot) ~= "function" then return end
         local n = #(api.GetExtSnapshot().plugins or {})
         if n > 0 then
@@ -1946,33 +2424,14 @@ local function CreateLiveCustomizerPanel(hud)
             ext_param_page = 1
             if panel_refresh_fn then panel_refresh_fn() end
         end
-    end)
+    end, FONT_NUM)
+    ext_prev_btn:SetTextColour(0.92, 0.94, 1.0, 1.0)
 
-    local ext_sel_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_sel_bg:ScaleToSize(310, 24)
-    ext_sel_bg:SetPosition(0, 100, 0)
-    ext_sel_bg:SetTint(0.14, 0.16, 0.22, 0.92)
+    local ext_sel_bg = NewImage(ext_body_root, 0, 109, 340, 24, 0.14, 0.16, 0.22, 0.92)
+    local ext_sel_txt = NewText(ext_body_root, 14, "", 0, 109, 330, 20, nil, 1.0, 0.92, 0.66, 1.0)
 
-    local ext_sel_txt = ext_body_root:AddChild(Text(FONT_BODY, 14, ""))
-    ext_sel_txt:SetRegionSize(302, 20)
-    ext_sel_txt:SetPosition(0, 100, 0)
-    ext_sel_txt:SetColour(1.0, 0.92, 0.66, 1.0)
-
-    local ext_next_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_next_bg:ScaleToSize(30, 24)
-    ext_next_bg:SetPosition(174, 100, 0)
-    ext_next_bg:SetTint(0.16, 0.18, 0.24, 0.94)
-
-    local ext_next_btn = ext_body_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_next_btn.scale_on_focus = false
-    ext_next_btn.move_on_click = false
-    ext_next_btn:ForceImageSize(30, 24)
-    ext_next_btn:SetPosition(174, 100, 0)
-    ext_next_btn:SetText(">")
-    ext_next_btn:SetTextSize(16)
-    ext_next_btn:SetFont(FONT_NUM)
-    ext_next_btn:SetTextColour(0.92, 0.94, 1.0, 1.0)
-    ext_next_btn:SetOnClick(function()
+    local ext_next_bg = NewImage(ext_body_root, 190, 109, 32, 24, 0.16, 0.18, 0.24, 0.94)
+    local ext_next_btn = NewButton(ext_body_root, 190, 109, 32, 24, ">", 16, function()
         if type(api.GetExtSnapshot) ~= "function" then return end
         local n = #(api.GetExtSnapshot().plugins or {})
         if n > 0 then
@@ -1980,22 +2439,12 @@ local function CreateLiveCustomizerPanel(hud)
             ext_param_page = 1
             if panel_refresh_fn then panel_refresh_fn() end
         end
-    end)
+    end, FONT_NUM)
+    ext_next_btn:SetTextColour(0.92, 0.94, 1.0, 1.0)
 
     -- Plugin Action Row: [Enable/Disable]  [Stage + Live GPU ms]  [Reset]
-    local ext_en_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_en_bg:ScaleToSize(92, 24)
-    ext_en_bg:SetPosition(-143, 70, 0)
-    ext_en_bg:SetTint(0.14, 0.28, 0.20, 0.94)
-
-    local ext_en_btn = ext_body_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_en_btn.scale_on_focus = false
-    ext_en_btn.move_on_click = false
-    ext_en_btn:ForceImageSize(92, 24)
-    ext_en_btn:SetPosition(-143, 70, 0)
-    ext_en_btn:SetTextSize(13)
-    ext_en_btn:SetFont(FONT_BODY)
-    ext_en_btn:SetOnClick(function()
+    local ext_en_bg = NewImage(ext_body_root, -157, 79, 98, 24, 0.14, 0.28, 0.20, 0.94)
+    local ext_en_btn = NewButton(ext_body_root, -157, 79, 98, 24, "", 13, function()
         if type(api.GetExtSnapshot) ~= "function" or type(api.SetExtPluginEnabled) ~= "function" then return end
         local list = api.GetExtSnapshot().plugins or {}
         local p = list[ext_selected_idx]
@@ -2005,31 +2454,11 @@ local function CreateLiveCustomizerPanel(hud)
         end
     end)
 
-    local ext_gpu_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_gpu_bg:ScaleToSize(192, 24)
-    ext_gpu_bg:SetPosition(3, 70, 0)
-    ext_gpu_bg:SetTint(0.08, 0.13, 0.19, 0.90)
+    local ext_gpu_bg = NewImage(ext_body_root, 0, 79, 210, 24, 0.08, 0.13, 0.19, 0.90)
+    local ext_gpu_txt = NewText(ext_body_root, 12, "", 0, 79, 202, 20, nil, 0.60, 0.96, 0.84, 0.98, FONT_NUM)
 
-    local ext_gpu_txt = ext_body_root:AddChild(Text(FONT_NUM, 12, ""))
-    ext_gpu_txt:SetRegionSize(186, 20)
-    ext_gpu_txt:SetPosition(3, 70, 0)
-    ext_gpu_txt:SetColour(0.60, 0.96, 0.84, 0.98)
-
-    local ext_rst_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_rst_bg:ScaleToSize(86, 24)
-    ext_rst_bg:SetPosition(146, 70, 0)
-    ext_rst_bg:SetTint(0.24, 0.18, 0.12, 0.92)
-
-    local ext_rst_btn = ext_body_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_rst_btn.scale_on_focus = false
-    ext_rst_btn.move_on_click = false
-    ext_rst_btn:ForceImageSize(86, 24)
-    ext_rst_btn:SetPosition(146, 70, 0)
-    ext_rst_btn:SetText(is_zh and "重置参数" or "Reset")
-    ext_rst_btn:SetTextSize(13)
-    ext_rst_btn:SetFont(FONT_BODY)
-    ext_rst_btn:SetTextColour(1.0, 0.88, 0.62, 1.0)
-    ext_rst_btn:SetOnClick(function()
+    local ext_rst_bg = NewImage(ext_body_root, 160, 79, 92, 24, 0.24, 0.18, 0.12, 0.92)
+    local ext_rst_btn = NewButton(ext_body_root, 160, 79, 92, 24, is_zh and "重置参数" or "Reset", 13, function()
         if type(api.GetExtSnapshot) ~= "function" or type(api.ResetExtPlugin) ~= "function" then return end
         local list = api.GetExtSnapshot().plugins or {}
         local p = list[ext_selected_idx]
@@ -2038,73 +2467,31 @@ local function CreateLiveCustomizerPanel(hud)
             if panel_refresh_fn then panel_refresh_fn() end
         end
     end)
+    ext_rst_btn:SetTextColour(1.0, 0.88, 0.62, 1.0)
 
     -- Meta / Author / Fault line
-    local ext_meta_bg = ext_body_root:AddChild(Image("images/global.xml", "square.tex"))
-    ext_meta_bg:ScaleToSize(W - 22, 24)
-    ext_meta_bg:SetPosition(0, 40, 0)
-    ext_meta_bg:SetTint(0.09, 0.11, 0.15, 0.84)
-
-    local ext_meta_txt = ext_body_root:AddChild(Text(FONT_BODY, 12, ""))
-    ext_meta_txt:SetRegionSize(W - 30, 22)
-    ext_meta_txt:SetPosition(0, 40, 0)
-    ext_meta_txt:SetColour(0.76, 0.82, 0.90, 0.94)
+    local ext_meta_bg = NewImage(ext_body_root, 0, 49, UI.L.full_w, 24, 0.09, 0.11, 0.15, 0.84)
+    local ext_meta_txt = NewText(ext_body_root, 12, "", 0, 49, UI.L.full_w - 12, 22, nil, 0.76, 0.82, 0.90, 0.94)
 
     -- 8-row reusable dynamic parameter pool (float steppers + bool toggles)
     local ext_param_rows = {}
     for r = 1, EXT_ROWS_PER_PAGE do
         local row_idx = r
-        local ry = 10 - (r - 1) * 32
+        local ry = 17 - (r - 1) * 32
         local rroot = ext_body_root:AddChild(Widget("HS_ExtParamRow_" .. r))
 
-        local rbg = rroot:AddChild(Image("images/global.xml", "square.tex"))
-        rbg:ScaleToSize(W - 22, 28)
-        rbg:SetPosition(0, ry, 0)
-        rbg:SetTint(0.11, 0.12, 0.16, 0.80)
+        local rbg = NewImage(rroot, 0, ry, UI.L.full_w, 28, 0.11, 0.12, 0.16, 0.80)
+        local rlbl = NewText(rroot, 14, "", -79, ry, 242, 24, G.ANCHOR_LEFT, 0.90, 0.92, 0.96, 1.0)
 
-        local rlbl = rroot:AddChild(Text(FONT_BODY, 14, ""))
-        rlbl:SetRegionSize(214, 24)
-        rlbl:SetHAlign(G.ANCHOR_LEFT)
-        rlbl:SetPosition(-76, ry, 0)
-        rlbl:SetColour(0.90, 0.92, 0.96, 1.0)
-
-        local mbg = rroot:AddChild(Image("images/global.xml", "square.tex"))
-        mbg:ScaleToSize(28, 22)
-        mbg:SetPosition(66, ry, 0)
-        mbg:SetTint(0.19, 0.20, 0.26, 0.94)
-
-        local mbtn = rroot:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        mbtn.scale_on_focus = false
-        mbtn.move_on_click = false
-        mbtn:ForceImageSize(28, 22)
-        mbtn:SetPosition(66, ry, 0)
-        mbtn:SetText("-")
-        mbtn:SetTextSize(16)
-        mbtn:SetFont(FONT_NUM)
+        local mbg = NewImage(rroot, 72, ry, 28, 22, 0.19, 0.20, 0.26, 0.94)
+        local mbtn = NewButton(rroot, 72, ry, 28, 22, "-", 16, nil, FONT_NUM)
         mbtn:SetTextColour(0.92, 0.92, 0.95, 1.0)
 
-        local vbtn = rroot:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        vbtn.scale_on_focus = false
-        vbtn.move_on_click = false
-        vbtn:ForceImageSize(68, 22)
-        vbtn:SetPosition(116, ry, 0)
-        vbtn:SetTextSize(13)
-        vbtn:SetFont(FONT_NUM)
+        local vbtn = NewButton(rroot, 126, ry, 72, 22, "", 13, nil, FONT_NUM)
         vbtn:SetTextColour(1.0, 0.90, 0.60, 1.0)
 
-        local pbg = rroot:AddChild(Image("images/global.xml", "square.tex"))
-        pbg:ScaleToSize(28, 22)
-        pbg:SetPosition(166, ry, 0)
-        pbg:SetTint(0.19, 0.20, 0.26, 0.94)
-
-        local pbtn = rroot:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-        pbtn.scale_on_focus = false
-        pbtn.move_on_click = false
-        pbtn:ForceImageSize(28, 22)
-        pbtn:SetPosition(166, ry, 0)
-        pbtn:SetText("+")
-        pbtn:SetTextSize(16)
-        pbtn:SetFont(FONT_NUM)
+        local pbg = NewImage(rroot, 180, ry, 28, 22, 0.19, 0.20, 0.26, 0.94)
+        local pbtn = NewButton(rroot, 180, ry, 28, 22, "+", 16, nil, FONT_NUM)
         pbtn:SetTextColour(0.92, 0.92, 0.95, 1.0)
 
         local function GetBoundParam()
@@ -2148,40 +2535,22 @@ local function CreateLiveCustomizerPanel(hud)
 
     -- Pager strip (only visible if plugin has >8 params)
     local ext_pager_root = ext_body_root:AddChild(Widget("HS_ExtPager"))
-    local ext_pg_prev = ext_pager_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_pg_prev.scale_on_focus = false
-    ext_pg_prev.move_on_click = false
-    ext_pg_prev:ForceImageSize(72, 22)
-    ext_pg_prev:SetPosition(-110, -254, 0)
-    ext_pg_prev:SetText("<")
-    ext_pg_prev:SetTextSize(13)
-    ext_pg_prev:SetFont(FONT_BODY)
-    ext_pg_prev:SetOnClick(function()
+    local ext_pg_prev = NewButton(ext_pager_root, -120, -244, 76, 22, "<", 13, function()
         if ext_param_page > 1 then
             ext_param_page = ext_param_page - 1
             if panel_refresh_fn then panel_refresh_fn() end
         end
     end)
 
-    local ext_pg_txt = ext_pager_root:AddChild(Text(FONT_NUM, 12, "1 / 1"))
-    ext_pg_txt:SetPosition(0, -254, 0)
-    ext_pg_txt:SetColour(0.78, 0.84, 0.92, 0.94)
+    local ext_pg_txt = NewText(ext_pager_root, 12, "1 / 1", 0, -244, 80, 18, nil, 0.78, 0.84, 0.92, 0.94, FONT_NUM)
 
-    local ext_pg_next = ext_pager_root:AddChild(ImageButton("images/global_redux.xml", "blank.tex", "spinner_focus.tex"))
-    ext_pg_next.scale_on_focus = false
-    ext_pg_next.move_on_click = false
-    ext_pg_next:ForceImageSize(72, 22)
-    ext_pg_next:SetPosition(110, -254, 0)
-    ext_pg_next:SetText(">")
-    ext_pg_next:SetTextSize(13)
-    ext_pg_next:SetFont(FONT_BODY)
-    ext_pg_next:SetOnClick(function()
+    local ext_pg_next = NewButton(ext_pager_root, 120, -244, 76, 22, ">", 13, function()
         if type(api.GetExtSnapshot) ~= "function" then return end
         local list = api.GetExtSnapshot().plugins or {}
         local p = list[ext_selected_idx]
         if p then
-            local pages = math.max(1, math.ceil(#p.params / EXT_ROWS_PER_PAGE))
-            if ext_param_page < pages then
+            local pages_cnt = math.max(1, math.ceil(#p.params / EXT_ROWS_PER_PAGE))
+            if ext_param_page < pages_cnt then
                 ext_param_page = ext_param_page + 1
                 if panel_refresh_fn then panel_refresh_fn() end
             end
@@ -2325,10 +2694,12 @@ local function CreateLiveCustomizerPanel(hud)
         dzh = "把鼠标移到任意选项上（或点一下名称），这里会用大白话告诉你它是干什么的。",
         den = "Hover over (or click) any option and a plain-language explanation shows up here.",
     }
-    UI.pro_chrome[#UI.pro_chrome + 1] = NewImage(panel, 0, -299, W - 22, 52, 0.035, 0.045, 0.068, 0.92)
-    UI.pro_chrome[#UI.pro_chrome + 1] = NewImage(panel, -W * 0.5 + 12, -299, 3, 52, 0.95, 0.74, 0.36, 0.90)
-    UI.desc_title = NewText(panel, 14, "", 0, -283, W - 40, 18, G.ANCHOR_LEFT, 0.98, 0.84, 0.50, 1.0)
-    UI.desc_body = NewText(panel, 12, "", 0, -303, W - 40, 30, G.ANCHOR_LEFT, 0.78, 0.84, 0.92, 0.96)
+    UI.desc_bg = NewImage(panel, 0, UI.L.desc_y, UI.L.full_w, UI.L.desc_h, 0.035, 0.045, 0.068, 0.94)
+    UI.desc_accent = NewImage(panel, -UI.L.full_w * 0.5 + 1.5, UI.L.desc_y, 3, UI.L.desc_h, 0.95, 0.74, 0.36, 0.92)
+    UI.desc_title = NewText(panel, 14, "", 4, UI.L.desc_y + 19, UI.L.full_w - 18, 18, G.ANCHOR_LEFT, 0.98, 0.84, 0.50, 1.0)
+    UI.desc_body = NewText(panel, 12, "", 4, UI.L.desc_y - 8, UI.L.full_w - 18, 40, G.ANCHOR_LEFT, 0.80, 0.86, 0.94, 0.96)
+    UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_bg
+    UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_accent
     UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_title
     UI.pro_chrome[#UI.pro_chrome + 1] = UI.desc_body
 
@@ -2347,7 +2718,7 @@ local function CreateLiveCustomizerPanel(hud)
     local function RefreshTelemetry()
         local snap = api.GetSnapshot()
         local zh_now = (snap.ui_zh ~= nil) and (snap.ui_zh == true) or IsChineseLocale()
-        local exp_ver = tostring(snap.expected_dll_ver or "2.9.5")
+        local exp_ver = tostring(snap.expected_dll_ver or "2.9.7")
         local ver = tostring(snap.dll_ver or exp_ver)
         if snap.dll_status == "ok" then
             UI.st_bg:SetTint(0.04, 0.12, 0.09, 0.84)
@@ -2399,6 +2770,171 @@ local function CreateLiveCustomizerPanel(hud)
             UI.diag3:SetString(zh_now
                 and ("反馈/交流 QQ 群：" .. UI.QQ_GROUP .. "（截图本区 + dst_fps_plugin.log）")
                 or ("Feedback QQ group: " .. UI.QQ_GROUP .. " (screenshot + dst_fps_plugin.log)"))
+        end
+        if #UI.clarity_groups > 0 then
+            local cur_g = snap.clarity_grade or 0
+            for gi = 1, #UI.clarity_groups do
+                local grp = UI.clarity_groups[gi]
+                if grp.lbl then
+                    grp.lbl:SetString(zh_now and grp.lbl_zh or grp.lbl_en)
+                end
+                for gid = 0, 3 do
+                    local info = grp.btns[gid]
+                    local bg = grp.bgs[gid]
+                    if info and bg then
+                        info.btn:SetText(zh_now and info.zh or info.en)
+                        if cur_g == gid then
+                            if gid == 3 then
+                                bg:SetTint(0.38, 0.24, 0.08, 0.98)
+                                info.btn:SetTextColour(1.0, 0.92, 0.58, 1.0)
+                            elseif gid == 2 then
+                                bg:SetTint(0.14, 0.28, 0.46, 0.98)
+                                info.btn:SetTextColour(0.68, 0.94, 1.0, 1.0)
+                            elseif gid == 1 then
+                                bg:SetTint(0.10, 0.32, 0.30, 0.96)
+                                info.btn:SetTextColour(0.58, 1.0, 0.86, 1.0)
+                            else
+                                bg:SetTint(0.16, 0.22, 0.30, 0.96)
+                                info.btn:SetTextColour(0.78, 0.92, 1.0, 1.0)
+                            end
+                        else
+                            bg:SetTint(0.12, 0.13, 0.18, 0.90)
+                            info.btn:SetTextColour(0.72, 0.76, 0.84, 0.95)
+                        end
+                    end
+                end
+            end
+        end
+        if UI.clarity_meta then
+            local cs = snap.clarity_stats or {}
+            local cur_g = snap.clarity_grade or 0
+            local be = tostring(snap.render_backend or "D3D9")
+            if cur_g == 0 then
+                UI.clarity_meta:SetColour(0.68, 0.76, 0.86, 0.92)
+                UI.clarity_meta:SetString(zh_now
+                    and "原版纯净：GPU 重建 0.00ms · 原生像素零改动"
+                    or "Vanilla Pure: 0.00ms GPU Compute · untouched stock image")
+            elseif cur_g >= 2 and cs.supported ~= true then
+                UI.clarity_meta:SetColour(0.98, 0.80, 0.45, 0.96)
+                UI.clarity_meta:SetString(zh_now
+                    and string.format("当前 %s 后端：16×AF 与清晰管线生效；切至 Native OpenGL 解锁超清/蓝光 GPU 计算", be)
+                    or string.format("Current %s backend: AF/BCAS active; Native OpenGL required for Compute UHD/BluRay", be))
+            elseif cur_g >= 2 then
+                local g_ms = cs.gpu_ms or 0.0
+                if g_ms > 8.0 then
+                    UI.clarity_meta:SetColour(1.0, 0.82, 0.44, 0.98)
+                else
+                    UI.clarity_meta:SetColour(0.56, 0.98, 0.84, 0.98)
+                end
+                local hdr_s = (cs.hdr_lm == true) and "16F HDR光照" or "1.0x光照"
+                local hdr_s_en = (cs.hdr_lm == true) and "16F HDR LM" or "1.0x LM"
+                UI.clarity_meta:SetString(zh_now
+                    and string.format("GPU重建 %.2fms · %s · 阴影 %d · 额外显存 %.0fMB", g_ms, hdr_s, cs.shadow_res or 0, cs.vram_mb or 0)
+                    or string.format("GPU Compute %.2fms · %s · Shadow %d · +VRAM %.0fMB", g_ms, hdr_s_en, cs.shadow_res or 0, cs.vram_mb or 0))
+            else
+                UI.clarity_meta:SetColour(0.58, 0.96, 0.84, 0.96)
+                UI.clarity_meta:SetString(zh_now
+                    and "清晰档已启用：16×AF · 1.0×全分辨率光照 · -0.60 LOD · 0.00ms 计算开销"
+                    or "HD Clarity active: 16x AF · 1.0x LightMap · -0.60 LOD · 0.00ms compute")
+            end
+        end
+        if UI.clarity_str_val and UI.clarity_str_fill then
+            local cs_val = tonumber(snap.clarity_strength) or 1.00
+            if cs_val < 0.20 then cs_val = 0.20 elseif cs_val > 1.50 then cs_val = 1.50 end
+            local active_comp = ((snap.clarity_grade or 0) >= 2)
+            if UI.clarity_str_lbl then
+                UI.clarity_str_lbl:SetString(zh_now and "计算重构强度" or "Compute Strength")
+                if active_comp then
+                    UI.clarity_str_lbl:SetColour(0.92, 0.96, 1.0, 1.0)
+                else
+                    UI.clarity_str_lbl:SetColour(0.58, 0.64, 0.72, 0.85)
+                end
+            end
+            UI.clarity_str_val:SetText(string.format("%.0f%%", cs_val * 100.0))
+            if active_comp then
+                UI.clarity_str_val:SetTextColour(0.45, 1.0, 0.72, 1.0)
+            else
+                UI.clarity_str_val:SetTextColour(0.58, 0.64, 0.72, 0.85)
+            end
+            local frac = (cs_val - 0.20) / 1.30
+            if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
+            local fw = math.max(1.0, frac * TRACK_W)
+            local tx0 = UI.clarity_str_track_x0 or TRACK_X0
+            UI.clarity_str_fill:ScaleToSize(fw, 4)
+            UI.clarity_str_fill:SetPosition(tx0 + fw * 0.5, 0, 0)
+            if active_comp then
+                UI.clarity_str_fill:SetTint(0.24, 0.78, 0.92, 0.96)
+            else
+                UI.clarity_str_fill:SetTint(0.32, 0.36, 0.42, 0.72)
+            end
+        end
+        if #UI.hw_groups > 0 then
+            local cur_t = snap.hardware_tier or 1
+            for gi = 1, #UI.hw_groups do
+                local grp = UI.hw_groups[gi]
+                if grp.lbl then
+                    grp.lbl:SetString(zh_now and grp.lbl_zh or grp.lbl_en)
+                end
+                for tid = 0, 2 do
+                    local info = grp.btns[tid]
+                    local bg = grp.bgs[tid]
+                    if info and bg then
+                        info.btn:SetText(zh_now and info.zh or info.en)
+                        if cur_t == tid then
+                            if tid == 2 then
+                                bg:SetTint(0.42, 0.28, 0.10, 0.97)
+                                info.btn:SetTextColour(1.0, 0.92, 0.62, 1.0)
+                            else
+                                bg:SetTint(0.14, 0.30, 0.38, 0.96)
+                                info.btn:SetTextColour(0.72, 0.96, 1.0, 1.0)
+                            end
+                        else
+                            bg:SetTint(0.12, 0.13, 0.18, 0.90)
+                            info.btn:SetTextColour(0.72, 0.76, 0.84, 0.95)
+                        end
+                    end
+                end
+            end
+        end
+        if UI.hw_meta then
+            local hw = snap.hw_info or {}
+            local pr_str = (hw.persistent_ring == true) and (zh_now and "开" or "ON") or (zh_now and "关" or "OFF")
+            UI.hw_meta:SetString(zh_now
+                and string.format("CPU %d核 · RAM %.0fGB · GL %d.%d · 持久环:%s · VB:%dMB 影:%dMB",
+                    hw.cores or 0, (hw.ram_mb or 0) / 1024.0, hw.gl_major or 0, hw.gl_minor or 0,
+                    pr_str, hw.vb_max_mb or 0, hw.sc_max_mb or 0)
+                or string.format("CPU %dc · RAM %.0fGB · GL %d.%d · AZDO:%s · VB:%dMB SC:%dMB",
+                    hw.cores or 0, (hw.ram_mb or 0) / 1024.0, hw.gl_major or 0, hw.gl_minor or 0,
+                    pr_str, hw.vb_max_mb or 0, hw.sc_max_mb or 0))
+        end
+        if UI.prof_btn and UI.prof_txt then
+            local ps = snap.prof_state or {}
+            if ps.running == true then
+                UI.prof_bg:SetTint(0.32, 0.24, 0.10, 0.96)
+                UI.prof_btn:SetText(zh_now and "采样中... 请正常操作3秒" or "Scanning... keep playing 3s")
+                UI.prof_btn:SetTextColour(1.0, 0.92, 0.60, 1.0)
+                UI.prof_txt:SetString(zh_now and "正在统计各 Mod Lua 指令耗时占比..." or "Sampling Lua instruction hotspots across active Mods...")
+            elseif type(ps.top_mods) == "table" and #(ps.top_mods) > 0 then
+                UI.prof_bg:SetTint(0.14, 0.28, 0.22, 0.95)
+                UI.prof_btn:SetText(zh_now and "重新 3秒定位卡顿 Mod" or "Re-scan FPS Culprits (3s)")
+                UI.prof_btn:SetTextColour(0.68, 1.0, 0.82, 1.0)
+                local parts = {}
+                for i = 1, math.min(3, #(ps.top_mods)) do
+                    local m = ps.top_mods[i]
+                    parts[i] = string.format("%d.%s(%.0f%%)", i, tostring(m.name or "?"), m.pct or 0)
+                end
+                local l2 = (type(ps.top_lines) == "table" and ps.top_lines[1])
+                    and string.format("Top1: %s (%.0f%%)", tostring(ps.top_lines[1].line or "?"), ps.top_lines[1].pct or 0)
+                    or ""
+                UI.prof_txt:SetString(table.concat(parts, "  ") .. ((#l2 > 0) and ("\n" .. l2) or ""))
+            else
+                UI.prof_bg:SetTint(0.16, 0.24, 0.30, 0.95)
+                UI.prof_btn:SetText(zh_now and "3秒定位卡顿 Mod (谁在吃帧率)" or "3s FPS Culprit Scan")
+                UI.prof_btn:SetTextColour(0.76, 0.96, 1.0, 1.0)
+                UI.prof_txt:SetString(zh_now
+                    and "点上方按钮采样3秒，直接点名最吃帧率的 Mod 与函数"
+                    or "Click above to sample 3s and pinpoint laggy Mods & functions")
+            end
         end
         -- QQ group header button (copy feedback flash auto-expires after ~2.5s)
         local fnNow = rawget(G, "GetTimeRealSeconds")
@@ -2453,16 +2989,17 @@ local function CreateLiveCustomizerPanel(hud)
         sw.active = active
         local b = (type(snap.bounds) == "table") and snap.bounds[sw.key] or nil
         if b and b.max > b.min then
+            local tx0 = sw.track_x0 or TRACK_X0
             local span = b.max - b.min
             local frac = (rawv - b.min) / span
             if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
-            local kx = TRACK_X0 + frac * TRACK_W
+            local kx = tx0 + frac * TRACK_W
             sw.knob:SetPosition(kx, sw.ry, 0)
             sw.knob_edge:SetPosition(kx, sw.ry, 0)
             local fw = frac * TRACK_W
             if fw < 0.5 then fw = 0.5 end
             sw.fill:ScaleToSize(fw, 4)
-            sw.fill:SetPosition(TRACK_X0 + fw * 0.5, sw.ry, 0)
+            sw.fill:SetPosition(tx0 + fw * 0.5, sw.ry, 0)
             if active then
                 sw.fill:SetTint(0.20, 0.72, 0.64, 0.95)
             else
@@ -2470,7 +3007,7 @@ local function CreateLiveCustomizerPanel(hud)
             end
             local dfrac = ((b.default or b.min) - b.min) / span
             if dfrac < 0 then dfrac = 0 elseif dfrac > 1 then dfrac = 1 end
-            sw.tick:SetPosition(TRACK_X0 + dfrac * TRACK_W, sw.ry, 0)
+            sw.tick:SetPosition(tx0 + dfrac * TRACK_W, sw.ry, 0)
             sw.tick:SetTint(0.95, 0.74, 0.36, active and 0.80 or 0.40)
             local changed = math.abs(rawv - (b.default or rawv)) > 1e-4
             sw.mark:SetTint(0.95, 0.74, 0.36, changed and 0.95 or 0.0)
@@ -2496,7 +3033,7 @@ local function CreateLiveCustomizerPanel(hud)
         UI.zh_now = zh_now
         if type(snap.bounds) == "table" then UI.bounds = snap.bounds end
 
-        UI.subtitle:SetString(zh_now and "超帧与视觉引擎 v2.9.5（原HS）" or "240FPS & Visual Engine v2.9.5")
+        UI.subtitle:SetString(zh_now and "超帧与硬件解放引擎 v3.0" or "240FPS & Hardware Engine v3.0")
         share_open_btn:SetText(zh_now and "分享 / 导入方案码" or "Share / Import")
         home_reset_btn:SetText(zh_now and "恢复原版纯净" or "Restore Vanilla")
         home_pro_btn:SetText(zh_now and "专业调参 >>" or "Pro Tuning >>")
@@ -2568,10 +3105,16 @@ local function CreateLiveCustomizerPanel(hud)
             if active_tab == tb.id then
                 tb.bg:SetTint(0.24, 0.36, 0.48, 0.96)
                 tb.btn:SetTextColour(0.98, 0.96, 0.78, 1.0)
+                if tb.bar then tb.bar:SetTint(0.95, 0.74, 0.36, 0.95) end
             else
                 tb.bg:SetTint(0.12, 0.13, 0.17, 0.86)
                 tb.btn:SetTextColour(0.72, 0.76, 0.82, 0.92)
+                if tb.bar then tb.bar:SetTint(0.95, 0.74, 0.36, 0.0) end
             end
+        end
+
+        for i = 1, #UI.slot_lbls do
+            UI.slot_lbls[i]:SetString(zh_now and "我的方案" or "My Looks")
         end
 
         for i = 1, #slot_widgets do
@@ -2724,6 +3267,7 @@ local function CreateLiveCustomizerPanel(hud)
     ApplyMode()
 
     panel_refresh_fn = RefreshStates
+    panel_release_focus_fn = UI.ReleaseTextFocus
     panel_telemetry_fn = RefreshTelemetry
     RefreshStates()
     return root
@@ -2757,6 +3301,7 @@ function HS_TogglePanel(force_state)
         panel_root:Show()
         panel_root:MoveToFront()
     else
+        if panel_release_focus_fn then pcall(panel_release_focus_fn) end
         panel_root:Hide()
     end
     return panel_visible

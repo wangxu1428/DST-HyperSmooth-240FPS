@@ -625,29 +625,32 @@ void main()
 \t\ts0 *= (0.7 + 0.6 * (4.0 * Ye * (1.0 - Ye)));
 \t\ts0 *= (0.75 + 0.25 * cpg);
 
-\t\tfloat raw = det * (bcas_str * 0.85) * nm * cpg;
-\t\tfloat y0 = Ye + Slt(max(0.0, raw), s0 * 0.22) + Slt(min(0.0, raw), s0);
+\t\tfloat raw = det * (bcas_str * 1.15) * nm * cpg;
+\t\tfloat y0 = Ye + Slt(max(0.0, raw), s0 * 0.72) + Slt(min(0.0, raw), s0 * 1.10);
 \t\tfloat th = max(1e-6, 0.01 * dark_prot);
 \t\tfloat y1 = mix(Ye, y0, clamp((y0 - th) / max(0.04, th), 0.0, 1.0));
 
+\t\tfloat mn5 = min(Ye, min(min(nbrY.x, nbrY.y), min(nbrY.z, nbrY.w)));
+\t\tfloat mx5 = max(Ye, max(max(nbrY.x, nbrY.y), max(nbrY.z, nbrY.w)));
 \t\tfloat Ysharp = y1;
 \t\tif (anti_ring > 0.001) {
-\t\t\tfloat mn5 = min(Ye, min(min(nbrY.x, nbrY.y), min(nbrY.z, nbrY.w)));
-\t\t\tfloat mx5 = max(Ye, max(max(nbrY.x, nbrY.y), max(nbrY.z, nbrY.w)));
-\t\t\tfloat md  = max(min(mx5 - Ye, Ye - mn5), 1e-6);
-\t\t\tfloat sd  = y1 - Ye;
-\t\t\tfloat ar_gate = smoothstep(ar_thresh, ar_thresh + 0.008, mx5 - mn5);
-\t\t\tfloat clamped = Ye + Slt(max(0.0, sd), md + ar_l_over + 0.00045) + Slt(min(0.0, sd), max(Ye - mn5, 0.05) + ar_d_over + 0.004);
-\t\t\tclamped = min(clamped, mx5 + ar_l_over);
+\t\t\tfloat localSpan = mx5 - mn5;
+\t\t\tfloat sd = y1 - Ye;
+\t\t\tfloat ar_gate = smoothstep(ar_thresh, ar_thresh + 0.008, localSpan);
+\t\t\tfloat brightLim = max(mx5 - Ye, localSpan * 0.24) + ar_l_over + 0.012;
+\t\t\tfloat darkLim   = max(Ye - mn5, max(localSpan * 0.35, 0.05)) + ar_d_over + 0.018;
+\t\t\tfloat clamped = Ye + Slt(max(0.0, sd), brightLim) + Slt(min(0.0, sd), darkLim);
+\t\t\tclamped = min(clamped, mx5 + ar_l_over + min(localSpan * 0.22, 0.065));
 \t\t\tYsharp = mix(y1, clamped, anti_ring * ar_gate);
 \t\t}
 
 \t\tYsharp += inkDeepen * nm * cpg;
-\t\tYsharp = clamp(min(Ysharp, Ye + 0.004 + ar_l_over), 0.0, 1.0);
+\t\tfloat posCap = min(mx5 + ar_l_over + 0.075, Ye + 0.085 * clamp(bcas_str, 0.0, 1.5) + ar_l_over + 0.015);
+\t\tYsharp = clamp(min(Ysharp, posCap), 0.0, 1.0);
 
 \t\tfloat sc = 1.0;
 \t\tif (Ye > 1e-6) {
-\t\t\tsc = mix(1.0, clamp(Ysharp / Ye, 0.82, 1.0), smoothstep(0.0, 0.1, Ye));
+\t\t\tsc = mix(1.0, clamp(Ysharp / Ye, 0.82, 1.18), smoothstep(0.0, 0.1, Ye));
 \t\t}
 \t\tfloat tmp = Ysharp - 0.5 * sc * Cge;
 \t\tcolor = vec3(tmp + 0.5 * sc * Coe, sc * Cge + tmp, tmp - 0.5 * sc * Coe);

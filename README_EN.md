@@ -53,8 +53,8 @@
 ## Player Installation & Controls
 
 1. **Install Client Mod**: Subscribe to **DST HyperShade — 240FPS & Visual Engine (formerly HyperSmooth)** on Steam Workshop (or copy `mods/dst_smooth_highfps/` from the release zip into `<DST>/mods/dst_smooth_highfps/`).
-2. **Install / Update `bin64/dinput8.dll`** *(Workshop updates never update `bin64/dinput8.dll`)*:
-   - **Recommended**: Extract `DST_HyperShade_v2.9.5_Release.zip`, close DST, and run **`一键安装与更新.bat`** (`[1]` Install/Update with SHA-256 verification, `[2]` 1-click Restore Vanilla).
+2. **Install / Update `bin64/dinput8.dll`** *(Workshop updates never update `bin64/dinput8.dll`; DNH companion `dnh_github` auto-update is also supported)*:
+   - **Recommended**: Extract `DST_HyperShade_v2.9.7-beta1_Release.zip`, close DST, and run **`一键安装与更新.bat`** (`[1]` Install/Update with SHA-256 verification, `[2]` 1-click Restore Vanilla).
    - **Manual**: Copy `bin64/dinput8.dll` into `<Don't Starve Together>/bin64/` alongside `dontstarve_steam_x64.exe`.
 3. **In-Game Controls**:
    - `c_hsmenu()` (or bind any hotkey/mouse button in `ESC -> Settings -> Controls`) to open the live Visual & Lighting Studio (Simple / Pro / Preset Gallery).
@@ -64,8 +64,8 @@
 
 ## Safety & Open-Source Build
 
-- Lockless passthrough of all 6 `System32\dinput8.dll` exports; process-gated strictly to `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe`; W^X `PAGE_EXECUTE_READ` trampolines, 58/58 fail-closed AOBs, and null-string `glShaderSource` driver crash protection.
-- Build from source with Zig (`x86_64-windows-gnu`, `-std=c++20 -O3`) via `tools/build_native.ps1`, rebuild Klei `.ksh` shaders via `tools/build_shaders.py`, and run full verification with `tools/test_redteam_client.py` + `tools/test_redteam_client.exe` (29/29) + `tools/test_world_shadow_gpu.exe` (Native GL + ANGLE D3D9) + `tools/test_client_lua_v24.py` (30/30 real DST Lua 5.1 VM tests, including 3,141-widget monkey test with 0 errors).
+- Lockless passthrough of all 6 `System32\dinput8.dll` exports; process-gated strictly to `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe`; W^X `PAGE_EXECUTE_READ` trampolines, 61/61 fail-closed AOBs, and null-string `glShaderSource` driver crash protection.
+- Build from source with Zig (`x86_64-windows-gnu`, `-std=c++20 -O3`) via `tools/build_native.ps1`, rebuild Klei `.ksh` shaders via `tools/build_shaders.py`, and run full verification with `tools/test_redteam_client.py` + `tools/test_redteam_client.exe` (41/41) + `tools/test_world_shadow_gpu.exe` (13/13 Native GL + ANGLE D3D9) + `tools/test_gpu_clarity.exe` (4/4 GPU Compute Clarity) + `tools/test_client_lua_v24.py` (35/35 real DST Lua 5.1 VM tests, including 3,141-widget monkey test with 0 errors).
 
 ---
 
@@ -75,6 +75,10 @@ This repository maintains an explicit three-pillar provenance and licensing reco
 
 - **Technical Sources & Independent Development Trail**: [`docs/PROVENANCE_AND_ARCHITECTURE_EN.md`](docs/PROVENANCE_AND_ARCHITECTURE_EN.md) ([简体中文](docs/PROVENANCE_AND_ARCHITECTURE.md))
   - Maps every native rendering, post-processing, batching, and animation module (`world_shadow_engine.h`, `water_reflection_engine.h`, `blue_noise_64.h`, `sprite_batcher.h`, `ui_batcher.h`, `skeletal_fluid.h`, `build_shaders.py`, etc.) to its peer-reviewed papers, textbooks, public talks, and Khronos/Microsoft specifications, alongside our public Git timeline, Architecture Decision Records (ADRs), and 700 KB+ automated CPU/GPU test suites (zero Lua entity/part cloning for shadows or reflections).
+- **v4.0 Architecture Roadmap & Clean-Room Research Volumes (ZH)**:
+  - [`docs/V4_0_ARCHITECTURE_ROADMAP.md`](docs/V4_0_ARCHITECTURE_ROADMAP.md) — Empirically calibrated v4.0 staged roadmap (Phase 1 persistent-coherent PBO upload ring & dual-thread hitch sampler, Phase 2 driver-sync elimination & SIMD batching, Phase 3+ retained scene mirror, decoupled presentation & next-gen lighting);
+  - [`docs/research/REF_VOL1_FACTORIO_FFF.md`](docs/research/REF_VOL1_FACTORIO_FFF.md) — Research Vol.1: Factorio FFF memory latency, read-only parallel render prep, ghost extrapolation guard bands & toroidal scrolling buffers;
+  - [`docs/research/REF_VOL2_4_SODIUM_FOLIA_POE2.md`](docs/research/REF_VOL2_4_SODIUM_FOLIA_POE2.md) — Research Vol.2–4: Clean-room architectural notes on Sodium/Iris, Folia/Minestom, and Path of Exile 2 Radiance Cascades mapped to DST.
 - **Third-Party Licensing & Asset Provenance Ledger**: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) & [`LICENSE`](LICENSE)
   - Statically linked libraries: `libdeflate v1.23` (MIT), `mimalloc v2.1.7` (MIT);
   - MIT open-source attributions & scope boundaries: `DST-BCAS-Studio` (Copyright 2026 Nanmianyi, MIT License, with automatic runtime coexistence yield via `IsExternalBcasActive()`), `DST-KeyBind-UI` (rtk0c / liolok, MIT License);

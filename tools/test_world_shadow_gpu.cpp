@@ -17,6 +17,8 @@
 #include "async_save_commit.h"
 #include "dxgi_flip_present.h"
 #include "combat_impact.h"
+#include "pbo_tex_ring.h"
+#include "gpu_clarity_engine.h"
 
 static void TestLog(const char* msg) {
     printf("  [LOG] %s\n", msg);
@@ -104,7 +106,7 @@ static bool RunPixelExactSuite(const BackendEnv& env) {
     ops.glGenBuffers(1, &vbo);
     ops.glGenBuffers(1, &ibo);
 
-    auto runCase = [&](float dirX, float dirZ, bool addOverlap, std::vector<uint8_t>& outRgba) -> bool {
+    auto runCase = [&](float dirX, float dirZ, bool addOverlap, std::vector<uint8_t>& outRgba, bool useDeferred = false) -> bool {
         auto vCopy = verts;
         auto iCopy = idxs;
         if (addOverlap) {
@@ -163,25 +165,49 @@ static bool RunPixelExactSuite(const BackendEnv& env) {
             printf("  [FAIL] Frame 1 OnBeforeFirstStandingEntity failed!\n");
             return false;
         }
-        ops.glBindBuffer(hs_world_shadow::kGlArrayBuffer, vbo);
-        ops.glBindBuffer(hs_world_shadow::kGlElementArrayBuffer, ibo);
-        ops.glEnableVertexAttribArray(0);
-        ops.glVertexAttribPointer(0, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
-                                  reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, x)));
-        ops.glEnableVertexAttribArray(7);
-        ops.glVertexAttribPointer(7, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
-                                  reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, wx)));
-        ops.glEnableVertexAttribArray(5);
-        ops.glVertexAttribPointer(5, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
-                                  reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, mr)));
-        ops.glEnableVertexAttribArray(6);
-        ops.glVertexAttribPointer(6, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
-                                  reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, ar)));
-        eng.MirrorBatchedSprites(static_cast<uint32_t>(iCopy.size()), cfg, saved, glCache);
-        ops.glDisableVertexAttribArray(5);
-        ops.glDisableVertexAttribArray(6);
-        ops.glDisableVertexAttribArray(7);
+        if (useDeferred) {
+            // Split into 2 deferred batches (with non-zero indexByteOffset!) and replay in 1 single FBO bind!
+            const uint32_t texArr[1] = { spriteTex };
+            const uint32_t firstCnt  = static_cast<uint32_t>(idxs.size());
+            const uint32_t secondCnt = static_cast<uint32_t>(iCopy.size()) - firstCnt;
+            if (!eng.RecordBatchedShadow(vbo, ibo, firstCnt, 0u, 0u, 1u, texArr, nullptr, primaryFbo)) {
+                printf("  [FAIL] Deferred RecordBatchedShadow #1 failed!\n");
+                return false;
+            }
+            if (secondCnt > 0u) {
+                if (!eng.RecordBatchedShadow(vbo, ibo, secondCnt, 0u,
+                                             static_cast<uintptr_t>(firstCnt) * sizeof(uint16_t),
+                                             1u, texArr, nullptr, primaryFbo)) {
+                    printf("  [FAIL] Deferred RecordBatchedShadow #2 failed!\n");
+                    return false;
+                }
+            }
+            eng.FlushDeferredBatchedShadows(cfg, saved, glCache);
+        } else {
+            ops.glBindBuffer(hs_world_shadow::kGlArrayBuffer, vbo);
+            ops.glBindBuffer(hs_world_shadow::kGlElementArrayBuffer, ibo);
+            ops.glEnableVertexAttribArray(0);
+            ops.glVertexAttribPointer(0, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, x)));
+            ops.glEnableVertexAttribArray(7);
+            ops.glVertexAttribPointer(7, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, wx)));
+            ops.glEnableVertexAttribArray(5);
+            ops.glVertexAttribPointer(5, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, mr)));
+            ops.glEnableVertexAttribArray(6);
+            ops.glVertexAttribPointer(6, 4, hs_world_shadow::kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, ar)));
+            eng.MirrorBatchedSprites(static_cast<uint32_t>(iCopy.size()), cfg, saved, glCache);
+            ops.glDisableVertexAttribArray(5);
+            ops.glDisableVertexAttribArray(6);
+            ops.glDisableVertexAttribArray(7);
+        }
         eng.OnEndFrame();
+        if (useDeferred && eng.LastFrameDeferredBatches() != 2u) {
+            printf("  [FAIL] Deferred replay batch count mismatch: got=%u exp=2\n", eng.LastFrameDeferredBatches());
+            return false;
+        }
         if (!checkNoErr("Frame 1")) return false;
 
         // Frame 2: Clear PrimaryRT to turf green (0.4, 0.7, 0.3, 0.8), composite shadow quad onto PrimaryRT!
@@ -227,6 +253,18 @@ static bool RunPixelExactSuite(const BackendEnv& env) {
     if (!runCase(0.0f, 1.0f, false, imgFront1)) return false;
     if (!runCase(0.0f, 1.0f, true, imgFront4)) return false;
     if (!runCase(1.0f, 0.0f, false, imgSide1)) return false;
+    if (env.isNativeGl) {
+        std::vector<uint8_t> imgFront4Def;
+        if (!runCase(0.0f, 1.0f, true, imgFront4Def, true)) return false;
+        int maxDiff = 0;
+        for (size_t i = 0; i < imgFront4.size(); ++i) {
+            int d = abs(static_cast<int>(imgFront4[i]) - static_cast<int>(imgFront4Def[i]));
+            if (d > maxDiff) maxDiff = d;
+        }
+        printf("  Deferred Shadow Replay (2 batches -> 1 FBO bind): maxPixelDiff=%d -> %s\n",
+               maxDiff, maxDiff == 0 ? "BIT_EXACT_PASS" : "DIFF_FAIL");
+        if (maxDiff != 0) return false;
+    }
 
     int pxF1 = 0, minGF1 = 0, ogF1 = 0; bool aF1 = false;
     int pxF4 = 0, minGF4 = 0, ogF4 = 0; bool aF4 = false;
@@ -3270,6 +3308,3885 @@ static bool TestDxgiFlipLiveGpu() {
            (err1 == 0u) && quadOk && resizeAllOk && benchOk && (errEnd == 0u);
 }
 
+static bool TestSpriteBatchAzdoLiveGpu() {
+    printf("\n=== Live RTX GPU Test: SpriteBatcher AZDO Persistent-Coherent Ring (GL_ARB_buffer_storage + glFenceSync) ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported) {
+        printf("  [SKIP] Native GL not supported on host GPU\n");
+        return true;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_AZDO_TEST", WS_POPUP, 0, 0, 128, 128, nullptr, nullptr, nullptr, nullptr);
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hwnd || !hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hwnd) DestroyWindow(hwnd);
+        printf("  [FAIL] Could not create Desktop OpenGL 4.6 context\n");
+        return false;
+    }
+
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    hs_native_gl::ResolveLiveGlesTable(rt, procs, opt);
+    auto findP = [&](const char* name) -> void* {
+        for (size_t i = 0; i < 76; ++i) {
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+        }
+        return nullptr;
+    };
+
+    static constexpr const char* kAnimVs =
+        "#ifdef SKINNED\n"
+        "\tuniform mat4 pv;\n"
+        "#else\n"
+        "\tuniform mat4 MatrixP;\n"
+        "\tuniform mat4 MatrixV;\n"
+        "\tuniform mat4 MatrixW;\n"
+        "#endif\n"
+        "uniform vec4 TIMEPARAMS;\n"
+        "uniform vec3 FLOAT_PARAMS;\n"
+        "attribute vec4 POS2D_UV;\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "varying vec3 PS_POS;\n"
+        "void main() {\n"
+        "#ifdef SKINNED\n"
+        "\tvec4 world_pos = vec4(0.0);\n"
+        "\tvec3 TEXCOORD0 = vec3(0.0);\n"
+        "#else\n"
+        "\tvec3 POSITION = vec3(POS2D_UV.xy, 0);\n"
+        "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+        "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+        "\tvec3 object_pos = POSITION.xyz;\n"
+        "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+        "\tif(FLOAT_PARAMS.z > 0.0) { world_pos.y += sin(MatrixW[3][0] + MatrixW[3][2] + TIMEPARAMS.x * 3.0) * 0.025; }\n"
+        "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+        "\tgl_Position = mtxPV * world_pos;\n"
+        "#endif\n"
+        "\tPS_TEXCOORD = TEXCOORD0;\n"
+        "\tPS_POS = world_pos.xyz;\n"
+        "}\n";
+    static constexpr const char* kAnimPs =
+        "#if defined( GL_ES )\n"
+        "precision mediump float;\n"
+        "#endif\n"
+        "uniform mat4 MatrixW;\n"
+        "uniform sampler2D SAMPLER[6];\n"
+        "varying vec3 PS_POS;\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+        "uniform mat4 COLOUR_XFORM;\n"
+        "uniform vec3 PARAMS;\n"
+        "uniform vec3 FLOAT_PARAMS;\n"
+        "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+        "uniform vec4 OCEAN_WORLD_EXTENTS;\n"
+        "#define ALPHA_TEST PARAMS.x\n"
+        "#define LIGHT_OVERRIDE PARAMS.y\n"
+        "#define BLOOM_TOGGLE PARAMS.z\n"
+        "#define OCEAN_SAMPLER SAMPLER[4]\n"
+        "vec3 CalculateLightingContribution() { return texture2D(SAMPLER[3], (PS_POS.xz - LIGHTMAP_WORLD_EXTENTS.xy) * LIGHTMAP_WORLD_EXTENTS.zw).rgb; }\n"
+        "void main() {\n"
+        "    vec4 colour;\n"
+        "#if defined( TRIPLE_ATLAS )\n"
+        "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+        "    else if( PS_TEXCOORD.z < 1.5 ) { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+        "    else { colour.rgba = texture2D( SAMPLER[5], PS_TEXCOORD.xy ); }\n"
+        "#else\n"
+        "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+        "    else { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+        "#endif\n"
+        "    if (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+        "    if(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+        "    gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+        "    vec2 world_uv = ( PS_POS.xz - OCEAN_WORLD_EXTENTS.xy ) * OCEAN_WORLD_EXTENTS.zw;\n"
+        "    vec3 world_tint = texture2D( OCEAN_SAMPLER, world_uv ).rgb;\n"
+        "    gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * world_tint.rgb, OCEAN_BLEND_PARAMS.x);\n"
+        "    vec3 light = CalculateLightingContribution();\n"
+        "    gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+        "}\n";
+
+    std::string vsOut, psOut;
+    const char* tag = nullptr;
+    bool txOk = hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, vsOut, tag) &&
+                hs_sprite_batch::TransformAnimBatchShaderSource(kAnimPs, psOut, tag, true);
+
+    auto pCreateSh   = reinterpret_cast<uint32_t (WINAPI*)(uint32_t)>(findP("glCreateShader"));
+    auto pShSrc      = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*)>(findP("glShaderSource"));
+    auto pCompSh     = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glCompileShader"));
+    auto pGetShIv    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t*)>(findP("glGetShaderiv"));
+    auto pGetShLog   = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t*, char*)>(findP("glGetShaderInfoLog"));
+    auto pCreatePr   = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glCreateProgram"));
+    auto pAttachSh   = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t)>(findP("glAttachShader"));
+    auto pLinkPr     = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glLinkProgram"));
+    auto pGetPrIv    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t*)>(findP("glGetProgramiv"));
+    auto pGetPrLog   = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t*, char*)>(findP("glGetProgramInfoLog"));
+    auto pDelSh      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glDeleteShader"));
+    auto pDelPr      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glDeleteProgram"));
+    auto pUsePr      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glUseProgram"));
+    auto pGetUni     = reinterpret_cast<int32_t (WINAPI*)(uint32_t, const char*)>(findP("glGetUniformLocation"));
+    auto pGetAtt     = reinterpret_cast<int32_t (WINAPI*)(uint32_t, const char*)>(findP("glGetAttribLocation"));
+    auto pUniMat4    = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, uint8_t, const float*)>(findP("glUniformMatrix4fv"));
+    auto pUni1iv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const int32_t*)>(findP("glUniform1iv"));
+    auto pUni3fv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const float*)>(findP("glUniform3fv"));
+    auto pUni4fv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const float*)>(findP("glUniform4fv"));
+    auto pGenTex     = reinterpret_cast<void (WINAPI*)(int32_t, uint32_t*)>(findP("glGenTextures"));
+    auto pDelTex     = reinterpret_cast<void (WINAPI*)(int32_t, const uint32_t*)>(findP("glDeleteTextures"));
+    auto pTexImg     = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*)>(findP("glTexImage2D"));
+    auto pTexPar     = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t)>(findP("glTexParameteri"));
+    auto pGenFbo     = reinterpret_cast<void (WINAPI*)(int32_t, uint32_t*)>(findP("glGenFramebuffers"));
+    auto pDelFbo     = reinterpret_cast<void (WINAPI*)(int32_t, const uint32_t*)>(findP("glDeleteFramebuffers"));
+    auto pBindFbo    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t)>(findP("glBindFramebuffer"));
+    auto pFboTex     = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t)>(findP("glFramebufferTexture2D"));
+    auto pVp         = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, int32_t, int32_t)>(findP("glViewport"));
+    auto pClrCol     = reinterpret_cast<void (WINAPI*)(float, float, float, float)>(findP("glClearColor"));
+    auto pClr        = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glClear"));
+    auto pReadPix    = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*)>(findP("glReadPixels"));
+    auto pFinish     = reinterpret_cast<void (WINAPI*)()>(findP("glFinish"));
+    auto pGetErr     = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glGetError"));
+
+    uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+    const char* vsP = vsOut.c_str(); int32_t vsL = static_cast<int32_t>(vsOut.size());
+    const char* fsP = psOut.c_str(); int32_t fsL = static_cast<int32_t>(psOut.size());
+    pShSrc(vs, 1, &vsP, &vsL); pCompSh(vs);
+    pShSrc(fs, 1, &fsP, &fsL); pCompSh(fs);
+    int32_t vsOk = 0, fsOk = 0, linkOk = 0;
+    if (pGetShIv) { pGetShIv(vs, 0x8B81u, &vsOk); pGetShIv(fs, 0x8B81u, &fsOk); }
+    auto pBindAtt    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, const char*)>(findP("glBindAttribLocation"));
+    uint32_t progId = pCreatePr();
+    pAttachSh(progId, vs); pAttachSh(progId, fs);
+    if (pBindAtt) pBindAtt(progId, 0u, "POS2D_UV");
+    pLinkPr(progId);
+    if (pGetPrIv) pGetPrIv(progId, 0x8B82u, &linkOk);
+    if (!vsOk || !fsOk || !linkOk) {
+        char logBuf[512]{}; int32_t len = 0;
+        if (!vsOk && pGetShLog) { pGetShLog(vs, 511, &len, logBuf); printf("  AZDO VS log: %s\n", logBuf); }
+        if (!fsOk && pGetShLog) { pGetShLog(fs, 511, &len, logBuf); printf("  AZDO FS log: %s\n", logBuf); }
+        if (!linkOk && pGetPrLog) { pGetPrLog(progId, 511, &len, logBuf); printf("  AZDO Link log: %s\n", logBuf); }
+    }
+    pDelSh(vs); pDelSh(fs);
+
+    hs_sprite_batch::GlBatchOps ops{};
+    ops.glGenBuffers               = reinterpret_cast<hs_sprite_batch::GlBatchOps::GenBuffers_t>(findP("glGenBuffers"));
+    ops.glDeleteBuffers            = reinterpret_cast<hs_sprite_batch::GlBatchOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+    ops.glBindBuffer               = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindBuffer_t>(findP("glBindBuffer"));
+    ops.glBufferData               = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferData_t>(findP("glBufferData"));
+    ops.glBufferSubData            = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferSubData_t>(opt.glBufferSubData);
+    ops.glMapBufferRange           = reinterpret_cast<hs_sprite_batch::GlBatchOps::MapBufferRange_t>(opt.glMapBufferRange);
+    ops.glUnmapBuffer              = reinterpret_cast<hs_sprite_batch::GlBatchOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+    ops.glActiveTexture            = reinterpret_cast<hs_sprite_batch::GlBatchOps::ActiveTexture_t>(findP("glActiveTexture"));
+    ops.glBindTexture              = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindTexture_t>(findP("glBindTexture"));
+    ops.glUniform1f                = reinterpret_cast<hs_sprite_batch::GlBatchOps::Uniform1f_t>(findP("glUniform1f"));
+    ops.glUniform1i                = reinterpret_cast<hs_sprite_batch::GlBatchOps::Uniform1i_t>(findP("glUniform1i"));
+    ops.glUniform3fv               = pUni3fv;
+    ops.glUniform4fv               = pUni4fv;
+    ops.glUniformMatrix4fv         = pUniMat4;
+    ops.glVertexAttribPointer      = reinterpret_cast<hs_sprite_batch::GlBatchOps::VertexAttribPointer_t>(findP("glVertexAttribPointer"));
+    ops.glEnableVertexAttribArray  = reinterpret_cast<hs_sprite_batch::GlBatchOps::EnableVertexAttribArray_t>(findP("glEnableVertexAttribArray"));
+    ops.glDisableVertexAttribArray = reinterpret_cast<hs_sprite_batch::GlBatchOps::DisableVertexAttribArray_t>(findP("glDisableVertexAttribArray"));
+    ops.glDrawElements             = reinterpret_cast<hs_sprite_batch::GlBatchOps::DrawElements_t>(findP("glDrawElements"));
+    ops.glDrawElementsBaseVertex   = reinterpret_cast<hs_sprite_batch::GlBatchOps::DrawElementsBaseVertex_t>(opt.glDrawElementsBaseVertex);
+    ops.glGetIntegerv              = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetIntegerv_t>(findP("glGetIntegerv"));
+    ops.glGetBufferParameteriv     = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetBufferParameteriv_t>(opt.glGetBufferParameteriv);
+    ops.glGetBufferSubData         = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetBufferSubData_t>(opt.glGetBufferSubData);
+    ops.glBufferStorage            = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferStorage_t>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+    ops.glFenceSync                = reinterpret_cast<hs_sprite_batch::GlBatchOps::FenceSync_t>(opt.glFenceSync);
+    ops.glClientWaitSync           = reinterpret_cast<hs_sprite_batch::GlBatchOps::ClientWaitSync_t>(opt.glClientWaitSync);
+    ops.glDeleteSync               = reinterpret_cast<hs_sprite_batch::GlBatchOps::DeleteSync_t>(opt.glDeleteSync);
+
+    uint32_t fbo = 0, fboTex = 0, texSprite = 0, texLight = 0;
+    pGenFbo(1, &fbo); pGenTex(1, &fboTex); pGenTex(1, &texSprite); pGenTex(1, &texLight);
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, fboTex);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 64, 64, 0, 0x1908u, 0x1401u, nullptr);
+    pBindFbo(0x8D40u, fbo);
+    pFboTex(0x8D40u, 0x8CE0u, hs_sprite_batch::kGlTexture2D, fboTex, 0);
+    pVp(0, 0, 64, 64);
+
+    const uint8_t whitePx[4] = { 255,255,255,255 };
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0 + 3u);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, texLight);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 1, 1, 0, 0x1908u, 0x1401u, whitePx);
+
+    const uint8_t orange[16] = { 255,140,20,255, 255,140,20,255, 255,140,20,255, 255,140,20,255 };
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, texSprite);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 2, 2, 0, 0x1908u, 0x1401u, orange);
+
+    pUsePr(progId);
+    const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    const int32_t sampUnits[6] = { 0, 1, 2, 3, 4, 5 };
+    const float paramsV[3] = { 0.0f, 1.0f, 0.0f };
+    const float extV[4]    = { 0.0f, 0.0f, 1.0f, 1.0f };
+    if (pUni1iv && pGetUni(progId, "SAMPLER") >= 0) pUni1iv(pGetUni(progId, "SAMPLER"), 6, sampUnits);
+    if (pUni3fv && pGetUni(progId, "PARAMS") >= 0) pUni3fv(pGetUni(progId, "PARAMS"), 1, paramsV);
+    if (pUni4fv && pGetUni(progId, "LIGHTMAP_WORLD_EXTENTS") >= 0) pUni4fv(pGetUni(progId, "LIGHTMAP_WORLD_EXTENTS"), 1, extV);
+    pUniMat4(pGetUni(progId, "MatrixP"), 1, 0, idMtx);
+    pUniMat4(pGetUni(progId, "MatrixV"), 1, 0, idMtx);
+    pUniMat4(pGetUni(progId, "COLOUR_XFORM"), 1, 0, idMtx);
+
+    hs_sprite_batch::BatchProgInfo info{};
+    info.checked        = true;
+    info.eligible       = true;
+    info.locBatchActive = pGetUni(progId, "HS_BATCH_ACTIVE");
+    info.locMatrixW     = pGetUni(progId, "MatrixW");
+    info.locColourXform = pGetUni(progId, "COLOUR_XFORM");
+    info.locFloatParams = pGetUni(progId, "FLOAT_PARAMS");
+    info.locPos2dUv     = pGetAtt(progId, "POS2D_UV");
+    info.locBatchWpos   = pGetAtt(progId, "HS_BATCH_WPOS");
+    info.locBatchCMult  = pGetAtt(progId, "HS_BATCH_CMULT");
+    info.locBatchCAdd   = pGetAtt(progId, "HS_BATCH_CADD");
+    info.progMaxTexSlots = 16u;
+    for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+        char nm[32]{};
+        snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+        info.locBatchTex[s] = pGetUni(progId, nm);
+    }
+
+    const float qv[16] = { -0.5f,-0.5f,0,0,  0.5f,-0.5f,1,0,  0.5f,0.5f,1,1,  -0.5f,0.5f,0,1 };
+    const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+
+    hs_sprite_batch::SpriteBatcher sb;
+    sb.SetOps(ops);
+    sb.SetPersistentRingPreferred(true);
+    sb.SetShadowCacheMaxBytes(256u * 1024u * 1024u);
+    sb.SetEnabled(true);
+    sb.OnUseProgram(progId, &info);
+    ops.glEnableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv));
+    sb.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv), true);
+    sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+    sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, texSprite);
+    sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+    sb.OnVertexAttribPointer(static_cast<uint32_t>(info.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+    sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+    // Run 20 consecutive flushes (> 2.5x kRingSlots=8) exercising glFenceSync + wait wraparound!
+    pClrCol(0, 0, 0, 1);
+    pClr(0x4000u);
+    bool batchAcc = false;
+    uint32_t rejCode = 0;
+    for (int f = 0; f < 20; ++f) {
+        sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+        sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+        if (sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi)) {
+            batchAcc = true;
+        } else if (rejCode == 0) {
+            rejCode = sb.LastRejectCode();
+        }
+        sb.Flush(hs_sprite_batch::FlushReason::End);
+    }
+    pFinish();
+    const bool azdoWasActive = sb.IsPersistentRingActive();
+    uint8_t px[4]{};
+    pReadPix(32, 32, 1, 1, 0x1908u, 0x1401u, px);
+    const uint32_t err1 = pGetErr();
+    const bool pixelOk = (px[0] > 230 && px[1] > 120 && px[1] < 170 && px[2] < 40 && px[3] == 255);
+
+    // Sticky AZDO BaseVertex live GPU verification (2 consecutive flushes, read flush #2 with basevertex != 0)
+    sb.SetDeferHostRestore(true);
+    sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+    sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+    sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+    sb.Flush(hs_sprite_batch::FlushReason::State);
+    pClrCol(0, 0, 0, 1);
+    pClr(0x4000u);
+    sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+    sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+    sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+    sb.Flush(hs_sprite_batch::FlushReason::State);
+    const bool stickyActiveOk = sb.IsStickySessionActive();
+    sb.EndStickyBatchSession();
+    const bool stickyEndedOk = !sb.IsStickySessionActive();
+    pFinish();
+    uint8_t stickyPx[4]{};
+    pReadPix(32, 32, 1, 1, 0x1908u, 0x1401u, stickyPx);
+    const uint32_t errSticky = pGetErr();
+    const bool stickyPixelOk = (stickyPx[0] > 230 && stickyPx[1] > 120 && stickyPx[1] < 170 && stickyPx[2] < 40 && stickyPx[3] == 255);
+    sb.SetDeferHostRestore(false);
+
+    // Switch dynamically to Low-tier (SetPersistentRingPreferred(false)) -> tears down AZDO ring cleanly!
+    sb.SetPersistentRingPreferred(false);
+    sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+    sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+    sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+    sb.Flush(hs_sprite_batch::FlushReason::End);
+    pFinish();
+    const bool fallbackInactive = !sb.IsPersistentRingActive();
+    sb.ReleaseGpuResources();
+    const uint32_t err2 = pGetErr();
+
+    // ANGLE fallback check when glBufferStorage == nullptr
+    auto angleOps = ops;
+    angleOps.glBufferStorage = nullptr;
+    hs_sprite_batch::SpriteBatcher sbAngle;
+    sbAngle.SetOps(angleOps);
+    sbAngle.SetPersistentRingPreferred(true);
+    sbAngle.SetEnabled(true);
+    sbAngle.OnUseProgram(progId, &info);
+    sbAngle.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv), true);
+    sbAngle.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+    sbAngle.OnBindTexture(hs_sprite_batch::kGlTexture2D, texSprite);
+    sbAngle.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+    sbAngle.OnVertexAttribPointer(static_cast<uint32_t>(info.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+    sbAngle.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+    sbAngle.TryAbsorbMatrixW(info.locMatrixW, 1, 0, idMtx);
+    sbAngle.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+    sbAngle.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+    sbAngle.Flush(hs_sprite_batch::FlushReason::End);
+    pFinish();
+    const bool angleFallbackOk = !sbAngle.IsPersistentRingActive();
+    sbAngle.ReleaseGpuResources();
+
+    pBindFbo(0x8D40u, 0u);
+    pDelFbo(1, &fbo);
+    pDelTex(1, &fboTex);
+    pDelTex(1, &texSprite);
+    pDelTex(1, &texLight);
+    pDelPr(progId);
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+
+    const bool ok = txOk && vsOk && fsOk && linkOk && batchAcc && azdoWasActive && pixelOk && (err1 == 0u) &&
+                    stickyActiveOk && stickyEndedOk && stickyPixelOk && (errSticky == 0u) &&
+                    fallbackInactive && (err2 == 0u) && angleFallbackOk;
+    printf("  AZDO Persistent-Coherent Ring (GL4.6): tx=%d sh=%d/%d/%d acc=%d(rej=%u) locs(act=%d mw=%d pos=%d wp=%d t0=%d) procs(bs=%d fs=%d cws=%d map=%d bv=%d) active=%d px=(%u,%u,%u,%u) sticky=(%d/%d px=%u,%u,%u,%u err=0x%X) err=(0x%X,0x%X) tierOffFallback=%d angleFallback=%d -> %s\n",
+           txOk ? 1 : 0, vsOk, fsOk, linkOk, batchAcc ? 1 : 0, rejCode,
+           info.locBatchActive, info.locMatrixW, info.locPos2dUv, info.locBatchWpos, info.locBatchTex[0],
+           ops.glBufferStorage ? 1 : 0, ops.glFenceSync ? 1 : 0, ops.glClientWaitSync ? 1 : 0, ops.glMapBufferRange ? 1 : 0,
+           ops.glDrawElementsBaseVertex ? 1 : 0,
+           azdoWasActive ? 1 : 0, px[0], px[1], px[2], px[3],
+           stickyActiveOk ? 1 : 0, stickyEndedOk ? 1 : 0, stickyPx[0], stickyPx[1], stickyPx[2], stickyPx[3], errSticky,
+           err1, err2, fallbackInactive ? 1 : 0, angleFallbackOk ? 1 : 0, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool TestGpuDrivenBindlessAndShadowParityLiveGpu() {
+    printf("\n=== Live RTX GPU Test: GPU-Driven Bindless+SSBO (32 Tex -> 1 Flush) & Deferred Shadow Parity ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported) {
+        printf("  [SKIP] Native GL not supported on host GPU\n");
+        return true;
+    }
+
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_GPUDRV_TEST", WS_POPUP, 0, 0, 256, 256, nullptr, nullptr, nullptr, nullptr);
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hwnd || !hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hwnd) DestroyWindow(hwnd);
+        printf("  [FAIL] Could not create Desktop OpenGL 4.6 context\n");
+        return false;
+    }
+
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    hs_native_gl::ResolveLiveGlesTable(rt, procs, opt);
+    auto findP = [&](const char* name) -> void* {
+        for (size_t i = 0; i < 76; ++i) {
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, name) == 0) return procs[i];
+        }
+        return nullptr;
+    };
+    if (!opt.glBindBufferBase || !opt.glGetTextureHandleARB || !opt.glMakeTextureHandleResidentARB ||
+        !opt.glMakeTextureHandleNonResidentARB || !opt.glDrawElementsBaseVertex ||
+        !(opt.glBufferStorage || opt.glBufferStorageExt)) {
+        printf("  [FAIL] Missing Bindless/SSBO/BufferStorage/BaseVertex procs on host GPU\n");
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    static constexpr const char* kAnimVs =
+        "#ifdef SKINNED\n"
+        "\tuniform mat4 pv;\n"
+        "#else\n"
+        "\tuniform mat4 MatrixP;\n"
+        "\tuniform mat4 MatrixV;\n"
+        "\tuniform mat4 MatrixW;\n"
+        "#endif\n"
+        "uniform vec4 TIMEPARAMS;\n"
+        "uniform vec3 FLOAT_PARAMS;\n"
+        "attribute vec4 POS2D_UV;\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "varying vec3 PS_POS;\n"
+        "void main() {\n"
+        "#ifdef SKINNED\n"
+        "\tvec4 world_pos = vec4(0.0);\n"
+        "\tvec3 TEXCOORD0 = vec3(0.0);\n"
+        "#else\n"
+        "\tvec3 POSITION = vec3(POS2D_UV.xy, 0);\n"
+        "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+        "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+        "\tvec3 object_pos = POSITION.xyz;\n"
+        "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+        "\tif(FLOAT_PARAMS.z > 0.0) { world_pos.y += sin(MatrixW[3][0] + MatrixW[3][2] + TIMEPARAMS.x * 3.0) * 0.025; }\n"
+        "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+        "\tgl_Position = mtxPV * world_pos;\n"
+        "#endif\n"
+        "\tPS_TEXCOORD = TEXCOORD0;\n"
+        "\tPS_POS = world_pos.xyz;\n"
+        "}\n";
+    static constexpr const char* kAnimPs =
+        "#if defined( GL_ES )\n"
+        "precision mediump float;\n"
+        "#endif\n"
+        "uniform mat4 MatrixW;\n"
+        "uniform sampler2D SAMPLER[6];\n"
+        "varying vec3 PS_POS;\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+        "uniform mat4 COLOUR_XFORM;\n"
+        "uniform vec3 PARAMS;\n"
+        "uniform vec3 FLOAT_PARAMS;\n"
+        "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+        "uniform vec4 OCEAN_WORLD_EXTENTS;\n"
+        "#define ALPHA_TEST PARAMS.x\n"
+        "#define LIGHT_OVERRIDE PARAMS.y\n"
+        "#define BLOOM_TOGGLE PARAMS.z\n"
+        "#define OCEAN_SAMPLER SAMPLER[4]\n"
+        "vec3 CalculateLightingContribution() { return texture2D(SAMPLER[3], (PS_POS.xz - LIGHTMAP_WORLD_EXTENTS.xy) * LIGHTMAP_WORLD_EXTENTS.zw).rgb; }\n"
+        "void main() {\n"
+        "    vec4 colour;\n"
+        "#if defined( TRIPLE_ATLAS )\n"
+        "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+        "    else if( PS_TEXCOORD.z < 1.5 ) { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+        "    else { colour.rgba = texture2D( SAMPLER[5], PS_TEXCOORD.xy ); }\n"
+        "#else\n"
+        "    if( PS_TEXCOORD.z < 0.5 ) { colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy ); }\n"
+        "    else { colour.rgba = texture2D( SAMPLER[1], PS_TEXCOORD.xy ); }\n"
+        "#endif\n"
+        "    if (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+        "    if(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+        "    gl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+        "    vec2 world_uv = ( PS_POS.xz - OCEAN_WORLD_EXTENTS.xy ) * OCEAN_WORLD_EXTENTS.zw;\n"
+        "    vec3 world_tint = texture2D( OCEAN_SAMPLER, world_uv ).rgb;\n"
+        "    gl_FragColor.rgb = mix(gl_FragColor.rgb, gl_FragColor.rgb * world_tint.rgb, OCEAN_BLEND_PARAMS.x);\n"
+        "    vec3 light = CalculateLightingContribution();\n"
+        "    gl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+        "}\n";
+
+    std::string vsOut, psOut;
+    const char* tag = nullptr;
+    const bool txOk = hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, vsOut, tag, true, true) &&
+                      hs_sprite_batch::TransformAnimBatchShaderSource(kAnimPs, psOut, tag, true, true);
+
+    auto pCreateSh   = reinterpret_cast<uint32_t (WINAPI*)(uint32_t)>(findP("glCreateShader"));
+    auto pShSrc      = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*)>(findP("glShaderSource"));
+    auto pCompSh     = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glCompileShader"));
+    auto pGetShIv    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t*)>(findP("glGetShaderiv"));
+    auto pGetShLog   = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t*, char*)>(findP("glGetShaderInfoLog"));
+    auto pCreatePr   = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glCreateProgram"));
+    auto pAttachSh   = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t)>(findP("glAttachShader"));
+    auto pLinkPr     = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glLinkProgram"));
+    auto pGetPrIv    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t*)>(findP("glGetProgramiv"));
+    auto pGetPrLog   = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t*, char*)>(findP("glGetProgramInfoLog"));
+    auto pDelSh      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glDeleteShader"));
+    auto pDelPr      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glDeleteProgram"));
+    auto pUsePr      = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glUseProgram"));
+    auto pGetUni     = reinterpret_cast<int32_t (WINAPI*)(uint32_t, const char*)>(findP("glGetUniformLocation"));
+    auto pGetAtt     = reinterpret_cast<int32_t (WINAPI*)(uint32_t, const char*)>(findP("glGetAttribLocation"));
+    auto pUniMat4    = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, uint8_t, const float*)>(findP("glUniformMatrix4fv"));
+    auto pUni1iv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const int32_t*)>(findP("glUniform1iv"));
+    auto pUni3fv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const float*)>(findP("glUniform3fv"));
+    auto pUni4fv     = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, const float*)>(findP("glUniform4fv"));
+    auto pGenTex     = reinterpret_cast<void (WINAPI*)(int32_t, uint32_t*)>(findP("glGenTextures"));
+    auto pDelTex     = reinterpret_cast<void (WINAPI*)(int32_t, const uint32_t*)>(findP("glDeleteTextures"));
+    auto pTexImg     = reinterpret_cast<void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*)>(findP("glTexImage2D"));
+    auto pTexPar     = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, int32_t)>(findP("glTexParameteri"));
+    auto pGenFbo     = reinterpret_cast<void (WINAPI*)(int32_t, uint32_t*)>(findP("glGenFramebuffers"));
+    auto pDelFbo     = reinterpret_cast<void (WINAPI*)(int32_t, const uint32_t*)>(findP("glDeleteFramebuffers"));
+    auto pBindFbo    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t)>(findP("glBindFramebuffer"));
+    auto pFboTex     = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t)>(findP("glFramebufferTexture2D"));
+    auto pVp         = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, int32_t, int32_t)>(findP("glViewport"));
+    auto pClrCol     = reinterpret_cast<void (WINAPI*)(float, float, float, float)>(findP("glClearColor"));
+    auto pClr        = reinterpret_cast<void (WINAPI*)(uint32_t)>(findP("glClear"));
+    auto pReadPix    = reinterpret_cast<void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*)>(findP("glReadPixels"));
+    auto pFinish     = reinterpret_cast<void (WINAPI*)()>(findP("glFinish"));
+    auto pGetErr     = reinterpret_cast<uint32_t (WINAPI*)()>(findP("glGetError"));
+
+    uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+    const char* vsP = vsOut.c_str(); int32_t vsL = static_cast<int32_t>(vsOut.size());
+    const char* fsP = psOut.c_str(); int32_t fsL = static_cast<int32_t>(psOut.size());
+    pShSrc(vs, 1, &vsP, &vsL); pCompSh(vs);
+    pShSrc(fs, 1, &fsP, &fsL); pCompSh(fs);
+    int32_t vsOk = 0, fsOk = 0, linkOk = 0;
+    if (pGetShIv) { pGetShIv(vs, 0x8B81u, &vsOk); pGetShIv(fs, 0x8B81u, &fsOk); }
+    auto pBindAtt    = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, const char*)>(findP("glBindAttribLocation"));
+    uint32_t progId = pCreatePr();
+    pAttachSh(progId, vs); pAttachSh(progId, fs);
+    if (pBindAtt) pBindAtt(progId, 0u, "POS2D_UV");
+    pLinkPr(progId);
+    if (pGetPrIv) pGetPrIv(progId, 0x8B82u, &linkOk);
+    if (!vsOk || !fsOk || !linkOk) {
+        char logBuf[512]{}; int32_t len = 0;
+        if (!vsOk && pGetShLog) { pGetShLog(vs, 511, &len, logBuf); printf("  GPU-Driven VS log: %s\n", logBuf); }
+        if (!fsOk && pGetShLog) { pGetShLog(fs, 511, &len, logBuf); printf("  GPU-Driven FS log: %s\n", logBuf); }
+        if (!linkOk && pGetPrLog) { pGetPrLog(progId, 511, &len, logBuf); printf("  GPU-Driven Link log: %s\n", logBuf); }
+    }
+    pDelSh(vs); pDelSh(fs);
+
+    hs_sprite_batch::GlBatchOps ops{};
+    ops.glGenBuffers               = reinterpret_cast<hs_sprite_batch::GlBatchOps::GenBuffers_t>(findP("glGenBuffers"));
+    ops.glDeleteBuffers            = reinterpret_cast<hs_sprite_batch::GlBatchOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+    ops.glBindBuffer               = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindBuffer_t>(findP("glBindBuffer"));
+    ops.glBufferData               = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferData_t>(findP("glBufferData"));
+    ops.glBufferSubData            = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferSubData_t>(opt.glBufferSubData);
+    ops.glMapBufferRange           = reinterpret_cast<hs_sprite_batch::GlBatchOps::MapBufferRange_t>(opt.glMapBufferRange);
+    ops.glUnmapBuffer              = reinterpret_cast<hs_sprite_batch::GlBatchOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+    ops.glActiveTexture            = reinterpret_cast<hs_sprite_batch::GlBatchOps::ActiveTexture_t>(findP("glActiveTexture"));
+    ops.glBindTexture              = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindTexture_t>(findP("glBindTexture"));
+    ops.glUniform1f                = reinterpret_cast<hs_sprite_batch::GlBatchOps::Uniform1f_t>(findP("glUniform1f"));
+    ops.glUniform1i                = reinterpret_cast<hs_sprite_batch::GlBatchOps::Uniform1i_t>(findP("glUniform1i"));
+    ops.glUniform3fv               = pUni3fv;
+    ops.glUniform4fv               = pUni4fv;
+    ops.glUniformMatrix4fv         = pUniMat4;
+    ops.glVertexAttribPointer      = reinterpret_cast<hs_sprite_batch::GlBatchOps::VertexAttribPointer_t>(findP("glVertexAttribPointer"));
+    ops.glEnableVertexAttribArray  = reinterpret_cast<hs_sprite_batch::GlBatchOps::EnableVertexAttribArray_t>(findP("glEnableVertexAttribArray"));
+    ops.glDisableVertexAttribArray = reinterpret_cast<hs_sprite_batch::GlBatchOps::DisableVertexAttribArray_t>(findP("glDisableVertexAttribArray"));
+    ops.glDrawElements             = reinterpret_cast<hs_sprite_batch::GlBatchOps::DrawElements_t>(findP("glDrawElements"));
+    ops.glDrawElementsBaseVertex   = reinterpret_cast<hs_sprite_batch::GlBatchOps::DrawElementsBaseVertex_t>(opt.glDrawElementsBaseVertex);
+    ops.glGetIntegerv              = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetIntegerv_t>(findP("glGetIntegerv"));
+    ops.glGetBufferParameteriv     = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetBufferParameteriv_t>(opt.glGetBufferParameteriv);
+    ops.glGetBufferSubData         = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetBufferSubData_t>(opt.glGetBufferSubData);
+    ops.glBufferStorage            = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferStorage_t>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+    ops.glFenceSync                = reinterpret_cast<hs_sprite_batch::GlBatchOps::FenceSync_t>(opt.glFenceSync);
+    ops.glClientWaitSync           = reinterpret_cast<hs_sprite_batch::GlBatchOps::ClientWaitSync_t>(opt.glClientWaitSync);
+    ops.glDeleteSync               = reinterpret_cast<hs_sprite_batch::GlBatchOps::DeleteSync_t>(opt.glDeleteSync);
+    ops.glBindBufferBase           = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindBufferBase_t>(opt.glBindBufferBase);
+    ops.glGetTextureHandleARB      = reinterpret_cast<hs_sprite_batch::GlBatchOps::GetTextureHandleArb_t>(opt.glGetTextureHandleARB);
+    ops.glMakeTextureHandleResidentARB    = reinterpret_cast<hs_sprite_batch::GlBatchOps::MakeTextureHandleResidentArb_t>(opt.glMakeTextureHandleResidentARB);
+    ops.glMakeTextureHandleNonResidentARB = reinterpret_cast<hs_sprite_batch::GlBatchOps::MakeTextureHandleNonResidentArb_t>(opt.glMakeTextureHandleNonResidentARB);
+
+    uint32_t fbo = 0, fboTex = 0, texLight = 0;
+    uint32_t tex32[32]{};
+    pGenFbo(1, &fbo); pGenTex(1, &fboTex); pGenTex(1, &texLight); pGenTex(32, tex32);
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, fboTex);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 64, 64, 0, 0x1908u, 0x1401u, nullptr);
+    pBindFbo(0x8D40u, fbo);
+    pFboTex(0x8D40u, 0x8CE0u, hs_sprite_batch::kGlTexture2D, fboTex, 0);
+    pVp(0, 0, 64, 64);
+
+    const uint8_t whitePx[4] = { 255,255,255,255 };
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0 + 3u);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, texLight);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 1, 1, 0, 0x1908u, 0x1401u, whitePx);
+
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0);
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        const uint8_t r = static_cast<uint8_t>(8u + i * 7u);
+        const uint8_t g = static_cast<uint8_t>(250u - i * 7u);
+        const uint8_t b = static_cast<uint8_t>((i * 37u) & 0xFFu);
+        const uint8_t pxData[16] = { r,g,b,255, r,g,b,255, r,g,b,255, r,g,b,255 };
+        ops.glBindTexture(hs_sprite_batch::kGlTexture2D, tex32[i]);
+        pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2600);
+        pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2600);
+        pTexPar(hs_sprite_batch::kGlTexture2D, 0x2802u, 0x812F);
+        pTexPar(hs_sprite_batch::kGlTexture2D, 0x2803u, 0x812F);
+        pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 2, 2, 0, 0x1908u, 0x1401u, pxData);
+    }
+
+    pUsePr(progId);
+    const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    const int32_t sampUnits[6] = { 0, 1, 2, 3, 4, 5 };
+    const float paramsV[3] = { 0.0f, 1.0f, 0.0f };
+    const float extV[4]    = { 0.0f, 0.0f, 1.0f, 1.0f };
+    if (pUni1iv && pGetUni(progId, "SAMPLER") >= 0) pUni1iv(pGetUni(progId, "SAMPLER"), 6, sampUnits);
+    if (pUni3fv && pGetUni(progId, "PARAMS") >= 0) pUni3fv(pGetUni(progId, "PARAMS"), 1, paramsV);
+    if (pUni4fv && pGetUni(progId, "LIGHTMAP_WORLD_EXTENTS") >= 0) pUni4fv(pGetUni(progId, "LIGHTMAP_WORLD_EXTENTS"), 1, extV);
+    pUniMat4(pGetUni(progId, "MatrixP"), 1, 0, idMtx);
+    pUniMat4(pGetUni(progId, "MatrixV"), 1, 0, idMtx);
+    pUniMat4(pGetUni(progId, "COLOUR_XFORM"), 1, 0, idMtx);
+
+    hs_sprite_batch::BatchProgInfo info{};
+    info.checked         = true;
+    info.eligible        = true;
+    info.hasGpuDriven    = true;
+    info.locBatchActive  = pGetUni(progId, "HS_BATCH_ACTIVE");
+    info.locMatrixW      = pGetUni(progId, "MatrixW");
+    info.locColourXform  = pGetUni(progId, "COLOUR_XFORM");
+    info.locFloatParams  = pGetUni(progId, "FLOAT_PARAMS");
+    info.locOceanBlend   = pGetUni(progId, "OCEAN_BLEND_PARAMS");
+    info.locSampler0     = pGetUni(progId, "SAMPLER[0]");
+    info.locSampler1     = pGetUni(progId, "SAMPLER[1]");
+    info.locSampler5     = pGetUni(progId, "SAMPLER[5]");
+    info.locPos2dUv      = pGetAtt(progId, "POS2D_UV");
+    info.locBatchWpos    = pGetAtt(progId, "HS_BATCH_WPOS");
+    info.locBatchCMult   = pGetAtt(progId, "HS_BATCH_CMULT");
+    info.locBatchCAdd    = pGetAtt(progId, "HS_BATCH_CADD");
+    info.progMaxTexSlots = 16u;
+    for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+        char nm[32]{};
+        snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+        info.locBatchTex[s] = pGetUni(progId, nm);
+    }
+
+    const float qv[16] = { -1.0f,-1.0f,0,0,  1.0f,-1.0f,1,0,  1.0f,1.0f,1,1,  -1.0f,1.0f,0,1 };
+    const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+
+    hs_sprite_batch::SpriteBatcher sb;
+    sb.SetOps(ops);
+    sb.SetPersistentRingPreferred(true);
+    sb.SetGpuDrivenPreferred(true);
+    sb.SetElasticRingBudget(262144u, 524288u, 32768u);
+    sb.SetShadowCacheMaxBytes(256u * 1024u * 1024u);
+    sb.SetDeferHostRestore(true);
+    sb.SetEnabled(true);
+    sb.OnUseProgram(progId, &info);
+    ops.glEnableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv));
+    sb.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv), true);
+    sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+    sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+    sb.OnVertexAttribPointer(static_cast<uint32_t>(info.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+    sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+    pClrCol(0, 0, 0, 1);
+    pClr(0x4000u);
+    while (pGetErr() != 0u) {}
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        float mw[16] = {
+            1.0f / 32.0f, 0, 0, 0,
+            0,            1, 0, 0,
+            0,            0, 1, 0,
+            -1.0f + (2.0f * static_cast<float>(i) + 1.0f) / 32.0f, 0.0f, 0.0f, 1.0f
+        };
+        const float fpVal[3] = { 0.0f, (i & 1u) ? 1.0f : 0.0f, 0.0f };
+        const float obVal[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        sb.TryAbsorbFloatParams(info.locFloatParams, 1, fpVal);
+        sb.TryAbsorbOceanBlend(info.locOceanBlend, 1, obVal);
+        sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, tex32[i]);
+        sb.TryAbsorbMatrixW(info.locMatrixW, 1, 0, mw);
+        sb.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+        sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+    }
+    sb.Flush(hs_sprite_batch::FlushReason::End);
+    sb.EndStickyBatchSession();
+    pFinish();
+
+    std::vector<uint8_t> fboBytes(64u * 64u * 4u, 0u);
+    pReadPix(0, 0, 64, 64, 0x1908u, 0x1401u, fboBytes.data());
+    const uint32_t errPartA = pGetErr();
+
+    int partAMaxDiff = 0;
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        const uint32_t pxX = 2u * i + 1u;
+        const size_t topIdx = (48u * 64u + pxX) * 4u; // y > 0 -> always kept!
+        const int er = static_cast<int>(8u + i * 7u);
+        const int eg = static_cast<int>(250u - i * 7u);
+        const int eb = static_cast<int>((i * 37u) & 0xFFu);
+        partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[topIdx + 0]) - er));
+        partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[topIdx + 1]) - eg));
+        partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[topIdx + 2]) - eb));
+        partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[topIdx + 3]) - 255));
+        // Odd quads have FLOAT_PARAMS = (0, 1, 0), so bottom half (y < 0) is clipped to clear black!
+        const size_t botIdx = (16u * 64u + pxX) * 4u;
+        if (i & 1u) {
+            partAMaxDiff = (std::max)(partAMaxDiff, static_cast<int>(fboBytes[botIdx + 0]));
+            partAMaxDiff = (std::max)(partAMaxDiff, static_cast<int>(fboBytes[botIdx + 1]));
+            partAMaxDiff = (std::max)(partAMaxDiff, static_cast<int>(fboBytes[botIdx + 2]));
+        } else {
+            partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[botIdx + 0]) - er));
+            partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[botIdx + 1]) - eg));
+            partAMaxDiff = (std::max)(partAMaxDiff, abs(static_cast<int>(fboBytes[botIdx + 2]) - eb));
+        }
+    }
+    const bool gpuActiveOk = sb.IsGpuDrivenActive();
+    const bool flush1Ok    = (sb.GetStats().flushes == 1);
+    const bool res32Ok     = (sb.BindlessResidentCount() == 32u);
+    const bool draws32Ok   = (sb.GpuDrivenDraws() == 32u);
+    const long long flushesA = static_cast<long long>(sb.GetStats().flushes);
+    const uint32_t resA    = sb.BindlessResidentCount();
+    const unsigned long long gdrA = static_cast<unsigned long long>(sb.GpuDrivenDraws());
+    sb.ReleaseGpuResources();
+
+    // Part B: Deferred Shadow Replay Bit-Exact Parity (CPU 16-Slot vs GPU-Driven SSBO+Bindless)
+    hs_world_shadow::GlShadowOps wops{};
+    wops.glGenFramebuffers          = reinterpret_cast<decltype(wops.glGenFramebuffers)>(findP("glGenFramebuffers"));
+    wops.glDeleteFramebuffers       = reinterpret_cast<decltype(wops.glDeleteFramebuffers)>(findP("glDeleteFramebuffers"));
+    wops.glBindFramebuffer          = pBindFbo;
+    wops.glFramebufferTexture2D     = pFboTex;
+    wops.glCheckFramebufferStatus   = reinterpret_cast<decltype(wops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+    wops.glGenRenderbuffers         = reinterpret_cast<decltype(wops.glGenRenderbuffers)>(findP("glGenRenderbuffers"));
+    wops.glDeleteRenderbuffers      = reinterpret_cast<decltype(wops.glDeleteRenderbuffers)>(findP("glDeleteRenderbuffers"));
+    wops.glBindRenderbuffer         = reinterpret_cast<decltype(wops.glBindRenderbuffer)>(findP("glBindRenderbuffer"));
+    wops.glRenderbufferStorage      = reinterpret_cast<decltype(wops.glRenderbufferStorage)>(findP("glRenderbufferStorage"));
+    wops.glFramebufferRenderbuffer  = reinterpret_cast<decltype(wops.glFramebufferRenderbuffer)>(findP("glFramebufferRenderbuffer"));
+    wops.glGenTextures              = pGenTex;
+    wops.glDeleteTextures           = pDelTex;
+    wops.glActiveTexture            = ops.glActiveTexture;
+    wops.glBindTexture              = ops.glBindTexture;
+    wops.glTexImage2D               = pTexImg;
+    wops.glTexParameteri            = pTexPar;
+    wops.glCreateShader             = pCreateSh;
+    wops.glShaderSource             = pShSrc;
+    wops.glCompileShader            = pCompSh;
+    wops.glGetShaderiv              = pGetShIv;
+    wops.glGetShaderInfoLog         = pGetShLog;
+    wops.glDeleteShader             = pDelSh;
+    wops.glCreateProgram            = pCreatePr;
+    wops.glAttachShader             = pAttachSh;
+    wops.glBindAttribLocation       = reinterpret_cast<decltype(wops.glBindAttribLocation)>(findP("glBindAttribLocation"));
+    wops.glLinkProgram              = pLinkPr;
+    wops.glGetProgramiv             = pGetPrIv;
+    wops.glGetProgramInfoLog        = pGetPrLog;
+    wops.glDeleteProgram            = pDelPr;
+    wops.glUseProgram               = pUsePr;
+    wops.glGetUniformLocation       = pGetUni;
+    wops.glUniform1f                = ops.glUniform1f;
+    wops.glUniform1i                = ops.glUniform1i;
+    wops.glUniform4fv               = pUni4fv;
+    wops.glUniformMatrix4fv         = pUniMat4;
+    wops.glGenBuffers               = ops.glGenBuffers;
+    wops.glDeleteBuffers            = ops.glDeleteBuffers;
+    wops.glBindBuffer               = ops.glBindBuffer;
+    wops.glBufferData               = ops.glBufferData;
+    wops.glEnableVertexAttribArray  = ops.glEnableVertexAttribArray;
+    wops.glDisableVertexAttribArray = ops.glDisableVertexAttribArray;
+    wops.glVertexAttribPointer      = ops.glVertexAttribPointer;
+    wops.glDrawArrays               = reinterpret_cast<decltype(wops.glDrawArrays)>(findP("glDrawArrays"));
+    wops.glDrawElements             = ops.glDrawElements;
+    wops.glDrawElementsBaseVertex   = ops.glDrawElementsBaseVertex;
+    wops.glBindBufferBase           = ops.glBindBufferBase;
+    wops.glViewport                 = pVp;
+    wops.glClearColor               = pClrCol;
+    wops.glClear                    = pClr;
+    wops.glEnable                   = reinterpret_cast<decltype(wops.glEnable)>(findP("glEnable"));
+    wops.glDisable                  = reinterpret_cast<decltype(wops.glDisable)>(findP("glDisable"));
+    wops.glBlendFunc                = reinterpret_cast<decltype(wops.glBlendFunc)>(findP("glBlendFunc"));
+    wops.glBlendFuncSeparate        = reinterpret_cast<decltype(wops.glBlendFuncSeparate)>(findP("glBlendFuncSeparate"));
+    wops.glBlendEquation            = reinterpret_cast<decltype(wops.glBlendEquation)>(findP("glBlendEquation"));
+    wops.glBlendEquationSeparate    = reinterpret_cast<decltype(wops.glBlendEquationSeparate)>(findP("glBlendEquationSeparate"));
+    wops.glDepthFunc                = reinterpret_cast<decltype(wops.glDepthFunc)>(findP("glDepthFunc"));
+    wops.glDepthMask                = reinterpret_cast<decltype(wops.glDepthMask)>(findP("glDepthMask"));
+    wops.glColorMask                = reinterpret_cast<decltype(wops.glColorMask)>(findP("glColorMask"));
+    wops.glGetIntegerv              = ops.glGetIntegerv;
+    wops.glGetError                 = pGetErr;
+    wops.logFn                      = &TestLog;
+
+    uint32_t rtFbo = 0, rtTex = 0;
+    pGenFbo(1, &rtFbo); pGenTex(1, &rtTex);
+    ops.glActiveTexture(hs_sprite_batch::kGlTexture0);
+    ops.glBindTexture(hs_sprite_batch::kGlTexture2D, rtTex);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2801u, 0x2601);
+    pTexPar(hs_sprite_batch::kGlTexture2D, 0x2800u, 0x2601);
+    pTexImg(hs_sprite_batch::kGlTexture2D, 0, 0x8058, 256, 256, 0, 0x1908u, 0x1401u, nullptr);
+    pBindFbo(0x8D40u, rtFbo);
+    pFboTex(0x8D40u, 0x8CE0u, hs_sprite_batch::kGlTexture2D, rtTex, 0);
+
+    bool wsGpuHasProg = false;
+    uint32_t errPartB = 0u;
+    auto runShadowParity = [&](bool useGpuDriven, std::vector<uint8_t>& outRgba) -> bool {
+        hs_world_shadow::WorldShadowEngine ws;
+        ws.SetOps(wops, true);
+        hs_gl_cache::ThreadState glCache;
+        glCache.caps[0] = 1; glCache.caps[1] = 0; glCache.caps[2] = 0; glCache.caps[3] = 0;
+        glCache.blendSrc = hs_world_shadow::kGlSrcAlpha;
+        glCache.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+        glCache.blendEq  = hs_world_shadow::kGlFuncAdd;
+        glCache.colorMask = 15;
+        glCache.depthMask = 0;
+
+        hs_sprite_batch::SpriteBatcher sbSh;
+        sbSh.SetOps(ops);
+        sbSh.SetPersistentRingPreferred(true);
+        sbSh.SetGpuDrivenPreferred(useGpuDriven);
+        sbSh.SetElasticRingBudget(262144u, 524288u, 32768u);
+        sbSh.SetDeferHostRestore(true);
+        sbSh.SetShadowActive(true);
+        sbSh.SetEnabled(true);
+
+        const float standV[16] = { -1.0f, 0.0f, 0.1f, 0.1f,  1.0f, 0.0f, 0.9f, 0.1f,  1.0f, 4.0f, 0.9f, 0.9f,  -1.0f, 4.0f, 0.1f, 0.9f };
+        sbSh.OnUseProgram(progId, &info);
+        sbSh.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(info.locPos2dUv), true);
+        sbSh.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+        sbSh.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+        sbSh.OnVertexAttribPointer(static_cast<uint32_t>(info.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, standV);
+        sbSh.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+        const float pv[16] = {
+            1.0f / 20.0f, 0, 0, 0,
+            0,            0, 0, 0,
+            0, 1.0f / 20.0f, 0, 0,
+            0,            0, 0, 1
+        };
+        hs_world_shadow::ShadowConfig cfg{};
+        cfg.dirWx = 0.0f; cfg.dirWz = 1.0f; cfg.stretch = 2.0f; cfg.projOn = 1.0f;
+        cfg.windTime = 1.25f; cfg.swayAmp = 0.50f; cfg.heightFade = 0.50f; cfg.penumbraBias = 1.0f;
+        cfg.density = 0.60f; cfg.soft = 0.80f;
+        cfg.tintR = 0.10f; cfg.tintG = 0.15f; cfg.tintB = 0.40f;
+        cfg.hdMode = true; cfg.skipNightmare = true;
+        cfg.hasLuaCam = true; cfg.luaCamX = 0.0f; cfg.luaCamZ = 0.0f;
+        cfg.luaCamRightX = 1.0f; cfg.luaCamRightZ = 0.0f;
+
+        const int32_t vp[4] = { 0, 0, 256, 256 };
+        hs_world_shadow::ShadowPassState saved{};
+        saved.dstFbo = rtFbo; saved.dstProg = progId;
+        memcpy(saved.vp, vp, sizeof(vp));
+        saved.activeUnit = 0;
+
+        // Frame 1: Render 4 standing foliage sprites into ShadowMask via Deferred Replay
+        pBindFbo(0x8D40u, rtFbo);
+        pVp(0, 0, 256, 256);
+        ws.OnGroundOrOceanDraw(rtFbo, vp);
+        ws.OnMatrixPV(pv);
+        if (!ws.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+        if (useGpuDriven) wsGpuHasProg = ws.HasGpuBatchProgram();
+
+        const float xOffsets[4] = { -8.0f, -2.5f, 3.0f, 8.5f };
+        for (int k = 0; k < 4; ++k) {
+            const float mw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, xOffsets[k], 0.0f, 0.0f, 1.0f };
+            sbSh.OnBindTexture(hs_sprite_batch::kGlTexture2D, tex32[k]);
+            sbSh.TryAbsorbMatrixW(info.locMatrixW, 1, 0, mw);
+            sbSh.TryAbsorbColourXform(info.locColourXform, 1, 0, idMtx);
+            sbSh.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+        }
+        sbSh.Flush(hs_sprite_batch::FlushReason::End);
+        sbSh.EndStickyBatchSession();
+
+        const bool recOk = useGpuDriven
+            ? ws.RecordBatchedShadowGpu(sbSh.LastFlushVboId(), sbSh.LastFlushIboId(), sbSh.LastFlushSsboId(),
+                                        24u, sbSh.LastFlushBaseVertex(), sbSh.LastFlushIndexByteOffset(),
+                                        sbSh.LastFlushShadowBoundsXZ(), rtFbo)
+            : ws.RecordBatchedShadow(sbSh.LastFlushVboId(), sbSh.LastFlushIboId(), 24u,
+                                     sbSh.LastFlushVertByteOffset(), sbSh.LastFlushIndexByteOffset(),
+                                     sbSh.LastFlushTexCount(), sbSh.LastFlushTexIds(),
+                                     sbSh.LastFlushShadowBoundsXZ(), rtFbo);
+        if (!recOk) return false;
+        ws.FlushDeferredBatchedShadows(cfg, saved, glCache);
+        sbSh.OnEndFrame();
+        ws.OnEndFrame();
+
+        // Frame 2: Composite ShadowMask over turf green PrimaryRT & read back
+        pBindFbo(0x8D40u, rtFbo);
+        pVp(0, 0, 256, 256);
+        wops.glColorMask(1, 1, 1, 1);
+        pClrCol(0.4f, 0.7f, 0.3f, 1.0f);
+        pClr(0x4000u);
+        ws.OnGroundOrOceanDraw(rtFbo, vp);
+        ws.OnMatrixPV(pv);
+        if (!ws.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+        ws.OnEndFrame();
+        pFinish();
+
+        outRgba.resize(256u * 256u * 4u);
+        pBindFbo(0x8D40u, rtFbo);
+        pReadPix(0, 0, 256, 256, 0x1908u, 0x1401u, outRgba.data());
+        errPartB |= pGetErr();
+
+        sbSh.ReleaseGpuResources();
+        ws.ResetContext(true);
+        return true;
+    };
+
+    std::vector<uint8_t> imgCpu, imgGpu;
+    const bool cpuOk = runShadowParity(false, imgCpu);
+    const bool gpuOk = runShadowParity(true, imgGpu);
+    int shadowMaxDiff = 0, shadowedPx = 0;
+    if (cpuOk && gpuOk && imgCpu.size() == imgGpu.size()) {
+        for (size_t i = 0; i + 3u < imgCpu.size(); i += 4u) {
+            if (imgCpu[i + 1] < 168u) ++shadowedPx;
+            for (int c = 0; c < 4; ++c) {
+                const int d = abs(static_cast<int>(imgCpu[i + c]) - static_cast<int>(imgGpu[i + c]));
+                if (d > shadowMaxDiff) shadowMaxDiff = d;
+            }
+        }
+    }
+
+    // Part C: Live GPU-Driven anim_bloom.ksh (Bindless + SSBO, outputs (0, 0, 0, alpha))
+    static constexpr const char* kBloomVs =
+        "#ifdef SKINNED\n"
+        "\tuniform mat4 pv;\n"
+        "#else\n"
+        "\tuniform mat4 MatrixP;\n"
+        "\tuniform mat4 MatrixV;\n"
+        "\tuniform mat4 MatrixW;\n"
+        "#endif\n"
+        "attribute vec4 POS2D_UV;\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "void main() {\n"
+        "#ifdef SKINNED\n"
+        "\tvec3 TEXCOORD0 = vec3(0.0);\n"
+        "#else\n"
+        "    vec3 POSITION = vec3(POS2D_UV.xy, 0);\n"
+        "    float samplerIndex = floor(POS2D_UV.z/2.0);\n"
+        "    vec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+        "    mat4 mtxPVW = MatrixP * MatrixV * MatrixW;\n"
+        "    gl_Position = mtxPVW * vec4( POSITION.xyz, 1.0 );\n"
+        "#endif\n"
+        "\tPS_TEXCOORD = TEXCOORD0;\n"
+        "}\n";
+    static constexpr const char* kBloomPs =
+        "#if defined( GL_ES )\n"
+        "precision mediump float;\n"
+        "#endif\n"
+        "#if defined( TRIPLE_ATLAS )\n"
+        "    uniform sampler2D SAMPLER[6];\n"
+        "#else\n"
+        "    uniform sampler2D SAMPLER[2];\n"
+        "#endif\n"
+        "varying vec3 PS_TEXCOORD;\n"
+        "void main() {\n"
+        "    vec4 colour;\n"
+        "#if defined( TRIPLE_ATLAS )\n"
+        "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+        "#else\n"
+        "    colour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+        "#endif\n"
+        "    gl_FragColor.rgba = vec4( 0, 0, 0, colour.a );\n"
+        "}\n";
+    std::string bVsOut, bPsOut;
+    const char* bTag = nullptr;
+    const bool bTxOk = hs_sprite_batch::TransformAnimBatchShaderSource(kBloomVs, bVsOut, bTag, true, true) &&
+                       hs_sprite_batch::TransformAnimBatchShaderSource(kBloomPs, bPsOut, bTag, true, true);
+    int32_t bVsOk = 0, bPsOk = 0, bLinkOk = 0;
+    uint32_t bProgId = 0u;
+    bool bGpuOk = false;
+    int bMaxDiff = 255;
+    uint32_t errPartC = 0u;
+    if (bTxOk) {
+        uint32_t bvs = pCreateSh(0x8B31u), bfs = pCreateSh(0x8B30u);
+        const char* bvsP = bVsOut.c_str(); int32_t bvsL = static_cast<int32_t>(bVsOut.size());
+        const char* bfsP = bPsOut.c_str(); int32_t bfsL = static_cast<int32_t>(bPsOut.size());
+        pShSrc(bvs, 1, &bvsP, &bvsL); pCompSh(bvs);
+        pShSrc(bfs, 1, &bfsP, &bfsL); pCompSh(bfs);
+        if (pGetShIv) { pGetShIv(bvs, 0x8B81u, &bVsOk); pGetShIv(bfs, 0x8B81u, &bPsOk); }
+        bProgId = pCreatePr();
+        pAttachSh(bProgId, bvs); pAttachSh(bProgId, bfs);
+        if (pBindAtt) pBindAtt(bProgId, 0u, "POS2D_UV");
+        pLinkPr(bProgId);
+        if (pGetPrIv) pGetPrIv(bProgId, 0x8B82u, &bLinkOk);
+        pDelSh(bvs); pDelSh(bfs);
+        if (bVsOk && bPsOk && bLinkOk) {
+            hs_sprite_batch::BatchProgInfo bInfo{};
+            bInfo.checked         = true;
+            bInfo.eligible        = true;
+            bInfo.hasGpuDriven    = true;
+            bInfo.isBloomPass     = true;
+            bInfo.locBatchActive  = pGetUni(bProgId, "HS_BATCH_ACTIVE");
+            bInfo.locMatrixW      = pGetUni(bProgId, "MatrixW");
+            bInfo.locSampler0     = pGetUni(bProgId, "SAMPLER[0]");
+            bInfo.locSampler1     = pGetUni(bProgId, "SAMPLER[1]");
+            bInfo.locPos2dUv      = pGetAtt(bProgId, "POS2D_UV");
+            bInfo.locBatchWpos    = pGetAtt(bProgId, "HS_BATCH_WPOS");
+            bInfo.progMaxTexSlots = 16u;
+            for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+                char nm[32]{};
+                snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+                bInfo.locBatchTex[s] = pGetUni(bProgId, nm);
+            }
+            pBindFbo(0x8D40u, fbo);
+            pVp(0, 0, 64, 64);
+            pUsePr(bProgId);
+            pUniMat4(pGetUni(bProgId, "MatrixP"), 1, 0, idMtx);
+            pUniMat4(pGetUni(bProgId, "MatrixV"), 1, 0, idMtx);
+            pClrCol(0.5f, 0.5f, 0.5f, 0.0f);
+            pClr(0x4000u);
+            while (pGetErr() != 0u) {}
+
+            hs_sprite_batch::SpriteBatcher sbBloom;
+            sbBloom.SetOps(ops);
+            sbBloom.SetPersistentRingPreferred(true);
+            sbBloom.SetGpuDrivenPreferred(true);
+            sbBloom.SetElasticRingBudget(262144u, 524288u, 32768u);
+            sbBloom.SetDeferHostRestore(true);
+            sbBloom.SetEnabled(true);
+            sbBloom.SetShadowActive(false);
+            sbBloom.OnUseProgram(bProgId, &bInfo);
+            ops.glEnableVertexAttribArray(static_cast<uint32_t>(bInfo.locPos2dUv));
+            sbBloom.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(bInfo.locPos2dUv), true);
+            sbBloom.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sbBloom.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sbBloom.OnVertexAttribPointer(static_cast<uint32_t>(bInfo.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, qv);
+            sbBloom.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+            for (uint32_t i = 0u; i < 8u; ++i) {
+                float mw[16] = {
+                    1.0f / 8.0f, 0, 0, 0,
+                    0,           1, 0, 0,
+                    0,           0, 1, 0,
+                    -1.0f + (2.0f * static_cast<float>(i) + 1.0f) / 8.0f, 0.0f, 0.0f, 1.0f
+                };
+                sbBloom.OnBindTexture(hs_sprite_batch::kGlTexture2D, tex32[i]);
+                sbBloom.TryAbsorbMatrixW(bInfo.locMatrixW, 1, 0, mw);
+                sbBloom.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, 6, hs_sprite_batch::kGlUnsignedShort, qi);
+            }
+            sbBloom.Flush(hs_sprite_batch::FlushReason::End);
+            sbBloom.EndStickyBatchSession();
+            pFinish();
+            std::vector<uint8_t> bPx(64u * 64u * 4u, 0u);
+            pReadPix(0, 0, 64, 64, 0x1908u, 0x1401u, bPx.data());
+            errPartC = pGetErr();
+            bMaxDiff = 0;
+            for (uint32_t i = 0u; i < 8u; ++i) {
+                const uint32_t pxX = 8u * i + 4u;
+                const size_t idx = (32u * 64u + pxX) * 4u;
+                bMaxDiff = (std::max)(bMaxDiff, static_cast<int>(bPx[idx + 0]));
+                bMaxDiff = (std::max)(bMaxDiff, static_cast<int>(bPx[idx + 1]));
+                bMaxDiff = (std::max)(bMaxDiff, static_cast<int>(bPx[idx + 2]));
+                bMaxDiff = (std::max)(bMaxDiff, abs(static_cast<int>(bPx[idx + 3]) - 255));
+            }
+            bGpuOk = sbBloom.IsGpuDrivenActive() && (sbBloom.GetStats().flushes == 1) && (sbBloom.GpuDrivenDraws() == 8u);
+            sbBloom.ReleaseGpuResources();
+        }
+    }
+
+    pBindFbo(0x8D40u, 0u);
+    pDelFbo(1, &fbo);
+    pDelTex(1, &fboTex);
+    pDelFbo(1, &rtFbo);
+    pDelTex(1, &rtTex);
+    pDelTex(1, &texLight);
+    pDelTex(32, tex32);
+    pDelPr(progId);
+    if (bProgId != 0u) pDelPr(bProgId);
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+
+    const bool ok = txOk && vsOk && fsOk && linkOk &&
+                    gpuActiveOk && flush1Ok && res32Ok && draws32Ok &&
+                    (partAMaxDiff == 0) && (errPartA == 0u) &&
+                    cpuOk && gpuOk && wsGpuHasProg && (shadowedPx > 100) &&
+                    (shadowMaxDiff == 0) && (errPartB == 0u) &&
+                    bTxOk && bVsOk && bPsOk && bLinkOk && bGpuOk &&
+                    (bMaxDiff == 0) && (errPartC == 0u);
+    printf("  GPU-Driven Bindless+SSBO (32 tex -> 1 flush): tx=%d sh=%d/%d/%d active=%d flush=%lld res=%u gdr=%llu maxDiff=%d err=0x%X\n",
+           txOk ? 1 : 0, vsOk, fsOk, linkOk, gpuActiveOk ? 1 : 0,
+           flushesA, resA, gdrA, partAMaxDiff, errPartA);
+    printf("  GPU-Driven anim_bloom (8 tex -> 1 flush): tx=%d sh=%d/%d/%d gpu=%d maxDiff=%d err=0x%X\n",
+           bTxOk ? 1 : 0, bVsOk, bPsOk, bLinkOk, bGpuOk ? 1 : 0, bMaxDiff, errPartC);
+    printf("  Deferred Shadow Parity (CPU 16-slot vs GPU SSBO+Bindless): cpu=%d gpu=%d gpuProg=%d shadowedPx=%d maxPixelDiff=%d err=0x%X -> %s\n",
+           cpuOk ? 1 : 0, gpuOk ? 1 : 0, wsGpuHasProg ? 1 : 0, shadowedPx, shadowMaxDiff, errPartB,
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool TestPboTexRingLiveGpu() {
+    printf("\n=== Live RTX GPU Pixel-Exact Verification: PersistentPboTexRing (DXT5 + RGBA8) ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported || !probe.hasBufferStorage) {
+        printf("  [SKIP] BufferStorage unavailable -> PASS\n");
+        return true;
+    }
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_PboTexLive", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) return false;
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hdc) ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    if (hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) != 76) {
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    auto findP = [&](const char* nm) -> void* {
+        for (size_t i = 0; i < 76; ++i)
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, nm) == 0) return procs[i];
+        return nullptr;
+    };
+
+    using GenTex_t   = void (WINAPI*)(int32_t, uint32_t*);
+    using DelTex_t   = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindTex_t  = void (WINAPI*)(uint32_t, uint32_t);
+    using TexPar_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+    using TexImg_t   = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+    using CompImg_t  = void (WINAPI*)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t, const void*);
+    using GenFbo_t   = void (WINAPI*)(int32_t, uint32_t*);
+    using DelFbo_t   = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindFbo_t  = void (WINAPI*)(uint32_t, uint32_t);
+    using FboTex_t   = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    using CreateSh_t = uint32_t (WINAPI*)(uint32_t);
+    using ShSrc_t    = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+    using CompSh_t   = void (WINAPI*)(uint32_t);
+    using DelSh_t    = void (WINAPI*)(uint32_t);
+    using CreatePr_t = uint32_t (WINAPI*)();
+    using AttachSh_t = void (WINAPI*)(uint32_t, uint32_t);
+    using BindAtt_t  = void (WINAPI*)(uint32_t, uint32_t, const char*);
+    using LinkPr_t   = void (WINAPI*)(uint32_t);
+    using DelPr_t    = void (WINAPI*)(uint32_t);
+    using UsePr_t    = void (WINAPI*)(uint32_t);
+    using GetUni_t   = int32_t (WINAPI*)(uint32_t, const char*);
+    using Uni1i_t    = void (WINAPI*)(int32_t, int32_t);
+    using ActTex_t   = void (WINAPI*)(uint32_t);
+    using Vp_t       = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+    using EnAtt_t    = void (WINAPI*)(uint32_t);
+    using AttPtr_t   = void (WINAPI*)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*);
+    using DrawArr_t  = void (WINAPI*)(uint32_t, int32_t, int32_t);
+    using ReadPix_t  = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+    using GetErr_t   = uint32_t (WINAPI*)();
+    using GetInt_t   = void (WINAPI*)(uint32_t, int32_t*);
+    using Finish_t   = void (WINAPI*)();
+
+    auto pGenTex   = reinterpret_cast<GenTex_t>(findP("glGenTextures"));
+    auto pDelTex   = reinterpret_cast<DelTex_t>(findP("glDeleteTextures"));
+    auto pBindTex  = reinterpret_cast<BindTex_t>(findP("glBindTexture"));
+    auto pTexPar   = reinterpret_cast<TexPar_t>(findP("glTexParameteri"));
+    auto pTexImg   = reinterpret_cast<TexImg_t>(findP("glTexImage2D"));
+    auto pCompImg  = reinterpret_cast<CompImg_t>(findP("glCompressedTexImage2D"));
+    auto pGenFbo   = reinterpret_cast<GenFbo_t>(findP("glGenFramebuffers"));
+    auto pDelFbo   = reinterpret_cast<DelFbo_t>(findP("glDeleteFramebuffers"));
+    auto pBindFbo  = reinterpret_cast<BindFbo_t>(findP("glBindFramebuffer"));
+    auto pFboTex   = reinterpret_cast<FboTex_t>(findP("glFramebufferTexture2D"));
+    auto pCreateSh = reinterpret_cast<CreateSh_t>(findP("glCreateShader"));
+    auto pShSrc    = reinterpret_cast<ShSrc_t>(findP("glShaderSource"));
+    auto pCompSh   = reinterpret_cast<CompSh_t>(findP("glCompileShader"));
+    auto pDelSh    = reinterpret_cast<DelSh_t>(findP("glDeleteShader"));
+    auto pCreatePr = reinterpret_cast<CreatePr_t>(findP("glCreateProgram"));
+    auto pAttachSh = reinterpret_cast<AttachSh_t>(findP("glAttachShader"));
+    auto pBindAtt  = reinterpret_cast<BindAtt_t>(findP("glBindAttribLocation"));
+    auto pLinkPr   = reinterpret_cast<LinkPr_t>(findP("glLinkProgram"));
+    auto pDelPr    = reinterpret_cast<DelPr_t>(findP("glDeleteProgram"));
+    auto pUsePr    = reinterpret_cast<UsePr_t>(findP("glUseProgram"));
+    auto pGetUni   = reinterpret_cast<GetUni_t>(findP("glGetUniformLocation"));
+    auto pUni1i    = reinterpret_cast<Uni1i_t>(findP("glUniform1i"));
+    auto pActTex   = reinterpret_cast<ActTex_t>(findP("glActiveTexture"));
+    auto pVp       = reinterpret_cast<Vp_t>(findP("glViewport"));
+    auto pEnAtt    = reinterpret_cast<EnAtt_t>(findP("glEnableVertexAttribArray"));
+    auto pAttPtr   = reinterpret_cast<AttPtr_t>(findP("glVertexAttribPointer"));
+    auto pDrawArr  = reinterpret_cast<DrawArr_t>(findP("glDrawArrays"));
+    auto pReadPix  = reinterpret_cast<ReadPix_t>(findP("glReadPixels"));
+    auto pGetErr   = reinterpret_cast<GetErr_t>(findP("glGetError"));
+    auto pGetInt   = reinterpret_cast<GetInt_t>(findP("glGetIntegerv"));
+    auto pFinish   = reinterpret_cast<Finish_t>(findP("glFinish"));
+
+    hs_pbo_tex::GlPboOps pops{};
+    pops.glGenBuffers           = reinterpret_cast<hs_pbo_tex::GlPboOps::GenBuffers_t>(findP("glGenBuffers"));
+    pops.glDeleteBuffers        = reinterpret_cast<hs_pbo_tex::GlPboOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+    pops.glBindBuffer           = reinterpret_cast<hs_pbo_tex::GlPboOps::BindBuffer_t>(findP("glBindBuffer"));
+    pops.glBufferStorage        = reinterpret_cast<hs_pbo_tex::GlPboOps::BufferStorage_t>(
+        opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+    pops.glMapBufferRange       = reinterpret_cast<hs_pbo_tex::GlPboOps::MapBufferRange_t>(opt.glMapBufferRange);
+    pops.glUnmapBuffer          = reinterpret_cast<hs_pbo_tex::GlPboOps::UnmapBuffer_t>(opt.glUnmapBuffer);
+    pops.glGetBufferParameteriv = reinterpret_cast<hs_pbo_tex::GlPboOps::GetBufferParameteriv_t>(opt.glGetBufferParameteriv);
+    pops.glFenceSync            = reinterpret_cast<hs_pbo_tex::GlPboOps::FenceSync_t>(opt.glFenceSync);
+    pops.glClientWaitSync       = reinterpret_cast<hs_pbo_tex::GlPboOps::ClientWaitSync_t>(opt.glClientWaitSync);
+    pops.glDeleteSync           = reinterpret_cast<hs_pbo_tex::GlPboOps::DeleteSync_t>(opt.glDeleteSync);
+
+    hs_pbo_tex::PersistentPboTexRing pbo;
+    pbo.SetOps(pops);
+    pbo.SetSlotBytes(4u * 1024u * 1024u);
+    pbo.SetEnabled(true);
+
+    // Simple passthrough textured quad program
+    static constexpr const char* kVs =
+        "#version 100\n"
+        "attribute vec2 aPos;\n"
+        "varying vec2 vUv;\n"
+        "void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+    static constexpr const char* kFs =
+        "#version 100\n"
+        "precision highp float;\n"
+        "uniform sampler2D uTex;\n"
+        "varying vec2 vUv;\n"
+        "void main() { gl_FragColor = texture2D(uTex, vUv); }\n";
+    uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+    pShSrc(vs, 1, &kVs, nullptr); pCompSh(vs);
+    pShSrc(fs, 1, &kFs, nullptr); pCompSh(fs);
+    uint32_t prog = pCreatePr();
+    pAttachSh(prog, vs); pAttachSh(prog, fs);
+    pBindAtt(prog, 0u, "aPos");
+    pLinkPr(prog);
+    pDelSh(vs); pDelSh(fs);
+
+    uint32_t fbo = 0u, fboTex = 0u, texDxtDir = 0u, texDxtPbo = 0u, texRgbDir = 0u, texRgbPbo = 0u;
+    pGenFbo(1, &fbo);
+    pGenTex(1, &fboTex);
+    pGenTex(1, &texDxtDir);
+    pGenTex(1, &texDxtPbo);
+    pGenTex(1, &texRgbDir);
+    pGenTex(1, &texRgbPbo);
+
+    auto setupNearest = [&](uint32_t tex) {
+        pBindTex(0x0DE1u, tex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600);
+        pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexPar(0x0DE1u, 0x2802u, 0x812F);
+        pTexPar(0x0DE1u, 0x2803u, 0x812F);
+    };
+    setupNearest(fboTex);
+    pTexImg(0x0DE1u, 0, 0x1908, 256, 256, 0, 0x1908u, 0x1401u, nullptr);
+    pBindFbo(0x8D40u, fbo);
+    pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, fboTex, 0);
+
+    const float quad[8] = { -1,-1, 1,-1, -1,1, 1,1 };
+    auto drawAndRead = [&](uint32_t tex, int32_t sz, std::vector<uint8_t>& out) {
+        pBindFbo(0x8D40u, fbo);
+        pVp(0, 0, sz, sz);
+        pUsePr(prog);
+        pActTex(0x84C0u);
+        pBindTex(0x0DE1u, tex);
+        pUni1i(pGetUni(prog, "uTex"), 0);
+        pops.glBindBuffer(0x8892u /*GL_ARRAY_BUFFER*/, 0u);
+        pEnAtt(0u);
+        pAttPtr(0u, 2, 0x1406u, 0u, 0, quad);
+        pDrawArr(0x0005u /*GL_TRIANGLE_STRIP*/, 0, 4);
+        pFinish();
+        out.resize(static_cast<size_t>(sz) * static_cast<size_t>(sz) * 4u);
+        pReadPix(0, 0, sz, sz, 0x1908u, 0x1401u, out.data());
+    };
+
+    while (pGetErr() != 0u) {}
+
+    // Part A: 128x128 DXT5 compressed texture (16,384 bytes)
+    std::vector<uint8_t> dxt5(128u * 128u);
+    for (size_t i = 0; i < dxt5.size(); ++i) {
+        dxt5[i] = static_cast<uint8_t>((i * 53u + (i >> 4) * 19u + 11u) & 0xFFu);
+    }
+    setupNearest(texDxtDir);
+    pCompImg(0x0DE1u, 0, 0x83F3u, 128, 128, 0, static_cast<int32_t>(dxt5.size()), dxt5.data());
+    setupNearest(texDxtPbo);
+    const bool dxtPboOk = pbo.TryUploadCompressedTexImage2D(
+        pCompImg, 0x0DE1u, 0, 0x83F3u, 128, 128, 0, static_cast<int32_t>(dxt5.size()), dxt5.data());
+    pbo.OnEndFrame();
+
+    std::vector<uint8_t> pxDxtDir, pxDxtPbo;
+    drawAndRead(texDxtDir, 128, pxDxtDir);
+    drawAndRead(texDxtPbo, 128, pxDxtPbo);
+    int dxtMaxDiff = 0;
+    for (size_t i = 0; i < pxDxtDir.size(); ++i) {
+        const int d = std::abs(static_cast<int>(pxDxtDir[i]) - static_cast<int>(pxDxtPbo[i]));
+        if (d > dxtMaxDiff) dxtMaxDiff = d;
+    }
+
+    // Part B: 4 consecutive frames of 256x256 RGBA8 (262,144 bytes each) -> wraps 3-frame ring & waits slot 0 fence!
+    std::vector<uint8_t> rgba(256u * 256u * 4u);
+    bool rgbaPboAllOk = true;
+    for (int f = 0; f < 4; ++f) {
+        for (size_t i = 0; i < rgba.size(); ++i) {
+            rgba[i] = static_cast<uint8_t>(((i * 17u) + static_cast<size_t>(f) * 61u + 5u) & 0xFFu);
+        }
+        setupNearest(texRgbPbo);
+        if (!pbo.TryUploadTexImage2D(pTexImg, 0x0DE1u, 0, 0x1908, 256, 256, 0, 0x1908u, 0x1401u, rgba.data())) {
+            rgbaPboAllOk = false;
+        }
+        pbo.OnEndFrame();
+    }
+    setupNearest(texRgbDir);
+    pTexImg(0x0DE1u, 0, 0x1908, 256, 256, 0, 0x1908u, 0x1401u, rgba.data());
+
+    std::vector<uint8_t> pxRgbDir, pxRgbPbo;
+    drawAndRead(texRgbDir, 256, pxRgbDir);
+    drawAndRead(texRgbPbo, 256, pxRgbPbo);
+    int rgbaMaxDiff = 0;
+    for (size_t i = 0; i < pxRgbDir.size(); ++i) {
+        const int d = std::abs(static_cast<int>(pxRgbDir[i]) - static_cast<int>(pxRgbPbo[i]));
+        if (d > rgbaMaxDiff) rgbaMaxDiff = d;
+    }
+
+    int32_t boundUnpack = -1;
+    pGetInt(0x88EFu /*GL_PIXEL_UNPACK_BUFFER_BINDING*/, &boundUnpack);
+    const uint32_t glErr = pGetErr();
+    const bool activeOk = pbo.IsActive();
+    const uint64_t upCnt = pbo.UploadCount();
+    const uint64_t ovfCnt = pbo.OverflowFallbacks();
+    const uint64_t toCnt = pbo.WaitTimeouts();
+
+    pbo.ReleaseGpu(true);
+    pBindFbo(0x8D40u, 0u);
+    pDelFbo(1, &fbo);
+    pDelTex(1, &fboTex);
+    pDelTex(1, &texDxtDir);
+    pDelTex(1, &texDxtPbo);
+    pDelTex(1, &texRgbDir);
+    pDelTex(1, &texRgbPbo);
+    pDelPr(prog);
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+
+    const bool ok = activeOk && dxtPboOk && rgbaPboAllOk &&
+                    (dxtMaxDiff == 0) && (rgbaMaxDiff == 0) &&
+                    (boundUnpack == 0) && (glErr == 0u) &&
+                    (upCnt == 5u) && (ovfCnt == 0u) && (toCnt == 0u);
+    printf("  PersistentPboTexRing Live RTX: active=%d up=%llu ovf=%llu to=%llu dxt5MaxDiff=%d rgba8MaxDiff=%d unpackBind=%d err=0x%X -> %s\n",
+           activeOk ? 1 : 0, static_cast<unsigned long long>(upCnt),
+           static_cast<unsigned long long>(ovfCnt), static_cast<unsigned long long>(toCnt),
+           dxtMaxDiff, rgbaMaxDiff, boundUnpack, glErr, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool TestPhase2LiveGpuSuite() {
+    printf("\n=== Live RTX GPU Phase 2 Verification: PreallocTexIdPool + Vectorized GpuDriven + Zero-Stall Shadow/Clarity ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported || !probe.hasBufferStorage || !probe.hasSsbo ||
+        !probe.hasBindlessTexture || !probe.hasComputeShader || !probe.hasImageLoadStore) {
+        printf("  [SKIP] GL 4.3+ / Bindless / Compute unavailable -> PASS\n");
+        return true;
+    }
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_Phase2Live", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) return false;
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hdc) ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    if (hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) != 76) {
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    auto findP = [&](const char* nm) -> void* {
+        for (size_t i = 0; i < 76; ++i)
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, nm) == 0) return procs[i];
+        return nullptr;
+    };
+
+    using GenTex_t    = void (WINAPI*)(int32_t, uint32_t*);
+    using DelTex_t    = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindTex_t   = void (WINAPI*)(uint32_t, uint32_t);
+    using TexPar_t    = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+    using TexImg_t    = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+    using CompImg_t   = void (WINAPI*)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t, const void*);
+    using IsTex_t     = uint8_t (WINAPI*)(uint32_t);
+    using GenFbo_t    = void (WINAPI*)(int32_t, uint32_t*);
+    using DelFbo_t    = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindFbo_t   = void (WINAPI*)(uint32_t, uint32_t);
+    using FboTex_t    = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    using CreateSh_t  = uint32_t (WINAPI*)(uint32_t);
+    using ShSrc_t     = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+    using CompSh_t    = void (WINAPI*)(uint32_t);
+    using GetShIv_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelSh_t     = void (WINAPI*)(uint32_t);
+    using CreatePr_t  = uint32_t (WINAPI*)();
+    using AttachSh_t  = void (WINAPI*)(uint32_t, uint32_t);
+    using BindAtt_t   = void (WINAPI*)(uint32_t, uint32_t, const char*);
+    using LinkPr_t    = void (WINAPI*)(uint32_t);
+    using GetPrIv_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelPr_t     = void (WINAPI*)(uint32_t);
+    using UsePr_t     = void (WINAPI*)(uint32_t);
+    using GetUni_t    = int32_t (WINAPI*)(uint32_t, const char*);
+    using GetAtt_t    = int32_t (WINAPI*)(uint32_t, const char*);
+    using Uni1i_t     = void (WINAPI*)(int32_t, int32_t);
+    using Uni1iv_t    = void (WINAPI*)(int32_t, int32_t, const int32_t*);
+    using Uni3fv_t    = void (WINAPI*)(int32_t, int32_t, const float*);
+    using Uni4fv_t    = void (WINAPI*)(int32_t, int32_t, const float*);
+    using UniMat4_t   = void (WINAPI*)(int32_t, int32_t, uint8_t, const float*);
+    using ActTex_t    = void (WINAPI*)(uint32_t);
+    using Vp_t        = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+    using ClrCol_t    = void (WINAPI*)(float, float, float, float);
+    using Clr_t       = void (WINAPI*)(uint32_t);
+    using EnAtt_t     = void (WINAPI*)(uint32_t);
+    using AttPtr_t    = void (WINAPI*)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*);
+    using DrawArr_t   = void (WINAPI*)(uint32_t, int32_t, int32_t);
+    using ReadPix_t   = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+    using GetErr_t    = uint32_t (WINAPI*)();
+    using GetInt_t    = void (WINAPI*)(uint32_t, int32_t*);
+    using IsEn_t      = uint8_t (WINAPI*)(uint32_t);
+    using Finish_t    = void (WINAPI*)();
+
+    auto pGenTex   = reinterpret_cast<GenTex_t>(findP("glGenTextures"));
+    auto pDelTex   = reinterpret_cast<DelTex_t>(findP("glDeleteTextures"));
+    auto pBindTex  = reinterpret_cast<BindTex_t>(findP("glBindTexture"));
+    auto pTexPar   = reinterpret_cast<TexPar_t>(findP("glTexParameteri"));
+    auto pTexImg   = reinterpret_cast<TexImg_t>(findP("glTexImage2D"));
+    auto pCompImg  = reinterpret_cast<CompImg_t>(findP("glCompressedTexImage2D"));
+    auto pIsTex    = reinterpret_cast<IsTex_t>(rt.ResolveGlProc("glIsTexture"));
+    auto pGenFbo   = reinterpret_cast<GenFbo_t>(findP("glGenFramebuffers"));
+    auto pDelFbo   = reinterpret_cast<DelFbo_t>(findP("glDeleteFramebuffers"));
+    auto pBindFbo  = reinterpret_cast<BindFbo_t>(findP("glBindFramebuffer"));
+    auto pFboTex   = reinterpret_cast<FboTex_t>(findP("glFramebufferTexture2D"));
+    auto pCreateSh = reinterpret_cast<CreateSh_t>(findP("glCreateShader"));
+    auto pShSrc    = reinterpret_cast<ShSrc_t>(findP("glShaderSource"));
+    auto pCompSh   = reinterpret_cast<CompSh_t>(findP("glCompileShader"));
+    auto pGetShIv  = reinterpret_cast<GetShIv_t>(findP("glGetShaderiv"));
+    auto pDelSh    = reinterpret_cast<DelSh_t>(findP("glDeleteShader"));
+    auto pCreatePr = reinterpret_cast<CreatePr_t>(findP("glCreateProgram"));
+    auto pAttachSh = reinterpret_cast<AttachSh_t>(findP("glAttachShader"));
+    auto pBindAtt  = reinterpret_cast<BindAtt_t>(findP("glBindAttribLocation"));
+    auto pLinkPr   = reinterpret_cast<LinkPr_t>(findP("glLinkProgram"));
+    auto pGetPrIv  = reinterpret_cast<GetPrIv_t>(findP("glGetProgramiv"));
+    auto pDelPr    = reinterpret_cast<DelPr_t>(findP("glDeleteProgram"));
+    auto pUsePr    = reinterpret_cast<UsePr_t>(findP("glUseProgram"));
+    auto pGetUni   = reinterpret_cast<GetUni_t>(findP("glGetUniformLocation"));
+    auto pGetAtt   = reinterpret_cast<GetAtt_t>(findP("glGetAttribLocation"));
+    auto pUni1i    = reinterpret_cast<Uni1i_t>(findP("glUniform1i"));
+    auto pUni1iv   = reinterpret_cast<Uni1iv_t>(findP("glUniform1iv"));
+    auto pUni3fv   = reinterpret_cast<Uni3fv_t>(findP("glUniform3fv"));
+    auto pUni4fv   = reinterpret_cast<Uni4fv_t>(findP("glUniform4fv"));
+    auto pUniMat4  = reinterpret_cast<UniMat4_t>(findP("glUniformMatrix4fv"));
+    auto pActTex   = reinterpret_cast<ActTex_t>(findP("glActiveTexture"));
+    auto pVp       = reinterpret_cast<Vp_t>(findP("glViewport"));
+    auto pClrCol   = reinterpret_cast<ClrCol_t>(findP("glClearColor"));
+    auto pClr      = reinterpret_cast<Clr_t>(findP("glClear"));
+    auto pEnAtt    = reinterpret_cast<EnAtt_t>(findP("glEnableVertexAttribArray"));
+    auto pAttPtr   = reinterpret_cast<AttPtr_t>(findP("glVertexAttribPointer"));
+    auto pDrawArr  = reinterpret_cast<DrawArr_t>(findP("glDrawArrays"));
+    auto pReadPix  = reinterpret_cast<ReadPix_t>(findP("glReadPixels"));
+    auto pGetErr   = reinterpret_cast<GetErr_t>(findP("glGetError"));
+    auto pGetInt   = reinterpret_cast<GetInt_t>(findP("glGetIntegerv"));
+    auto pIsEn     = reinterpret_cast<IsEn_t>(opt.glIsEnabled);
+    auto pFinish   = reinterpret_cast<Finish_t>(findP("glFinish"));
+
+    while (pGetErr() != 0u) {}
+
+    // -------------------------------------------------------------------------
+    // Part A: Live RTX 4060 PreallocTexIdPool (acquire, upload RGBA8/DXT5,
+    //         pixel-exact readback, low-water refill & zero-leak ReleaseGpu)
+    // -------------------------------------------------------------------------
+    bool partAOk = false;
+    {
+        hs_pbo_tex::GlTexPoolOps tops{};
+        tops.glGenTextures    = pGenTex;
+        tops.glDeleteTextures = pDelTex;
+        hs_pbo_tex::PreallocTexIdPool pool;
+        pool.SetOps(tops);
+        pool.SetEnabled(true);
+        pool.RefillIfLow();
+
+        uint32_t texPoolRgba = 0u, texPoolDxt = 0u, texDirRgba = 0u, texDirDxt = 0u;
+        uint32_t batch8[8]{};
+        const bool acqOk = (pool.AvailableCount() == 256u) &&
+                           pool.TryAcquire(1, &texPoolRgba) &&
+                           pool.TryAcquire(1, &texPoolDxt) &&
+                           pool.TryAcquire(8, batch8) &&
+                           (pool.AvailableCount() == 246u) &&
+                           (pool.HitCount() == 3u) &&
+                           (texPoolRgba != 0u && texPoolDxt != 0u && texPoolRgba != texPoolDxt);
+        pGenTex(1, &texDirRgba);
+        pGenTex(1, &texDirDxt);
+
+        static constexpr const char* kVs =
+            "#version 100\nattribute vec2 aPos; varying vec2 vUv;\n"
+            "void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+        static constexpr const char* kFs =
+            "#version 100\nprecision highp float; uniform sampler2D uTex; varying vec2 vUv;\n"
+            "void main() { gl_FragColor = texture2D(uTex, vUv); }\n";
+        uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+        pShSrc(vs, 1, &kVs, nullptr); pCompSh(vs);
+        pShSrc(fs, 1, &kFs, nullptr); pCompSh(fs);
+        uint32_t pr = pCreatePr();
+        pAttachSh(pr, vs); pAttachSh(pr, fs); pBindAtt(pr, 0u, "aPos"); pLinkPr(pr);
+        pDelSh(vs); pDelSh(fs);
+
+        uint32_t fbo = 0u, fboTex = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &fboTex);
+        auto prepTex = [&](uint32_t t) {
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t);
+            pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+            pTexPar(0x0DE1u, 0x2802u, 0x812F); pTexPar(0x0DE1u, 0x2803u, 0x812F);
+        };
+        prepTex(fboTex);
+        pTexImg(0x0DE1u, 0, 0x1908, 64, 64, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, fbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, fboTex, 0);
+
+        std::vector<uint8_t> rgba(64u * 64u * 4u);
+        for (size_t i = 0; i < rgba.size(); ++i) rgba[i] = static_cast<uint8_t>((i * 41u + 9u) & 0xFFu);
+        std::vector<uint8_t> dxt5(64u * 64u);
+        for (size_t i = 0; i < dxt5.size(); ++i) dxt5[i] = static_cast<uint8_t>((i * 23u + 17u) & 0xFFu);
+        prepTex(texPoolRgba); pTexImg(0x0DE1u, 0, 0x1908, 64, 64, 0, 0x1908u, 0x1401u, rgba.data());
+        prepTex(texDirRgba);  pTexImg(0x0DE1u, 0, 0x1908, 64, 64, 0, 0x1908u, 0x1401u, rgba.data());
+        prepTex(texPoolDxt);  pCompImg(0x0DE1u, 0, 0x83F3u, 64, 64, 0, static_cast<int32_t>(dxt5.size()), dxt5.data());
+        prepTex(texDirDxt);   pCompImg(0x0DE1u, 0, 0x83F3u, 64, 64, 0, static_cast<int32_t>(dxt5.size()), dxt5.data());
+
+        const float quad[8] = { -1,-1, 1,-1, -1,1, 1,1 };
+        auto readTex = [&](uint32_t t, std::vector<uint8_t>& out) {
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 64, 64); pUsePr(pr);
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t); pUni1i(pGetUni(pr, "uTex"), 0);
+            reinterpret_cast<void(WINAPI*)(uint32_t,uint32_t)>(findP("glBindBuffer"))(0x8892u, 0u);
+            pEnAtt(0u); pAttPtr(0u, 2, 0x1406u, 0u, 0, quad);
+            pDrawArr(0x0005u, 0, 4); pFinish();
+            out.resize(64u * 64u * 4u);
+            pReadPix(0, 0, 64, 64, 0x1908u, 0x1401u, out.data());
+        };
+        std::vector<uint8_t> rP, rD, dP, dD;
+        readTex(texPoolRgba, rP); readTex(texDirRgba, rD);
+        readTex(texPoolDxt,  dP); readTex(texDirDxt,  dD);
+        int maxDiff = 0;
+        for (size_t i = 0; i < rP.size(); ++i) {
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(rP[i]) - static_cast<int>(rD[i])));
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(dP[i]) - static_cast<int>(dD[i])));
+        }
+        // Drain below low-water (64) & refill -> 256, then ReleaseGpu(true) deletes all unused IDs with 0 GL error
+        std::vector<uint32_t> drain(190u, 0u);
+        const bool drainOk = pool.TryAcquire(190, drain.data()) && (pool.AvailableCount() == 56u);
+        pool.RefillIfLow(64u);
+        const bool refillOk = (pool.AvailableCount() == 256u) && (pool.RefillCount() == 2u);
+        pDelTex(190, drain.data());
+        pDelTex(8, batch8);
+        pDelTex(1, &texPoolRgba); pDelTex(1, &texPoolDxt);
+        pDelTex(1, &texDirRgba);  pDelTex(1, &texDirDxt);
+        pool.ReleaseGpu(true);
+        const bool releasedOk = (pool.AvailableCount() == 0u) && (!pIsTex || pIsTex(texPoolRgba) == 0u);
+        pBindFbo(0x8D40u, 0u);
+        pDelFbo(1, &fbo); pDelTex(1, &fboTex); pDelPr(pr);
+        const uint32_t errA = pGetErr();
+        partAOk = acqOk && drainOk && refillOk && releasedOk && (maxDiff == 0) && (errA == 0u);
+        printf("  Part A PreallocTexIdPool Live RTX: acq=%d refill=%d rel=%d maxDiff=%d err=0x%X -> %s\n",
+               acqOk ? 1 : 0, refillOk ? 1 : 0, releasedOk ? 1 : 0, maxDiff, errA, partAOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part B: Live RTX 4060 Vectorized TryBatchGpuDrivenInternal Parity
+    //         (odd vertex counts 5/7/13, stride=16, trackMaxWy minShadowHeight=1.5f,
+    //          hasCamRight=true & false, CPU 16-slot vs GPU-Driven SSBO+Bindless)
+    // -------------------------------------------------------------------------
+    bool partBOk = false;
+    {
+        static constexpr const char* kAnimVs =
+            "uniform mat4 MatrixP; uniform mat4 MatrixV; uniform mat4 MatrixW;\n"
+            "uniform vec3 FLOAT_PARAMS; uniform vec4 TIMEPARAMS;\n"
+            "attribute vec4 POS2D_UV; varying vec3 PS_TEXCOORD; varying vec3 PS_POS;\n"
+            "void main() {\n"
+            "#if defined(SKINNED)\n"
+            "\tvec4 world_pos = vec4(0.0); vec3 TEXCOORD0 = vec3(0.0);\n"
+            "#else\n"
+            "\tvec3 POSITION = vec3(POS2D_UV.xy, 0.0);\n"
+            "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+            "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+            "\tvec3 object_pos = POSITION.xyz;\n"
+            "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+            "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+            "\tgl_Position = mtxPV * world_pos;\n"
+            "#endif\n"
+            "\tPS_TEXCOORD = TEXCOORD0; PS_POS = world_pos.xyz;\n"
+            "}\n";
+        static constexpr const char* kAnimPs =
+            "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
+            "uniform sampler2D SAMPLER[6]; uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+            "uniform mat4 COLOUR_XFORM; uniform vec3 PARAMS; uniform vec3 FLOAT_PARAMS;\n"
+            "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+            "varying vec3 PS_POS; varying vec3 PS_TEXCOORD;\n"
+            "#define LIGHT_OVERRIDE PARAMS.y\n#define BLOOM_TOGGLE PARAMS.z\n"
+            "vec3 CalculateLightingContribution() { return vec3(1.0); }\n"
+            "void main() {\n"
+            "\tvec4 colour;\n"
+            "#if defined( TRIPLE_ATLAS )\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+            "#else\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n"
+            "#endif\n"
+            "\tif (BLOOM_TOGGLE == 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+            "\tif(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+            "\tgl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+            "\tvec3 light = CalculateLightingContribution();\n"
+            "\tgl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+            "}\n";
+
+        std::string gVs, gFs;
+        const char* tag = nullptr;
+        const bool txOk = hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, gVs, tag, true, true) &&
+                          hs_sprite_batch::TransformAnimBatchShaderSource(kAnimPs, gFs, tag, true, true);
+        uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+        const char* vp = gVs.c_str(); int32_t vl = static_cast<int32_t>(gVs.size());
+        const char* fp = gFs.c_str(); int32_t fl = static_cast<int32_t>(gFs.size());
+        pShSrc(vs, 1, &vp, &vl); pCompSh(vs);
+        pShSrc(fs, 1, &fp, &fl); pCompSh(fs);
+        uint32_t prog = pCreatePr();
+        pAttachSh(prog, vs); pAttachSh(prog, fs); pBindAtt(prog, 0u, "POS2D_UV"); pLinkPr(prog);
+        pDelSh(vs); pDelSh(fs);
+        int32_t linkOk = 0; pGetPrIv(prog, 0x8B82u, &linkOk);
+
+        hs_sprite_batch::GlBatchOps bops{};
+        bops.glGenBuffers               = reinterpret_cast<decltype(bops.glGenBuffers)>(findP("glGenBuffers"));
+        bops.glDeleteBuffers            = reinterpret_cast<decltype(bops.glDeleteBuffers)>(findP("glDeleteBuffers"));
+        bops.glBindBuffer               = reinterpret_cast<decltype(bops.glBindBuffer)>(findP("glBindBuffer"));
+        bops.glBufferData               = reinterpret_cast<decltype(bops.glBufferData)>(findP("glBufferData"));
+        bops.glBufferSubData            = reinterpret_cast<decltype(bops.glBufferSubData)>(opt.glBufferSubData);
+        bops.glMapBufferRange           = reinterpret_cast<decltype(bops.glMapBufferRange)>(opt.glMapBufferRange);
+        bops.glUnmapBuffer              = reinterpret_cast<decltype(bops.glUnmapBuffer)>(opt.glUnmapBuffer);
+        bops.glBufferStorage            = reinterpret_cast<decltype(bops.glBufferStorage)>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+        bops.glFenceSync                = reinterpret_cast<decltype(bops.glFenceSync)>(opt.glFenceSync);
+        bops.glClientWaitSync           = reinterpret_cast<decltype(bops.glClientWaitSync)>(opt.glClientWaitSync);
+        bops.glDeleteSync               = reinterpret_cast<decltype(bops.glDeleteSync)>(opt.glDeleteSync);
+        bops.glActiveTexture            = pActTex;
+        bops.glBindTexture              = pBindTex;
+        bops.glUniform1f                = reinterpret_cast<decltype(bops.glUniform1f)>(findP("glUniform1f"));
+        bops.glUniform1i                = pUni1i;
+        bops.glUniform3fv               = pUni3fv;
+        bops.glUniform4fv               = pUni4fv;
+        bops.glUniformMatrix4fv         = pUniMat4;
+        bops.glVertexAttribPointer      = pAttPtr;
+        bops.glEnableVertexAttribArray  = pEnAtt;
+        bops.glDisableVertexAttribArray = reinterpret_cast<decltype(bops.glDisableVertexAttribArray)>(findP("glDisableVertexAttribArray"));
+        bops.glDrawElements             = reinterpret_cast<decltype(bops.glDrawElements)>(findP("glDrawElements"));
+        bops.glDrawElementsBaseVertex   = reinterpret_cast<decltype(bops.glDrawElementsBaseVertex)>(opt.glDrawElementsBaseVertex);
+        bops.glBindBufferBase           = reinterpret_cast<decltype(bops.glBindBufferBase)>(opt.glBindBufferBase);
+        bops.glGetIntegerv              = pGetInt;
+        bops.glGetBufferParameteriv     = reinterpret_cast<decltype(bops.glGetBufferParameteriv)>(opt.glGetBufferParameteriv);
+        bops.glGetTextureHandleARB      = reinterpret_cast<decltype(bops.glGetTextureHandleARB)>(opt.glGetTextureHandleARB);
+        bops.glMakeTextureHandleResidentARB    = reinterpret_cast<decltype(bops.glMakeTextureHandleResidentARB)>(opt.glMakeTextureHandleResidentARB);
+        bops.glMakeTextureHandleNonResidentARB = reinterpret_cast<decltype(bops.glMakeTextureHandleNonResidentARB)>(opt.glMakeTextureHandleNonResidentARB);
+
+        hs_world_shadow::GlShadowOps wops{};
+        wops.glGenFramebuffers          = pGenFbo;
+        wops.glDeleteFramebuffers       = pDelFbo;
+        wops.glBindFramebuffer          = pBindFbo;
+        wops.glFramebufferTexture2D     = pFboTex;
+        wops.glCheckFramebufferStatus   = reinterpret_cast<decltype(wops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        wops.glGenRenderbuffers         = reinterpret_cast<decltype(wops.glGenRenderbuffers)>(findP("glGenRenderbuffers"));
+        wops.glDeleteRenderbuffers      = reinterpret_cast<decltype(wops.glDeleteRenderbuffers)>(findP("glDeleteRenderbuffers"));
+        wops.glBindRenderbuffer         = reinterpret_cast<decltype(wops.glBindRenderbuffer)>(findP("glBindRenderbuffer"));
+        wops.glRenderbufferStorage      = reinterpret_cast<decltype(wops.glRenderbufferStorage)>(findP("glRenderbufferStorage"));
+        wops.glFramebufferRenderbuffer  = reinterpret_cast<decltype(wops.glFramebufferRenderbuffer)>(findP("glFramebufferRenderbuffer"));
+        wops.glGenTextures              = pGenTex;
+        wops.glDeleteTextures           = pDelTex;
+        wops.glActiveTexture            = pActTex;
+        wops.glBindTexture              = pBindTex;
+        wops.glTexImage2D               = pTexImg;
+        wops.glTexParameteri            = pTexPar;
+        wops.glCreateShader             = pCreateSh;
+        wops.glShaderSource             = pShSrc;
+        wops.glCompileShader            = pCompSh;
+        wops.glGetShaderiv              = pGetShIv;
+        wops.glGetShaderInfoLog         = reinterpret_cast<decltype(wops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        wops.glDeleteShader             = pDelSh;
+        wops.glCreateProgram            = pCreatePr;
+        wops.glAttachShader             = pAttachSh;
+        wops.glBindAttribLocation       = pBindAtt;
+        wops.glLinkProgram              = pLinkPr;
+        wops.glGetProgramiv             = pGetPrIv;
+        wops.glGetProgramInfoLog        = reinterpret_cast<decltype(wops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        wops.glDeleteProgram            = pDelPr;
+        wops.glUseProgram               = pUsePr;
+        wops.glGetUniformLocation       = pGetUni;
+        wops.glUniform1f                = bops.glUniform1f;
+        wops.glUniform1i                = pUni1i;
+        wops.glUniform4fv               = pUni4fv;
+        wops.glUniformMatrix4fv         = pUniMat4;
+        wops.glGenBuffers               = bops.glGenBuffers;
+        wops.glDeleteBuffers            = bops.glDeleteBuffers;
+        wops.glBindBuffer               = bops.glBindBuffer;
+        wops.glBufferData               = bops.glBufferData;
+        wops.glEnableVertexAttribArray  = pEnAtt;
+        wops.glDisableVertexAttribArray = bops.glDisableVertexAttribArray;
+        wops.glVertexAttribPointer      = pAttPtr;
+        wops.glDrawArrays               = pDrawArr;
+        wops.glDrawElements             = bops.glDrawElements;
+        wops.glDrawElementsBaseVertex   = bops.glDrawElementsBaseVertex;
+        wops.glBindBufferBase           = bops.glBindBufferBase;
+        wops.glViewport                 = pVp;
+        wops.glClearColor               = pClrCol;
+        wops.glClear                    = pClr;
+        wops.glEnable                   = reinterpret_cast<decltype(wops.glEnable)>(findP("glEnable"));
+        wops.glDisable                  = reinterpret_cast<decltype(wops.glDisable)>(findP("glDisable"));
+        wops.glBlendFunc                = reinterpret_cast<decltype(wops.glBlendFunc)>(findP("glBlendFunc"));
+        wops.glBlendFuncSeparate        = reinterpret_cast<decltype(wops.glBlendFuncSeparate)>(findP("glBlendFuncSeparate"));
+        wops.glBlendEquation            = reinterpret_cast<decltype(wops.glBlendEquation)>(findP("glBlendEquation"));
+        wops.glBlendEquationSeparate    = reinterpret_cast<decltype(wops.glBlendEquationSeparate)>(findP("glBlendEquationSeparate"));
+        wops.glDepthFunc                = reinterpret_cast<decltype(wops.glDepthFunc)>(findP("glDepthFunc"));
+        wops.glDepthMask                = reinterpret_cast<decltype(wops.glDepthMask)>(findP("glDepthMask"));
+        wops.glColorMask                = reinterpret_cast<decltype(wops.glColorMask)>(findP("glColorMask"));
+        wops.glGetIntegerv              = pGetInt;
+        wops.glGetError                 = pGetErr;
+        wops.logFn                      = &TestLog;
+
+        uint32_t rtFbo = 0u, rtTex = 0u, spTex = 0u;
+        pGenFbo(1, &rtFbo); pGenTex(1, &rtTex); pGenTex(1, &spTex);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, rtTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        pTexImg(0x0DE1u, 0, 0x8058, 256, 256, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, rtFbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, rtTex, 0);
+
+        uint8_t white4[4 * 4 * 4]; std::memset(white4, 255, sizeof(white4));
+        pBindTex(0x0DE1u, spTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexImg(0x0DE1u, 0, 0x8058, 4, 4, 0, 0x1908u, 0x1401u, white4);
+
+        hs_sprite_batch::BatchProgInfo binfo{};
+        binfo.checked = true; binfo.eligible = true; binfo.hasGpuDriven = true;
+        binfo.locBatchActive = pGetUni(prog, "HS_BATCH_ACTIVE");
+        binfo.locMatrixW     = pGetUni(prog, "MatrixW");
+        binfo.locColourXform = pGetUni(prog, "COLOUR_XFORM");
+        binfo.locFloatParams = pGetUni(prog, "FLOAT_PARAMS");
+        binfo.locOceanBlend  = pGetUni(prog, "OCEAN_BLEND_PARAMS");
+        binfo.locSampler0    = pGetUni(prog, "SAMPLER[0]");
+        binfo.locSampler1    = pGetUni(prog, "SAMPLER[1]");
+        binfo.locPos2dUv     = pGetAtt(prog, "POS2D_UV");
+        binfo.locBatchWpos   = pGetAtt(prog, "HS_BATCH_WPOS");
+        binfo.locBatchCMult  = pGetAtt(prog, "HS_BATCH_CMULT");
+        binfo.locBatchCAdd   = pGetAtt(prog, "HS_BATCH_CADD");
+        binfo.progMaxTexSlots = 16u;
+        for (uint32_t s = 0; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+            char nm[32]{}; snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+            binfo.locBatchTex[s] = pGetUni(prog, nm);
+        }
+
+        const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        const float pv[16] = { 1.0f/20.0f,0,0,0, 0,0,0,0, 0,1.0f/20.0f,0,0, 0,0,0,1 };
+        const int32_t sampUnits[6] = { 0,1,2,3,4,5 };
+        const float paramsV[3] = { 0.0f, 0.0f, 0.0f };
+        pUsePr(prog);
+        if (pUni1iv && pGetUni(prog, "SAMPLER") >= 0) pUni1iv(pGetUni(prog, "SAMPLER"), 6, sampUnits);
+        if (pUni3fv && pGetUni(prog, "PARAMS") >= 0) pUni3fv(pGetUni(prog, "PARAMS"), 1, paramsV);
+        pUniMat4(pGetUni(prog, "MatrixP"), 1, 0, idMtx);
+        pUniMat4(pGetUni(prog, "MatrixV"), 1, 0, idMtx);
+
+        // Odd-vertex fan mesh builder (5, 7, 13 verts -> tests SIMD 4x loop + remainder 1/3!)
+        auto buildFan = [](uint32_t nv, float halfW, float hTop, std::vector<float>& outV, std::vector<uint16_t>& outI) {
+            outV.clear(); outI.clear();
+            // v0 = center, v1..v(nv-1) = perimeter covering [-halfW..+halfW] x [0..hTop]
+            outV.insert(outV.end(), { 0.0f, hTop * 0.5f, 0.5f, 0.5f });
+            const uint32_t rim = nv - 1u;
+            for (uint32_t i = 0u; i < rim; ++i) {
+                const float ang = static_cast<float>(i) * (6.2831853f / static_cast<float>(rim));
+                const float vx = std::cos(ang) * halfW;
+                const float vy = (0.5f + 0.5f * std::sin(ang)) * hTop;
+                outV.insert(outV.end(), { vx, vy, 0.5f + 0.4f * std::cos(ang), 0.5f + 0.4f * std::sin(ang) });
+            }
+            for (uint32_t i = 0u; i < rim; ++i) {
+                outI.push_back(0u);
+                outI.push_back(static_cast<uint16_t>(1u + i));
+                outI.push_back(static_cast<uint16_t>(1u + ((i + 1u) % rim)));
+            }
+        };
+
+        auto runOddVertShadow = [&](bool useGpuDriven, bool hasCamRight, std::vector<uint8_t>& outShadowRgba) -> bool {
+            hs_world_shadow::WorldShadowEngine ws;
+            ws.SetOps(wops, true);
+            hs_gl_cache::ThreadState glCache;
+            glCache.caps[0] = 1; glCache.caps[1] = 0; glCache.caps[2] = 0; glCache.caps[3] = 0; glCache.caps[4] = 0;
+            glCache.blendSrc = hs_world_shadow::kGlSrcAlpha;
+            glCache.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+            glCache.blendEq  = hs_world_shadow::kGlFuncAdd;
+            glCache.depthFunc = hs_world_shadow::kGlLess;
+            glCache.colorMask = 15; glCache.depthMask = 0;
+
+            hs_sprite_batch::SpriteBatcher sb;
+            sb.SetOps(bops);
+            sb.SetPersistentRingPreferred(true);
+            sb.SetGpuDrivenPreferred(useGpuDriven);
+            sb.SetElasticRingBudget(262144u, 524288u, 32768u);
+            sb.SetDeferHostRestore(true);
+            sb.SetShadowActive(true);
+            sb.SetShadowHints(true, hasCamRight, 1.0f, 0.0f, 1.5f); // trackMaxWy active! (minShadowHeight=1.5)
+            sb.SetEnabled(true);
+            sb.OnUseProgram(prog, &binfo);
+            bops.glEnableVertexAttribArray(static_cast<uint32_t>(binfo.locPos2dUv));
+            sb.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(binfo.locPos2dUv), true);
+            sb.OnActiveTexture(hs_sprite_batch::kGlTexture0);
+            sb.OnBindBuffer(hs_sprite_batch::kGlArrayBuffer, 0u);
+            sb.OnBindBuffer(hs_sprite_batch::kGlElementArrayBuffer, 0u);
+
+            hs_world_shadow::ShadowConfig cfg{};
+            cfg.dirWx = 0.0f; cfg.dirWz = 1.0f; cfg.stretch = 2.0f; cfg.projOn = 1.0f;
+            cfg.minHeight = 1.5f; cfg.density = 0.65f; cfg.soft = 0.60f;
+            cfg.tintR = 0.10f; cfg.tintG = 0.15f; cfg.tintB = 0.40f;
+            cfg.hdMode = true; cfg.skipNightmare = true;
+            cfg.hasLuaCam = true; cfg.luaCamRightX = 1.0f; cfg.luaCamRightZ = 0.0f;
+            const int32_t vp[4] = { 0, 0, 256, 256 };
+            hs_world_shadow::ShadowPassState saved{};
+            saved.dstFbo = rtFbo; saved.dstProg = prog;
+            memcpy(saved.vp, vp, sizeof(vp));
+            saved.glCacheTrusted = true; saved.blendCacheTrusted = true;
+
+            pBindFbo(0x8D40u, rtFbo); pVp(0, 0, 256, 256);
+            ws.OnGroundOrOceanDraw(rtFbo, vp); ws.OnMatrixPV(pv);
+            if (!ws.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+
+            const uint32_t oddCounts[3] = { 5u, 7u, 13u };
+            uint32_t totalIdx = 0u;
+            for (int k = 0; k < 3; ++k) {
+                std::vector<float> vf; std::vector<uint16_t> idf;
+                // Tall mesh (h=4.0 >= 1.5 -> casts shadow at x=-10,-2,+6)
+                buildFan(oddCounts[k], 1.4f, 4.0f, vf, idf);
+                const float mwTall[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, -10.0f + k * 8.0f, 0.0f, -4.0f, 1.0f };
+                sb.OnVertexAttribPointer(static_cast<uint32_t>(binfo.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, vf.data());
+                sb.OnBindTexture(hs_sprite_batch::kGlTexture2D, spTex);
+                sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mwTall);
+                sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+                if (!sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, static_cast<int32_t>(idf.size()), hs_sprite_batch::kGlUnsignedShort, idf.data())) return false;
+                totalIdx += static_cast<uint32_t>(idf.size());
+
+                // Short mesh (h=0.5 < 1.5 -> MUST be filtered out by vectorized trackMaxWy!)
+                buildFan(oddCounts[k], 1.4f, 0.5f, vf, idf);
+                const float mwShort[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, -10.0f + k * 8.0f, 0.0f, 10.0f, 1.0f };
+                sb.OnVertexAttribPointer(static_cast<uint32_t>(binfo.locPos2dUv), 4, hs_sprite_batch::kGlFloat, 0, 16, vf.data());
+                sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mwShort);
+                sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+                if (!sb.TryBatchDrawElements(hs_sprite_batch::kGlTriangles, static_cast<int32_t>(idf.size()), hs_sprite_batch::kGlUnsignedShort, idf.data())) return false;
+                totalIdx += static_cast<uint32_t>(idf.size());
+            }
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+            sb.EndStickyBatchSession();
+            const bool recOk = useGpuDriven
+                ? ws.RecordBatchedShadowGpu(sb.LastFlushVboId(), sb.LastFlushIboId(), sb.LastFlushSsboId(),
+                                            totalIdx, sb.LastFlushBaseVertex(), sb.LastFlushIndexByteOffset(),
+                                            sb.LastFlushShadowBoundsXZ(), rtFbo)
+                : ws.RecordBatchedShadow(sb.LastFlushVboId(), sb.LastFlushIboId(), totalIdx,
+                                         sb.LastFlushVertByteOffset(), sb.LastFlushIndexByteOffset(),
+                                         sb.LastFlushTexCount(), sb.LastFlushTexIds(),
+                                         sb.LastFlushShadowBoundsXZ(), rtFbo);
+            if (!recOk) return false;
+            ws.FlushDeferredBatchedShadows(cfg, saved, glCache);
+            sb.OnEndFrame(); ws.OnEndFrame();
+
+            pBindFbo(0x8D40u, rtFbo); pVp(0, 0, 256, 256);
+            wops.glColorMask(1, 1, 1, 1); pClrCol(0.4f, 0.7f, 0.3f, 1.0f); pClr(0x4000u);
+            ws.OnGroundOrOceanDraw(rtFbo, vp); ws.OnMatrixPV(pv);
+            if (!ws.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+            ws.OnEndFrame(); pFinish();
+
+            outShadowRgba.resize(256u * 256u * 4u);
+            pBindFbo(0x8D40u, rtFbo);
+            pReadPix(0, 0, 256, 256, 0x1908u, 0x1401u, outShadowRgba.data());
+            sb.ReleaseGpuResources(); ws.ResetContext(true);
+            return true;
+        };
+
+        std::vector<uint8_t> imgCpuT, imgGpuT, imgCpuF, imgGpuF;
+        const bool ok1 = txOk && linkOk &&
+                         runOddVertShadow(false, true,  imgCpuT) &&
+                         runOddVertShadow(true,  true,  imgGpuT) &&
+                         runOddVertShadow(false, false, imgCpuF) &&
+                         runOddVertShadow(true,  false, imgGpuF);
+        int maxDiffT = 0, maxDiffF = 0, tallShadPx = 0, shortShadPx = 0;
+        if (ok1) {
+            for (int y = 0; y < 256; ++y) {
+                for (int x = 0; x < 256; ++x) {
+                    const size_t i = (static_cast<size_t>(y) * 256u + static_cast<size_t>(x)) * 4u;
+                    for (int c = 0; c < 4; ++c) {
+                        maxDiffT = (std::max)(maxDiffT, abs(static_cast<int>(imgCpuT[i + c]) - static_cast<int>(imgGpuT[i + c])));
+                        maxDiffF = (std::max)(maxDiffF, abs(static_cast<int>(imgCpuF[i + c]) - static_cast<int>(imgGpuF[i + c])));
+                    }
+                    // z=-4 -> y ~ 102..165 (tall); z=+10 -> y ~ 192..230 (short MUST be 0 shadowed!)
+                    if (y >= 90 && y <= 170 && imgGpuT[i + 1] < 168u) ++tallShadPx;
+                    if (y >= 195 && y <= 245 && imgGpuT[i + 1] < 168u) ++shortShadPx;
+                }
+            }
+        }
+        pBindFbo(0x8D40u, 0u);
+        pDelFbo(1, &rtFbo); pDelTex(1, &rtTex); pDelTex(1, &spTex); pDelPr(prog);
+        const uint32_t errB = pGetErr();
+        partBOk = ok1 && (maxDiffT == 0) && (maxDiffF == 0) && (tallShadPx > 100) && (shortShadPx == 0) && (errB == 0u);
+        printf("  Part B Vectorized GpuDriven (5/7/13v + trackMaxWy + camR T/F): diffT=%d diffF=%d tallPx=%d shortPx=%d err=0x%X -> %s\n",
+               maxDiffT, maxDiffF, tallShadPx, shortShadPx, errB, partBOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part C: Live RTX 4060 Zero-Stall Counters:
+    //   1) WorldShadowEngine blendCacheTrusted=true (0 glGetIntegerv) + DirShadowCullBox (0 draws on far batch)
+    //   2) GpuClarityEngine KnownGlState (0 glGetIntegerv / 0 glIsEnabled / 0 queryObj) +
+    //      Grade 2 & Grade 3 RGB10_A2 odd-resolution (641x361) bit-exact parity vs uncached path!
+    // -------------------------------------------------------------------------
+    bool partCOk = false;
+    {
+        struct LiveCounters {
+            GetInt_t realGetInt = nullptr;
+            IsEn_t   realIsEn   = nullptr;
+            hs_gpu_clarity::GlComputeOps::GetQueryObjectiv_t realGetQiv = nullptr;
+            uint32_t getIntCnt = 0u;
+            uint32_t isEnCnt   = 0u;
+            uint32_t qObjCnt   = 0u;
+        };
+        static LiveCounters* s_lc = nullptr;
+        LiveCounters lc{};
+        lc.realGetInt = pGetInt;
+        lc.realIsEn   = pIsEn;
+        lc.realGetQiv = reinterpret_cast<hs_gpu_clarity::GlComputeOps::GetQueryObjectiv_t>(opt.glGetQueryObjectiv);
+        s_lc = &lc;
+
+        auto countGetInt = [](uint32_t p, int32_t* o) WINAPI { ++s_lc->getIntCnt; s_lc->realGetInt(p, o); };
+        auto countIsEn   = [](uint32_t c) WINAPI -> uint8_t { ++s_lc->isEnCnt; return s_lc->realIsEn ? s_lc->realIsEn(c) : 0u; };
+        auto countGetQiv = [](uint32_t q, uint32_t p, int32_t* o) WINAPI { ++s_lc->qObjCnt; if (s_lc->realGetQiv) s_lc->realGetQiv(q, p, o); };
+
+        // C1: WorldShadowEngine blendCacheTrusted + DirShadowCullBox
+        hs_world_shadow::GlShadowOps wops{};
+        wops.glGenFramebuffers          = pGenFbo;
+        wops.glDeleteFramebuffers       = pDelFbo;
+        wops.glBindFramebuffer          = pBindFbo;
+        wops.glFramebufferTexture2D     = pFboTex;
+        wops.glCheckFramebufferStatus   = reinterpret_cast<decltype(wops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        wops.glGenRenderbuffers         = reinterpret_cast<decltype(wops.glGenRenderbuffers)>(findP("glGenRenderbuffers"));
+        wops.glDeleteRenderbuffers      = reinterpret_cast<decltype(wops.glDeleteRenderbuffers)>(findP("glDeleteRenderbuffers"));
+        wops.glBindRenderbuffer         = reinterpret_cast<decltype(wops.glBindRenderbuffer)>(findP("glBindRenderbuffer"));
+        wops.glRenderbufferStorage      = reinterpret_cast<decltype(wops.glRenderbufferStorage)>(findP("glRenderbufferStorage"));
+        wops.glFramebufferRenderbuffer  = reinterpret_cast<decltype(wops.glFramebufferRenderbuffer)>(findP("glFramebufferRenderbuffer"));
+        wops.glGenTextures              = pGenTex;
+        wops.glDeleteTextures           = pDelTex;
+        wops.glActiveTexture            = pActTex;
+        wops.glBindTexture              = pBindTex;
+        wops.glTexImage2D               = pTexImg;
+        wops.glTexParameteri            = pTexPar;
+        wops.glCreateShader             = pCreateSh;
+        wops.glShaderSource             = pShSrc;
+        wops.glCompileShader            = pCompSh;
+        wops.glGetShaderiv              = pGetShIv;
+        wops.glGetShaderInfoLog         = reinterpret_cast<decltype(wops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        wops.glDeleteShader             = pDelSh;
+        wops.glCreateProgram            = pCreatePr;
+        wops.glAttachShader             = pAttachSh;
+        wops.glBindAttribLocation       = pBindAtt;
+        wops.glLinkProgram              = pLinkPr;
+        wops.glGetProgramiv             = pGetPrIv;
+        wops.glGetProgramInfoLog        = reinterpret_cast<decltype(wops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        wops.glDeleteProgram            = pDelPr;
+        wops.glUseProgram               = pUsePr;
+        wops.glGetUniformLocation       = pGetUni;
+        wops.glUniform1f                = reinterpret_cast<decltype(wops.glUniform1f)>(findP("glUniform1f"));
+        wops.glUniform1i                = pUni1i;
+        wops.glUniform4fv               = pUni4fv;
+        wops.glUniformMatrix4fv         = pUniMat4;
+        wops.glGenBuffers               = reinterpret_cast<decltype(wops.glGenBuffers)>(findP("glGenBuffers"));
+        wops.glDeleteBuffers            = reinterpret_cast<decltype(wops.glDeleteBuffers)>(findP("glDeleteBuffers"));
+        wops.glBindBuffer               = reinterpret_cast<decltype(wops.glBindBuffer)>(findP("glBindBuffer"));
+        wops.glBufferData               = reinterpret_cast<decltype(wops.glBufferData)>(findP("glBufferData"));
+        wops.glEnableVertexAttribArray  = pEnAtt;
+        wops.glDisableVertexAttribArray = reinterpret_cast<decltype(wops.glDisableVertexAttribArray)>(findP("glDisableVertexAttribArray"));
+        wops.glVertexAttribPointer      = pAttPtr;
+        wops.glDrawArrays               = pDrawArr;
+        wops.glDrawElements             = reinterpret_cast<decltype(wops.glDrawElements)>(findP("glDrawElements"));
+        wops.glDrawElementsBaseVertex   = reinterpret_cast<decltype(wops.glDrawElementsBaseVertex)>(opt.glDrawElementsBaseVertex);
+        wops.glBindBufferBase           = reinterpret_cast<decltype(wops.glBindBufferBase)>(opt.glBindBufferBase);
+        wops.glViewport                 = pVp;
+        wops.glClearColor               = pClrCol;
+        wops.glClear                    = pClr;
+        wops.glEnable                   = reinterpret_cast<decltype(wops.glEnable)>(findP("glEnable"));
+        wops.glDisable                  = reinterpret_cast<decltype(wops.glDisable)>(findP("glDisable"));
+        wops.glBlendFunc                = reinterpret_cast<decltype(wops.glBlendFunc)>(findP("glBlendFunc"));
+        wops.glBlendFuncSeparate        = reinterpret_cast<decltype(wops.glBlendFuncSeparate)>(findP("glBlendFuncSeparate"));
+        wops.glBlendEquation            = reinterpret_cast<decltype(wops.glBlendEquation)>(findP("glBlendEquation"));
+        wops.glBlendEquationSeparate    = reinterpret_cast<decltype(wops.glBlendEquationSeparate)>(findP("glBlendEquationSeparate"));
+        wops.glDepthFunc                = reinterpret_cast<decltype(wops.glDepthFunc)>(findP("glDepthFunc"));
+        wops.glDepthMask                = reinterpret_cast<decltype(wops.glDepthMask)>(findP("glDepthMask"));
+        wops.glColorMask                = reinterpret_cast<decltype(wops.glColorMask)>(findP("glColorMask"));
+        wops.glGetIntegerv              = countGetInt;
+        wops.glGetError                 = pGetErr;
+        wops.logFn                      = &TestLog;
+
+        uint32_t wsFbo = 0u, wsTex = 0u, dummyVbo = 0u, dummyIbo = 0u;
+        pGenFbo(1, &wsFbo); pGenTex(1, &wsTex);
+        wops.glGenBuffers(1, &dummyVbo); wops.glGenBuffers(1, &dummyIbo);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, wsTex);
+        pTexImg(0x0DE1u, 0, 0x8058, 128, 128, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, wsFbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, wsTex, 0);
+
+        hs_world_shadow::WorldShadowEngine ws;
+        ws.SetOps(wops, true);
+        hs_gl_cache::ThreadState glc;
+        glc.curProgram = 0u;
+        glc.caps[0] = 1; glc.caps[1] = 0; glc.caps[2] = 0; glc.caps[3] = 0; glc.caps[4] = 0;
+        glc.blendSrc = hs_world_shadow::kGlSrcAlpha; glc.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+        glc.blendEq = hs_world_shadow::kGlFuncAdd; glc.depthFunc = hs_world_shadow::kGlLess;
+        glc.colorMask = 15; glc.depthMask = 0;
+
+        const float pv[16] = { 1.0f/20.0f,0,0,0, 0,0,0,0, 0,1.0f/20.0f,0,0, 0,0,0,1 };
+        const int32_t vp128[4] = { 0, 0, 128, 128 };
+        hs_world_shadow::ShadowConfig scfg{};
+        scfg.dirWx = 0.0f; scfg.dirWz = 1.0f; scfg.stretch = 1.5f; scfg.projOn = 1.0f;
+        scfg.density = 0.6f; scfg.soft = 0.8f; scfg.hdMode = true; scfg.hasLuaCam = true;
+        hs_world_shadow::ShadowPassState saved{};
+        saved.dstFbo = wsFbo; saved.dstProg = 0u; memcpy(saved.vp, vp128, sizeof(vp128));
+        saved.glCacheTrusted = true; saved.blendCacheTrusted = true;
+
+        // Warmup frame 1 initializes shadow FBOs/programs
+        ws.OnGroundOrOceanDraw(wsFbo, vp128); ws.OnMatrixPV(pv);
+        ws.OnBeforeFirstStandingEntity(scfg, saved, glc);
+        ws.OnEndFrame();
+
+        // Steady-state frame 2 with blendCacheTrusted=true + far out-of-box batch -> 0 glGetIntegerv & 0 shadow draws!
+        lc.getIntCnt = 0u;
+        ws.OnGroundOrOceanDraw(wsFbo, vp128); ws.OnMatrixPV(pv);
+        const bool wsBeginOk = ws.OnBeforeFirstStandingEntity(scfg, saved, glc);
+        const float farBounds[4] = { 480.0f, 520.0f, 480.0f, 520.0f };
+        const uint32_t tArr[1] = { wsTex };
+        ws.RecordBatchedShadow(dummyVbo, dummyIbo, 6u, 0u, 0u, 1u, tArr, farBounds, wsFbo);
+        ws.FlushDeferredBatchedShadows(scfg, saved, glc);
+        ws.OnEndFrame();
+        const uint32_t wsGetIntCnt = lc.getIntCnt;
+        const uint32_t wsFarDraws  = ws.LastFrameShadowDraws();
+        ws.ResetContext(true);
+        wops.glDeleteBuffers(1, &dummyVbo); wops.glDeleteBuffers(1, &dummyIbo);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &wsFbo); pDelTex(1, &wsTex);
+
+        // C2: GpuClarityEngine KnownGlState zero-stall + Grade 2 & Grade 3 RGB10_A2 odd resolution (641x361) parity!
+        hs_gpu_clarity::GlComputeOps cops{};
+        cops.glGenFramebuffers        = pGenFbo;
+        cops.glDeleteFramebuffers     = pDelFbo;
+        cops.glBindFramebuffer        = pBindFbo;
+        cops.glFramebufferTexture2D   = pFboTex;
+        cops.glCheckFramebufferStatus = reinterpret_cast<decltype(cops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        cops.glBlitFramebuffer        = reinterpret_cast<decltype(cops.glBlitFramebuffer)>(opt.glBlitFramebuffer);
+        cops.glGenTextures            = pGenTex;
+        cops.glDeleteTextures         = pDelTex;
+        cops.glActiveTexture          = pActTex;
+        cops.glBindTexture            = pBindTex;
+        cops.glTexStorage2D           = reinterpret_cast<decltype(cops.glTexStorage2D)>(opt.glTexStorage2D);
+        cops.glTexParameteri          = pTexPar;
+        cops.glCreateShader           = pCreateSh;
+        cops.glShaderSource           = pShSrc;
+        cops.glCompileShader          = pCompSh;
+        cops.glGetShaderiv            = pGetShIv;
+        cops.glGetShaderInfoLog       = reinterpret_cast<decltype(cops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        cops.glDeleteShader           = pDelSh;
+        cops.glCreateProgram          = pCreatePr;
+        cops.glAttachShader           = pAttachSh;
+        cops.glLinkProgram            = pLinkPr;
+        cops.glGetProgramiv           = pGetPrIv;
+        cops.glGetProgramInfoLog      = reinterpret_cast<decltype(cops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        cops.glDeleteProgram          = pDelPr;
+        cops.glUseProgram             = pUsePr;
+        cops.glGetUniformLocation     = pGetUni;
+        cops.glUniform4f              = reinterpret_cast<decltype(cops.glUniform4f)>(opt.glUniform4f);
+        cops.glDispatchCompute        = reinterpret_cast<decltype(cops.glDispatchCompute)>(opt.glDispatchCompute);
+        cops.glMemoryBarrier          = reinterpret_cast<decltype(cops.glMemoryBarrier)>(opt.glMemoryBarrier);
+        cops.glBindImageTexture       = reinterpret_cast<decltype(cops.glBindImageTexture)>(opt.glBindImageTexture);
+        cops.glGetIntegerv            = countGetInt;
+        cops.glIsEnabled              = countIsEn;
+        cops.glEnable                 = reinterpret_cast<decltype(cops.glEnable)>(findP("glEnable"));
+        cops.glDisable                = reinterpret_cast<decltype(cops.glDisable)>(findP("glDisable"));
+        cops.glGenQueries             = reinterpret_cast<decltype(cops.glGenQueries)>(opt.glGenQueries);
+        cops.glDeleteQueries          = reinterpret_cast<decltype(cops.glDeleteQueries)>(opt.glDeleteQueries);
+        cops.glBeginQuery             = reinterpret_cast<decltype(cops.glBeginQuery)>(opt.glBeginQuery);
+        cops.glEndQuery               = reinterpret_cast<decltype(cops.glEndQuery)>(opt.glEndQuery);
+        cops.glGetQueryObjectiv       = countGetQiv;
+        cops.glGetQueryObjectui64v    = reinterpret_cast<decltype(cops.glGetQueryObjectui64v)>(opt.glGetQueryObjectui64v);
+        cops.logFn                    = &TestLog;
+
+        const int32_t oddW = 641, oddH = 361;
+        std::vector<uint8_t> srcImg(static_cast<size_t>(oddW) * static_cast<size_t>(oddH) * 4u);
+        for (int32_t y = 0; y < oddH; ++y) {
+            for (int32_t x = 0; x < oddW; ++x) {
+                const size_t i = (static_cast<size_t>(y) * static_cast<size_t>(oddW) + static_cast<size_t>(x)) * 4u;
+                const bool ink = (std::abs(y - (x / 2 + 40)) < 2);
+                srcImg[i + 0] = ink ? 24u : static_cast<uint8_t>(140 + (x * 90) / oddW);
+                srcImg[i + 1] = ink ? 20u : static_cast<uint8_t>(130 + (y * 90) / oddH);
+                srcImg[i + 2] = ink ? 22u : 115u;
+                srcImg[i + 3] = 255u;
+            }
+        }
+        uint32_t clFbo = 0u, clTex = 0u;
+        pGenFbo(1, &clFbo); pGenTex(1, &clTex);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, clTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        pTexImg(0x0DE1u, 0, 0x8058, oddW, oddH, 0, 0x1908u, 0x1401u, srcImg.data());
+        pBindFbo(0x8D40u, clFbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, clTex, 0);
+
+        hs_gpu_clarity::GpuClarityEngine cl;
+        cl.SetOps(cops, true);
+        int g2Diff = 255, g3Diff = 255;
+        uint32_t clGetIntSteady = 999u, clIsEnSteady = 999u, clQObjSteady = 999u;
+        bool scPreserved = false;
+        auto runClarity = [&](int grade, bool useKnown, std::vector<uint8_t>& outPx, bool measureCounters) -> bool {
+            pActTex(0x84C0u); pBindTex(0x0DE1u, clTex);
+            pTexImg(0x0DE1u, 0, 0x8058, oddW, oddH, 0, 0x1908u, 0x1401u, srcImg.data());
+            pBindFbo(0x8D40u, clFbo);
+            pUsePr(0u);
+            cops.glEnable(hs_gpu_clarity::kGlScissorTest);
+            hs_gpu_clarity::KnownGlState ks{};
+            ks.drawFbo = static_cast<int32_t>(clFbo);
+            ks.readFbo = static_cast<int32_t>(clFbo);
+            ks.curProgram = 0;
+            ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+            ks.boundTex0 = static_cast<int32_t>(clTex);
+            ks.scissorEnabled = 1;
+            ks.sampleTimer = false;
+            if (measureCounters) { lc.getIntCnt = 0u; lc.isEnCnt = 0u; lc.qObjCnt = 0u; }
+            const bool r = cl.ProcessFrame(clFbo, oddW, oddH, { grade, 1.0f }, useKnown ? &ks : nullptr);
+            if (measureCounters) {
+                clGetIntSteady = lc.getIntCnt;
+                clIsEnSteady   = lc.isEnCnt;
+                clQObjSteady   = lc.qObjCnt;
+                scPreserved    = (pIsEn && pIsEn(hs_gpu_clarity::kGlScissorTest) != 0u);
+            }
+            cops.glDisable(hs_gpu_clarity::kGlScissorTest);
+            pFinish();
+            outPx.resize(srcImg.size());
+            pBindFbo(0x8CA8u /*GL_READ_FRAMEBUFFER*/, clFbo);
+            pReadPix(0, 0, oddW, oddH, 0x1908u, 0x1401u, outPx.data());
+            return r;
+        };
+
+        std::vector<uint8_t> g2Ref, g2Fast, g3Ref, g3Fast;
+        const bool clOk = runClarity(2, false, g2Ref,  false) &&
+                          runClarity(2, true,  g2Fast, false) &&
+                          runClarity(3, false, g3Ref,  false) &&
+                          runClarity(3, true,  g3Fast, true);
+        if (clOk) {
+            g2Diff = 0; g3Diff = 0;
+            for (size_t i = 0; i < g2Ref.size(); ++i) {
+                g2Diff = (std::max)(g2Diff, abs(static_cast<int>(g2Ref[i]) - static_cast<int>(g2Fast[i])));
+                g3Diff = (std::max)(g3Diff, abs(static_cast<int>(g3Ref[i]) - static_cast<int>(g3Fast[i])));
+            }
+        }
+        cl.OnContextReset(true);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &clFbo); pDelTex(1, &clTex);
+        s_lc = nullptr;
+        const uint32_t errC = pGetErr();
+        partCOk = wsBeginOk && (wsGetIntCnt == 0u) && (wsFarDraws == 0u) &&
+                  clOk && (g2Diff == 0) && (g3Diff == 0) &&
+                  (clGetIntSteady == 0u) && (clIsEnSteady == 0u) && (clQObjSteady == 0u) &&
+                  scPreserved && (errC == 0u);
+        printf("  Part C Zero-Stall Live RTX: wsGetInt=%u farDraws=%u | cl641x361(getInt=%u isEn=%u qObj=%u g2Diff=%d g3Diff=%d scPres=%d) err=0x%X -> %s\n",
+               wsGetIntCnt, wsFarDraws, clGetIntSteady, clIsEnSteady, clQObjSteady,
+               g2Diff, g3Diff, scPreserved ? 1 : 0, errC, partCOk ? "PASS" : "FAIL");
+    }
+
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return partAOk && partBOk && partCOk;
+}
+
+static bool TestPhase3LiveGpuSuite() {
+    printf("\n=== Live RTX GPU Phase 3 Verification: 6-Slot Zero-Wait PBO + PARAMS SSBO + Shadow Reuse/Coalescing + Adaptive Clarity ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported || !probe.hasBufferStorage || !probe.hasSsbo ||
+        !probe.hasBindlessTexture || !probe.hasComputeShader || !probe.hasImageLoadStore) {
+        printf("  [SKIP] GL 4.3+ / Bindless / Compute unavailable -> PASS\n");
+        return true;
+    }
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_Phase3Live", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) return false;
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hdc) ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    if (hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) != 76) {
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    auto findP = [&](const char* nm) -> void* {
+        for (size_t i = 0; i < 76; ++i)
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, nm) == 0) return procs[i];
+        return nullptr;
+    };
+
+    using GenTex_t    = void (WINAPI*)(int32_t, uint32_t*);
+    using DelTex_t    = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindTex_t   = void (WINAPI*)(uint32_t, uint32_t);
+    using TexPar_t    = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+    using TexImg_t    = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+    using CompImg_t   = void (WINAPI*)(uint32_t, int32_t, uint32_t, int32_t, int32_t, int32_t, int32_t, const void*);
+    using GenFbo_t    = void (WINAPI*)(int32_t, uint32_t*);
+    using DelFbo_t    = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindFbo_t   = void (WINAPI*)(uint32_t, uint32_t);
+    using FboTex_t    = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    using CreateSh_t  = uint32_t (WINAPI*)(uint32_t);
+    using ShSrc_t     = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+    using CompSh_t    = void (WINAPI*)(uint32_t);
+    using GetShIv_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelSh_t     = void (WINAPI*)(uint32_t);
+    using CreatePr_t  = uint32_t (WINAPI*)();
+    using AttachSh_t  = void (WINAPI*)(uint32_t, uint32_t);
+    using BindAtt_t   = void (WINAPI*)(uint32_t, uint32_t, const char*);
+    using LinkPr_t    = void (WINAPI*)(uint32_t);
+    using GetPrIv_t   = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelPr_t     = void (WINAPI*)(uint32_t);
+    using UsePr_t     = void (WINAPI*)(uint32_t);
+    using GetUni_t    = int32_t (WINAPI*)(uint32_t, const char*);
+    using GetAtt_t    = int32_t (WINAPI*)(uint32_t, const char*);
+    using Uni1f_t     = void (WINAPI*)(int32_t, float);
+    using Uni1i_t     = void (WINAPI*)(int32_t, int32_t);
+    using Uni1iv_t    = void (WINAPI*)(int32_t, int32_t, const int32_t*);
+    using Uni3fv_t    = void (WINAPI*)(int32_t, int32_t, const float*);
+    using Uni4fv_t    = void (WINAPI*)(int32_t, int32_t, const float*);
+    using UniMat4_t   = void (WINAPI*)(int32_t, int32_t, uint8_t, const float*);
+    using ActTex_t    = void (WINAPI*)(uint32_t);
+    using Vp_t        = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+    using ClrCol_t    = void (WINAPI*)(float, float, float, float);
+    using Clr_t       = void (WINAPI*)(uint32_t);
+    using EnAtt_t     = void (WINAPI*)(uint32_t);
+    using DisAtt_t    = void (WINAPI*)(uint32_t);
+    using AttPtr_t    = void (WINAPI*)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*);
+    using DrawArr_t   = void (WINAPI*)(uint32_t, int32_t, int32_t);
+    using DrawEl_t    = void (WINAPI*)(uint32_t, int32_t, uint32_t, const void*);
+    using ReadPix_t   = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+    using GetErr_t    = uint32_t (WINAPI*)();
+    using GetInt_t    = void (WINAPI*)(uint32_t, int32_t*);
+    using Finish_t    = void (WINAPI*)();
+
+    auto pGenTex   = reinterpret_cast<GenTex_t>(findP("glGenTextures"));
+    auto pDelTex   = reinterpret_cast<DelTex_t>(findP("glDeleteTextures"));
+    auto pBindTex  = reinterpret_cast<BindTex_t>(findP("glBindTexture"));
+    auto pTexPar   = reinterpret_cast<TexPar_t>(findP("glTexParameteri"));
+    auto pTexImg   = reinterpret_cast<TexImg_t>(findP("glTexImage2D"));
+    auto pCompImg  = reinterpret_cast<CompImg_t>(findP("glCompressedTexImage2D"));
+    auto pGenFbo   = reinterpret_cast<GenFbo_t>(findP("glGenFramebuffers"));
+    auto pDelFbo   = reinterpret_cast<DelFbo_t>(findP("glDeleteFramebuffers"));
+    auto pBindFbo  = reinterpret_cast<BindFbo_t>(findP("glBindFramebuffer"));
+    auto pFboTex   = reinterpret_cast<FboTex_t>(findP("glFramebufferTexture2D"));
+    auto pCreateSh = reinterpret_cast<CreateSh_t>(findP("glCreateShader"));
+    auto pShSrc    = reinterpret_cast<ShSrc_t>(findP("glShaderSource"));
+    auto pCompSh   = reinterpret_cast<CompSh_t>(findP("glCompileShader"));
+    auto pGetShIv  = reinterpret_cast<GetShIv_t>(findP("glGetShaderiv"));
+    auto pDelSh    = reinterpret_cast<DelSh_t>(findP("glDeleteShader"));
+    auto pCreatePr = reinterpret_cast<CreatePr_t>(findP("glCreateProgram"));
+    auto pAttachSh = reinterpret_cast<AttachSh_t>(findP("glAttachShader"));
+    auto pBindAtt  = reinterpret_cast<BindAtt_t>(findP("glBindAttribLocation"));
+    auto pLinkPr   = reinterpret_cast<LinkPr_t>(findP("glLinkProgram"));
+    auto pGetPrIv  = reinterpret_cast<GetPrIv_t>(findP("glGetProgramiv"));
+    auto pDelPr    = reinterpret_cast<DelPr_t>(findP("glDeleteProgram"));
+    auto pUsePr    = reinterpret_cast<UsePr_t>(findP("glUseProgram"));
+    auto pGetUni   = reinterpret_cast<GetUni_t>(findP("glGetUniformLocation"));
+    auto pGetAtt   = reinterpret_cast<GetAtt_t>(findP("glGetAttribLocation"));
+    auto pUni1f    = reinterpret_cast<Uni1f_t>(findP("glUniform1f"));
+    auto pUni1i    = reinterpret_cast<Uni1i_t>(findP("glUniform1i"));
+    auto pUni1iv   = reinterpret_cast<Uni1iv_t>(findP("glUniform1iv"));
+    auto pUni3fv   = reinterpret_cast<Uni3fv_t>(findP("glUniform3fv"));
+    auto pUni4fv   = reinterpret_cast<Uni4fv_t>(findP("glUniform4fv"));
+    auto pUniMat4  = reinterpret_cast<UniMat4_t>(findP("glUniformMatrix4fv"));
+    auto pActTex   = reinterpret_cast<ActTex_t>(findP("glActiveTexture"));
+    auto pVp       = reinterpret_cast<Vp_t>(findP("glViewport"));
+    auto pClrCol   = reinterpret_cast<ClrCol_t>(findP("glClearColor"));
+    auto pClr      = reinterpret_cast<Clr_t>(findP("glClear"));
+    auto pEnAtt    = reinterpret_cast<EnAtt_t>(findP("glEnableVertexAttribArray"));
+    auto pDisAtt   = reinterpret_cast<DisAtt_t>(findP("glDisableVertexAttribArray"));
+    auto pAttPtr   = reinterpret_cast<AttPtr_t>(findP("glVertexAttribPointer"));
+    auto pDrawArr  = reinterpret_cast<DrawArr_t>(findP("glDrawArrays"));
+    auto pDrawEl   = reinterpret_cast<DrawEl_t>(findP("glDrawElements"));
+    auto pReadPix  = reinterpret_cast<ReadPix_t>(findP("glReadPixels"));
+    auto pGetErr   = reinterpret_cast<GetErr_t>(findP("glGetError"));
+    auto pGetInt   = reinterpret_cast<GetInt_t>(findP("glGetIntegerv"));
+    auto pFinish   = reinterpret_cast<Finish_t>(findP("glFinish"));
+    auto pMultiDrawBv = reinterpret_cast<hs_world_shadow::GlShadowOps::MultiDrawElementsBaseVertex_t>(
+        rt.ResolveGlProc("glMultiDrawElementsBaseVertex"));
+
+    while (pGetErr() != 0u) {}
+
+    // -------------------------------------------------------------------------
+    // Part A: Live RTX 4060 6-Slot Zero-Wait PBO Ring (8-frame wrap, flags=0,
+    //         timeout=0 enforced, pixel-exact RGBA8 + DXT5 readback, 0 leaks)
+    // -------------------------------------------------------------------------
+    bool partAOk = false;
+    {
+        struct PboWaitSpy {
+            hs_pbo_tex::GlPboOps::ClientWaitSync_t realWait = nullptr;
+            uint32_t maxFlags = 0u;
+            uint64_t maxTimeout = 0ULL;
+            uint32_t waitCalls = 0u;
+        };
+        static PboWaitSpy* s_spy = nullptr;
+        PboWaitSpy spy{};
+        spy.realWait = reinterpret_cast<hs_pbo_tex::GlPboOps::ClientWaitSync_t>(opt.glClientWaitSync);
+        s_spy = &spy;
+
+        hs_pbo_tex::GlPboOps pops{};
+        pops.glGenBuffers           = reinterpret_cast<decltype(pops.glGenBuffers)>(findP("glGenBuffers"));
+        pops.glDeleteBuffers        = reinterpret_cast<decltype(pops.glDeleteBuffers)>(findP("glDeleteBuffers"));
+        pops.glBindBuffer           = reinterpret_cast<decltype(pops.glBindBuffer)>(findP("glBindBuffer"));
+        pops.glBufferStorage        = reinterpret_cast<decltype(pops.glBufferStorage)>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+        pops.glMapBufferRange       = reinterpret_cast<decltype(pops.glMapBufferRange)>(opt.glMapBufferRange);
+        pops.glUnmapBuffer          = reinterpret_cast<decltype(pops.glUnmapBuffer)>(opt.glUnmapBuffer);
+        pops.glGetBufferParameteriv = reinterpret_cast<decltype(pops.glGetBufferParameteriv)>(opt.glGetBufferParameteriv);
+        pops.glFenceSync            = reinterpret_cast<decltype(pops.glFenceSync)>(opt.glFenceSync);
+        pops.glClientWaitSync       = [](void* sync, uint32_t flags, uint64_t timeout) WINAPI -> uint32_t {
+            ++s_spy->waitCalls;
+            if (flags > s_spy->maxFlags) s_spy->maxFlags = flags;
+            if (timeout > s_spy->maxTimeout) s_spy->maxTimeout = timeout;
+            return s_spy->realWait(sync, flags, timeout);
+        };
+        pops.glDeleteSync           = reinterpret_cast<decltype(pops.glDeleteSync)>(opt.glDeleteSync);
+
+        hs_pbo_tex::PersistentPboTexRing pbo;
+        pbo.SetOps(pops);
+        pbo.SetSlotBytes(hs_pbo_tex::kMinSlotBytes); // 6 x 4MB = 24MB
+        pbo.SetEnabled(true);
+
+        static constexpr const char* kVs =
+            "#version 100\nattribute vec2 aPos; varying vec2 vUv;\n"
+            "void main() { vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+        static constexpr const char* kFs =
+            "#version 100\nprecision highp float; uniform sampler2D uTex; varying vec2 vUv;\n"
+            "void main() { gl_FragColor = texture2D(uTex, vUv); }\n";
+        uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+        pShSrc(vs, 1, &kVs, nullptr); pCompSh(vs);
+        pShSrc(fs, 1, &kFs, nullptr); pCompSh(fs);
+        uint32_t pr = pCreatePr();
+        pAttachSh(pr, vs); pAttachSh(pr, fs); pBindAtt(pr, 0u, "aPos"); pLinkPr(pr);
+        pDelSh(vs); pDelSh(fs);
+
+        uint32_t fbo = 0u, fboTex = 0u, tPbo = 0u, tDir = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &fboTex); pGenTex(1, &tPbo); pGenTex(1, &tDir);
+        auto prep = [&](uint32_t t) {
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t);
+            pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+            pTexPar(0x0DE1u, 0x2802u, 0x812F); pTexPar(0x0DE1u, 0x2803u, 0x812F);
+        };
+        prep(fboTex);
+        pTexImg(0x0DE1u, 0, 0x1908, 128, 128, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, fbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, fboTex, 0);
+
+        std::vector<uint8_t> rgba(128u * 128u * 4u);
+        std::vector<uint8_t> dxt5(128u * 128u);
+        for (size_t i = 0; i < dxt5.size(); ++i) dxt5[i] = static_cast<uint8_t>((i * 47u + 19u) & 0xFFu);
+        bool allUp = true;
+        for (int f = 0; f < 8; ++f) {
+            for (size_t i = 0; i < rgba.size(); ++i) rgba[i] = static_cast<uint8_t>((i * 31u + static_cast<size_t>(f) * 73u + 11u) & 0xFFu);
+            prep(tPbo);
+            const bool okR = (f == 0)
+                ? pbo.TryUploadCompressedTexImage2D(pCompImg, 0x0DE1u, 0, 0x83F3u, 128, 128, 0, static_cast<int32_t>(dxt5.size()), dxt5.data())
+                : pbo.TryUploadTexImage2D(pTexImg, 0x0DE1u, 0, 0x1908, 128, 128, 0, 0x1908u, 0x1401u, rgba.data());
+            if (!okR) {
+                pFinish();
+                allUp = ((f == 0)
+                    ? pbo.TryUploadCompressedTexImage2D(pCompImg, 0x0DE1u, 0, 0x83F3u, 128, 128, 0, static_cast<int32_t>(dxt5.size()), dxt5.data())
+                    : pbo.TryUploadTexImage2D(pTexImg, 0x0DE1u, 0, 0x1908, 128, 128, 0, 0x1908u, 0x1401u, rgba.data())) && allUp;
+            }
+            pbo.OnEndFrame();
+        }
+        prep(tDir);
+        pTexImg(0x0DE1u, 0, 0x1908, 128, 128, 0, 0x1908u, 0x1401u, rgba.data());
+
+        const float quad[8] = { -1,-1, 1,-1, -1,1, 1,1 };
+        auto readTex = [&](uint32_t t, std::vector<uint8_t>& out) {
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 128, 128); pUsePr(pr);
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t); pUni1i(pGetUni(pr, "uTex"), 0);
+            pops.glBindBuffer(0x8892u, 0u);
+            pEnAtt(0u); pAttPtr(0u, 2, 0x1406u, 0u, 0, quad);
+            pDrawArr(0x0005u, 0, 4); pFinish();
+            out.resize(128u * 128u * 4u);
+            pReadPix(0, 0, 128, 128, 0x1908u, 0x1401u, out.data());
+        };
+        std::vector<uint8_t> pxPbo, pxDir;
+        readTex(tPbo, pxPbo); readTex(tDir, pxDir);
+        int maxDiff = 0;
+        for (size_t i = 0; i < pxPbo.size(); ++i) {
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(pxPbo[i]) - static_cast<int>(pxDir[i])));
+        }
+        int32_t unpackBind = -1;
+        pGetInt(0x88EFu, &unpackBind);
+        const uint64_t skips = pbo.SlotSkips();
+        const uint64_t upCnt = pbo.UploadCount();
+        pbo.ReleaseGpu(true);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &fbo); pDelTex(1, &fboTex); pDelTex(1, &tPbo); pDelTex(1, &tDir); pDelPr(pr);
+        const uint32_t errA = pGetErr();
+        s_spy = nullptr;
+        partAOk = allUp && (maxDiff == 0) && (unpackBind == 0) &&
+                  (spy.maxFlags == 0u) && (spy.maxTimeout == 0ULL) &&
+                  (upCnt == 8u) && (errA == 0u);
+        printf("  Part A 6-Slot Zero-Wait PBO Live RTX: up=%llu sk=%llu waits=%u flags=%u toNs=%llu maxDiff=%d err=0x%X -> %s\n",
+               static_cast<unsigned long long>(upCnt), static_cast<unsigned long long>(skips),
+               spy.waitCalls, spy.maxFlags, static_cast<unsigned long long>(spy.maxTimeout),
+               maxDiff, errA, partAOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part B: Live RTX 4060 PARAMS SSBO Absorption (5 sprites with distinct
+    //         LIGHT_OVERRIDE 0.0 / 0.502 / 1.0 + ALPHA_TEST + BLOOM_TOGGLE in
+    //         1 SINGLE FLUSH [FlushReason::Uni3 == 0], maxDiff == 0 vs unbatched,
+    //         plus PrepareForUnbatchedDraw() & CPU 16-slot fallback parity!)
+    // -------------------------------------------------------------------------
+    bool partBOk = false;
+    {
+        static constexpr const char* kAnimVs =
+            "uniform mat4 MatrixP; uniform mat4 MatrixV; uniform mat4 MatrixW;\n"
+            "uniform vec3 FLOAT_PARAMS; uniform vec4 TIMEPARAMS;\n"
+            "attribute vec4 POS2D_UV; varying vec3 PS_TEXCOORD; varying vec3 PS_POS;\n"
+            "void main() {\n#if defined(SKINNED)\n\tvec4 world_pos=vec4(0.0); vec3 TEXCOORD0=vec3(0.0);\n#else\n"
+            "\tvec3 POSITION = vec3(POS2D_UV.xy, 0.0);\n"
+            "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+            "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+            "\tvec3 object_pos = POSITION.xyz;\n"
+            "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+            "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+            "\tgl_Position = mtxPV * world_pos;\n#endif\n"
+            "\tPS_TEXCOORD = TEXCOORD0; PS_POS = world_pos.xyz;\n}\n";
+        // Faithful anim.ksh fragment shader with non-1.0 lighting (0.30, 0.40, 0.50) + HD-2D LIGHT_OVERRIDE gate!
+        static constexpr const char* kAnimPs =
+            "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
+            "uniform sampler2D SAMPLER[6]; uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+            "uniform mat4 COLOUR_XFORM; uniform vec3 PARAMS; uniform vec3 FLOAT_PARAMS;\n"
+            "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+            "varying vec3 PS_POS; varying vec3 PS_TEXCOORD;\n"
+            "#define ALPHA_TEST PARAMS.x\n#define LIGHT_OVERRIDE PARAMS.y\n#define BLOOM_TOGGLE PARAMS.z\n"
+            "vec3 CalculateLightingContribution() { return vec3(0.30, 0.40, 0.50); }\n"
+            "void main() {\n\tvec4 colour;\n#if defined( TRIPLE_ATLAS )\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#else\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#endif\n"
+            "\tif (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+            "\tif(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+            "\tif (ALPHA_TEST > 0.0) { if (colour.a >= ALPHA_TEST) { gl_FragColor = colour.rgba; } else { discard; } } else {\n"
+            "\t\tgl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+            "\t\tvec3 light = CalculateLightingContribution();\n"
+            "\t\tgl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+            "\t\tfloat hdGate = 1.0 - smoothstep(0.05, 0.35, LIGHT_OVERRIDE);\n"
+            "\t\tgl_FragColor.r = clamp(gl_FragColor.r + 0.08 * hdGate, 0.0, 1.0);\n"
+            "\t}\n}\n";
+
+        std::string gVs, gFs;
+        const char* tag = nullptr;
+        const bool txOk = hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, gVs, tag, true, true) &&
+                          hs_sprite_batch::TransformAnimBatchShaderSource(kAnimPs, gFs, tag, true, true);
+        uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+        const char* vp = gVs.c_str(); int32_t vl = static_cast<int32_t>(gVs.size());
+        const char* fp = gFs.c_str(); int32_t fl = static_cast<int32_t>(gFs.size());
+        pShSrc(vs, 1, &vp, &vl); pCompSh(vs);
+        pShSrc(fs, 1, &fp, &fl); pCompSh(fs);
+        uint32_t prog = pCreatePr();
+        pAttachSh(prog, vs); pAttachSh(prog, fs); pBindAtt(prog, 0u, "POS2D_UV"); pLinkPr(prog);
+        pDelSh(vs); pDelSh(fs);
+        int32_t linkOk = 0; pGetPrIv(prog, 0x8B82u, &linkOk);
+
+        hs_sprite_batch::GlBatchOps bops{};
+        bops.glGenBuffers               = reinterpret_cast<decltype(bops.glGenBuffers)>(findP("glGenBuffers"));
+        bops.glDeleteBuffers            = reinterpret_cast<decltype(bops.glDeleteBuffers)>(findP("glDeleteBuffers"));
+        bops.glBindBuffer               = reinterpret_cast<decltype(bops.glBindBuffer)>(findP("glBindBuffer"));
+        bops.glBufferData               = reinterpret_cast<decltype(bops.glBufferData)>(findP("glBufferData"));
+        bops.glBufferSubData            = reinterpret_cast<decltype(bops.glBufferSubData)>(opt.glBufferSubData);
+        bops.glMapBufferRange           = reinterpret_cast<decltype(bops.glMapBufferRange)>(opt.glMapBufferRange);
+        bops.glUnmapBuffer              = reinterpret_cast<decltype(bops.glUnmapBuffer)>(opt.glUnmapBuffer);
+        bops.glBufferStorage            = reinterpret_cast<decltype(bops.glBufferStorage)>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+        bops.glFenceSync                = reinterpret_cast<decltype(bops.glFenceSync)>(opt.glFenceSync);
+        bops.glClientWaitSync           = reinterpret_cast<decltype(bops.glClientWaitSync)>(opt.glClientWaitSync);
+        bops.glDeleteSync               = reinterpret_cast<decltype(bops.glDeleteSync)>(opt.glDeleteSync);
+        bops.glActiveTexture            = pActTex;
+        bops.glBindTexture              = pBindTex;
+        bops.glUniform1f                = pUni1f;
+        bops.glUniform1i                = pUni1i;
+        bops.glUniform3fv               = pUni3fv;
+        bops.glUniform4fv               = pUni4fv;
+        bops.glUniformMatrix4fv         = pUniMat4;
+        bops.glVertexAttribPointer      = pAttPtr;
+        bops.glEnableVertexAttribArray  = pEnAtt;
+        bops.glDisableVertexAttribArray = pDisAtt;
+        bops.glDrawElements             = pDrawEl;
+        bops.glDrawElementsBaseVertex   = reinterpret_cast<decltype(bops.glDrawElementsBaseVertex)>(opt.glDrawElementsBaseVertex);
+        bops.glBindBufferBase           = reinterpret_cast<decltype(bops.glBindBufferBase)>(opt.glBindBufferBase);
+        bops.glGetIntegerv              = pGetInt;
+        bops.glGetBufferParameteriv     = reinterpret_cast<decltype(bops.glGetBufferParameteriv)>(opt.glGetBufferParameteriv);
+        bops.glGetTextureHandleARB      = reinterpret_cast<decltype(bops.glGetTextureHandleARB)>(opt.glGetTextureHandleARB);
+        bops.glMakeTextureHandleResidentARB    = reinterpret_cast<decltype(bops.glMakeTextureHandleResidentARB)>(opt.glMakeTextureHandleResidentARB);
+        bops.glMakeTextureHandleNonResidentARB = reinterpret_cast<decltype(bops.glMakeTextureHandleNonResidentARB)>(opt.glMakeTextureHandleNonResidentARB);
+
+        uint32_t fbo = 0u, rtTex = 0u, spOpaque = 0u, spHalf = 0u, spCpuOnly = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &rtTex); pGenTex(1, &spOpaque); pGenTex(1, &spHalf); pGenTex(1, &spCpuOnly);
+        auto makeTex = [&](uint32_t t, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+            uint8_t px[4 * 4 * 4];
+            for (int i = 0; i < 16; ++i) { px[i*4+0] = r; px[i*4+1] = g; px[i*4+2] = b; px[i*4+3] = a; }
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t);
+            pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+            pTexImg(0x0DE1u, 0, 0x8058, 4, 4, 0, 0x1908u, 0x1401u, px);
+        };
+        pActTex(0x84C0u); pBindTex(0x0DE1u, rtTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexImg(0x0DE1u, 0, 0x8058, 256, 64, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, fbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, rtTex, 0);
+        makeTex(spOpaque,  200u, 180u, 160u, 255u);
+        makeTex(spHalf,    220u, 140u, 100u, 102u); // alpha = 0.40 < 0.50 (discarded when ALPHA_TEST=0.50!)
+        makeTex(spCpuOnly, 180u, 210u, 140u, 255u);
+
+        hs_sprite_batch::BatchProgInfo binfo{};
+        binfo.checked = true; binfo.eligible = true; binfo.hasGpuDriven = true;
+        binfo.locBatchActive = pGetUni(prog, "HS_BATCH_ACTIVE");
+        binfo.locMatrixW     = pGetUni(prog, "MatrixW");
+        binfo.locColourXform = pGetUni(prog, "COLOUR_XFORM");
+        binfo.locFloatParams = pGetUni(prog, "FLOAT_PARAMS");
+        binfo.locParams      = pGetUni(prog, "PARAMS");
+        binfo.locOceanBlend  = pGetUni(prog, "OCEAN_BLEND_PARAMS");
+        binfo.locSampler0    = pGetUni(prog, "SAMPLER[0]");
+        binfo.locSampler1    = pGetUni(prog, "SAMPLER[1]");
+        binfo.locPos2dUv     = pGetAtt(prog, "POS2D_UV");
+        binfo.locBatchWpos   = pGetAtt(prog, "HS_BATCH_WPOS");
+        binfo.locBatchCMult  = pGetAtt(prog, "HS_BATCH_CMULT");
+        binfo.locBatchCAdd   = pGetAtt(prog, "HS_BATCH_CADD");
+        binfo.hasParamsAbsorption = binfo.hasGpuDriven && !binfo.isBloomPass && (binfo.locParams >= 0);
+        binfo.progMaxTexSlots = 16u;
+        for (uint32_t s = 0u; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+            char nm[32]{}; snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+            binfo.locBatchTex[s] = pGetUni(prog, nm);
+        }
+
+        const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        const int32_t sampUnits[6] = { 0,1,2,3,4,5 };
+        const float qv[16] = { -0.14f,-0.6f,0.2f,0.2f, 0.14f,-0.6f,0.8f,0.2f, 0.14f,0.6f,0.8f,0.8f, -0.14f,0.6f,0.2f,0.8f };
+        const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+        struct Case { float tx; uint32_t tex; float params[3]; };
+        const Case cases[5] = {
+            { -0.75f, spOpaque, { 0.0f, 0.0f,   0.0f } }, // normal lit + HD2D gate
+            { -0.40f, spOpaque, { 0.0f, 0.502f, 0.0f } }, // self-lit 0.502
+            { -0.05f, spOpaque, { 0.0f, 1.0f,   0.0f } }, // fullbright 1.0
+            {  0.30f, spHalf,   { 0.5f, 0.0f,   0.0f } }, // ALPHA_TEST=0.5 -> discarded!
+            {  0.65f, spOpaque, { 0.0f, 0.0f,   1.0f } }  // BLOOM_TOGGLE=1.0 -> black rgb, alpha 255!
+        };
+        const Case unbatchedCase{ 0.88f, spOpaque, { 0.0f, 0.75f, 0.0f } };
+        const Case cpuFallbackCase{ -0.92f, spCpuOnly, { 0.0f, 0.62f, 0.0f } };
+
+        // 1. Reference unbatched draw of all 7 sprites
+        auto setupCommon = [&]() {
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 256, 64);
+            pClrCol(0.12f, 0.16f, 0.24f, 1.0f); pClr(0x4000u);
+            pUsePr(prog);
+            if (pUni1iv && pGetUni(prog, "SAMPLER") >= 0) pUni1iv(pGetUni(prog, "SAMPLER"), 6, sampUnits);
+            pUniMat4(pGetUni(prog, "MatrixP"), 1, 0, idMtx);
+            pUniMat4(pGetUni(prog, "MatrixV"), 1, 0, idMtx);
+            pUniMat4(binfo.locColourXform, 1, 0, idMtx);
+            const float z3[3] = { 0,0,0 }, z4[4] = { 0,0,0,0 };
+            if (binfo.locFloatParams >= 0) pUni3fv(binfo.locFloatParams, 1, z3);
+            if (binfo.locOceanBlend >= 0) pUni4fv(binfo.locOceanBlend, 1, z4);
+            pUni1f(binfo.locBatchActive, 0.0f);
+            bops.glBindBuffer(0x8892u, 0u); bops.glBindBuffer(0x8893u, 0u);
+            pEnAtt(static_cast<uint32_t>(binfo.locPos2dUv));
+            pAttPtr(static_cast<uint32_t>(binfo.locPos2dUv), 4, 0x1406u, 0, 16, qv);
+        };
+        auto drawRef = [&](const Case& c) {
+            float mw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, c.tx,0,0,1 };
+            pActTex(0x84C0u); pBindTex(0x0DE1u, c.tex);
+            pUniMat4(binfo.locMatrixW, 1, 0, mw);
+            pUni3fv(binfo.locParams, 1, c.params);
+            pDrawEl(0x0004u, 6, 0x1403u, qi);
+        };
+
+        std::vector<uint8_t> pxRef(256u * 64u * 4u), pxBat(256u * 64u * 4u);
+        setupCommon();
+        for (const auto& c : cases) drawRef(c);
+        drawRef(unbatchedCase);
+        drawRef(cpuFallbackCase);
+        pFinish();
+        pReadPix(0, 0, 256, 64, 0x1908u, 0x1401u, pxRef.data());
+
+        // 2. Batched GPU-Driven SSBO PARAMS absorption (5 cases -> 1 single flush, Uni3 == 0!)
+        //    + PrepareForUnbatchedDraw() commit (unbatchedCase) + CPU 16-slot fallback (cpuFallbackCase)
+        setupCommon();
+        hs_sprite_batch::SpriteBatcher sb;
+        sb.SetOps(bops);
+        sb.SetPersistentRingPreferred(true);
+        sb.SetGpuDrivenPreferred(true);
+        sb.SetEnabled(true);
+        sb.OnUseProgram(prog, &binfo);
+        sb.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(binfo.locPos2dUv), true);
+        sb.OnActiveTexture(0x84C0u);
+        sb.OnBindBuffer(0x8892u, 0u);
+        sb.OnBindBuffer(0x8893u, 0u);
+        sb.OnVertexAttribPointer(static_cast<uint32_t>(binfo.locPos2dUv), 4, 0x1406u, 0, 16, qv);
+        sb.OnTexImageMutated(spCpuOnly, true); // forces spCpuOnly onto CPU 16-slot fallback!
+
+        // Draw 0 establishes GPU ring, then draws 1..4 vary PARAMS with TryAbsorbParams -> 1 flush total!
+        int64_t flushesAfter5 = 0, uni3After5 = 0;
+        bool absorbAllOk = true;
+        for (int k = 0; k < 5; ++k) {
+            float mw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, cases[k].tx,0,0,1 };
+            sb.OnBindTexture(0x0DE1u, cases[k].tex);
+            if (k == 0) {
+                pUni3fv(binfo.locParams, 1, cases[k].params);
+                sb.OnUniform3fv(binfo.locParams, 1, cases[k].params, false);
+            } else {
+                if (!sb.TryAbsorbParams(binfo.locParams, 1, cases[k].params)) absorbAllOk = false;
+            }
+            sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mw);
+            sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+            if (!sb.TryBatchDrawElements(0x0004u, 6, 0x1403u, qi)) absorbAllOk = false;
+        }
+        sb.Flush(hs_sprite_batch::FlushReason::End);
+        flushesAfter5 = sb.GetStats().flushes;
+        uni3After5    = sb.GetStats().flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Uni3)];
+
+        // Test PrepareForUnbatchedDraw() commits dirty PARAMS=(0, 0.75, 0) to live GL!
+        {
+            float mw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, unbatchedCase.tx,0,0,1 };
+            absorbAllOk = absorbAllOk && sb.TryAbsorbParams(binfo.locParams, 1, unbatchedCase.params);
+            sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mw);
+            sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+            sb.PrepareForUnbatchedDraw(); // MUST commit dirty PARAMS & MatrixW & COLOUR_XFORM!
+            pActTex(0x84C0u); pBindTex(0x0DE1u, unbatchedCase.tex);
+            pDrawEl(0x0004u, 6, 0x1403u, qi);
+        }
+
+        // Test CPU 16-slot fallback commits dirty PARAMS=(0, 0.62, 0) before CPU batch!
+        {
+            float mw[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, cpuFallbackCase.tx,0,0,1 };
+            absorbAllOk = absorbAllOk && sb.TryAbsorbParams(binfo.locParams, 1, cpuFallbackCase.params);
+            sb.OnBindTexture(0x0DE1u, cpuFallbackCase.tex);
+            sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mw);
+            sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+            absorbAllOk = absorbAllOk && sb.TryBatchDrawElements(0x0004u, 6, 0x1403u, qi);
+            sb.Flush(hs_sprite_batch::FlushReason::End);
+        }
+        pFinish();
+        pReadPix(0, 0, 256, 64, 0x1908u, 0x1401u, pxBat.data());
+        sb.ReleaseGpuResources();
+
+        int maxDiff = 0;
+        for (size_t i = 0; i < pxRef.size(); ++i) {
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(pxRef[i]) - static_cast<int>(pxBat[i])));
+        }
+        pBindFbo(0x8D40u, 0u);
+        pDelFbo(1, &fbo); pDelTex(1, &rtTex); pDelTex(1, &spOpaque); pDelTex(1, &spHalf); pDelTex(1, &spCpuOnly); pDelPr(prog);
+        const uint32_t errB = pGetErr();
+        partBOk = txOk && linkOk && absorbAllOk && (flushesAfter5 == 1) && (uni3After5 == 0) &&
+                  (maxDiff == 0) && (errB == 0u);
+        printf("  Part B PARAMS SSBO Live RTX (5->1 flush, unbatched + CPU fallback): flushes=%lld uni3=%lld maxDiff=%d err=0x%X -> %s\n",
+               static_cast<long long>(flushesAfter5), static_cast<long long>(uni3After5),
+               maxDiff, errB, partBOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part C: Live RTX 4060 WorldShadowEngine Deferred Coalescing (6 -> 1 draw,
+    //         maxDiff == 0) + Temporal Reuse (+2.0wu walk locked cachedBounds_,
+    //         0 shadow swimming, teleport invalidates immediately!)
+    // -------------------------------------------------------------------------
+    bool partCOk = false;
+    {
+        hs_world_shadow::GlShadowOps wops{};
+        wops.glGenFramebuffers             = pGenFbo;
+        wops.glDeleteFramebuffers          = pDelFbo;
+        wops.glBindFramebuffer             = pBindFbo;
+        wops.glFramebufferTexture2D        = pFboTex;
+        wops.glCheckFramebufferStatus      = reinterpret_cast<decltype(wops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        wops.glGenRenderbuffers            = reinterpret_cast<decltype(wops.glGenRenderbuffers)>(findP("glGenRenderbuffers"));
+        wops.glDeleteRenderbuffers         = reinterpret_cast<decltype(wops.glDeleteRenderbuffers)>(findP("glDeleteRenderbuffers"));
+        wops.glBindRenderbuffer            = reinterpret_cast<decltype(wops.glBindRenderbuffer)>(findP("glBindRenderbuffer"));
+        wops.glRenderbufferStorage         = reinterpret_cast<decltype(wops.glRenderbufferStorage)>(findP("glRenderbufferStorage"));
+        wops.glFramebufferRenderbuffer     = reinterpret_cast<decltype(wops.glFramebufferRenderbuffer)>(findP("glFramebufferRenderbuffer"));
+        wops.glGenTextures                 = pGenTex;
+        wops.glDeleteTextures              = pDelTex;
+        wops.glActiveTexture               = pActTex;
+        wops.glBindTexture                 = pBindTex;
+        wops.glTexImage2D                  = pTexImg;
+        wops.glTexParameteri               = pTexPar;
+        wops.glCreateShader                = pCreateSh;
+        wops.glShaderSource                = pShSrc;
+        wops.glCompileShader               = pCompSh;
+        wops.glGetShaderiv                 = pGetShIv;
+        wops.glGetShaderInfoLog            = reinterpret_cast<decltype(wops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        wops.glDeleteShader                = pDelSh;
+        wops.glCreateProgram               = pCreatePr;
+        wops.glAttachShader                = pAttachSh;
+        wops.glBindAttribLocation          = pBindAtt;
+        wops.glLinkProgram                 = pLinkPr;
+        wops.glGetProgramiv                = pGetPrIv;
+        wops.glGetProgramInfoLog           = reinterpret_cast<decltype(wops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        wops.glDeleteProgram               = pDelPr;
+        wops.glUseProgram                  = pUsePr;
+        wops.glGetUniformLocation          = pGetUni;
+        wops.glUniform1f                   = pUni1f;
+        wops.glUniform1i                   = pUni1i;
+        wops.glUniform4fv                  = pUni4fv;
+        wops.glUniformMatrix4fv            = pUniMat4;
+        wops.glGenBuffers                  = reinterpret_cast<decltype(wops.glGenBuffers)>(findP("glGenBuffers"));
+        wops.glDeleteBuffers               = reinterpret_cast<decltype(wops.glDeleteBuffers)>(findP("glDeleteBuffers"));
+        wops.glBindBuffer                  = reinterpret_cast<decltype(wops.glBindBuffer)>(findP("glBindBuffer"));
+        wops.glBufferData                  = reinterpret_cast<decltype(wops.glBufferData)>(findP("glBufferData"));
+        wops.glEnableVertexAttribArray     = pEnAtt;
+        wops.glDisableVertexAttribArray    = pDisAtt;
+        wops.glVertexAttribPointer         = pAttPtr;
+        wops.glDrawArrays                  = pDrawArr;
+        wops.glDrawElements                = pDrawEl;
+        wops.glDrawElementsBaseVertex      = reinterpret_cast<decltype(wops.glDrawElementsBaseVertex)>(opt.glDrawElementsBaseVertex);
+        wops.glMultiDrawElementsBaseVertex = pMultiDrawBv;
+        wops.glBindBufferBase              = reinterpret_cast<decltype(wops.glBindBufferBase)>(opt.glBindBufferBase);
+        wops.glViewport                    = pVp;
+        wops.glClearColor                  = pClrCol;
+        wops.glClear                       = pClr;
+        wops.glEnable                      = reinterpret_cast<decltype(wops.glEnable)>(findP("glEnable"));
+        wops.glDisable                     = reinterpret_cast<decltype(wops.glDisable)>(findP("glDisable"));
+        wops.glBlendFunc                   = reinterpret_cast<decltype(wops.glBlendFunc)>(findP("glBlendFunc"));
+        wops.glBlendFuncSeparate           = reinterpret_cast<decltype(wops.glBlendFuncSeparate)>(findP("glBlendFuncSeparate"));
+        wops.glBlendEquation               = reinterpret_cast<decltype(wops.glBlendEquation)>(findP("glBlendEquation"));
+        wops.glBlendEquationSeparate       = reinterpret_cast<decltype(wops.glBlendEquationSeparate)>(findP("glBlendEquationSeparate"));
+        wops.glDepthFunc                   = reinterpret_cast<decltype(wops.glDepthFunc)>(findP("glDepthFunc"));
+        wops.glDepthMask                   = reinterpret_cast<decltype(wops.glDepthMask)>(findP("glDepthMask"));
+        wops.glColorMask                   = reinterpret_cast<decltype(wops.glColorMask)>(findP("glColorMask"));
+        wops.glGetIntegerv                 = pGetInt;
+        wops.glGetError                    = pGetErr;
+        wops.logFn                         = &TestLog;
+
+        auto pGetTexH = reinterpret_cast<uint64_t (WINAPI*)(uint32_t)>(opt.glGetTextureHandleARB);
+        auto pMakeRes = reinterpret_cast<void (WINAPI*)(uint64_t)>(opt.glMakeTextureHandleResidentARB);
+        auto pMakeNon = reinterpret_cast<void (WINAPI*)(uint64_t)>(opt.glMakeTextureHandleNonResidentARB);
+
+        uint32_t fbo = 0u, rtTex = 0u, spTex = 0u, vbo = 0u, ibo = 0u, ssbo = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &rtTex); pGenTex(1, &spTex);
+        wops.glGenBuffers(1, &vbo); wops.glGenBuffers(1, &ibo); wops.glGenBuffers(1, &ssbo);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, rtTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        pTexImg(0x0DE1u, 0, 0x8058, 256, 256, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, fbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, rtTex, 0);
+
+        uint8_t white4[4 * 4 * 4]; std::memset(white4, 255, sizeof(white4));
+        pBindTex(0x0DE1u, spTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexImg(0x0DE1u, 0, 0x8058, 4, 4, 0, 0x1908u, 0x1401u, white4);
+        uint64_t hTex = pGetTexH(spTex);
+        pMakeRes(hTex);
+
+        // Build 6 standing quads in GPU-Driven VBO/IBO/SSBO (4 contiguous @ baseVertex=0 + 2 @ baseVertex=16, 20)
+        std::vector<hs_sprite_batch::GpuBatchVertex> gv;
+        std::vector<uint16_t> gi;
+        std::vector<hs_sprite_batch::GpuSpriteInstance> gins(6);
+        for (uint32_t k = 0u; k < 6u; ++k) {
+            const float wx = -10.0f + static_cast<float>(k) * 4.0f;
+            auto& ins = gins[k];
+            ins.m0[0] = 1.0f; ins.m1[1] = 1.0f;
+            ins.m2[0] = wx; ins.m2[1] = 0.0f; ins.m2[2] = -2.0f; ins.m2[3] = 0.0f;
+            ins.cmult[0] = ins.cmult[1] = ins.cmult[2] = ins.cmult[3] = 1.0f;
+            ins.cadd[3] = 1.0f; // casts shadow!
+            ins.meta[0] = 1.0f; ins.meta[1] = 0.0f; ins.meta[2] = 0.0f;
+            std::memcpy(ins.tex0, &hTex, 8u);
+            std::memcpy(ins.tex1, &hTex, 8u);
+            std::memcpy(ins.tex2, &hTex, 8u);
+
+            const float idf = static_cast<float>(k);
+            gv.push_back({ -1.0f, 0.0f, 0.2f, 0.2f, idf });
+            gv.push_back({  1.0f, 0.0f, 0.8f, 0.2f, idf });
+            gv.push_back({ -1.0f, 4.0f, 0.2f, 0.8f, idf });
+            gv.push_back({  1.0f, 4.0f, 0.8f, 0.8f, idf });
+            const uint16_t b = (k < 4u) ? static_cast<uint16_t>(k * 4u) : 0u;
+            gi.push_back(b + 0); gi.push_back(b + 1); gi.push_back(b + 2);
+            gi.push_back(b + 1); gi.push_back(b + 3); gi.push_back(b + 2);
+        }
+        wops.glBindBuffer(hs_world_shadow::kGlArrayBuffer, vbo);
+        wops.glBufferData(hs_world_shadow::kGlArrayBuffer, gv.size() * sizeof(hs_sprite_batch::GpuBatchVertex), gv.data(), hs_world_shadow::kGlStaticDraw);
+        wops.glBindBuffer(hs_world_shadow::kGlElementArrayBuffer, ibo);
+        wops.glBufferData(hs_world_shadow::kGlElementArrayBuffer, gi.size() * sizeof(uint16_t), gi.data(), hs_world_shadow::kGlStaticDraw);
+        wops.glBindBuffer(hs_world_shadow::kGlShaderStorageBuffer, ssbo);
+        wops.glBufferData(hs_world_shadow::kGlShaderStorageBuffer, gins.size() * sizeof(hs_sprite_batch::GpuSpriteInstance), gins.data(), hs_world_shadow::kGlStaticDraw);
+
+        const float pv[16] = { 1.0f/20.0f,0,0,0, 0,0,0,0, 0,1.0f/20.0f,0,0, 0,0,0,1 };
+        const int32_t vp[4] = { 0, 0, 256, 256 };
+        hs_world_shadow::ShadowConfig cfg{};
+        cfg.dirWx = 0.0f; cfg.dirWz = 1.0f; cfg.stretch = 2.0f; cfg.projOn = 1.0f;
+        cfg.density = 0.65f; cfg.soft = 0.80f; cfg.tintR = 0.1f; cfg.tintG = 0.15f; cfg.tintB = 0.4f;
+        cfg.hdMode = true; cfg.hasLuaCam = true; cfg.luaCamX = 0.0f; cfg.luaCamZ = 0.0f;
+        cfg.luaCamRightX = 1.0f; cfg.luaCamRightZ = 0.0f;
+        hs_world_shadow::ShadowPassState saved{};
+        saved.dstFbo = fbo; saved.dstProg = 0u; memcpy(saved.vp, vp, sizeof(vp));
+        saved.glCacheTrusted = true; saved.blendCacheTrusted = true;
+        hs_gl_cache::ThreadState glc;
+        glc.caps[0] = 1; glc.caps[1] = 0; glc.caps[2] = 0; glc.caps[3] = 0; glc.caps[4] = 0;
+        glc.blendSrc = hs_world_shadow::kGlSrcAlpha; glc.blendDst = hs_world_shadow::kGlOneMinusSrcAlpha;
+        glc.blendEq = hs_world_shadow::kGlFuncAdd; glc.depthFunc = hs_world_shadow::kGlLess;
+        glc.colorMask = 15; glc.depthMask = 0;
+
+        auto renderComposite = [&](hs_world_shadow::GlShadowOps useOps, bool testReuse,
+                                   uint32_t& outDraws, uint32_t& outCoal, bool& outReused, bool& outTeleportFresh,
+                                   std::vector<uint8_t>& outFrame2, std::vector<uint8_t>& outReuseImg) -> bool {
+            hs_world_shadow::WorldShadowEngine ws;
+            ws.SetOps(useOps, true);
+            hs_world_shadow::ShadowConfig c = cfg;
+            c.temporalStride = testReuse ? 2u : 1u;
+
+            // Frame 1: record 6 GPU batches (4 contiguous baseVertex=0 + 2 distinct baseVertex=16, 20)
+            ws.OnGroundOrOceanDraw(fbo, vp); ws.OnMatrixPV(pv);
+            if (!ws.OnBeforeFirstStandingEntity(c, saved, glc)) return false;
+            for (uint32_t k = 0u; k < 4u; ++k) {
+                if (!ws.RecordBatchedShadowGpu(vbo, ibo, ssbo, 6u, 0, static_cast<uintptr_t>(k * 12u), nullptr, fbo)) return false;
+            }
+            if (!ws.RecordBatchedShadowGpu(vbo, ibo, ssbo, 6u, 16, 48u, nullptr, fbo)) return false;
+            if (!ws.RecordBatchedShadowGpu(vbo, ibo, ssbo, 6u, 20, 60u, nullptr, fbo)) return false;
+            ws.FlushDeferredBatchedShadows(c, saved, glc);
+            ws.OnEndFrame();
+            outDraws = ws.LastFrameShadowDraws();
+            outCoal  = ws.LastFrameCoalescedDraws();
+            float cachedB[4]{};
+            ws.GetCachedBounds(cachedB);
+
+            // Frame 2: composite onto turf green (when testReuse=true, walk +2.0 wu -> MUST reuse cached map & lock bounds!)
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 256, 256);
+            wops.glColorMask(1, 1, 1, 1); pClrCol(0.4f, 0.7f, 0.3f, 1.0f); pClr(0x4000u);
+            if (testReuse) c.luaCamX = 2.0f;
+            ws.OnGroundOrOceanDraw(fbo, vp); ws.OnMatrixPV(pv);
+            if (!ws.OnBeforeFirstStandingEntity(c, saved, glc)) return false;
+            float recvB[4]{}, recvT[4]{};
+            ws.GetEntityReceiveUniforms(c, recvB, recvT);
+            const bool boundsLocked = (recvB[0] == cachedB[0] && recvB[1] == cachedB[1]);
+            ws.OnEndFrame(); pFinish();
+            outReused = ws.LastFrameReused() && boundsLocked && (ws.ShadowReuseSkips() == 1ULL) && (ws.LastFrameShadowDraws() == 0u);
+
+            outFrame2.resize(256u * 256u * 4u);
+            pBindFbo(0x8D40u, fbo);
+            pReadPix(0, 0, 256, 256, 0x1908u, 0x1401u, outFrame2.data());
+            if (testReuse) {
+                outReuseImg = outFrame2;
+                // Frame 3: teleport +12.0 wu with stride=3 -> MUST invalidate immediately!
+                c.temporalStride = 3u;
+                c.luaCamX = 12.0f;
+                ws.OnGroundOrOceanDraw(fbo, vp); ws.OnMatrixPV(pv);
+                if (!ws.OnBeforeFirstStandingEntity(c, saved, glc)) return false;
+                outTeleportFresh = ws.BeganWriteThisFrame();
+                ws.OnEndFrame();
+            }
+            ws.ResetContext(true);
+            return true;
+        };
+
+        // Run without MultiDraw (reference) vs with MultiDraw + Temporal Reuse!
+        hs_world_shadow::GlShadowOps opsNoMd = wops;
+        opsNoMd.glMultiDrawElementsBaseVertex = nullptr;
+        uint32_t drawsRef = 0u, coalRef = 0u, drawsMd = 0u, coalMd = 0u;
+        bool reusedRef = false, teleRef = false, reusedMd = false, teleMd = false;
+        std::vector<uint8_t> imgRef, imgMd, imgReuse, dummyReuse;
+        const bool cRunOk = renderComposite(opsNoMd, false, drawsRef, coalRef, reusedRef, teleRef, imgRef, dummyReuse) &&
+                            renderComposite(wops,    true,  drawsMd,  coalMd,  reusedMd,  teleMd,  imgMd,  imgReuse);
+        int coalMaxDiff = 255;
+        if (cRunOk) {
+            coalMaxDiff = 0;
+            for (size_t i = 0; i < imgRef.size(); ++i) {
+                coalMaxDiff = (std::max)(coalMaxDiff, abs(static_cast<int>(imgRef[i]) - static_cast<int>(imgMd[i])));
+            }
+        }
+        pMakeNon(hTex);
+        wops.glDeleteBuffers(1, &vbo); wops.glDeleteBuffers(1, &ibo); wops.glDeleteBuffers(1, &ssbo);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &fbo); pDelTex(1, &rtTex); pDelTex(1, &spTex);
+        const uint32_t errC = pGetErr();
+        const bool mdExpect = (pMultiDrawBv != nullptr) ? (drawsMd == 1u && coalMd == 5u) : (drawsMd == 3u && coalMd == 3u);
+        partCOk = cRunOk && (drawsRef == 3u && coalRef == 3u) && mdExpect &&
+                  reusedMd && teleMd && (coalMaxDiff == 0) && (errC == 0u);
+        printf("  Part C WorldShadow Coalesce+Reuse Live RTX: ref(drw=%u coal=%u) md(drw=%u coal=%u) reused=%d teleFresh=%d maxDiff=%d err=0x%X -> %s\n",
+               drawsRef, coalRef, drawsMd, coalMd, reusedMd ? 1 : 0, teleMd ? 1 : 0,
+               coalMaxDiff, errC, partCOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part D: Live RTX 4060 GpuClarityEngine Adaptive Grade 3 <-> Grade 2
+    //         Smooth Hysteresis with ZERO Texture/FBO Reallocations!
+    // -------------------------------------------------------------------------
+    bool partDOk = false;
+    {
+        struct ClarityAllocSpy {
+            GenTex_t realGenTex = nullptr;
+            DelTex_t realDelTex = nullptr;
+            hs_gpu_clarity::GlComputeOps::TexStorage2D_t realTexStor = nullptr;
+            GenFbo_t realGenFbo = nullptr;
+            DelFbo_t realDelFbo = nullptr;
+            uint32_t genTex = 0u, delTex = 0u, texStor = 0u, genFbo = 0u, delFbo = 0u;
+        };
+        static ClarityAllocSpy* s_cs = nullptr;
+        ClarityAllocSpy cs{};
+        cs.realGenTex  = pGenTex;
+        cs.realDelTex  = pDelTex;
+        cs.realTexStor = reinterpret_cast<decltype(cs.realTexStor)>(opt.glTexStorage2D);
+        cs.realGenFbo  = pGenFbo;
+        cs.realDelFbo  = pDelFbo;
+        s_cs = &cs;
+
+        hs_gpu_clarity::GlComputeOps cops{};
+        cops.glGenFramebuffers        = [](int32_t n, uint32_t* p) WINAPI { s_cs->genFbo += static_cast<uint32_t>(n); s_cs->realGenFbo(n, p); };
+        cops.glDeleteFramebuffers     = [](int32_t n, const uint32_t* p) WINAPI { s_cs->delFbo += static_cast<uint32_t>(n); s_cs->realDelFbo(n, p); };
+        cops.glBindFramebuffer        = pBindFbo;
+        cops.glFramebufferTexture2D   = pFboTex;
+        cops.glCheckFramebufferStatus = reinterpret_cast<decltype(cops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        cops.glBlitFramebuffer        = reinterpret_cast<decltype(cops.glBlitFramebuffer)>(opt.glBlitFramebuffer);
+        cops.glGenTextures            = [](int32_t n, uint32_t* p) WINAPI { s_cs->genTex += static_cast<uint32_t>(n); s_cs->realGenTex(n, p); };
+        cops.glDeleteTextures         = [](int32_t n, const uint32_t* p) WINAPI { s_cs->delTex += static_cast<uint32_t>(n); s_cs->realDelTex(n, p); };
+        cops.glActiveTexture          = pActTex;
+        cops.glBindTexture            = pBindTex;
+        cops.glTexStorage2D           = [](uint32_t t, int32_t l, uint32_t f, int32_t w, int32_t h) WINAPI { ++s_cs->texStor; s_cs->realTexStor(t, l, f, w, h); };
+        cops.glTexParameteri          = pTexPar;
+        cops.glCreateShader           = pCreateSh;
+        cops.glShaderSource           = pShSrc;
+        cops.glCompileShader          = pCompSh;
+        cops.glGetShaderiv            = pGetShIv;
+        cops.glGetShaderInfoLog       = reinterpret_cast<decltype(cops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        cops.glDeleteShader           = pDelSh;
+        cops.glCreateProgram          = pCreatePr;
+        cops.glAttachShader           = pAttachSh;
+        cops.glLinkProgram            = pLinkPr;
+        cops.glGetProgramiv           = pGetPrIv;
+        cops.glGetProgramInfoLog      = reinterpret_cast<decltype(cops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        cops.glDeleteProgram          = pDelPr;
+        cops.glUseProgram             = pUsePr;
+        cops.glGetUniformLocation     = pGetUni;
+        cops.glUniform4f              = reinterpret_cast<decltype(cops.glUniform4f)>(opt.glUniform4f);
+        cops.glDispatchCompute        = reinterpret_cast<decltype(cops.glDispatchCompute)>(opt.glDispatchCompute);
+        cops.glMemoryBarrier          = reinterpret_cast<decltype(cops.glMemoryBarrier)>(opt.glMemoryBarrier);
+        cops.glBindImageTexture       = reinterpret_cast<decltype(cops.glBindImageTexture)>(opt.glBindImageTexture);
+        cops.glGetIntegerv            = pGetInt;
+        cops.glIsEnabled              = reinterpret_cast<decltype(cops.glIsEnabled)>(opt.glIsEnabled);
+        cops.glEnable                 = reinterpret_cast<decltype(cops.glEnable)>(findP("glEnable"));
+        cops.glDisable                = reinterpret_cast<decltype(cops.glDisable)>(findP("glDisable"));
+        cops.logFn                    = &TestLog;
+
+        const int32_t oddW = 641, oddH = 361;
+        uint32_t clFbo = 0u, clTex = 0u;
+        pGenFbo(1, &clFbo); pGenTex(1, &clTex);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, clTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        std::vector<uint8_t> img(static_cast<size_t>(oddW) * static_cast<size_t>(oddH) * 4u, 160u);
+        pTexImg(0x0DE1u, 0, 0x8058, oddW, oddH, 0, 0x1908u, 0x1401u, img.data());
+        pBindFbo(0x8D40u, clFbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, clTex, 0);
+
+        hs_gpu_clarity::GpuClarityEngine cl;
+        cl.SetOps(cops, true);
+        hs_gpu_clarity::KnownGlState ks{};
+        ks.drawFbo = static_cast<int32_t>(clFbo); ks.readFbo = static_cast<int32_t>(clFbo);
+        ks.curProgram = 0; ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+        ks.boundTex0 = static_cast<int32_t>(clTex); ks.scissorEnabled = 0; ks.sampleTimer = false;
+
+        // Warmup Grade 3
+        bool ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 3.0f, 5.5f }, &ks);
+        cs.genTex = cs.delTex = cs.texStor = cs.genFbo = cs.delFbo = 0u;
+
+        // 45 frames @ 7.5ms -> smooth step 3 -> 2
+        for (int f = 0; f < 45 && ok; ++f) {
+            ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 7.5f, 5.5f }, &ks);
+        }
+        const int effAfterDown = cl.EffectiveGrade();
+        const uint64_t stepsAfterDown = cl.AdaptiveGradeSteps();
+
+        // 120 frames @ 3.5ms -> smooth step 2 -> 3
+        for (int f = 0; f < 120 && ok; ++f) {
+            ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 3.5f, 5.5f }, &ks);
+        }
+        const int effAfterUp = cl.EffectiveGrade();
+        const uint64_t stepsAfterUp = cl.AdaptiveGradeSteps();
+        const uint32_t reallocTotal = cs.genTex + cs.delTex + cs.texStor + cs.genFbo + cs.delFbo;
+        pFinish();
+
+        cl.OnContextReset(true);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &clFbo); pDelTex(1, &clTex);
+        const uint32_t errD = pGetErr();
+        s_cs = nullptr;
+        partDOk = ok && (effAfterDown == 2) && (stepsAfterDown == 1ULL) &&
+                  (effAfterUp == 3) && (stepsAfterUp == 2ULL) &&
+                  (reallocTotal == 0u) && (errD == 0u);
+        printf("  Part D Adaptive GpuClarity Live RTX (641x361 3->2->3): effDown=%d effUp=%d steps=%llu reallocs=%u err=0x%X -> %s\n",
+               effAfterDown, effAfterUp, static_cast<unsigned long long>(stepsAfterUp),
+               reallocTotal, errD, partDOk ? "PASS" : "FAIL");
+    }
+
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return partAOk && partBOk && partCOk && partDOk;
+}
+
+static bool TestPhase4LiveGpuSuite() {
+    printf("\n=== Live RTX GPU Phase 4 Verification: ANIM Early-Out + 1-Tap Recv + 64-Stencil-Flush Batcher + Clarity 3->2->1->0->3 ===\n");
+    hs_native_gl::WglRuntime rt{};
+    const auto probe = hs_native_gl::ProbeNativeEs2Support(hs_native_gl::BackendMode::Auto, rt);
+    if (!probe.supported || !probe.hasBufferStorage || !probe.hasSsbo ||
+        !probe.hasBindlessTexture || !probe.hasComputeShader || !probe.hasImageLoadStore) {
+        printf("  [SKIP] GL 4.3+ / Bindless / Compute unavailable -> PASS\n");
+        return true;
+    }
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"HS_Phase4Live", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) return false;
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hs_native_gl::CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        if (hdc) ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    void* procs[76]{};
+    hs_native_gl::OptionalGlProcs opt{};
+    if (hs_native_gl::ResolveLiveGlesTable(rt, procs, opt) != 76) {
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+    auto findP = [&](const char* nm) -> void* {
+        for (size_t i = 0; i < 76; ++i)
+            if (std::strcmp(hs_native_gl::kDstGles2Imports[i].name, nm) == 0) return procs[i];
+        return nullptr;
+    };
+
+    using GenTex_t       = void (WINAPI*)(int32_t, uint32_t*);
+    using DelTex_t       = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindTex_t      = void (WINAPI*)(uint32_t, uint32_t);
+    using TexPar_t       = void (WINAPI*)(uint32_t, uint32_t, int32_t);
+    using TexImg_t       = void (WINAPI*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, const void*);
+    using GenFbo_t       = void (WINAPI*)(int32_t, uint32_t*);
+    using DelFbo_t       = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindFbo_t      = void (WINAPI*)(uint32_t, uint32_t);
+    using FboTex_t       = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    using GenRbo_t       = void (WINAPI*)(int32_t, uint32_t*);
+    using DelRbo_t       = void (WINAPI*)(int32_t, const uint32_t*);
+    using BindRbo_t      = void (WINAPI*)(uint32_t, uint32_t);
+    using RboStor_t      = void (WINAPI*)(uint32_t, uint32_t, int32_t, int32_t);
+    using FboRbo_t       = void (WINAPI*)(uint32_t, uint32_t, uint32_t, uint32_t);
+    using CreateSh_t     = uint32_t (WINAPI*)(uint32_t);
+    using ShSrc_t        = void (WINAPI*)(uint32_t, int32_t, const char* const*, const int32_t*);
+    using CompSh_t       = void (WINAPI*)(uint32_t);
+    using GetShIv_t      = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelSh_t        = void (WINAPI*)(uint32_t);
+    using CreatePr_t     = uint32_t (WINAPI*)();
+    using AttachSh_t     = void (WINAPI*)(uint32_t, uint32_t);
+    using BindAtt_t      = void (WINAPI*)(uint32_t, uint32_t, const char*);
+    using LinkPr_t       = void (WINAPI*)(uint32_t);
+    using GetPrIv_t      = void (WINAPI*)(uint32_t, uint32_t, int32_t*);
+    using DelPr_t        = void (WINAPI*)(uint32_t);
+    using UsePr_t        = void (WINAPI*)(uint32_t);
+    using GetUni_t       = int32_t (WINAPI*)(uint32_t, const char*);
+    using GetAtt_t       = int32_t (WINAPI*)(uint32_t, const char*);
+    using Uni1f_t        = void (WINAPI*)(int32_t, float);
+    using Uni1i_t        = void (WINAPI*)(int32_t, int32_t);
+    using Uni1iv_t       = void (WINAPI*)(int32_t, int32_t, const int32_t*);
+    using Uni3fv_t       = void (WINAPI*)(int32_t, int32_t, const float*);
+    using Uni4fv_t       = void (WINAPI*)(int32_t, int32_t, const float*);
+    using UniMat4_t      = void (WINAPI*)(int32_t, int32_t, uint8_t, const float*);
+    using ActTex_t       = void (WINAPI*)(uint32_t);
+    using Vp_t           = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
+    using ClrCol_t       = void (WINAPI*)(float, float, float, float);
+    using ClrStencil_t   = void (WINAPI*)(int32_t);
+    using Clr_t          = void (WINAPI*)(uint32_t);
+    using En_t           = void (WINAPI*)(uint32_t);
+    using Dis_t          = void (WINAPI*)(uint32_t);
+    using StencilFunc_t  = void (WINAPI*)(uint32_t, int32_t, uint32_t);
+    using StencilMask_t  = void (WINAPI*)(uint32_t);
+    using StencilOp_t    = void (WINAPI*)(uint32_t, uint32_t, uint32_t);
+    using EnAtt_t        = void (WINAPI*)(uint32_t);
+    using DisAtt_t       = void (WINAPI*)(uint32_t);
+    using AttPtr_t       = void (WINAPI*)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*);
+    using DrawArr_t      = void (WINAPI*)(uint32_t, int32_t, int32_t);
+    using DrawEl_t       = void (WINAPI*)(uint32_t, int32_t, uint32_t, const void*);
+    using ReadPix_t      = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t, uint32_t, uint32_t, void*);
+    using GetErr_t       = uint32_t (WINAPI*)();
+    using GetInt_t       = void (WINAPI*)(uint32_t, int32_t*);
+    using Finish_t       = void (WINAPI*)();
+
+    auto pGenTex      = reinterpret_cast<GenTex_t>(findP("glGenTextures"));
+    auto pDelTex      = reinterpret_cast<DelTex_t>(findP("glDeleteTextures"));
+    auto pBindTex     = reinterpret_cast<BindTex_t>(findP("glBindTexture"));
+    auto pTexPar      = reinterpret_cast<TexPar_t>(findP("glTexParameteri"));
+    auto pTexImg      = reinterpret_cast<TexImg_t>(findP("glTexImage2D"));
+    auto pGenFbo      = reinterpret_cast<GenFbo_t>(findP("glGenFramebuffers"));
+    auto pDelFbo      = reinterpret_cast<DelFbo_t>(findP("glDeleteFramebuffers"));
+    auto pBindFbo     = reinterpret_cast<BindFbo_t>(findP("glBindFramebuffer"));
+    auto pFboTex      = reinterpret_cast<FboTex_t>(findP("glFramebufferTexture2D"));
+    auto pGenRbo      = reinterpret_cast<GenRbo_t>(findP("glGenRenderbuffers"));
+    auto pDelRbo      = reinterpret_cast<DelRbo_t>(findP("glDeleteRenderbuffers"));
+    auto pBindRbo     = reinterpret_cast<BindRbo_t>(findP("glBindRenderbuffer"));
+    auto pRboStor     = reinterpret_cast<RboStor_t>(findP("glRenderbufferStorage"));
+    auto pFboRbo      = reinterpret_cast<FboRbo_t>(findP("glFramebufferRenderbuffer"));
+    auto pCreateSh    = reinterpret_cast<CreateSh_t>(findP("glCreateShader"));
+    auto pShSrc       = reinterpret_cast<ShSrc_t>(findP("glShaderSource"));
+    auto pCompSh      = reinterpret_cast<CompSh_t>(findP("glCompileShader"));
+    auto pGetShIv     = reinterpret_cast<GetShIv_t>(findP("glGetShaderiv"));
+    auto pDelSh       = reinterpret_cast<DelSh_t>(findP("glDeleteShader"));
+    auto pCreatePr    = reinterpret_cast<CreatePr_t>(findP("glCreateProgram"));
+    auto pAttachSh    = reinterpret_cast<AttachSh_t>(findP("glAttachShader"));
+    auto pBindAtt     = reinterpret_cast<BindAtt_t>(findP("glBindAttribLocation"));
+    auto pLinkPr      = reinterpret_cast<LinkPr_t>(findP("glLinkProgram"));
+    auto pGetPrIv     = reinterpret_cast<GetPrIv_t>(findP("glGetProgramiv"));
+    auto pDelPr       = reinterpret_cast<DelPr_t>(findP("glDeleteProgram"));
+    auto pUsePr       = reinterpret_cast<UsePr_t>(findP("glUseProgram"));
+    auto pGetUni      = reinterpret_cast<GetUni_t>(findP("glGetUniformLocation"));
+    auto pGetAtt      = reinterpret_cast<GetAtt_t>(findP("glGetAttribLocation"));
+    auto pUni1f       = reinterpret_cast<Uni1f_t>(findP("glUniform1f"));
+    auto pUni1i       = reinterpret_cast<Uni1i_t>(findP("glUniform1i"));
+    auto pUni1iv      = reinterpret_cast<Uni1iv_t>(findP("glUniform1iv"));
+    auto pUni3fv      = reinterpret_cast<Uni3fv_t>(findP("glUniform3fv"));
+    auto pUni4fv      = reinterpret_cast<Uni4fv_t>(findP("glUniform4fv"));
+    auto pUniMat4     = reinterpret_cast<UniMat4_t>(findP("glUniformMatrix4fv"));
+    auto pActTex      = reinterpret_cast<ActTex_t>(findP("glActiveTexture"));
+    auto pVp          = reinterpret_cast<Vp_t>(findP("glViewport"));
+    auto pClrCol      = reinterpret_cast<ClrCol_t>(findP("glClearColor"));
+    auto pClrStencil  = reinterpret_cast<ClrStencil_t>(findP("glClearStencil"));
+    auto pClr         = reinterpret_cast<Clr_t>(findP("glClear"));
+    auto pEn          = reinterpret_cast<En_t>(findP("glEnable"));
+    auto pDis         = reinterpret_cast<Dis_t>(findP("glDisable"));
+    auto pStFunc      = reinterpret_cast<StencilFunc_t>(findP("glStencilFunc"));
+    auto pStMask      = reinterpret_cast<StencilMask_t>(findP("glStencilMask"));
+    auto pStOp        = reinterpret_cast<StencilOp_t>(findP("glStencilOp"));
+    auto pEnAtt       = reinterpret_cast<EnAtt_t>(findP("glEnableVertexAttribArray"));
+    auto pDisAtt      = reinterpret_cast<DisAtt_t>(findP("glDisableVertexAttribArray"));
+    auto pAttPtr      = reinterpret_cast<AttPtr_t>(findP("glVertexAttribPointer"));
+    auto pDrawArr     = reinterpret_cast<DrawArr_t>(findP("glDrawArrays"));
+    auto pDrawEl      = reinterpret_cast<DrawEl_t>(findP("glDrawElements"));
+    auto pReadPix     = reinterpret_cast<ReadPix_t>(findP("glReadPixels"));
+    auto pGetErr      = reinterpret_cast<GetErr_t>(findP("glGetError"));
+    auto pGetInt      = reinterpret_cast<GetInt_t>(findP("glGetIntegerv"));
+    auto pFinish      = reinterpret_cast<Finish_t>(findP("glFinish"));
+    auto pBindBuf     = reinterpret_cast<hs_sprite_batch::GlBatchOps::BindBuffer_t>(findP("glBindBuffer"));
+    auto pGenBuf      = reinterpret_cast<hs_sprite_batch::GlBatchOps::GenBuffers_t>(findP("glGenBuffers"));
+    auto pDelBuf      = reinterpret_cast<hs_sprite_batch::GlBatchOps::DeleteBuffers_t>(findP("glDeleteBuffers"));
+    auto pBufData     = reinterpret_cast<hs_sprite_batch::GlBatchOps::BufferData_t>(findP("glBufferData"));
+
+    while (pGetErr() != 0u) {}
+
+    // -------------------------------------------------------------------------
+    // Part A: Live RTX 4060 TransformHd2dShaderSource ANIM Fragment Shader
+    //         Comparing Pre-Phase4 vs Phase4 `if (hs_effMask > 0.001)` early-out
+    //         across opaque, semi-transparent (0.04, 0.25, 0.5, 1.0), transparent
+    //         margin (0.0), and glowing (LIGHT_OVERRIDE=0.5) quads with active
+    //         derivatives + HD2D shade + 5-tap shadow -> maxDiff == 0, err == 0x0!
+    //         Plus HS_RECV_BOUNDS.w = 0.65f 1-tap shadow receive verification!
+    // -------------------------------------------------------------------------
+    bool partAOk = false;
+    {
+        static constexpr const char* kAnimVs =
+            "#version 100\n"
+            "attribute vec4 aPosUv;\n"
+            "varying vec2 vUv;\n"
+            "varying vec3 PS_POS;\n"
+            "varying vec2 HS_LOCAL_METRES;\n"
+            "void main() {\n"
+            "  vUv = aPosUv.zw;\n"
+            "  PS_POS = vec3(aPosUv.x * 2.0, (aPosUv.y + 1.0) * 1.2, 0.0);\n"
+            "  HS_LOCAL_METRES = vec2(aPosUv.x * 1.5, (aPosUv.y + 1.0) * 1.2);\n"
+            "  gl_Position = vec4(aPosUv.xy, 0.0, 1.0);\n"
+            "}\n";
+
+        static constexpr const char* kAnimFsHead =
+            "#version 100\n"
+            "#extension GL_OES_standard_derivatives : enable\n"
+            "precision highp float;\n"
+            "uniform sampler2D uTex;\n"
+            "uniform sampler2D HS_SHADOW_MASK;\n"
+            "uniform vec4 HS_HD2D_PARAMS;\n"
+            "uniform vec4 HS_HD2D_SHADE;\n"
+            "uniform vec4 HS_HD2D_SHADE2;\n"
+            "uniform vec4 HS_HD2D_SHAD_PROJ;\n"
+            "uniform vec4 HS_DETAIL_PARAMS;\n"
+            "uniform vec4 HS_RECV_BOUNDS;\n"
+            "uniform vec4 HS_RECV_TINT;\n"
+            "uniform float LIGHT_OVERRIDE;\n"
+            "varying vec2 vUv;\n"
+            "varying vec3 PS_POS;\n"
+            "varying vec2 HS_LOCAL_METRES;\n"
+            "void main() {\n"
+            "  vec4 c = texture2D(uTex, vUv);\n"
+            "  gl_FragColor = vec4(c.rgb * c.a, c.a);\n";
+
+        // Pre-Phase 4 ANIM body (no hs_effMask > 0.001 early-out)
+        static constexpr const char* kAnimBodyOld =
+            "  if (HS_HD2D_PARAMS.x > 0.001 || HS_HD2D_SHADE.x > 0.001 || HS_RECV_TINT.a > 0.001 || HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
+            "    float hs_a = gl_FragColor.a;\n"
+            "    float hs_effMask = step(0.08, hs_a) * (1.0 - smoothstep(0.05, 0.35, LIGHT_OVERRIDE));\n"
+            "    float hs_aSafe = max(hs_a, 0.001);\n"
+            "    vec3 hs_col = gl_FragColor.rgb / hs_aSafe;\n"
+            "    float hs_luma = dot(hs_col, vec3(0.299, 0.587, 0.114));\n"
+            "    float hs_ink = smoothstep(0.05, 0.22, hs_luma);\n"
+            "    vec3 hs_res = hs_col;\n"
+            "    float hs_outA = hs_a;\n"
+            "#ifdef GL_OES_standard_derivatives\n"
+            "    if (HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
+            "      float hs_fa = fwidth(hs_a);\n"
+            "      float hs_lgrad = length(vec2(dFdx(hs_luma), dFdy(hs_luma)));\n"
+            "      float hs_litGate = 1.0 - smoothstep(0.05, 0.28, LIGHT_OVERRIDE);\n"
+            "      if (HS_DETAIL_PARAMS.y > 0.001 && hs_a > 0.005 && hs_a < 0.995) {\n"
+            "        float hs_eMask = smoothstep(0.14, 0.44, hs_fa) * hs_litGate;\n"
+            "        float hs_crisp = clamp((hs_a - 0.48) / max(hs_fa * 0.72, 0.22) + 0.50, 0.0, 1.0);\n"
+            "        hs_outA = mix(hs_a, hs_crisp, clamp(clamp(HS_DETAIL_PARAMS.y, 0.0, 1.5) * 0.55 * hs_eMask, 0.0, 0.85));\n"
+            "      }\n"
+            "      if (HS_DETAIL_PARAMS.z > 0.001 && hs_a > 0.50) {\n"
+            "        float hs_dInkStr = clamp(HS_DETAIL_PARAMS.z, 0.0, 1.5);\n"
+            "        float hs_dStroke = smoothstep(0.045, 0.22, hs_lgrad) * smoothstep(0.015, 0.06, hs_luma) * (1.0 - smoothstep(0.12, 0.38, hs_luma));\n"
+            "        hs_res *= (1.0 - 0.22 * hs_dInkStr * hs_dStroke);\n"
+            "        float hs_solidMask = smoothstep(0.85, 0.98, hs_a) * (1.0 - smoothstep(0.18, 0.42, hs_fa));\n"
+            "        float hs_bEdge = smoothstep(0.06, 0.26, hs_lgrad) * smoothstep(0.28, 0.65, hs_luma) * (1.0 - smoothstep(0.82, 0.98, hs_luma));\n"
+            "        hs_res *= (1.0 + 0.075 * hs_dInkStr * hs_bEdge * hs_solidMask);\n"
+            "      }\n"
+            "    }\n"
+            "#endif\n"
+            "    if (HS_HD2D_PARAMS.x > 0.001) {\n"
+            "      float hs_s = min(HS_HD2D_PARAMS.x, 1.50);\n"
+            "      float hs_y = max(PS_POS.y, 0.0);\n"
+            "      float hs_ao = mix(1.0 - 0.13 * hs_s, 1.0, smoothstep(0.0, 0.45, hs_y));\n"
+            "      hs_res *= mix(1.0, hs_ao, hs_ink);\n"
+            "      vec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
+            "      hs_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
+            "    }\n"
+            "    if (HS_HD2D_SHADE.x > 0.001 && HS_HD2D_SHADE2.w > 0.005) {\n"
+            "      float hs_sl = clamp(HS_HD2D_SHADE.x, 0.0, 1.5) * clamp(HS_HD2D_SHADE2.w, 0.0, 1.0);\n"
+            "      float hs_warm = clamp(HS_HD2D_SHADE.y, 0.0, 1.0);\n"
+            "      float hs_con = clamp(HS_HD2D_SHADE.z, 0.0, 1.0);\n"
+            "      float hs_scool = clamp(HS_HD2D_SHADE.w, 0.0, 1.0);\n"
+            "      float hs_sdark = clamp(HS_HD2D_SHADE2.x, 0.0, 1.0);\n"
+            "      float hs_theta = HS_HD2D_SHADE2.y;\n"
+            "      float hs_el = clamp(HS_HD2D_SHADE2.z, 0.08, 1.50);\n"
+            "      float hs_elev_n = clamp(hs_el * 0.63661977, 0.0, 1.0);\n"
+            "      float hs_sun_x = cos(hs_theta);\n"
+            "      float hs_sun_f = sin(hs_theta);\n"
+            "      float hs_lx = HS_LOCAL_METRES.x;\n"
+            "      float hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
+            "      float hs_roof = smoothstep(0.30, 2.30, HS_LOCAL_METRES.y);\n"
+            "      float hs_nup = 0.22 + hs_roof * 0.28;\n"
+            "      float hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
+            "      vec2 hs_sun2 = normalize(vec2(hs_sun_x, sin(hs_el) * 2.60 + 0.18));\n"
+            "      float hs_diff = max(hs_nx * hs_sun2.x + hs_nup * 1.35 * hs_sun2.y + hs_nfront * 0.50 * hs_sun_f, 0.0);\n"
+            "      float hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
+            "      float hs_back = 1.0 - hs_direct;\n"
+            "      float hs_amp = 0.40 + 1.20 * hs_con;\n"
+            "      float hs_warmth = 1.0 - smoothstep(0.10, 0.85, hs_elev_n);\n"
+            "      vec3 hs_sun_col = mix(vec3(1.0, 0.96, 0.86), vec3(1.0, 0.70, 0.34), hs_warmth);\n"
+            "      vec3 hs_lit_hue = mix(vec3(0.86, 0.98, 1.18), vec3(1.14, 1.02, 0.82), hs_warm);\n"
+            "      vec3 hs_back_hue = mix(vec3(1.14, 1.00, 0.84), vec3(0.84, 0.95, 1.22), hs_scool);\n"
+            "      float hs_dark_amp = 0.40 + 1.20 * hs_sdark;\n"
+            "      float hs_h_mask = smoothstep(0.05, 0.25, max(PS_POS.y, HS_LOCAL_METRES.y));\n"
+            "      float hs_str = hs_sl * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
+            "      vec3 hs_lit_mul = mix(vec3(1.0), hs_sun_col * hs_lit_hue * (1.0 + 0.16 * hs_amp), hs_direct * hs_str);\n"
+            "      vec3 hs_shd_mul = mix(vec3(1.0), hs_back_hue * (1.0 - 0.17 * hs_amp * hs_dark_amp), hs_back * hs_str);\n"
+            "      float hs_rim = clamp(-hs_sun_f, 0.0, 1.0) * pow(1.0 - hs_nfront, 1.6) * (0.20 * hs_amp * hs_str);\n"
+            "      hs_res = hs_res * hs_lit_mul * hs_shd_mul + hs_sun_col * hs_lit_hue * hs_rim;\n"
+            "    }\n"
+            "    if (HS_RECV_TINT.a > 0.001 && HS_RECV_BOUNDS.w > 0.5) {\n"
+            "      float hs_py = max(PS_POS.y, 0.0);\n"
+            "      vec2 hs_rdir = normalize(HS_HD2D_SHAD_PROJ.xy + vec2(1e-6, 0.0));\n"
+            "      vec2 hs_rperp = vec2(-hs_rdir.y, hs_rdir.x);\n"
+            "      vec2 hs_rg = PS_POS.xz + hs_rdir * (hs_py * HS_HD2D_SHAD_PROJ.z);\n"
+            "      vec2 hs_ruv = (hs_rg - HS_RECV_BOUNDS.xy) * (HS_RECV_BOUNDS.z * 0.5) + 0.5;\n"
+            "      vec2 hs_redge = abs(hs_ruv * 2.0 - 1.0);\n"
+            "      float hs_rin = 1.0 - smoothstep(0.90, 1.0, max(hs_redge.x, hs_redge.y));\n"
+            "      if (hs_rin > 0.001) {\n"
+            "        float hs_uvs = HS_RECV_BOUNDS.z * 0.5;\n"
+            "        vec2 hs_dp1 = hs_rperp * (((HS_RECV_BOUNDS.w > 1.5) ? 0.62 : 0.28) * hs_uvs);\n"
+            "        vec2 hs_dp2 = (HS_RECV_BOUNDS.w > 1.5) ? (hs_rperp * (0.95 * hs_uvs)) : (hs_rdir * (0.22 * hs_uvs));\n"
+            "        vec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+            "        vec4 hs_t1 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
+            "        vec4 hs_t2 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
+            "        vec4 hs_t3 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
+            "        vec4 hs_t4 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
+            "        float hs_o0 = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+            "        float hs_o1 = hs_t1.r * smoothstep(0.45, 1.15, hs_t1.b * 7.5 - hs_py);\n"
+            "        float hs_o2 = hs_t2.r * smoothstep(0.45, 1.15, hs_t2.b * 7.5 - hs_py);\n"
+            "        float hs_o3 = hs_t3.r * smoothstep(0.45, 1.15, hs_t3.b * 7.5 - hs_py);\n"
+            "        float hs_o4 = hs_t4.r * smoothstep(0.45, 1.15, hs_t4.b * 7.5 - hs_py);\n"
+            "        float hs_occ = (HS_RECV_BOUNDS.w > 1.5) ? max(hs_o0, max((hs_o1 + hs_o2) * 0.50, min(hs_o3, hs_o4))) : (hs_o0 * 0.40 + (hs_o1 + hs_o2 + hs_o3 + hs_o4) * 0.15);\n"
+            "        float hs_rstr = clamp(hs_occ, 0.0, 1.0) * hs_rin * clamp(HS_RECV_TINT.a, 0.0, 1.0);\n"
+            "        hs_res *= mix(vec3(1.0), clamp(HS_RECV_TINT.rgb, vec3(0.0), vec3(1.0)), hs_rstr * hs_ink);\n"
+            "      }\n"
+            "    }\n"
+            "    vec3 hs_origScaled = (hs_a > 0.001) ? (gl_FragColor.rgb * (hs_outA / hs_a)) : vec3(0.0);\n"
+            "    gl_FragColor.rgb = mix(hs_origScaled, min(max(hs_res, vec3(0.0)) * hs_outA, vec3(hs_outA)), hs_effMask);\n"
+            "    gl_FragColor.a = hs_outA;\n"
+            "  }\n}\n";
+
+        // Exact Phase 4 ANIM body from native_plugin/dinput8.cpp:L7210-L7318
+        static constexpr const char* kAnimBodyNew =
+            "  if (HS_HD2D_PARAMS.x > 0.001 || HS_HD2D_SHADE.x > 0.001 || HS_RECV_TINT.a > 0.001 || HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
+            "    float hs_a = gl_FragColor.a;\n"
+            "    float hs_effMask = step(0.08, hs_a) * (1.0 - smoothstep(0.05, 0.35, LIGHT_OVERRIDE));\n"
+            "    float hs_aSafe = max(hs_a, 0.001);\n"
+            "    vec3 hs_col = gl_FragColor.rgb / hs_aSafe;\n"
+            "    float hs_luma = dot(hs_col, vec3(0.299, 0.587, 0.114));\n"
+            "    vec3 hs_res = hs_col;\n"
+            "    float hs_outA = hs_a;\n"
+            "#ifdef GL_OES_standard_derivatives\n"
+            "    if (HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
+            "      float hs_fa = fwidth(hs_a);\n"
+            "      float hs_lgrad = length(vec2(dFdx(hs_luma), dFdy(hs_luma)));\n"
+            "      float hs_litGate = 1.0 - smoothstep(0.05, 0.28, LIGHT_OVERRIDE);\n"
+            "      if (HS_DETAIL_PARAMS.y > 0.001 && hs_a > 0.005 && hs_a < 0.995) {\n"
+            "        float hs_eMask = smoothstep(0.14, 0.44, hs_fa) * hs_litGate;\n"
+            "        float hs_crisp = clamp((hs_a - 0.48) / max(hs_fa * 0.72, 0.22) + 0.50, 0.0, 1.0);\n"
+            "        hs_outA = mix(hs_a, hs_crisp, clamp(clamp(HS_DETAIL_PARAMS.y, 0.0, 1.5) * 0.55 * hs_eMask, 0.0, 0.85));\n"
+            "      }\n"
+            "      if (HS_DETAIL_PARAMS.z > 0.001 && hs_a > 0.50) {\n"
+            "        float hs_dInkStr = clamp(HS_DETAIL_PARAMS.z, 0.0, 1.5);\n"
+            "        float hs_dStroke = smoothstep(0.045, 0.22, hs_lgrad) * smoothstep(0.015, 0.06, hs_luma) * (1.0 - smoothstep(0.12, 0.38, hs_luma));\n"
+            "        hs_res *= (1.0 - 0.22 * hs_dInkStr * hs_dStroke);\n"
+            "        float hs_solidMask = smoothstep(0.85, 0.98, hs_a) * (1.0 - smoothstep(0.18, 0.42, hs_fa));\n"
+            "        float hs_bEdge = smoothstep(0.06, 0.26, hs_lgrad) * smoothstep(0.28, 0.65, hs_luma) * (1.0 - smoothstep(0.82, 0.98, hs_luma));\n"
+            "        hs_res *= (1.0 + 0.075 * hs_dInkStr * hs_bEdge * hs_solidMask);\n"
+            "      }\n"
+            "    }\n"
+            "#endif\n"
+            "    if (hs_effMask > 0.001) {\n"
+            "      float hs_ink = smoothstep(0.05, 0.22, hs_luma);\n"
+            "      if (HS_HD2D_PARAMS.x > 0.001) {\n"
+            "        float hs_s = min(HS_HD2D_PARAMS.x, 1.50);\n"
+            "        float hs_y = max(PS_POS.y, 0.0);\n"
+            "        float hs_ao = mix(1.0 - 0.13 * hs_s, 1.0, smoothstep(0.0, 0.45, hs_y));\n"
+            "        hs_res *= mix(1.0, hs_ao, hs_ink);\n"
+            "        vec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
+            "        hs_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
+            "      }\n"
+            "      if (HS_HD2D_SHADE.x > 0.001 && HS_HD2D_SHADE2.w > 0.005) {\n"
+            "        float hs_sl = clamp(HS_HD2D_SHADE.x, 0.0, 1.5) * clamp(HS_HD2D_SHADE2.w, 0.0, 1.0);\n"
+            "        float hs_warm = clamp(HS_HD2D_SHADE.y, 0.0, 1.0);\n"
+            "        float hs_con = clamp(HS_HD2D_SHADE.z, 0.0, 1.0);\n"
+            "        float hs_scool = clamp(HS_HD2D_SHADE.w, 0.0, 1.0);\n"
+            "        float hs_sdark = clamp(HS_HD2D_SHADE2.x, 0.0, 1.0);\n"
+            "        float hs_theta = HS_HD2D_SHADE2.y;\n"
+            "        float hs_el = clamp(HS_HD2D_SHADE2.z, 0.08, 1.50);\n"
+            "        float hs_elev_n = clamp(hs_el * 0.63661977, 0.0, 1.0);\n"
+            "        float hs_sun_x = cos(hs_theta);\n"
+            "        float hs_sun_f = sin(hs_theta);\n"
+            "        float hs_lx = HS_LOCAL_METRES.x;\n"
+            "        float hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
+            "        float hs_roof = smoothstep(0.30, 2.30, HS_LOCAL_METRES.y);\n"
+            "        float hs_nup = 0.22 + hs_roof * 0.28;\n"
+            "        float hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
+            "        vec2 hs_sun2 = normalize(vec2(hs_sun_x, sin(hs_el) * 2.60 + 0.18));\n"
+            "        float hs_diff = max(hs_nx * hs_sun2.x + hs_nup * 1.35 * hs_sun2.y + hs_nfront * 0.50 * hs_sun_f, 0.0);\n"
+            "        float hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
+            "        float hs_back = 1.0 - hs_direct;\n"
+            "        float hs_amp = 0.40 + 1.20 * hs_con;\n"
+            "        float hs_warmth = 1.0 - smoothstep(0.10, 0.85, hs_elev_n);\n"
+            "        vec3 hs_sun_col = mix(vec3(1.0, 0.96, 0.86), vec3(1.0, 0.70, 0.34), hs_warmth);\n"
+            "        vec3 hs_lit_hue = mix(vec3(0.86, 0.98, 1.18), vec3(1.14, 1.02, 0.82), hs_warm);\n"
+            "        vec3 hs_back_hue = mix(vec3(1.14, 1.00, 0.84), vec3(0.84, 0.95, 1.22), hs_scool);\n"
+            "        float hs_dark_amp = 0.40 + 1.20 * hs_sdark;\n"
+            "        float hs_h_mask = smoothstep(0.05, 0.25, max(PS_POS.y, HS_LOCAL_METRES.y));\n"
+            "        float hs_str = hs_sl * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
+            "        vec3 hs_lit_mul = mix(vec3(1.0), hs_sun_col * hs_lit_hue * (1.0 + 0.16 * hs_amp), hs_direct * hs_str);\n"
+            "        vec3 hs_shd_mul = mix(vec3(1.0), hs_back_hue * (1.0 - 0.17 * hs_amp * hs_dark_amp), hs_back * hs_str);\n"
+            "        float hs_rim = clamp(-hs_sun_f, 0.0, 1.0) * pow(1.0 - hs_nfront, 1.6) * (0.20 * hs_amp * hs_str);\n"
+            "        hs_res = hs_res * hs_lit_mul * hs_shd_mul + hs_sun_col * hs_lit_hue * hs_rim;\n"
+            "      }\n"
+            "      if (HS_RECV_TINT.a > 0.001 && HS_RECV_BOUNDS.w > 0.5) {\n"
+            "        float hs_py = max(PS_POS.y, 0.0);\n"
+            "        vec2 hs_rdir = normalize(HS_HD2D_SHAD_PROJ.xy + vec2(1e-6, 0.0));\n"
+            "        vec2 hs_rg = PS_POS.xz + hs_rdir * (hs_py * HS_HD2D_SHAD_PROJ.z);\n"
+            "        vec2 hs_ruv = (hs_rg - HS_RECV_BOUNDS.xy) * (HS_RECV_BOUNDS.z * 0.5) + 0.5;\n"
+            "        vec2 hs_redge = abs(hs_ruv * 2.0 - 1.0);\n"
+            "        float hs_rin = 1.0 - smoothstep(0.90, 1.0, max(hs_redge.x, hs_redge.y));\n"
+            "        if (hs_rin > 0.001) {\n"
+            "          float hs_occ = 0.0;\n"
+            "          if (HS_RECV_BOUNDS.w < 0.75) {\n"
+            "            vec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+            "            hs_occ = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+            "          } else {\n"
+            "            vec2 hs_rperp = vec2(-hs_rdir.y, hs_rdir.x);\n"
+            "            float hs_uvs = HS_RECV_BOUNDS.z * 0.5;\n"
+            "            vec2 hs_dp1 = hs_rperp * (((HS_RECV_BOUNDS.w > 1.5) ? 0.62 : 0.28) * hs_uvs);\n"
+            "            vec2 hs_dp2 = (HS_RECV_BOUNDS.w > 1.5) ? (hs_rperp * (0.95 * hs_uvs)) : (hs_rdir * (0.22 * hs_uvs));\n"
+            "            vec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+            "            vec4 hs_t1 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
+            "            vec4 hs_t2 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
+            "            vec4 hs_t3 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
+            "            vec4 hs_t4 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
+            "            float hs_o0 = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+            "            float hs_o1 = hs_t1.r * smoothstep(0.45, 1.15, hs_t1.b * 7.5 - hs_py);\n"
+            "            float hs_o2 = hs_t2.r * smoothstep(0.45, 1.15, hs_t2.b * 7.5 - hs_py);\n"
+            "            float hs_o3 = hs_t3.r * smoothstep(0.45, 1.15, hs_t3.b * 7.5 - hs_py);\n"
+            "            float hs_o4 = hs_t4.r * smoothstep(0.45, 1.15, hs_t4.b * 7.5 - hs_py);\n"
+            "            hs_occ = (HS_RECV_BOUNDS.w > 1.5) ? max(hs_o0, max((hs_o1 + hs_o2) * 0.50, min(hs_o3, hs_o4))) : (hs_o0 * 0.40 + (hs_o1 + hs_o2 + hs_o3 + hs_o4) * 0.15);\n"
+            "          }\n"
+            "          float hs_rstr = clamp(hs_occ, 0.0, 1.0) * hs_rin * clamp(HS_RECV_TINT.a, 0.0, 1.0);\n"
+            "          hs_res *= mix(vec3(1.0), clamp(HS_RECV_TINT.rgb, vec3(0.0), vec3(1.0)), hs_rstr * hs_ink);\n"
+            "        }\n"
+            "      }\n"
+            "    }\n"
+            "    vec3 hs_origScaled = (hs_a > 0.001) ? (gl_FragColor.rgb * (hs_outA / hs_a)) : vec3(0.0);\n"
+            "    gl_FragColor.rgb = mix(hs_origScaled, min(max(hs_res, vec3(0.0)) * hs_outA, vec3(hs_outA)), hs_effMask);\n"
+            "    gl_FragColor.a = hs_outA;\n"
+            "  }\n}\n";
+
+        auto buildAnimProg = [&](const char* body, int32_t& outOk) -> uint32_t {
+            std::string fsSrc = std::string(kAnimFsHead) + body;
+            uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+            const char* vp = kAnimVs; int32_t vl = static_cast<int32_t>(std::strlen(kAnimVs));
+            const char* fp = fsSrc.c_str(); int32_t fl = static_cast<int32_t>(fsSrc.size());
+            pShSrc(vs, 1, &vp, &vl); pCompSh(vs);
+            pShSrc(fs, 1, &fp, &fl); pCompSh(fs);
+            uint32_t pr = pCreatePr();
+            pAttachSh(pr, vs); pAttachSh(pr, fs);
+            pBindAtt(pr, 0u, "aPosUv");
+            pLinkPr(pr);
+            pDelSh(vs); pDelSh(fs);
+            pGetPrIv(pr, 0x8B82u, &outOk);
+            return pr;
+        };
+        int32_t okOld = 0, okNew = 0;
+        uint32_t prOld = buildAnimProg(kAnimBodyOld, okOld);
+        uint32_t prNew = buildAnimProg(kAnimBodyNew, okNew);
+
+        // Build 64x64 sprite test texture with alpha bands (0.00, 0.04, 0.25, 0.50, 1.00 + soft edge gradient for dFdx/dFdy!)
+        // and a 64x64 shadow mask texture with full shadow coverage + height=6.0m (b=0.80)
+        uint32_t fbo = 0u, rtTex = 0u, spTex = 0u, shTex = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &rtTex); pGenTex(1, &spTex); pGenTex(1, &shTex);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, rtTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexImg(0x0DE1u, 0, 0x8058, 64, 64, 0, 0x1908u, 0x1401u, nullptr);
+        pBindFbo(0x8D40u, fbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, rtTex, 0);
+
+        std::vector<uint8_t> spPx(64u * 64u * 4u);
+        for (int y = 0; y < 64; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                float a = 1.0f;
+                if (x < 10) a = 0.0f;
+                else if (x < 20) a = 0.04f;
+                else if (x < 30) a = 0.25f;
+                else if (x < 40) a = 0.50f;
+                else if (x < 48) a = static_cast<float>(x - 40) / 8.0f; // active alpha edge ramp for dFdx/dFdy!
+                else a = 1.0f;
+                const size_t i = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
+                spPx[i + 0] = static_cast<uint8_t>(90 + ((x * 5 + y * 3) & 127));
+                spPx[i + 1] = static_cast<uint8_t>(110 + ((x * 3 + y * 7) & 95));
+                spPx[i + 2] = static_cast<uint8_t>(80 + ((x * 7 + y * 5) & 111));
+                spPx[i + 3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
+            }
+        }
+        pActTex(0x84C0u); pBindTex(0x0DE1u, spTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        pTexImg(0x0DE1u, 0, 0x8058, 64, 64, 0, 0x1908u, 0x1401u, spPx.data());
+
+        std::vector<uint8_t> shPx(64u * 64u * 4u);
+        for (size_t i = 0; i < 64u * 64u; ++i) {
+            shPx[i * 4 + 0] = 240u; // coverage ~0.94
+            shPx[i * 4 + 1] = 128u;
+            shPx[i * 4 + 2] = 220u; // caster height ~6.47m > hs_py
+            shPx[i * 4 + 3] = 255u;
+        }
+        pActTex(0x84C1u); pBindTex(0x0DE1u, shTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        pTexImg(0x0DE1u, 0, 0x8058, 64, 64, 0, 0x1908u, 0x1401u, shPx.data());
+        pActTex(0x84C0u);
+
+        const float quad[16] = { -1,-1,0,0, 1,-1,1,0, -1,1,0,1, 1,1,1,1 };
+        auto renderAnim = [&](uint32_t prog, float lightOv, float recvW, std::vector<uint8_t>& out) {
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 64, 64);
+            pDis(0x0BE2u /*GL_BLEND*/); pDis(0x0B90u /*GL_STENCIL_TEST*/);
+            pClrCol(0.0f, 0.0f, 0.0f, 0.0f); pClr(0x4000u);
+            pUsePr(prog);
+            pUni1i(pGetUni(prog, "uTex"), 0);
+            pUni1i(pGetUni(prog, "HS_SHADOW_MASK"), 1);
+            const float hdP[4]   = { 1.0f, 0.0f, 0.0f, 0.0f };
+            const float hdS[4]   = { 1.0f, 0.7f, 0.8f, 0.6f };
+            const float hdS2[4]  = { 0.7f, 0.9f, 0.6f, 1.0f };
+            const float shPr[4]  = { 0.0f, 1.0f, 1.5f, 1.0f };
+            const float detP[4]  = { 0.0f, 0.8f, 0.8f, 0.0f };
+            const float recvB[4] = { 0.0f, 0.0f, 0.05f, recvW };
+            const float recvT[4] = { 0.12f, 0.16f, 0.38f, 0.65f };
+            pUni4fv(pGetUni(prog, "HS_HD2D_PARAMS"), 1, hdP);
+            pUni4fv(pGetUni(prog, "HS_HD2D_SHADE"), 1, hdS);
+            pUni4fv(pGetUni(prog, "HS_HD2D_SHADE2"), 1, hdS2);
+            pUni4fv(pGetUni(prog, "HS_HD2D_SHAD_PROJ"), 1, shPr);
+            pUni4fv(pGetUni(prog, "HS_DETAIL_PARAMS"), 1, detP);
+            pUni4fv(pGetUni(prog, "HS_RECV_BOUNDS"), 1, recvB);
+            pUni4fv(pGetUni(prog, "HS_RECV_TINT"), 1, recvT);
+            pUni1f(pGetUni(prog, "LIGHT_OVERRIDE"), lightOv);
+            pBindBuf(0x8892u, 0u); pBindBuf(0x8893u, 0u);
+            pEnAtt(0u); pAttPtr(0u, 4, 0x1406u, 0u, 16, quad);
+            pDrawArr(0x0005u, 0, 4);
+            pFinish();
+            out.resize(64u * 64u * 4u);
+            pReadPix(0, 0, 64, 64, 0x1908u, 0x1401u, out.data());
+        };
+
+        std::vector<uint8_t> oldLit, newLit, oldGlow, newGlow, new1Tap, newNoShad;
+        renderAnim(prOld, 0.0f, 1.0f, oldLit);
+        renderAnim(prNew, 0.0f, 1.0f, newLit);
+        renderAnim(prOld, 0.5f, 1.0f, oldGlow);
+        renderAnim(prNew, 0.5f, 1.0f, newGlow);
+        renderAnim(prNew, 0.0f, 0.65f, new1Tap);
+        renderAnim(prNew, 0.0f, 0.0f, newNoShad);
+
+        int maxDiff = 0;
+        for (size_t i = 0; i < oldLit.size(); ++i) {
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(oldLit[i]) - static_cast<int>(newLit[i])));
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(oldGlow[i]) - static_cast<int>(newGlow[i])));
+        }
+        // Verify 1-tap shadow receive (w=0.65) genuinely darkens opaque lit pixel (x=56, y=32) vs unshadowed (w=0.0)!
+        const size_t probeIdx = (32u * 64u + 56u) * 4u;
+        const int gNoShad = newNoShad[probeIdx + 1];
+        const int g1Tap   = new1Tap[probeIdx + 1];
+        const bool oneTapActive = (g1Tap + 10 < gNoShad);
+
+        pBindFbo(0x8D40u, 0u);
+        pDelFbo(1, &fbo); pDelTex(1, &rtTex); pDelTex(1, &spTex); pDelTex(1, &shTex);
+        pDelPr(prOld); pDelPr(prNew);
+        const uint32_t errA = pGetErr();
+        partAOk = okOld && okNew && (maxDiff == 0) && oneTapActive && (errA == 0u);
+        printf("  Part A ANIM Early-Out + 1-Tap Recv Live RTX: maxDiff=%d 1TapG=%d(unshad=%d) err=0x%X -> %s\n",
+               maxDiff, g1Tap, gNoShad, errA, partAOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part B: Live RTX 4060 SpriteBatcher 64-Consecutive-Stencil-Flush +
+    //         Interleaved Unbatched Draw + FLOAT_PARAMS.z Ocean Bobbing Parity!
+    // -------------------------------------------------------------------------
+    bool partBOk = false;
+    {
+        static constexpr const char* kAnimVs =
+            "uniform mat4 MatrixP; uniform mat4 MatrixV; uniform mat4 MatrixW;\n"
+            "uniform vec3 FLOAT_PARAMS; uniform vec4 TIMEPARAMS;\n"
+            "attribute vec4 POS2D_UV; varying vec3 PS_TEXCOORD; varying vec3 PS_POS;\n"
+            "void main() {\n#if defined(SKINNED)\n\tvec4 world_pos=vec4(0.0); vec3 TEXCOORD0=vec3(0.0);\n#else\n"
+            "\tvec3 POSITION = vec3(POS2D_UV.xy, 0.0);\n"
+            "\tfloat samplerIndex = floor(POS2D_UV.z/2.0);\n"
+            "\tvec3 TEXCOORD0 = vec3(POS2D_UV.z - 2.0*samplerIndex, POS2D_UV.w, samplerIndex);\n"
+            "\tvec3 object_pos = POSITION.xyz;\n"
+            "\tvec4 world_pos = MatrixW * vec4( object_pos, 1.0 );\n"
+            "\tif (FLOAT_PARAMS.z > 0.0) { world_pos.y += sin(MatrixW[3][0] + MatrixW[3][2] + TIMEPARAMS.x * 3.0) * 0.025; }\n"
+            "\tmat4 mtxPV = MatrixP * MatrixV;\n"
+            "\tgl_Position = mtxPV * world_pos;\n#endif\n"
+            "\tPS_TEXCOORD = TEXCOORD0; PS_POS = world_pos.xyz;\n}\n";
+        static constexpr const char* kAnimPs =
+            "#if defined( GL_ES )\nprecision mediump float;\n#endif\n"
+            "uniform sampler2D SAMPLER[6]; uniform vec4 LIGHTMAP_WORLD_EXTENTS;\n"
+            "uniform mat4 COLOUR_XFORM; uniform vec3 PARAMS; uniform vec3 FLOAT_PARAMS;\n"
+            "uniform vec4 OCEAN_BLEND_PARAMS;\n"
+            "varying vec3 PS_POS; varying vec3 PS_TEXCOORD;\n"
+            "#define ALPHA_TEST PARAMS.x\n#define LIGHT_OVERRIDE PARAMS.y\n#define BLOOM_TOGGLE PARAMS.z\n"
+            "vec3 CalculateLightingContribution() { return vec3(1.0, 1.0, 1.0); }\n"
+            "void main() {\n\tvec4 colour;\n#if defined( TRIPLE_ATLAS )\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#else\n"
+            "\tcolour.rgba = texture2D( SAMPLER[0], PS_TEXCOORD.xy );\n#endif\n"
+            "\tif (BLOOM_TOGGLE == 1.0) { gl_FragColor.rgba = vec4(0.0, 0.0, 0.0, colour.a); return; }\n"
+            "\tif(FLOAT_PARAMS.y > 0.0) { if(PS_POS.y < FLOAT_PARAMS.x) { discard; } }\n"
+            "\tif (ALPHA_TEST > 0.0) { if (colour.a >= ALPHA_TEST) { gl_FragColor = colour.rgba; } else { discard; } } else {\n"
+            "\t\tgl_FragColor.rgba = colour.rgba * COLOUR_XFORM;\n"
+            "\t\tvec3 light = CalculateLightingContribution();\n"
+            "\t\tgl_FragColor.rgb *= max( light.rgb, vec3( LIGHT_OVERRIDE, LIGHT_OVERRIDE, LIGHT_OVERRIDE ) );\n"
+            "\t}\n}\n";
+
+        std::string gVs, gFs;
+        const char* tag = nullptr;
+        const bool txOk = hs_sprite_batch::TransformAnimBatchShaderSource(kAnimVs, gVs, tag, true, true) &&
+                          hs_sprite_batch::TransformAnimBatchShaderSource(kAnimPs, gFs, tag, true, true);
+        uint32_t vs = pCreateSh(0x8B31u), fs = pCreateSh(0x8B30u);
+        const char* vp = gVs.c_str(); int32_t vl = static_cast<int32_t>(gVs.size());
+        const char* fp = gFs.c_str(); int32_t fl = static_cast<int32_t>(gFs.size());
+        pShSrc(vs, 1, &vp, &vl); pCompSh(vs);
+        pShSrc(fs, 1, &fp, &fl); pCompSh(fs);
+        uint32_t prog = pCreatePr();
+        pAttachSh(prog, vs); pAttachSh(prog, fs); pBindAtt(prog, 0u, "POS2D_UV"); pLinkPr(prog);
+        pDelSh(vs); pDelSh(fs);
+        int32_t linkOk = 0; pGetPrIv(prog, 0x8B82u, &linkOk);
+
+        // Build 256x64 FBO with RGBA8 color + DEPTH24_STENCIL8 stencil attachment!
+        uint32_t fbo = 0u, rtTex = 0u, dsRbo = 0u, spTexA = 0u, spTexB = 0u;
+        pGenFbo(1, &fbo); pGenTex(1, &rtTex); pGenRbo(1, &dsRbo);
+        pGenTex(1, &spTexA); pGenTex(1, &spTexB);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, rtTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+        pTexImg(0x0DE1u, 0, 0x8058, 256, 64, 0, 0x1908u, 0x1401u, nullptr);
+        pBindRbo(0x8D41u, dsRbo);
+        pRboStor(0x8D41u, 0x88F0u /*GL_DEPTH24_STENCIL8*/, 256, 64);
+        pBindFbo(0x8D40u, fbo);
+        pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, rtTex, 0);
+        pFboRbo(0x8D40u, 0x821Au /*GL_DEPTH_STENCIL_ATTACHMENT*/, 0x8D41u, dsRbo);
+
+        auto makeSolidTex = [&](uint32_t t, uint8_t r, uint8_t g, uint8_t b) {
+            uint8_t px[4 * 4 * 4];
+            for (int i = 0; i < 16; ++i) { px[i*4+0] = r; px[i*4+1] = g; px[i*4+2] = b; px[i*4+3] = 255u; }
+            pActTex(0x84C0u); pBindTex(0x0DE1u, t);
+            pTexPar(0x0DE1u, 0x2801u, 0x2600); pTexPar(0x0DE1u, 0x2800u, 0x2600);
+            pTexImg(0x0DE1u, 0, 0x8058, 4, 4, 0, 0x1908u, 0x1401u, px);
+        };
+        makeSolidTex(spTexA, 210u, 150u, 90u);
+        makeSolidTex(spTexB, 90u, 180u, 220u);
+
+        hs_sprite_batch::GlBatchOps bops{};
+        bops.glGenBuffers               = pGenBuf;
+        bops.glDeleteBuffers            = pDelBuf;
+        bops.glBindBuffer               = pBindBuf;
+        bops.glBufferData               = pBufData;
+        bops.glBufferSubData            = reinterpret_cast<decltype(bops.glBufferSubData)>(opt.glBufferSubData);
+        bops.glMapBufferRange           = reinterpret_cast<decltype(bops.glMapBufferRange)>(opt.glMapBufferRange);
+        bops.glUnmapBuffer              = reinterpret_cast<decltype(bops.glUnmapBuffer)>(opt.glUnmapBuffer);
+        bops.glBufferStorage            = reinterpret_cast<decltype(bops.glBufferStorage)>(opt.glBufferStorage ? opt.glBufferStorage : opt.glBufferStorageExt);
+        bops.glFenceSync                = reinterpret_cast<decltype(bops.glFenceSync)>(opt.glFenceSync);
+        bops.glClientWaitSync           = reinterpret_cast<decltype(bops.glClientWaitSync)>(opt.glClientWaitSync);
+        bops.glDeleteSync               = reinterpret_cast<decltype(bops.glDeleteSync)>(opt.glDeleteSync);
+        bops.glActiveTexture            = pActTex;
+        bops.glBindTexture              = pBindTex;
+        bops.glUniform1f                = pUni1f;
+        bops.glUniform1i                = pUni1i;
+        bops.glUniform3fv               = pUni3fv;
+        bops.glUniform4fv               = pUni4fv;
+        bops.glUniformMatrix4fv         = pUniMat4;
+        bops.glVertexAttribPointer      = pAttPtr;
+        bops.glEnableVertexAttribArray  = pEnAtt;
+        bops.glDisableVertexAttribArray = pDisAtt;
+        bops.glDrawElements             = pDrawEl;
+        bops.glDrawElementsBaseVertex   = reinterpret_cast<decltype(bops.glDrawElementsBaseVertex)>(opt.glDrawElementsBaseVertex);
+        bops.glBindBufferBase           = reinterpret_cast<decltype(bops.glBindBufferBase)>(opt.glBindBufferBase);
+        bops.glGetIntegerv              = pGetInt;
+        bops.glGetBufferParameteriv     = reinterpret_cast<decltype(bops.glGetBufferParameteriv)>(opt.glGetBufferParameteriv);
+        bops.glGetTextureHandleARB      = reinterpret_cast<decltype(bops.glGetTextureHandleARB)>(opt.glGetTextureHandleARB);
+        bops.glMakeTextureHandleResidentARB    = reinterpret_cast<decltype(bops.glMakeTextureHandleResidentARB)>(opt.glMakeTextureHandleResidentARB);
+        bops.glMakeTextureHandleNonResidentARB = reinterpret_cast<decltype(bops.glMakeTextureHandleNonResidentARB)>(opt.glMakeTextureHandleNonResidentARB);
+
+        hs_sprite_batch::BatchProgInfo binfo{};
+        binfo.checked = true; binfo.eligible = true; binfo.hasGpuDriven = true;
+        binfo.locBatchActive = pGetUni(prog, "HS_BATCH_ACTIVE");
+        binfo.locMatrixW     = pGetUni(prog, "MatrixW");
+        binfo.locColourXform = pGetUni(prog, "COLOUR_XFORM");
+        binfo.locFloatParams = pGetUni(prog, "FLOAT_PARAMS");
+        binfo.locParams      = pGetUni(prog, "PARAMS");
+        binfo.locOceanBlend  = pGetUni(prog, "OCEAN_BLEND_PARAMS");
+        binfo.locSampler0    = pGetUni(prog, "SAMPLER[0]");
+        binfo.locSampler1    = pGetUni(prog, "SAMPLER[1]");
+        binfo.locPos2dUv     = pGetAtt(prog, "POS2D_UV");
+        binfo.locBatchWpos   = pGetAtt(prog, "HS_BATCH_WPOS");
+        binfo.locBatchCMult  = pGetAtt(prog, "HS_BATCH_CMULT");
+        binfo.locBatchCAdd   = pGetAtt(prog, "HS_BATCH_CADD");
+        binfo.hasParamsAbsorption = binfo.hasGpuDriven && !binfo.isBloomPass && (binfo.locParams >= 0);
+        binfo.progMaxTexSlots = 16u;
+        for (uint32_t s = 0u; s < hs_sprite_batch::kMaxBatchTexSlots; ++s) {
+            char nm[32]{}; snprintf(nm, sizeof(nm), "HS_BATCH_TEX%u", s);
+            binfo.locBatchTex[s] = pGetUni(prog, nm);
+        }
+
+        const float idMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        const int32_t sampUnits[6] = { 0,1,2,3,4,5 };
+        const float timeP[4] = { 1.25f, 0.0f, 0.0f, 0.0f };
+        const float qv[16] = { -0.014f,-0.5f,0.2f,0.2f, 0.014f,-0.5f,0.8f,0.2f, 0.014f,0.5f,0.8f,0.8f, -0.014f,0.5f,0.2f,0.8f };
+        const uint16_t qi[6] = { 0,1,2, 0,2,3 };
+        uint32_t hostVbo = 0u, hostIbo = 0u;
+        pGenBuf(1, &hostVbo); pGenBuf(1, &hostIbo);
+        pBindBuf(0x8892u, hostVbo); pBufData(0x8892u, sizeof(qv), qv, 0x88E4u);
+        pBindBuf(0x8893u, hostIbo); pBufData(0x8893u, sizeof(qi), qi, 0x88E4u);
+
+        auto setupPass = [&]() {
+            pBindFbo(0x8D40u, fbo); pVp(0, 0, 256, 64);
+            pDis(0x0BE2u);
+            pClrCol(0.08f, 0.10f, 0.14f, 1.0f);
+            pClrStencil(0);
+            pStMask(0xFFu);
+            pClr(0x4000u | 0x0400u /*GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT*/);
+            pEn(0x0B90u /*GL_STENCIL_TEST*/);
+            pUsePr(prog);
+            if (pUni1iv && pGetUni(prog, "SAMPLER") >= 0) pUni1iv(pGetUni(prog, "SAMPLER"), 6, sampUnits);
+            pUniMat4(pGetUni(prog, "MatrixP"), 1, 0, idMtx);
+            pUniMat4(pGetUni(prog, "MatrixV"), 1, 0, idMtx);
+            pUniMat4(binfo.locColourXform, 1, 0, idMtx);
+            if (pGetUni(prog, "TIMEPARAMS") >= 0) pUni4fv(pGetUni(prog, "TIMEPARAMS"), 1, timeP);
+            const float z3[3] = { 0,0,0 }, z4[4] = { 0,0,0,0 };
+            if (binfo.locFloatParams >= 0) pUni3fv(binfo.locFloatParams, 1, z3);
+            if (binfo.locParams >= 0) pUni3fv(binfo.locParams, 1, z3);
+            if (binfo.locOceanBlend >= 0) pUni4fv(binfo.locOceanBlend, 1, z4);
+            pUni1f(binfo.locBatchActive, 0.0f);
+            pBindBuf(0x8892u, hostVbo); pBindBuf(0x8893u, hostIbo);
+            pEnAtt(static_cast<uint32_t>(binfo.locPos2dUv));
+            pAttPtr(static_cast<uint32_t>(binfo.locPos2dUv), 4, 0x1406u, 0, 16, nullptr);
+        };
+
+        auto makeMtx = [](int idx) {
+            const float tx = -0.95f + static_cast<float>(idx) * (1.90f / 64.0f);
+            return std::vector<float>{ 1,0,0,0, 0,1,0,0, 0,0,1,0, tx,0,0,1 };
+        };
+        const float midMtx[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0.0f,0.12f,0,1 };
+        const float fpBob[3]   = { -0.05f, 1.0f, 1.0f };
+        const float fpZero[3]  = {  0.0f,  0.0f, 0.0f };
+
+        // 1. Reference unbatched draw: 64 stencil-stepped quads + 1 interleaved unbatched quad at #32
+        std::vector<uint8_t> pxRef(256u * 64u * 4u), pxBat(256u * 64u * 4u);
+        setupPass();
+        for (int i = 0; i < 64; ++i) {
+            if (i == 32) {
+                pStFunc(0x0207u /*GL_ALWAYS*/, 7, 0xFFu);
+                pStOp(0x1E00u, 0x1E00u, 0x1E01u);
+                pActTex(0x84C0u); pBindTex(0x0DE1u, spTexB);
+                pUniMat4(binfo.locMatrixW, 1, 0, midMtx);
+                pUni3fv(binfo.locFloatParams, 1, fpZero);
+                pDrawEl(0x0004u, 6, 0x1403u, nullptr);
+            }
+            pStFunc(0x0207u /*GL_ALWAYS*/, (i & 15) + 1, 0xFFu);
+            pStOp(0x1E00u, 0x1E00u, 0x1E01u);
+            auto mw = makeMtx(i);
+            pActTex(0x84C0u); pBindTex(0x0DE1u, (i & 1) ? spTexB : spTexA);
+            pUniMat4(binfo.locMatrixW, 1, 0, mw.data());
+            pUni3fv(binfo.locFloatParams, 1, (i & 1) ? fpBob : fpZero);
+            pDrawEl(0x0004u, 6, 0x1403u, nullptr);
+        }
+        pFinish();
+        pReadPix(0, 0, 256, 64, 0x1908u, 0x1401u, pxRef.data());
+
+        // 2. Batched GPU-Driven 64 consecutive stencil flushes + interleaved unbatched draw at #32!
+        setupPass();
+        hs_sprite_batch::SpriteBatcher sb;
+        sb.SetOps(bops);
+        sb.SetPersistentRingPreferred(true);
+        sb.SetGpuDrivenPreferred(true);
+        sb.SetDeferHostRestore(false);
+        sb.SetEnabled(true);
+        sb.OnUseProgram(prog, &binfo);
+        sb.OnEnableDisableVertexAttribArray(static_cast<uint32_t>(binfo.locPos2dUv), true);
+        sb.OnActiveTexture(0x84C0u);
+        sb.OnBindBuffer(0x8892u, hostVbo);
+        sb.OnBindBuffer(0x8893u, hostIbo);
+        sb.OnVertexAttribPointer(static_cast<uint32_t>(binfo.locPos2dUv), 4, 0x1406u, 0, 16, nullptr);
+
+        bool allBatchOk = true;
+        for (int i = 0; i < 64; ++i) {
+            if (i == 32) {
+                // Interleaved unbatched draw in the middle!
+                sb.PrepareForUnbatchedDraw();
+                pStFunc(0x0207u, 7, 0xFFu);
+                pStOp(0x1E00u, 0x1E00u, 0x1E01u);
+                pActTex(0x84C0u); pBindTex(0x0DE1u, spTexB);
+                sb.OnBindTexture(0x0DE1u, spTexB);
+                pUniMat4(binfo.locMatrixW, 1, 0, midMtx);
+                pUni3fv(binfo.locFloatParams, 1, fpZero);
+                sb.OnUniform3fv(binfo.locFloatParams, 1, fpZero, false);
+                pDrawEl(0x0004u, 6, 0x1403u, nullptr);
+            }
+            // Stencil state change flushes batcher every single iteration (64 consecutive flushes!)
+            if (sb.HasPending()) sb.Flush(hs_sprite_batch::FlushReason::State);
+            pStFunc(0x0207u, (i & 15) + 1, 0xFFu);
+            pStOp(0x1E00u, 0x1E00u, 0x1E01u);
+            auto mw = makeMtx(i);
+            const uint32_t tid = (i & 1) ? spTexB : spTexA;
+            sb.OnBindTexture(0x0DE1u, tid);
+            const float* fp = (i & 1) ? fpBob : fpZero;
+            if (!sb.TryAbsorbFloatParams(binfo.locFloatParams, 1, fp)) {
+                pUni3fv(binfo.locFloatParams, 1, fp);
+                sb.OnUniform3fv(binfo.locFloatParams, 1, fp, false);
+            }
+            sb.TryAbsorbMatrixW(binfo.locMatrixW, 1, 0, mw.data());
+            sb.TryAbsorbColourXform(binfo.locColourXform, 1, 0, idMtx);
+            if (!sb.TryBatchDrawElements(0x0004u, 6, 0x1403u, nullptr)) allBatchOk = false;
+        }
+        sb.Flush(hs_sprite_batch::FlushReason::End);
+        pFinish();
+        pReadPix(0, 0, 256, 64, 0x1908u, 0x1401u, pxBat.data());
+        const int64_t totalFlushes = sb.GetStats().flushes;
+        const int64_t uni3Flushes  = sb.GetStats().flReason[static_cast<size_t>(hs_sprite_batch::FlushReason::Uni3)];
+        sb.ReleaseGpuResources();
+
+        int maxDiff = 0;
+        for (size_t i = 0; i < pxRef.size(); ++i) {
+            maxDiff = (std::max)(maxDiff, abs(static_cast<int>(pxRef[i]) - static_cast<int>(pxBat[i])));
+        }
+        pDis(0x0B90u);
+        pBindFbo(0x8D40u, 0u);
+        pDelBuf(1, &hostVbo); pDelBuf(1, &hostIbo);
+        pDelRbo(1, &dsRbo); pDelFbo(1, &fbo);
+        pDelTex(1, &rtTex); pDelTex(1, &spTexA); pDelTex(1, &spTexB); pDelPr(prog);
+        const uint32_t errB = pGetErr();
+        partBOk = txOk && linkOk && allBatchOk && (totalFlushes == 64) && (uni3Flushes == 0) &&
+                  (maxDiff == 0) && (errB == 0u);
+        printf("  Part B 64-Stencil-Flush + Unbatched Mid + FloatParamsZ Live RTX: flushes=%lld uni3=%lld maxDiff=%d err=0x%X -> %s\n",
+               static_cast<long long>(totalFlushes), static_cast<long long>(uni3Flushes),
+               maxDiff, errB, partBOk ? "PASS" : "FAIL");
+    }
+
+    // -------------------------------------------------------------------------
+    // Part C: Live RTX 4060 GpuClarityEngine Full 3->2->1->0->1->2->3 Ladder
+    //         with strictly ZERO GL Texture/FBO Reallocations & err == 0x0!
+    // -------------------------------------------------------------------------
+    bool partCOk = false;
+    {
+        struct ClaritySpy4 {
+            GenTex_t realGenTex = nullptr;
+            DelTex_t realDelTex = nullptr;
+            hs_gpu_clarity::GlComputeOps::TexStorage2D_t realTexStor = nullptr;
+            GenFbo_t realGenFbo = nullptr;
+            DelFbo_t realDelFbo = nullptr;
+            uint32_t genTex = 0u, delTex = 0u, texStor = 0u, genFbo = 0u, delFbo = 0u;
+        };
+        static ClaritySpy4* s_c4 = nullptr;
+        ClaritySpy4 cs{};
+        cs.realGenTex  = pGenTex;
+        cs.realDelTex  = pDelTex;
+        cs.realTexStor = reinterpret_cast<decltype(cs.realTexStor)>(opt.glTexStorage2D);
+        cs.realGenFbo  = pGenFbo;
+        cs.realDelFbo  = pDelFbo;
+        s_c4 = &cs;
+
+        hs_gpu_clarity::GlComputeOps cops{};
+        cops.glGenFramebuffers        = [](int32_t n, uint32_t* p) WINAPI { s_c4->genFbo += static_cast<uint32_t>(n); s_c4->realGenFbo(n, p); };
+        cops.glDeleteFramebuffers     = [](int32_t n, const uint32_t* p) WINAPI { s_c4->delFbo += static_cast<uint32_t>(n); s_c4->realDelFbo(n, p); };
+        cops.glBindFramebuffer        = pBindFbo;
+        cops.glFramebufferTexture2D   = pFboTex;
+        cops.glCheckFramebufferStatus = reinterpret_cast<decltype(cops.glCheckFramebufferStatus)>(findP("glCheckFramebufferStatus"));
+        cops.glBlitFramebuffer        = reinterpret_cast<decltype(cops.glBlitFramebuffer)>(opt.glBlitFramebuffer);
+        cops.glGenTextures            = [](int32_t n, uint32_t* p) WINAPI { s_c4->genTex += static_cast<uint32_t>(n); s_c4->realGenTex(n, p); };
+        cops.glDeleteTextures         = [](int32_t n, const uint32_t* p) WINAPI { s_c4->delTex += static_cast<uint32_t>(n); s_c4->realDelTex(n, p); };
+        cops.glActiveTexture          = pActTex;
+        cops.glBindTexture            = pBindTex;
+        cops.glTexStorage2D           = [](uint32_t t, int32_t l, uint32_t f, int32_t w, int32_t h) WINAPI { ++s_c4->texStor; s_c4->realTexStor(t, l, f, w, h); };
+        cops.glTexParameteri          = pTexPar;
+        cops.glCreateShader           = pCreateSh;
+        cops.glShaderSource           = pShSrc;
+        cops.glCompileShader          = pCompSh;
+        cops.glGetShaderiv            = pGetShIv;
+        cops.glGetShaderInfoLog       = reinterpret_cast<decltype(cops.glGetShaderInfoLog)>(findP("glGetShaderInfoLog"));
+        cops.glDeleteShader           = pDelSh;
+        cops.glCreateProgram          = pCreatePr;
+        cops.glAttachShader           = pAttachSh;
+        cops.glLinkProgram            = pLinkPr;
+        cops.glGetProgramiv           = pGetPrIv;
+        cops.glGetProgramInfoLog      = reinterpret_cast<decltype(cops.glGetProgramInfoLog)>(findP("glGetProgramInfoLog"));
+        cops.glDeleteProgram          = pDelPr;
+        cops.glUseProgram             = pUsePr;
+        cops.glGetUniformLocation     = pGetUni;
+        cops.glUniform4f              = reinterpret_cast<decltype(cops.glUniform4f)>(opt.glUniform4f);
+        cops.glDispatchCompute        = reinterpret_cast<decltype(cops.glDispatchCompute)>(opt.glDispatchCompute);
+        cops.glMemoryBarrier          = reinterpret_cast<decltype(cops.glMemoryBarrier)>(opt.glMemoryBarrier);
+        cops.glBindImageTexture       = reinterpret_cast<decltype(cops.glBindImageTexture)>(opt.glBindImageTexture);
+        cops.glGetIntegerv            = pGetInt;
+        cops.glIsEnabled              = reinterpret_cast<decltype(cops.glIsEnabled)>(opt.glIsEnabled);
+        cops.glEnable                 = pEn;
+        cops.glDisable                = pDis;
+        cops.logFn                    = &TestLog;
+
+        const int32_t oddW = 641, oddH = 361;
+        uint32_t clFbo = 0u, clTex = 0u;
+        pGenFbo(1, &clFbo); pGenTex(1, &clTex);
+        pActTex(0x84C0u); pBindTex(0x0DE1u, clTex);
+        pTexPar(0x0DE1u, 0x2801u, 0x2601); pTexPar(0x0DE1u, 0x2800u, 0x2601);
+        std::vector<uint8_t> img(static_cast<size_t>(oddW) * static_cast<size_t>(oddH) * 4u, 148u);
+        pTexImg(0x0DE1u, 0, 0x8058, oddW, oddH, 0, 0x1908u, 0x1401u, img.data());
+        pBindFbo(0x8D40u, clFbo); pFboTex(0x8D40u, 0x8CE0u, 0x0DE1u, clTex, 0);
+
+        hs_gpu_clarity::GpuClarityEngine cl;
+        cl.SetOps(cops, true);
+        hs_gpu_clarity::KnownGlState ks{};
+        ks.drawFbo = static_cast<int32_t>(clFbo); ks.readFbo = static_cast<int32_t>(clFbo);
+        ks.curProgram = 0; ks.activeTexEnum = static_cast<int32_t>(hs_gpu_clarity::kGlTexture0);
+        ks.boundTex0 = static_cast<int32_t>(clTex); ks.scissorEnabled = 0; ks.sampleTimer = false;
+
+        // Warmup Grade 3, then zero alloc counters
+        bool ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 3.0f, 5.5f }, &ks);
+        cs.genTex = cs.delTex = cs.texStor = cs.genFbo = cs.delFbo = 0u;
+
+        // 3 -> 2 (45 frames @ 6.2ms)
+        for (int f = 0; f < 45 && ok; ++f) ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 6.2f, 5.5f }, &ks);
+        const int g2 = cl.EffectiveGrade();
+        // 2 -> 1 (45 frames @ 7.0ms)
+        for (int f = 0; f < 45 && ok; ++f) ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 7.0f, 5.5f }, &ks);
+        const int g1 = cl.EffectiveGrade();
+        // 1 -> 0 (60 frames @ 8.0ms; 60th frame returns false!)
+        for (int f = 0; f < 59 && ok; ++f) ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 8.0f, 5.5f }, &ks);
+        const bool ranAt0 = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 8.0f, 5.5f }, &ks);
+        const int g0 = cl.EffectiveGrade();
+        const bool bypassAt0 = !ranAt0 && cl.IsAdaptiveBypassed();
+        // 0 -> 1 (120 frames @ 5.5ms; 120th frame returns true!)
+        for (int f = 0; f < 119; ++f) (void)cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 5.5f, 5.5f }, &ks);
+        ok = ok && cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 5.5f, 5.5f }, &ks);
+        const int g1Up = cl.EffectiveGrade();
+        // 1 -> 2 (120 frames @ 4.5ms)
+        for (int f = 0; f < 120 && ok; ++f) ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 4.5f, 5.5f }, &ks);
+        const int g2Up = cl.EffectiveGrade();
+        // 2 -> 3 (120 frames @ 3.5ms)
+        for (int f = 0; f < 120 && ok; ++f) ok = cl.ProcessFrame(clFbo, oddW, oddH, { 3, 1.0f, true, 3.5f, 5.5f }, &ks);
+        const int g3Up = cl.EffectiveGrade();
+        const uint64_t totalSteps = cl.AdaptiveGradeSteps();
+        const uint32_t reallocTotal = cs.genTex + cs.delTex + cs.texStor + cs.genFbo + cs.delFbo;
+        pFinish();
+
+        cl.OnContextReset(true);
+        pBindFbo(0x8D40u, 0u); pDelFbo(1, &clFbo); pDelTex(1, &clTex);
+        const uint32_t errC = pGetErr();
+        s_c4 = nullptr;
+        partCOk = ok && (g2 == 2) && (g1 == 1) && (g0 == 0) && bypassAt0 &&
+                  (g1Up == 1) && (g2Up == 2) && (g3Up == 3) && (totalSteps == 6ULL) &&
+                  (reallocTotal == 0u) && (errC == 0u);
+        printf("  Part C GpuClarity Full 3->2->1->0->1->2->3 Live RTX: path=%d->%d->%d->%d->%d->%d steps=%llu reallocs=%u err=0x%X -> %s\n",
+               g2, g1, g0, g1Up, g2Up, g3Up, static_cast<unsigned long long>(totalSteps),
+               reallocTotal, errC, partCOk ? "PASS" : "FAIL");
+    }
+
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+    return partAOk && partBOk && partCOk;
+}
+
 int main() {
     bool okGl    = TestNativeOpenGl();
     bool okAngle = TestAngleD3d9();
@@ -3278,11 +7195,17 @@ int main() {
     bool okAba   = TestDualContextABAReuse();
     bool okM124  = TestM1M2M4UnitSuite();
     bool okFlip  = TestDxgiFlipLiveGpu();
-    if (okGl && okAngle && okMock && okSave && okAba && okM124 && okFlip) {
-        printf("\n[PASS] ALL DUAL-BACKEND GPU (SHADOW + WATER_REFL + DXGI-FLIP) + MOCK-GL + CONCURRENT-SAVE + DUAL-CTX + M1/M2/M4 TESTS VERIFIED!\n");
+    bool okAzdo  = TestSpriteBatchAzdoLiveGpu();
+    bool okGpuDriven = TestGpuDrivenBindlessAndShadowParityLiveGpu();
+    bool okPboTex = TestPboTexRingLiveGpu();
+    bool okPhase2 = TestPhase2LiveGpuSuite();
+    bool okPhase3 = TestPhase3LiveGpuSuite();
+    bool okPhase4 = TestPhase4LiveGpuSuite();
+    if (okGl && okAngle && okMock && okSave && okAba && okM124 && okFlip && okAzdo && okGpuDriven && okPboTex && okPhase2 && okPhase3 && okPhase4) {
+        printf("\n[PASS] ALL 13 DUAL-BACKEND GPU (SHADOW + WATER_REFL + DXGI-FLIP + AZDO-RING + GPU-DRIVEN-BINDLESS + PBO-TEX-RING + PHASE2 + PHASE3 + PHASE4-ANIM-EARLYOUT/1TAP-RECV/64-STENCIL-FLUSH/CLARITY-3-2-1-0-3) + MOCK-GL + CONCURRENT-SAVE + DUAL-CTX + M1/M2/M4 TESTS VERIFIED!\n");
         return 0;
     }
-    printf("\n[FAIL] gl=%d angle=%d mock=%d save=%d aba=%d m124=%d flip=%d\n",
-           okGl ? 1 : 0, okAngle ? 1 : 0, okMock ? 1 : 0, okSave ? 1 : 0, okAba ? 1 : 0, okM124 ? 1 : 0, okFlip ? 1 : 0);
+    printf("\n[FAIL] gl=%d angle=%d mock=%d save=%d aba=%d m124=%d flip=%d azdo=%d gpuDriven=%d pboTex=%d phase2=%d phase3=%d phase4=%d\n",
+           okGl ? 1 : 0, okAngle ? 1 : 0, okMock ? 1 : 0, okSave ? 1 : 0, okAba ? 1 : 0, okM124 ? 1 : 0, okFlip ? 1 : 0, okAzdo ? 1 : 0, okGpuDriven ? 1 : 0, okPboTex ? 1 : 0, okPhase2 ? 1 : 0, okPhase3 ? 1 : 0, okPhase4 ? 1 : 0);
     return 1;
 }

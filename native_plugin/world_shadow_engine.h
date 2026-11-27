@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "gl_state_cache.h"
 #include "blue_noise_64.h"
@@ -71,6 +72,8 @@ inline constexpr uint32_t kGlTextureWrapS           = 0x2802u;
 inline constexpr uint32_t kGlTextureWrapT           = 0x2803u;
 inline constexpr uint32_t kGlArrayBuffer            = 0x8892u;
 inline constexpr uint32_t kGlElementArrayBuffer     = 0x8893u;
+inline constexpr uint32_t kGlShaderStorageBuffer    = 0x90D2u;
+inline constexpr uint32_t kGpuInstBinding           = 0u;
 inline constexpr uint32_t kGlStaticDraw             = 0x88E4u;
 inline constexpr uint32_t kGlTriangles              = 0x0004u;
 inline constexpr uint32_t kGlTriangleStrip          = 0x0005u;
@@ -107,11 +110,17 @@ inline constexpr uint32_t kGlBlendSrcAlpha          = 0x80CBu;
 inline constexpr uint32_t kGlBlendDstAlpha          = 0x80CAu;
 
 inline constexpr uint32_t kBatchTexUnitBase         = 6u;
-inline constexpr uint32_t kMaxBatchTexSlots         = 8u;
+inline constexpr uint32_t kMaxBatchTexSlots         = 16u;
+inline constexpr uint32_t kLegacyBatchTexSlots      = 8u;
+inline constexpr uint32_t BatchSlotToTexUnit(uint32_t slot) noexcept {
+    return (slot < 8u) ? (kBatchTexUnitBase + slot) : (16u + (slot - 8u));
+}
 inline constexpr uint32_t kCompositeTexUnit         = 14u; // Unused by DST (0..5) & SpriteBatch (6..13)
 inline constexpr uint32_t kBlueNoiseTexUnit         = 15u; // 64x64 Void-and-Cluster Blue Noise (GL_TEXTURE15)
 inline constexpr float    kShadowHalfExtent         = 48.0f; // 96x96 world units = 24x24 DST tiles
+inline constexpr float    kWorldUnitsPerTile        = 4.0f;  // 1 DST turf tile = 4.0 world units
 inline constexpr uint32_t kMaxPointShadowLights     = 3u;    // Top-3 near-field campfire/lantern point shadows
+inline constexpr size_t   kMaxDeferredBatches       = 2048u; // Covers 800+ stencil-flush mega-bases in 1 FBO bind!
 
 struct PointShadowLight {
     float wx       = 0.0f;
@@ -139,6 +148,9 @@ struct ShadowConfig {
     float entityRecv        = 0.68f;
     float ovalKeep          = 0.24f;
     float minHeight         = 0.0f;  // [0, 1.5] world-unit sprite height cutoff (0 = all standing sprites)
+    uint32_t maxHdRes       = 2048u; // Native GL can scale up to 4096 when BluRay clarity is active
+    uint32_t temporalStride = 1u;    // Opt-in temporal shadow reuse cadence (1=every frame, 2=every 2nd, 3=every 3rd; zero FBO realloc!)
+    bool  fastEntityReceive1Tap = false; // Opt-in 1-tap fast entity shadow receive (HS_RECV_BOUNDS.w = 0.65f, cuts 80% 4K shadow fetches)
     bool  hdMode            = true;
     bool  skipNightmare     = true;
     bool  hasLuaCam         = false;
@@ -237,7 +249,10 @@ struct GlShadowOps {
     using DisableVertexAttribArray_t = void (WINAPI*)(uint32_t);
     using VertexAttribPointer_t      = void (WINAPI*)(uint32_t, int32_t, uint32_t, uint8_t, int32_t, const void*);
     using DrawArrays_t               = void (WINAPI*)(uint32_t, int32_t, int32_t);
-    using DrawElements_t             = void (WINAPI*)(uint32_t, int32_t, uint32_t, const void*);
+    using DrawElements_t                = void (WINAPI*)(uint32_t, int32_t, uint32_t, const void*);
+    using DrawElementsBaseVertex_t      = void (WINAPI*)(uint32_t, int32_t, uint32_t, const void*, int32_t);
+    using MultiDrawElementsBaseVertex_t = void (WINAPI*)(uint32_t, const int32_t*, uint32_t, const void* const*, int32_t, const int32_t*);
+    using BindBufferBase_t              = void (WINAPI*)(uint32_t, uint32_t, uint32_t);
     using Viewport_t                 = void (WINAPI*)(int32_t, int32_t, int32_t, int32_t);
     using ClearColor_t               = void (WINAPI*)(float, float, float, float);
     using Clear_t                    = void (WINAPI*)(uint32_t);
@@ -313,6 +328,9 @@ struct GlShadowOps {
     GetIntegerv_t              glGetIntegerv              = nullptr;
     GetError_t                 glGetError                 = nullptr;
     LogFn_t                    logFn                      = nullptr;
+    DrawElementsBaseVertex_t      glDrawElementsBaseVertex      = nullptr;
+    BindBufferBase_t              glBindBufferBase              = nullptr;
+    MultiDrawElementsBaseVertex_t glMultiDrawElementsBaseVertex = nullptr; // Optional GL 3.2+ core (coalesces multi-baseVertex GPU shadow batches)
 
     bool IsComplete() const noexcept {
         return glGenFramebuffers && glDeleteFramebuffers && glBindFramebuffer &&
@@ -345,15 +363,16 @@ struct SavedAttrib0 {
 };
 
 struct ShadowPassState {
-    uint32_t     dstFbo         = 0;
-    uint32_t     dstProg        = 0;
-    int32_t      vp[4]          = { 0, 0, 1280, 720 };
-    uint32_t     activeUnit     = 0;
-    uint32_t     boundArrayBuf  = 0;
-    uint32_t     boundElemBuf   = 0;
-    float        clearColor[4]  = { 0.0f, 0.0f, 0.0f, 0.0f };
-    bool         hasClearColor  = false;
-    bool         glCacheTrusted = true;
+    uint32_t     dstFbo            = 0;
+    uint32_t     dstProg           = 0;
+    int32_t      vp[4]             = { 0, 0, 1280, 720 };
+    uint32_t     activeUnit        = 0;
+    uint32_t     boundArrayBuf     = 0;
+    uint32_t     boundElemBuf      = 0;
+    float        clearColor[4]     = { 0.0f, 0.0f, 0.0f, 0.0f };
+    bool         hasClearColor     = false;
+    bool         glCacheTrusted    = true;
+    bool         blendCacheTrusted = false; // Opt-in: true when host only calls tracked symmetric glBlendFunc/glBlendEquation (0 blend glGetIntegerv!)
     SavedAttrib0 attr0{};
     SavedAttrib0 attr1{};
 };
@@ -418,13 +437,16 @@ inline constexpr const char* kShadowBatchVs =
     "\t\ths_perp = -hs_perp;\n"
     "\t}\n"
     "\tvec2 hs_flat = hs_anch + hs_perp * hs_lx;\n"
-    "\tfloat hs_wt = u_shadDyn.x;\n"
-    "\tfloat hs_ph = hs_anch.x * 0.29 + hs_anch.y * 0.21;\n"
-    "\tfloat hs_bz = sin(hs_wt * 1.15 + hs_ph + hs_h * 0.14) * 0.65\n"
-    "\t            + sin(hs_wt * 2.03 + hs_ph * 1.70 - hs_h * 0.22) * 0.35;\n"
-    "\tfloat hs_sw0 = smoothstep(0.60, 3.60, hs_h);\n"
-    "\tfloat hs_soff = hs_bz * (hs_sw0 * hs_sw0) * clamp(u_shadDyn.y, 0.0, 1.5) * (0.28 + 0.06 * hs_h);\n"
-    "\tvec2 hs_wvec = hs_perp * hs_soff + hs_dir * (hs_soff * 0.35);\n"
+    "\tvec2 hs_wvec = vec2(0.0);\n"
+    "\tif (hs_h > 0.60 && u_shadDyn.y > 0.0) {\n"
+    "\t\tfloat hs_wt = u_shadDyn.x;\n"
+    "\t\tfloat hs_ph = hs_anch.x * 0.29 + hs_anch.y * 0.21;\n"
+    "\t\tfloat hs_bz = sin(hs_wt * 1.15 + hs_ph + hs_h * 0.14) * 0.65\n"
+    "\t\t            + sin(hs_wt * 2.03 + hs_ph * 1.70 - hs_h * 0.22) * 0.35;\n"
+    "\t\tfloat hs_sw0 = smoothstep(0.60, 3.60, hs_h);\n"
+    "\t\tfloat hs_soff = hs_bz * (hs_sw0 * hs_sw0) * clamp(u_shadDyn.y, 0.0, 1.5) * (0.28 + 0.06 * hs_h);\n"
+    "\t\ths_wvec = hs_perp * hs_soff + hs_dir * (hs_soff * 0.35);\n"
+    "\t}\n"
     "\tvec2 hs_pxz = hs_flat + hs_dir * (hs_h * hs_stretch) + hs_wvec;\n"
     "\tvec2 hs_ndc = (hs_pxz - u_bounds.xy) * u_bounds.z;\n"
     "\tfloat hs_hn = hs_h / 7.5;\n"
@@ -475,6 +497,188 @@ inline constexpr const char* kShadowBatchFs =
     "\tgl_FragColor = vec4(cov, prox, hMax, 1.0);\n"
     "}\n";
 
+inline constexpr const char* kShadowBatchFs16 =
+    "#if defined(GL_ES)\n"
+    "precision highp float;\n"
+    "#endif\n"
+    "uniform sampler2D HS_BATCH_TEX0;\n"
+    "uniform sampler2D HS_BATCH_TEX1;\n"
+    "uniform sampler2D HS_BATCH_TEX2;\n"
+    "uniform sampler2D HS_BATCH_TEX3;\n"
+    "uniform sampler2D HS_BATCH_TEX4;\n"
+    "uniform sampler2D HS_BATCH_TEX5;\n"
+    "uniform sampler2D HS_BATCH_TEX6;\n"
+    "uniform sampler2D HS_BATCH_TEX7;\n"
+    "uniform sampler2D HS_BATCH_TEX8;\n"
+    "uniform sampler2D HS_BATCH_TEX9;\n"
+    "uniform sampler2D HS_BATCH_TEX10;\n"
+    "uniform sampler2D HS_BATCH_TEX11;\n"
+    "uniform sampler2D HS_BATCH_TEX12;\n"
+    "uniform sampler2D HS_BATCH_TEX13;\n"
+    "uniform sampler2D HS_BATCH_TEX14;\n"
+    "uniform sampler2D HS_BATCH_TEX15;\n"
+    "uniform vec4 u_bounds;\n"
+    "uniform vec4 u_shadDyn;\n"
+    "varying vec3 v_tc;\n"
+    "varying vec3 v_meta;\n"
+    "void main() {\n"
+    "\tfloat s = v_tc.z;\n"
+    "\tvec4 c;\n"
+    "\tif (s < 7.5) {\n"
+    "\t\tif (s < 3.5) {\n"
+    "\t\t\tif (s < 1.5)      c = (s < 0.5) ? texture2D(HS_BATCH_TEX0, v_tc.xy) : texture2D(HS_BATCH_TEX1, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 2.5) ? texture2D(HS_BATCH_TEX2, v_tc.xy) : texture2D(HS_BATCH_TEX3, v_tc.xy);\n"
+    "\t\t} else {\n"
+    "\t\t\tif (s < 5.5)      c = (s < 4.5) ? texture2D(HS_BATCH_TEX4, v_tc.xy) : texture2D(HS_BATCH_TEX5, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 6.5) ? texture2D(HS_BATCH_TEX6, v_tc.xy) : texture2D(HS_BATCH_TEX7, v_tc.xy);\n"
+    "\t\t}\n"
+    "\t} else {\n"
+    "\t\tif (s < 11.5) {\n"
+    "\t\t\tif (s < 9.5)      c = (s < 8.5) ? texture2D(HS_BATCH_TEX8, v_tc.xy) : texture2D(HS_BATCH_TEX9, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 10.5) ? texture2D(HS_BATCH_TEX10, v_tc.xy) : texture2D(HS_BATCH_TEX11, v_tc.xy);\n"
+    "\t\t} else {\n"
+    "\t\t\tif (s < 13.5)     c = (s < 12.5) ? texture2D(HS_BATCH_TEX12, v_tc.xy) : texture2D(HS_BATCH_TEX13, v_tc.xy);\n"
+    "\t\t\telse              c = (s < 14.5) ? texture2D(HS_BATCH_TEX14, v_tc.xy) : texture2D(HS_BATCH_TEX15, v_tc.xy);\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\tfloat a = c.a * v_meta.y;\n"
+    "\tfloat h = v_meta.x;\n"
+    "\tfloat hf = clamp(u_shadDyn.z, 0.0, 1.0);\n"
+    "\tfloat hfade = mix(1.0, 1.0 - 0.58 * smoothstep(0.60, 5.80, h), hf);\n"
+    "\tfloat root = smoothstep(0.01, 0.14, h);\n"
+    "\tfloat cov = smoothstep(0.16, 0.66, a) * root * hfade * clamp(v_meta.z, 0.0, 1.0);\n"
+    "\tif (u_bounds.w > 0.5 && cov < 0.08) {\n"
+    "\t\tdiscard;\n"
+    "\t}\n"
+    "\tfloat hNorm = clamp(h / 7.5, 0.0, 1.0);\n"
+    "\tfloat prox = (1.0 - hNorm) * step(0.05, cov);\n"
+    "\tfloat hMax = hNorm * step(0.12, cov);\n"
+    "\tgl_FragColor = vec4(cov, prox, hMax, 1.0);\n"
+    "}\n";
+
+inline constexpr const char* kShadowBatchGpuVs =
+    "#version 430 compatibility\n"
+    "#extension GL_ARB_bindless_texture : require\n"
+    "struct HsGpuInst { vec4 m0; vec4 m1; vec4 m2; vec4 cmult; vec4 cadd; vec4 meta; vec4 meta2; uvec2 tex0; uvec2 tex1; uvec2 tex2; uvec2 flags; };\n"
+    "layout(std430, binding = 0) readonly buffer HsGpuInstBuf { HsGpuInst hs_gpu_insts[]; };\n"
+    "uniform vec4 u_bounds;\n"
+    "uniform vec4 u_shadProj;\n"
+    "uniform vec4 u_shadDyn;\n"
+    "uniform vec4 u_camRight;\n"
+    "uniform vec4 u_pointLight;\n"
+    "attribute vec4 POS2D_UV;\n"
+    "attribute vec4 HS_BATCH_WPOS;\n"
+    "varying vec2 v_tc;\n"
+    "varying vec3 v_meta;\n"
+    "flat out uvec2 v_btex;\n"
+    "void main() {\n"
+    "\tint hs_iid = int(HS_BATCH_WPOS.x + 0.5);\n"
+    "\tHsGpuInst hs_ins = hs_gpu_insts[hs_iid];\n"
+    "\tif (hs_ins.cadd.w < 0.5) {\n"
+    "\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+    "\t\tv_tc = vec2(0.0);\n"
+    "\t\tv_meta = vec3(0.0);\n"
+    "\t\tv_btex = uvec2(0u, 0u);\n"
+    "\t\treturn;\n"
+    "\t}\n"
+    "\tvec2 hs_p = POS2D_UV.xy;\n"
+    "\tfloat hs_dx = hs_ins.m0.x * hs_p.x + hs_ins.m1.x * hs_p.y;\n"
+    "\tfloat hs_dy = hs_ins.m0.y * hs_p.x + hs_ins.m1.y * hs_p.y;\n"
+    "\tfloat hs_dz = hs_ins.m0.z * hs_p.x + hs_ins.m1.z * hs_p.y;\n"
+    "\tfloat hs_wx = hs_dx + hs_ins.m2.x;\n"
+    "\tfloat hs_wy = hs_dy + hs_ins.m2.y;\n"
+    "\tfloat hs_wz = hs_dz + hs_ins.m2.z;\n"
+    "\tfloat hs_ho = 0.0;\n"
+    "\tif (hs_ins.meta2.z > 0.5 && hs_dy > 0.06) {\n"
+    "\t\tif (hs_ins.meta2.z < 1.5) {\n"
+    "\t\t\ths_ho = hs_ins.meta2.x * smoothstep(0.08, 1.35, hs_dy)\n"
+    "\t\t\t      + hs_ins.meta2.y * smoothstep(0.06, 1.10, hs_dy);\n"
+    "\t\t} else {\n"
+    "\t\t\tfloat hs_b2 = smoothstep(1.00, 3.80, hs_dy);\n"
+    "\t\t\tfloat hs_hc = min(hs_dy, 8.0);\n"
+    "\t\t\ths_ho = hs_ins.meta2.x * (hs_b2 * hs_b2) * (0.18 + 0.025 * hs_hc);\n"
+    "\t\t}\n"
+    "\t\ths_wx += hs_ins.meta.w * hs_ho;\n"
+    "\t\ths_wz += hs_ins.meta2.w * hs_ho;\n"
+    "\t}\n"
+    "\tfloat hs_si = floor(POS2D_UV.z * 0.5);\n"
+    "\tv_tc = vec2(POS2D_UV.z - 2.0 * hs_si, POS2D_UV.w);\n"
+    "\tv_btex = (hs_si < 0.5) ? hs_ins.tex0 : ((hs_si < 1.5) ? hs_ins.tex1 : hs_ins.tex2);\n"
+    "\tfloat hs_h = clamp(hs_wy, 0.0, 7.5);\n"
+    "\tvec2 hs_cr = normalize(u_camRight.xy + vec2(1e-6, 0.0));\n"
+    "\tvec2 hs_cf = vec2(-hs_cr.y, hs_cr.x);\n"
+    "\tfloat hs_lx = dot(vec3(hs_dx, hs_dy, hs_dz), hs_ins.meta.xyz) + hs_ho;\n"
+    "\tvec2 hs_anch = vec2(hs_wx, hs_wz) - hs_cr * hs_lx;\n"
+    "\tvec2 hs_dir = normalize(u_shadProj.xy + vec2(1e-6, 0.0));\n"
+    "\tfloat hs_stretch = u_shadProj.z;\n"
+    "\tfloat hs_lw = clamp(u_pointLight.w, 0.0, 1.0);\n"
+    "\tfloat hs_airFade = clamp(1.0 - max(max(hs_ins.m0.w, 0.0) - 0.45, 0.0) / 8.5, 0.08, 1.0);\n"
+    "\ths_lw *= hs_airFade;\n"
+    "\tif (u_pointLight.z > 0.5) {\n"
+    "\t\tvec2 hs_d = hs_anch - u_pointLight.xy;\n"
+    "\t\tfloat hs_dist = length(hs_d);\n"
+    "\t\tfloat hs_rad = max(u_pointLight.z, 1.0);\n"
+    "\t\tfloat hs_near = smoothstep(0.42, 1.15, hs_dist);\n"
+    "\t\tfloat hs_far = smoothstep(hs_rad, hs_rad * 0.25, hs_dist);\n"
+    "\t\ths_lw = hs_near * hs_far * hs_lw;\n"
+    "\t\tif (hs_lw <= 0.008) {\n"
+    "\t\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+    "\t\t\tv_meta = vec3(0.0);\n"
+    "\t\t\treturn;\n"
+    "\t\t}\n"
+    "\t\ths_dir = hs_d / max(hs_dist, 0.42);\n"
+    "\t\tfloat hs_plen = clamp(u_camRight.w, 0.50, 1.80);\n"
+    "\t\ths_stretch = (0.55 + clamp(hs_dist / hs_rad, 0.0, 1.0) * 1.70) * hs_plen;\n"
+    "\t} else if (hs_lw <= 0.005) {\n"
+    "\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+    "\t\tv_meta = vec3(0.0);\n"
+    "\t\treturn;\n"
+    "\t}\n"
+    "\tv_meta = vec3(hs_h, hs_ins.cmult.a, hs_lw);\n"
+    "\tvec2 hs_perp = vec2(-hs_dir.y, hs_dir.x);\n"
+    "\tif (dot(hs_perp, hs_cr) + 0.05 * dot(hs_perp, hs_cf) < 0.0) {\n"
+    "\t\ths_perp = -hs_perp;\n"
+    "\t}\n"
+    "\tvec2 hs_flat = hs_anch + hs_perp * hs_lx;\n"
+    "\tvec2 hs_wvec = vec2(0.0);\n"
+    "\tif (hs_h > 0.60 && u_shadDyn.y > 0.0) {\n"
+    "\t\tfloat hs_wt = u_shadDyn.x;\n"
+    "\t\tfloat hs_ph = hs_anch.x * 0.29 + hs_anch.y * 0.21;\n"
+    "\t\tfloat hs_bz = sin(hs_wt * 1.15 + hs_ph + hs_h * 0.14) * 0.65\n"
+    "\t\t            + sin(hs_wt * 2.03 + hs_ph * 1.70 - hs_h * 0.22) * 0.35;\n"
+    "\t\tfloat hs_sw0 = smoothstep(0.60, 3.60, hs_h);\n"
+    "\t\tfloat hs_soff = hs_bz * (hs_sw0 * hs_sw0) * clamp(u_shadDyn.y, 0.0, 1.5) * (0.28 + 0.06 * hs_h);\n"
+    "\t\ths_wvec = hs_perp * hs_soff + hs_dir * (hs_soff * 0.35);\n"
+    "\t}\n"
+    "\tvec2 hs_pxz = hs_flat + hs_dir * (hs_h * hs_stretch) + hs_wvec;\n"
+    "\tvec2 hs_ndc = (hs_pxz - u_bounds.xy) * u_bounds.z;\n"
+    "\tfloat hs_hn = hs_h / 7.5;\n"
+    "\tfloat hs_zKey = (u_bounds.w > 0.5) ? ((1.0 - hs_lw) * 0.92 + hs_hn * 0.08) : hs_hn;\n"
+    "\tfloat hs_z = hs_zKey * 1.98 - 0.99;\n"
+    "\tgl_Position = vec4(hs_ndc.x, hs_ndc.y, hs_z, 1.0);\n"
+    "}\n";
+
+inline constexpr const char* kShadowBatchGpuFs =
+    "#version 430 compatibility\n"
+    "#extension GL_ARB_bindless_texture : require\n"
+    "uniform vec4 u_shadDyn;\n"
+    "varying vec2 v_tc;\n"
+    "varying vec3 v_meta;\n"
+    "flat in uvec2 v_btex;\n"
+    "void main() {\n"
+    "\tvec4 c = texture2D(sampler2D(v_btex), v_tc);\n"
+    "\tfloat a = c.a * v_meta.y;\n"
+    "\tfloat h = v_meta.x;\n"
+    "\tfloat hf = clamp(u_shadDyn.z, 0.0, 1.0);\n"
+    "\tfloat hfade = mix(1.0, 1.0 - 0.58 * smoothstep(0.60, 5.80, h), hf);\n"
+    "\tfloat root = smoothstep(0.01, 0.14, h);\n"
+    "\tfloat cov = smoothstep(0.16, 0.66, a) * root * hfade * clamp(v_meta.z, 0.0, 1.0);\n"
+    "\tfloat hNorm = clamp(h / 7.5, 0.0, 1.0);\n"
+    "\tfloat prox = (1.0 - hNorm) * step(0.05, cov);\n"
+    "\tfloat hMax = hNorm * step(0.12, cov);\n"
+    "\tgl_FragColor = vec4(cov, prox, hMax, 1.0);\n"
+    "}\n";
+
 inline constexpr const char* kShadowCompositeVs =
     "uniform mat4 u_curPV;\n"
     "uniform vec4 u_prevBounds;\n"
@@ -498,6 +702,10 @@ inline constexpr const char* kShadowCompositeFs =
     "void main() {\n"
     "\tvec2 edge = abs(v_uv * 2.0 - 1.0);\n"
     "\tfloat boxFade = 1.0 - smoothstep(0.90, 1.0, max(edge.x, edge.y));\n"
+    "\tif (boxFade <= 0.001) {\n"
+    "\t\tgl_FragColor = vec4(1.0);\n"
+    "\t\treturn;\n"
+    "\t}\n"
     "\tvec4 c0 = texture2D(u_shadowMap, v_uv);\n"
     "\tfloat softVal = clamp(u_filterCfg.y, 0.0, 2.0);\n"
     "\tfloat cov;\n"
@@ -519,23 +727,17 @@ inline constexpr const char* kShadowCompositeFs =
     "\t\tfloat rad = basePx * mix(0.32, 1.45, hNorm) * radJit;\n"
     "\t\tfloat ca = cos(ang);\n"
     "\t\tfloat sa = sin(ang);\n"
-    "\t\tvec2 d1 = vec2( 0.3536,  0.0000);\n"
-    "\t\tvec2 d2 = vec2(-0.3688,  0.3375);\n"
-    "\t\tvec2 d3 = vec2( 0.0437, -0.6108);\n"
-    "\t\tvec2 d4 = vec2( 0.4535,  0.5513);\n"
-    "\t\tvec2 d5 = vec2(-0.7900, -0.0566);\n"
-    "\t\tvec2 d6 = vec2( 0.6250, -0.6020);\n"
-    "\t\tvec2 d7 = vec2(-0.0728,  0.9325);\n"
-    "\t\tvec2 d8 = vec2(-0.6644, -0.7474);\n"
+    "\t\tvec2 rx = vec2(ca, sa) * rad;\n"
+    "\t\tvec2 ry = vec2(-sa, ca) * rad;\n"
     "\t\tfloat s0 = c0.r;\n"
-    "\t\tfloat s1 = texture2D(u_shadowMap, v_uv + rad * vec2(d1.x * ca - d1.y * sa, d1.x * sa + d1.y * ca)).r;\n"
-    "\t\tfloat s2 = texture2D(u_shadowMap, v_uv + rad * vec2(d2.x * ca - d2.y * sa, d2.x * sa + d2.y * ca)).r;\n"
-    "\t\tfloat s3 = texture2D(u_shadowMap, v_uv + rad * vec2(d3.x * ca - d3.y * sa, d3.x * sa + d3.y * ca)).r;\n"
-    "\t\tfloat s4 = texture2D(u_shadowMap, v_uv + rad * vec2(d4.x * ca - d4.y * sa, d4.x * sa + d4.y * ca)).r;\n"
-    "\t\tfloat s5 = texture2D(u_shadowMap, v_uv + rad * vec2(d5.x * ca - d5.y * sa, d5.x * sa + d5.y * ca)).r;\n"
-    "\t\tfloat s6 = texture2D(u_shadowMap, v_uv + rad * vec2(d6.x * ca - d6.y * sa, d6.x * sa + d6.y * ca)).r;\n"
-    "\t\tfloat s7 = texture2D(u_shadowMap, v_uv + rad * vec2(d7.x * ca - d7.y * sa, d7.x * sa + d7.y * ca)).r;\n"
-    "\t\tfloat s8 = texture2D(u_shadowMap, v_uv + rad * vec2(d8.x * ca - d8.y * sa, d8.x * sa + d8.y * ca)).r;\n"
+    "\t\tfloat s1 = texture2D(u_shadowMap, v_uv + rx *  0.3536               ).r;\n"
+    "\t\tfloat s2 = texture2D(u_shadowMap, v_uv + rx * -0.3688 + ry *  0.3375).r;\n"
+    "\t\tfloat s3 = texture2D(u_shadowMap, v_uv + rx *  0.0437 + ry * -0.6108).r;\n"
+    "\t\tfloat s4 = texture2D(u_shadowMap, v_uv + rx *  0.4535 + ry *  0.5513).r;\n"
+    "\t\tfloat s5 = texture2D(u_shadowMap, v_uv + rx * -0.7900 + ry * -0.0566).r;\n"
+    "\t\tfloat s6 = texture2D(u_shadowMap, v_uv + rx *  0.6250 + ry * -0.6020).r;\n"
+    "\t\tfloat s7 = texture2D(u_shadowMap, v_uv + rx * -0.0728 + ry *  0.9325).r;\n"
+    "\t\tfloat s8 = texture2D(u_shadowMap, v_uv + rx * -0.6644 + ry * -0.7474).r;\n"
     "\t\tcov = (s0 * 2.2 + (s1 + s2 + s3 + s4) * 1.15 + (s5 + s6 + s7 + s8) * 0.80) * 0.10;\n"
     "\t\tcov = clamp(cov, 0.0, 1.0) * boxFade;\n"
     "\t}\n"
@@ -568,6 +770,9 @@ public:
     void SetOps(const GlShadowOps& ops, bool isNativeGl) noexcept {
         ops_ = ops;
         isNativeGl_ = isNativeGl;
+        if (hdResCap_ == 2048u && isNativeGl) {
+            hdResCap_ = 4096u;
+        }
     }
 
     bool IsReady() const noexcept { return ready_ && !failed_; }
@@ -579,6 +784,24 @@ public:
     uint32_t LastFrameShadowDraws() const noexcept { return lastFrameDraws_; }
     uint32_t LastFrameBatchedDraws() const noexcept { return lastFrameBatchDraws_; }
     uint32_t LastFrameUnbatchedDraws() const noexcept { return lastFrameUnbatchedDraws_; }
+    uint32_t LastFrameDeferredBatches() const noexcept { return lastFrameDeferredBatches_; }
+    // Number of deferred shadow draw calls eliminated (merged) via contiguous / MultiDraw coalescing last frame
+    // (e.g. N batches coalesced into 1 GL draw -> LastFrameDeferredBatches()==N, LastFrameShadowDraws()==1, LastFrameCoalescedDraws()==N-1).
+    uint32_t LastFrameCoalescedDraws() const noexcept { return lastFrameCoalescedDraws_; }
+    uint64_t ShadowReuseSkips() const noexcept { return totalShadowReuseSkips_; }
+    bool     LastFrameReused() const noexcept { return lastFrameReused_; }
+    bool     LastFrameShadowReused() const noexcept { return lastFrameReused_; }
+    bool     HasDeferredBatches() const noexcept { return !deferredBatches_.empty(); }
+    bool     HasGpuBatchProgram() const noexcept { return progBatchGpu_ != 0u; }
+    bool     IsFastEntityReceive1Tap() const noexcept { return fastEntityReceive1Tap_; }
+
+    void GetCachedBounds(float outBounds[4]) const noexcept {
+        if (!outBounds) return;
+        outBounds[0] = prevCenterX_;
+        outBounds[1] = prevCenterZ_;
+        outBounds[2] = 1.0f / kShadowHalfExtent;
+        outBounds[3] = hasPrevMap_ ? 1.0f : 0.0f;
+    }
 
     bool HasEntityReceiveData(const ShadowConfig& cfg) const noexcept {
         return ready_ && hasPrevMap_ && compositedThisFrame_ &&
@@ -591,10 +814,12 @@ public:
             const float effRecv = std::clamp(cfg.density, 0.0f, 1.0f) *
                                   std::clamp(cfg.entityRecv, 0.0f, 1.0f) *
                                   std::clamp(cfg.dirStrength, 0.0f, 1.0f);
+            const bool fast1Tap = cfg.fastEntityReceive1Tap;
+            fastEntityReceive1Tap_ = fast1Tap;
             outBounds[0] = prevCenterX_;
             outBounds[1] = prevCenterZ_;
             outBounds[2] = 1.0f / kShadowHalfExtent;
-            outBounds[3] = isNativeGl_ ? 1.0f : 2.0f; // 1.0 = exact GL_MAX h_max, 2.0 = ANGLE DEPTH16 wide-tap
+            outBounds[3] = fast1Tap ? 0.65f : (isNativeGl_ ? 1.0f : 2.0f); // 0.65 = 1-tap fast receive, 1.0 = exact GL_MAX 5-tap, 2.0 = ANGLE DEPTH16 wide-tap
             outTint[0]   = cfg.tintR;
             outTint[1]   = cfg.tintG;
             outTint[2]   = cfg.tintB;
@@ -620,14 +845,21 @@ public:
             depthRbo_[0] = depthRbo_[1] = 0;
             texBlueNoise_ = 0;
             progBatch_ = 0;
+            progBatchGpu_ = 0;
             progComposite_ = 0;
             quadVbo_ = 0;
         }
         ready_ = false;
         failed_ = false;
         res_ = 0;
-        hdResCap_ = 2048u;
+        hdResCap_ = isNativeGl_ ? 4096u : 2048u;
         hasPrevMap_ = false;
+        hasCachedSnapshot_ = false;
+        reuseStreak_ = 0u;
+        lastFrameReused_ = false;
+        fastEntityReceive1Tap_ = false;
+        lastFrameCoalescedDraws_ = 0u;
+        totalShadowReuseSkips_ = 0ULL;
         ++frameRecvGen_;
         ResetFrameFlags();
         ++frameRecvGen_;
@@ -682,7 +914,7 @@ public:
     bool NeedsCompositeOrBeginWrite(uint32_t curFbo, const ShadowConfig& cfg) const noexcept {
         if (failed_ || !HasAnyShadowLight(cfg)) return false;
         if (!IsInsideWorldPass(curFbo)) return false;
-        return !beganWriteThisFrame_;
+        return !frameShadowHandled_;
     }
 
     bool IsEntityInsideShadowBox(float wx, float wz) const noexcept {
@@ -693,15 +925,21 @@ public:
     // Called right BEFORE the first standing world entity draws onto PrimaryRT:
     //   1. Lazily creates/resizes ping-pong RGBA8 ShadowMask FBOs & internal shaders.
     //   2. Composites previous completed ping-pong shadow map onto PrimaryRT (world quad y=0.04).
-    //   3. Clears this frame's write ShadowMask FBO ready to accept standing entity mirrors!
+    //   3. Either reuses the cached shadow map (opt-in temporalStride > 1, 0 FBO clear / 0 shadow draws,
+    //      keeping ground & entity bounds strictly locked to cached prevCenterX_/Z_), OR clears this
+    //      frame's write ShadowMask FBO ready to accept standing entity mirrors!
     bool OnBeforeFirstStandingEntity(const ShadowConfig& cfg,
                                      const ShadowPassState& saved,
                                      hs_gl_cache::ThreadState& glCache) noexcept {
-        if (beganWriteThisFrame_) return ready_;
-        if (!HasAnyShadowLight(cfg)) return false;
+        if (frameShadowHandled_) return ready_;
+        if (!HasAnyShadowLight(cfg)) {
+            fastEntityReceive1Tap_ = false;
+            return false;
+        }
         if (!ops_.IsComplete() || !IsInsideWorldPass(saved.dstFbo)) return false;
 
-        const uint32_t wantRes = cfg.hdMode ? hdResCap_ : 512u;
+        const uint32_t maxTarget = cfg.maxHdRes > 0u ? std::min(cfg.maxHdRes, hdResCap_) : std::min(2048u, hdResCap_);
+        const uint32_t wantRes = cfg.hdMode ? maxTarget : 512u;
         if (!EnsureResources(wantRes, saved, glCache)) {
             return false;
         }
@@ -715,39 +953,69 @@ public:
                 hasCamRight_ = true;
             }
         }
-        if (!hasCamCenter_ && cfg.hasLuaCam) {
-            camCenterX_ = cfg.luaCamX;
-            camCenterZ_ = cfg.luaCamZ;
-            hasCamCenter_ = true;
+
+        const float cx = hasCamCenter_ ? camCenterX_ : (cfg.hasLuaCam ? cfg.luaCamX : 0.0f);
+        const float cz = hasCamCenter_ ? camCenterZ_ : (cfg.hasLuaCam ? cfg.luaCamZ : 0.0f);
+
+        const bool didComposite = (hasPrevMap_ && hasPV_ && !compositedThisFrame_);
+        if (CanReuseCachedShadowMap(cfg, cx, cz)) {
+            if (didComposite) {
+                const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
+                CompositeGroundQuad(cfg, saved, glCache);
+                compositedThisFrame_ = true;
+                ++frameRecvGen_;
+                RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                                   true /*restoreBlend*/, false /*restoreDepthFunc*/);
+            }
+            const bool wantFast1Tap = cfg.fastEntityReceive1Tap && HasEntityReceiveData(cfg);
+            if (wantFast1Tap != fastEntityReceive1Tap_) {
+                fastEntityReceive1Tap_ = wantFast1Tap;
+                ++frameRecvGen_;
+            }
+            frameShadowHandled_  = true;
+            beganWriteThisFrame_ = false;
+            reusedThisFrame_     = true;
+            ++reuseStreak_;
+            ++totalShadowReuseSkips_;
+            return true;
         }
 
-        // Capture exact host raster state BEFORE any mutation (zero GL queries when glCache is known & trusted;
-        // falls back to glGetIntegerv whenever any glCache field is unknown or glCache is disabled!).
-        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted);
+        // Capture exact host raster state BEFORE any mutation (zero GL queries when glCache + blendCache are trusted;
+        // falls back to glGetIntegerv whenever any glCache field is unknown or untrusted!).
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
 
         // 1. Composite previous frame's world-space shadow map onto PrimaryRT BEFORE standing entities!
-        if (hasPrevMap_ && hasPV_ && !compositedThisFrame_) {
-            CompositeGroundQuad(cfg, saved, savedRaster, glCache);
+        //    Defer raster restore until after step 3 clears the write FBO (eliminates redundant double-restore!).
+        if (didComposite) {
+            CompositeGroundQuad(cfg, saved, glCache);
             compositedThisFrame_ = true;
+            ++frameRecvGen_;
+        }
+        const bool wantFast1Tap = cfg.fastEntityReceive1Tap && HasEntityReceiveData(cfg);
+        if (wantFast1Tap != fastEntityReceive1Tap_) {
+            fastEntityReceive1Tap_ = wantFast1Tap;
             ++frameRecvGen_;
         }
 
         // 2. Snap current write ortho bounds to exact shadow-texel grid (0 sub-texel crawl!)
         const float texelWorld = (2.0f * kShadowHalfExtent) / static_cast<float>(res_);
-        const float cx = hasCamCenter_ ? camCenterX_ : (cfg.hasLuaCam ? cfg.luaCamX : 0.0f);
-        const float cz = hasCamCenter_ ? camCenterZ_ : (cfg.hasLuaCam ? cfg.luaCamZ : 0.0f);
-        writeCenterX_ = std::floor(cx / texelWorld + 0.5f) * texelWorld;
-        writeCenterZ_ = std::floor(cz / texelWorld + 0.5f) * texelWorld;
+        const float safeCx = std::isfinite(cx) ? cx : 0.0f;
+        const float safeCz = std::isfinite(cz) ? cz : 0.0f;
+        writeCenterX_ = std::floor(safeCx / texelWorld + 0.5f) * texelWorld;
+        writeCenterZ_ = std::floor(safeCz / texelWorld + 0.5f) * texelWorld;
         writeBounds_[0] = writeCenterX_;
         writeBounds_[1] = writeCenterZ_;
         writeBounds_[2] = 1.0f / kShadowHalfExtent;
         writeBounds_[3] = isNativeGl_ ? 0.0f : 1.0f; // 1.0 = ANGLE D3D9 depth-discard anti-overlap
+        CaptureShadowSnapshot(cfg, res_, pendingSnapshot_);
 
         // 3. Clear current write ShadowMask FBO
         ops_.glBindFramebuffer(kGlFramebuffer, fbo_[writeSlot_]);
         ops_.glViewport(0, 0, static_cast<int32_t>(res_), static_cast<int32_t>(res_));
-        ops_.glDisable(kGlScissorTest);
-        ops_.glDisable(kGlStencilTest);
+        if (!didComposite) {
+            ops_.glDisable(kGlScissorTest);
+            ops_.glDisable(kGlStencilTest);
+        }
         ops_.glColorMask(1, 1, 1, 1);
         ops_.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         if (isNativeGl_) {
@@ -757,30 +1025,40 @@ public:
             ops_.glClear(kGlColorBufferBit | kGlDepthBufferBit);
         }
 
-        // Restore DST FBO, viewport, clearColor, scissor, colorMask, depthMask
+        // Restore DST FBO, viewport, clearColor, and host raster state ONCE!
         ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
         ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
         if (saved.hasClearColor) {
             ops_.glClearColor(saved.clearColor[0], saved.clearColor[1], saved.clearColor[2], saved.clearColor[3]);
         }
-        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                           didComposite /*restoreBlend*/, false /*restoreDepthFunc*/);
 
+        frameShadowHandled_ = true;
         beganWriteThisFrame_ = true;
+        reusedThisFrame_ = false;
         batchUniUploadedFrame_ = false;
+        batchGpuUniUploadedFrame_ = false;
         return true;
     }
 
     // Mirrors a SpriteBatcher flush directly from the ALREADY-BOUND Ring VBO/IBO & GL_TEXTURE6..13!
-    // Optional batchBoundsXZ[4] = {minX, maxX, minZ, maxZ} enables O(1) CPU per-light culling!
+    // Optional batchBoundsXZ[4] = {minX, maxX, minZ, maxZ} enables O(1) CPU per-light & shadow-box culling!
     void MirrorBatchedSprites(uint32_t indexCount,
                               const ShadowConfig& cfg,
                               const ShadowPassState& saved,
                               hs_gl_cache::ThreadState& glCache,
-                              const float* batchBoundsXZ = nullptr) noexcept {
+                              const float* batchBoundsXZ = nullptr,
+                              uintptr_t indexByteOffset = 0u) noexcept {
         if (!ready_ || !beganWriteThisFrame_ || indexCount == 0u || !ops_.IsComplete()) return;
         if (!IsInsideWorldPass(saved.dstFbo)) return;
 
-        const bool drawDir = HasActiveDirectionalShadow(cfg);
+        bool drawDir = HasActiveDirectionalShadow(cfg);
+        if (drawDir && batchBoundsXZ) {
+            DirShadowCullBox cbox{};
+            BuildDirShadowCullBox(cfg, cbox);
+            if (!cbox.TouchesAabbXZ(batchBoundsXZ)) drawDir = false;
+        }
         uint32_t activePtIdx[kMaxPointShadowLights]{};
         uint32_t activePtCnt = 0u;
         const uint32_t ptCnt = (cfg.pointLightCount < kMaxPointShadowLights)
@@ -795,7 +1073,7 @@ public:
         }
         if (!drawDir && activePtCnt == 0u) return;
 
-        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted);
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
         const uint32_t restoreProg = ResolveHostProgram(saved, glCache);
 
         ops_.glBindFramebuffer(kGlFramebuffer, fbo_[writeSlot_]);
@@ -804,22 +1082,16 @@ public:
 
         ops_.glUseProgram(progBatch_);
         if (!batchUniUploadedFrame_) {
-            const float proj[4] = { cfg.dirWx, cfg.dirWz, cfg.stretch, cfg.projOn };
-            const float dyn[4]  = { cfg.windTime, cfg.swayAmp, cfg.heightFade, cfg.penumbraBias };
-            const float ptScale = std::isfinite(cfg.pointStretchScale)
-                ? std::clamp(cfg.pointStretchScale, 0.50f, 1.80f) : 1.0f;
-            const float camR[4] = { camRightX_, camRightZ_, cfg.skipNightmare ? 1.0f : 0.0f, ptScale };
-            if (locBatchBounds_ >= 0)   ops_.glUniform4fv(locBatchBounds_, 1, writeBounds_);
-            if (locBatchShadProj_ >= 0) ops_.glUniform4fv(locBatchShadProj_, 1, proj);
-            if (locBatchShadDyn_ >= 0)  ops_.glUniform4fv(locBatchShadDyn_, 1, dyn);
-            if (locBatchCamRight_ >= 0) ops_.glUniform4fv(locBatchCamRight_, 1, camR);
+            UploadShadowBatchUniforms(locBatchBounds_, locBatchShadProj_,
+                                      locBatchShadDyn_, locBatchCamRight_, cfg);
             batchUniUploadedFrame_ = true;
         }
 
+        const void* const idxPtr = reinterpret_cast<const void*>(indexByteOffset);
         if (drawDir) {
             const float dirU[4] = { 0.0f, 0.0f, 0.0f, std::clamp(cfg.dirStrength, 0.0f, 1.0f) };
             if (locBatchPointLight_ >= 0) ops_.glUniform4fv(locBatchPointLight_, 1, dirU);
-            ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(indexCount), kGlUnsignedShort, nullptr);
+            ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(indexCount), kGlUnsignedShort, idxPtr);
             ++curFrameDraws_;
             ++curFrameBatchDraws_;
             wroteAnyThisFrame_ = true;
@@ -828,7 +1100,7 @@ public:
             const auto& pl = cfg.pointLights[activePtIdx[pi]];
             const float ptU[4] = { pl.wx, pl.wz, pl.radius, std::clamp(pl.strength, 0.0f, 1.0f) };
             ops_.glUniform4fv(locBatchPointLight_, 1, ptU);
-            ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(indexCount), kGlUnsignedShort, nullptr);
+            ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(indexCount), kGlUnsignedShort, idxPtr);
             ++curFrameDraws_;
             ++curFrameBatchDraws_;
             wroteAnyThisFrame_ = true;
@@ -842,10 +1114,554 @@ public:
         ops_.glUseProgram(restoreProg);
         ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
         ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
-        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                           isNativeGl_ /*restoreBlend*/, !isNativeGl_ /*restoreDepthFunc*/);
         if (saved.glCacheTrusted) {
             glCache.curProgram = restoreProg;
         }
+    }
+
+    void MirrorBatchedSpritesGpu(uint32_t ssboId,
+                                 uint32_t indexCount,
+                                 int32_t baseVertex,
+                                 uintptr_t indexByteOffset,
+                                 const ShadowConfig& cfg,
+                                 const ShadowPassState& saved,
+                                 hs_gl_cache::ThreadState& glCache,
+                                 const float* batchBoundsXZ = nullptr) noexcept {
+        if (!ready_ || !beganWriteThisFrame_ || !isNativeGl_ || progBatchGpu_ == 0u ||
+            indexCount == 0u || ssboId == 0u || !ops_.IsComplete() ||
+            !ops_.glBindBufferBase || !ops_.glDrawElementsBaseVertex) {
+            return;
+        }
+        if (!IsInsideWorldPass(saved.dstFbo)) return;
+
+        bool drawDir = HasActiveDirectionalShadow(cfg);
+        if (drawDir && batchBoundsXZ) {
+            DirShadowCullBox cbox{};
+            BuildDirShadowCullBox(cfg, cbox);
+            if (!cbox.TouchesAabbXZ(batchBoundsXZ)) drawDir = false;
+        }
+        uint32_t activePtIdx[kMaxPointShadowLights]{};
+        uint32_t activePtCnt = 0u;
+        const uint32_t ptCnt = (locBatchGpuPointLight_ >= 0)
+            ? ((cfg.pointLightCount < kMaxPointShadowLights) ? cfg.pointLightCount : kMaxPointShadowLights)
+            : 0u;
+        for (uint32_t li = 0u; li < ptCnt; ++li) {
+            const auto& pl = cfg.pointLights[li];
+            if (!IsPointLightValid(pl)) continue;
+            if (batchBoundsXZ && !PointLightTouchesAabbXZ(pl, batchBoundsXZ)) continue;
+            activePtIdx[activePtCnt++] = li;
+        }
+        if (!drawDir && activePtCnt == 0u) return;
+
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
+        const uint32_t restoreProg = ResolveHostProgram(saved, glCache);
+
+        ops_.glBindFramebuffer(kGlFramebuffer, fbo_[writeSlot_]);
+        ops_.glViewport(0, 0, static_cast<int32_t>(res_), static_cast<int32_t>(res_));
+        ApplyShadowWriteRasterState();
+
+        ops_.glUseProgram(progBatchGpu_);
+        ops_.glBindBufferBase(kGlShaderStorageBuffer, kGpuInstBinding, ssboId);
+        if (!batchGpuUniUploadedFrame_) {
+            UploadShadowBatchUniforms(locBatchGpuBounds_, locBatchGpuShadProj_,
+                                      locBatchGpuShadDyn_, locBatchGpuCamRight_, cfg);
+            batchGpuUniUploadedFrame_ = true;
+        }
+
+        const void* const idxPtr = reinterpret_cast<const void*>(indexByteOffset);
+        if (drawDir) {
+            const float dirU[4] = { 0.0f, 0.0f, 0.0f, std::clamp(cfg.dirStrength, 0.0f, 1.0f) };
+            if (locBatchGpuPointLight_ >= 0) ops_.glUniform4fv(locBatchGpuPointLight_, 1, dirU);
+            ops_.glDrawElementsBaseVertex(kGlTriangles, static_cast<int32_t>(indexCount),
+                                          kGlUnsignedShort, idxPtr, baseVertex);
+            ++curFrameDraws_;
+            ++curFrameBatchDraws_;
+            wroteAnyThisFrame_ = true;
+        }
+        for (uint32_t pi = 0u; pi < activePtCnt; ++pi) {
+            const auto& pl = cfg.pointLights[activePtIdx[pi]];
+            const float ptU[4] = { pl.wx, pl.wz, pl.radius, std::clamp(pl.strength, 0.0f, 1.0f) };
+            ops_.glUniform4fv(locBatchGpuPointLight_, 1, ptU);
+            ops_.glDrawElementsBaseVertex(kGlTriangles, static_cast<int32_t>(indexCount),
+                                          kGlUnsignedShort, idxPtr, baseVertex);
+            ++curFrameDraws_;
+            ++curFrameBatchDraws_;
+            wroteAnyThisFrame_ = true;
+        }
+        if (activePtCnt > 0u && locBatchGpuPointLight_ >= 0) {
+            const float resetU[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            ops_.glUniform4fv(locBatchGpuPointLight_, 1, resetU);
+        }
+
+        ops_.glUseProgram(restoreProg);
+        ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
+        ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                           true /*restoreBlend*/, false /*restoreDepthFunc*/);
+        if (saved.glCacheTrusted) {
+            glCache.curProgram = restoreProg;
+        }
+    }
+
+    // Deferred Shadow Replay (Native GL 4.6 AZDO Persistent Ring — Zero Per-Flush FBO Ping-Pong!):
+    //   - Records a lightweight ~100B descriptor for each SpriteBatcher flush whose vertices/indices
+    //     live untouched inside the frame's linear-bump AZDO Persistent Ring.
+    //   - Because Native GL ShadowMask uses commutative/associative GL_MAX with depth test OFF,
+    //     replaying all recorded batches in ONE single FBO bind at end-of-world produces 100%
+    //     bit-exact identical shadow pixels while eliminating up to 390 FBO switches/frame!
+    bool RecordBatchedShadow(uint32_t vboId,
+                             uint32_t iboId,
+                             uint32_t indexCount,
+                             uintptr_t vertByteOffset,
+                             uintptr_t indexByteOffset,
+                             uint32_t texCount,
+                             const uint32_t* texIds,
+                             const float* batchBoundsXZ,
+                             uint32_t curFbo) noexcept {
+        if (!ready_ || !beganWriteThisFrame_ || !isNativeGl_ || !ops_.IsComplete()) return false;
+        if (indexCount == 0u || vboId == 0u || iboId == 0u || texCount == 0u || !texIds) return false;
+        if (!IsInsideWorldPass(curFbo)) return false;
+        if (deferredBatches_.size() >= kMaxDeferredBatches) return false;
+        if (deferredBatches_.capacity() < 128u) {
+            deferredBatches_.reserve(128u);
+        }
+        DeferredShadowBatch b{};
+        b.vboId           = vboId;
+        b.iboId           = iboId;
+        b.indexCount      = indexCount;
+        b.vertByteOffset  = vertByteOffset;
+        b.indexByteOffset = indexByteOffset;
+        b.texCount        = (texCount <= kMaxBatchTexSlots) ? texCount : kMaxBatchTexSlots;
+        std::memcpy(b.texIds, texIds, static_cast<size_t>(b.texCount) * sizeof(uint32_t));
+        if (batchBoundsXZ) {
+            std::memcpy(b.boundsXZ, batchBoundsXZ, sizeof(b.boundsXZ));
+            b.hasBounds = true;
+        }
+        deferredBatches_.push_back(b);
+        return true;
+    }
+
+    bool RecordBatchedShadowGpu(uint32_t vboId,
+                                uint32_t iboId,
+                                uint32_t ssboId,
+                                uint32_t indexCount,
+                                int32_t baseVertex,
+                                uintptr_t indexByteOffset,
+                                const float* batchBoundsXZ,
+                                uint32_t curFbo) noexcept {
+        if (!ready_ || !beganWriteThisFrame_ || !isNativeGl_ || progBatchGpu_ == 0u ||
+            !ops_.IsComplete() || !ops_.glBindBufferBase || !ops_.glDrawElementsBaseVertex) {
+            return false;
+        }
+        if (indexCount == 0u || vboId == 0u || iboId == 0u || ssboId == 0u) return false;
+        if (!IsInsideWorldPass(curFbo)) return false;
+        if (deferredBatches_.size() >= kMaxDeferredBatches) return false;
+        if (deferredBatches_.capacity() < 128u) {
+            deferredBatches_.reserve(128u);
+        }
+        DeferredShadowBatch b{};
+        b.vboId           = vboId;
+        b.iboId           = iboId;
+        b.ssboId          = ssboId;
+        b.indexCount      = indexCount;
+        b.baseVertex      = baseVertex;
+        b.indexByteOffset = indexByteOffset;
+        b.isGpuDriven     = true;
+        if (batchBoundsXZ) {
+            std::memcpy(b.boundsXZ, batchBoundsXZ, sizeof(b.boundsXZ));
+            b.hasBounds = true;
+        }
+        deferredBatches_.push_back(b);
+        return true;
+    }
+
+    void FlushDeferredBatchedShadows(const ShadowConfig& cfg,
+                                     const ShadowPassState& saved,
+                                     hs_gl_cache::ThreadState& glCache) noexcept {
+        if (deferredBatches_.empty()) return;
+        if (!ready_ || !beganWriteThisFrame_ || !isNativeGl_ || !ops_.IsComplete()) {
+            deferredBatches_.clear();
+            return;
+        }
+
+        const bool drawDir = HasActiveDirectionalShadow(cfg);
+        DirShadowCullBox dirCullBox{};
+        if (drawDir) {
+            BuildDirShadowCullBox(cfg, dirCullBox);
+        }
+        const uint32_t ptCnt = (locBatchPointLight_ >= 0 || locBatchGpuPointLight_ >= 0)
+            ? ((cfg.pointLightCount < kMaxPointShadowLights) ? cfg.pointLightCount : kMaxPointShadowLights)
+            : 0u;
+        bool ptValid[kMaxPointShadowLights]{};
+        bool anyPtValid = false;
+        for (uint32_t li = 0u; li < ptCnt; ++li) {
+            ptValid[li] = IsPointLightValid(cfg.pointLights[li]);
+            if (ptValid[li]) anyPtValid = true;
+        }
+        if (!drawDir && !anyPtValid) {
+            deferredBatches_.clear();
+            return;
+        }
+
+        // Pre-pass: compute per-batch active light bitmask (bit 0 = directional, bits 1..3 = point lights).
+        // Because Native GL ShadowMask uses commutative/associative GL_MAX with depth test OFF, grouping by
+        // light pass and coalescing contiguous IBO / same-buffer GPU batches is 100% bit-exact identical!
+        const size_t n = std::min(deferredBatches_.size(), kMaxDeferredBatches);
+        if (batchLightMask_.size() < n) {
+            batchLightMask_.resize(n);
+            batchIsGpu_.resize(n);
+            mdCounts_.resize(n);
+            mdPtrs_.resize(n);
+            mdBaseVerts_.resize(n);
+        }
+        std::memset(batchLightMask_.data(), 0, n);
+        std::memset(batchIsGpu_.data(), 0, n);
+        uint8_t* const batchLightMask = batchLightMask_.data();
+        uint8_t* const batchIsGpu     = batchIsGpu_.data();
+        uint8_t anyPassMask = 0u;
+        for (size_t i = 0u; i < n; ++i) {
+            const auto& b = deferredBatches_[i];
+            const bool wantGpu = b.isGpuDriven && (progBatchGpu_ != 0u) && (b.ssboId != 0u) &&
+                                 (ops_.glBindBufferBase != nullptr) && (ops_.glDrawElementsBaseVertex != nullptr);
+            if (b.isGpuDriven && !wantGpu) continue;
+            batchIsGpu[i] = wantGpu ? 1u : 0u;
+
+            uint8_t mask = 0u;
+            if (drawDir && (!b.hasBounds || dirCullBox.TouchesAabbXZ(b.boundsXZ))) {
+                mask |= 1u;
+            }
+            const int32_t ptLoc = wantGpu ? locBatchGpuPointLight_ : locBatchPointLight_;
+            if (anyPtValid && ptLoc >= 0) {
+                for (uint32_t li = 0u; li < ptCnt; ++li) {
+                    if (!ptValid[li]) continue;
+                    if (b.hasBounds && !PointLightTouchesAabbXZ(cfg.pointLights[li], b.boundsXZ)) continue;
+                    mask |= static_cast<uint8_t>(1u << (li + 1u));
+                }
+            }
+            if (mask != 0u) {
+                batchLightMask[i] = mask;
+                anyPassMask |= mask;
+                ++curFrameDeferredBatches_;
+            }
+        }
+
+        // Lazy FBO/state enter: if every deferred batch is culled by AABB bounds, emit ZERO GL calls!
+        if (anyPassMask == 0u) {
+            deferredBatches_.clear();
+            return;
+        }
+
+        CaptureShadowSnapshot(cfg, res_, pendingSnapshot_);
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
+        const uint32_t         restoreProg = ResolveHostProgram(saved, glCache);
+        ops_.glBindFramebuffer(kGlFramebuffer, fbo_[writeSlot_]);
+        ops_.glViewport(0, 0, static_cast<int32_t>(res_), static_cast<int32_t>(res_));
+        ApplyShadowWriteRasterState();
+        ops_.glEnableVertexAttribArray(0u);
+        ops_.glEnableVertexAttribArray(7u);
+
+        bool     touchedActiveTex  = false;
+        uint32_t progMode          = 0u; // 1 = CPU, 2 = GPU
+        bool     cpuAttribsEnabled = false;
+        uint32_t boundVbo          = 0xFFFFFFFFu;
+        uint32_t boundIbo          = 0xFFFFFFFFu;
+        uint32_t boundSsbo         = 0xFFFFFFFFu;
+        uint32_t gpuAttribVbo      = 0xFFFFFFFFu;
+        uint32_t cpuAttribVbo      = 0xFFFFFFFFu;
+        uintptr_t cpuAttribOff     = 0u;
+        uint32_t boundSlotTex[kMaxBatchTexSlots];
+        for (uint32_t s = 0u; s < kMaxBatchTexSlots; ++s) boundSlotTex[s] = 0xFFFFFFFFu;
+        int32_t  lastLightKey      = -2;
+        bool     usedCpuPt         = false;
+        bool     usedGpuPt         = false;
+        const float dirStrengthClamped = std::clamp(cfg.dirStrength, 0.0f, 1.0f);
+
+        int32_t*     const mdCounts    = mdCounts_.data();
+        const void** const mdPtrs      = mdPtrs_.data();
+        int32_t*     const mdBaseVerts = mdBaseVerts_.data();
+
+        for (uint32_t pass = 0u; pass <= ptCnt; ++pass) {
+            const uint8_t passBit = static_cast<uint8_t>(1u << pass);
+            if ((anyPassMask & passBit) == 0u) continue;
+
+            const int32_t curLightKey = (pass == 0u) ? -1 : static_cast<int32_t>(pass - 1u);
+            float lightU[4];
+            if (pass == 0u) {
+                lightU[0] = 0.0f; lightU[1] = 0.0f; lightU[2] = 0.0f; lightU[3] = dirStrengthClamped;
+            } else {
+                const auto& pl = cfg.pointLights[pass - 1u];
+                lightU[0] = pl.wx; lightU[1] = pl.wz; lightU[2] = pl.radius; lightU[3] = std::clamp(pl.strength, 0.0f, 1.0f);
+            }
+
+            size_t i = 0u;
+            while (i < n) {
+                if ((batchLightMask[i] & passBit) == 0u) {
+                    ++i;
+                    continue;
+                }
+                const auto& b0 = deferredBatches_[i];
+                const bool wantGpu = batchIsGpu[i];
+
+                if (wantGpu) {
+                    if (progMode != 2u) {
+                        if (cpuAttribsEnabled) {
+                            ops_.glDisableVertexAttribArray(5u);
+                            ops_.glDisableVertexAttribArray(6u);
+                            cpuAttribsEnabled = false;
+                        }
+                        ops_.glUseProgram(progBatchGpu_);
+                        if (!batchGpuUniUploadedFrame_) {
+                            UploadShadowBatchUniforms(locBatchGpuBounds_, locBatchGpuShadProj_,
+                                                      locBatchGpuShadDyn_, locBatchGpuCamRight_, cfg);
+                            batchGpuUniUploadedFrame_ = true;
+                        }
+                        progMode     = 2u;
+                        lastLightKey = -2;
+                        gpuAttribVbo = 0xFFFFFFFFu;
+                        cpuAttribVbo = 0xFFFFFFFFu;
+                    }
+                    if (boundSsbo != b0.ssboId) {
+                        ops_.glBindBufferBase(kGlShaderStorageBuffer, kGpuInstBinding, b0.ssboId);
+                        boundSsbo = b0.ssboId;
+                    }
+                    if (boundVbo != b0.vboId) {
+                        ops_.glBindBuffer(kGlArrayBuffer, b0.vboId);
+                        boundVbo = b0.vboId;
+                    }
+                    if (boundIbo != b0.iboId) {
+                        ops_.glBindBuffer(kGlElementArrayBuffer, b0.iboId);
+                        boundIbo = b0.iboId;
+                    }
+                    if (gpuAttribVbo != b0.vboId) {
+                        ops_.glVertexAttribPointer(0u, 4, kGlFloat, 0, 20, reinterpret_cast<const void*>(0u));
+                        ops_.glVertexAttribPointer(7u, 1, kGlFloat, 0, 20, reinterpret_cast<const void*>(16u));
+                        gpuAttribVbo = b0.vboId;
+                    }
+                    if (locBatchGpuPointLight_ >= 0 && lastLightKey != curLightKey) {
+                        ops_.glUniform4fv(locBatchGpuPointLight_, 1, lightU);
+                        lastLightKey = curLightKey;
+                    }
+
+                    // Coalesce consecutive active GPU batches sharing (vbo, ibo, ssbo):
+                    //   Level 1: merge contiguous index ranges with identical baseVertex into one draw.
+                    //   Level 2: when glMultiDrawElementsBaseVertex is available, issue ALL distinct
+                    //            baseVertex ranges in ONE single driver call (363 batches -> 1 draw)!
+                    uint32_t  subCnt       = 0u;
+                    uint32_t  mergedInRun  = 0u;
+                    uintptr_t lastEndOff   = 0u;
+                    int32_t   lastBaseVert = 0;
+                    size_t j = i;
+                    while (j < n) {
+                        if ((batchLightMask[j] & passBit) == 0u) {
+                            ++j;
+                            continue;
+                        }
+                        if (!batchIsGpu[j]) break;
+                        const auto& bj = deferredBatches_[j];
+                        if (bj.vboId != b0.vboId || bj.iboId != b0.iboId || bj.ssboId != b0.ssboId) break;
+
+                        if (subCnt > 0u &&
+                            bj.baseVertex == lastBaseVert &&
+                            bj.indexByteOffset == lastEndOff &&
+                            static_cast<uint64_t>(mdCounts[subCnt - 1u]) + static_cast<uint64_t>(bj.indexCount) <= 0x3FFFFFFFULL) {
+                            mdCounts[subCnt - 1u] += static_cast<int32_t>(bj.indexCount);
+                            lastEndOff += static_cast<uintptr_t>(bj.indexCount) * sizeof(uint16_t);
+                            ++mergedInRun;
+                        } else {
+                            mdCounts[subCnt]    = static_cast<int32_t>(bj.indexCount);
+                            mdPtrs[subCnt]      = reinterpret_cast<const void*>(bj.indexByteOffset);
+                            mdBaseVerts[subCnt] = bj.baseVertex;
+                            lastBaseVert        = bj.baseVertex;
+                            lastEndOff          = bj.indexByteOffset + static_cast<uintptr_t>(bj.indexCount) * sizeof(uint16_t);
+                            ++subCnt;
+                        }
+                        ++j;
+                    }
+                    i = j;
+
+                    if (subCnt == 1u) {
+                        ops_.glDrawElementsBaseVertex(kGlTriangles, mdCounts[0], kGlUnsignedShort, mdPtrs[0], mdBaseVerts[0]);
+                        ++curFrameDraws_;
+                        ++curFrameBatchDraws_;
+                        curFrameCoalescedDraws_ += mergedInRun;
+                    } else if (ops_.glMultiDrawElementsBaseVertex != nullptr) {
+                        ops_.glMultiDrawElementsBaseVertex(kGlTriangles, mdCounts, kGlUnsignedShort, mdPtrs,
+                                                           static_cast<int32_t>(subCnt), mdBaseVerts);
+                        ++curFrameDraws_;
+                        ++curFrameBatchDraws_;
+                        curFrameCoalescedDraws_ += mergedInRun + (subCnt - 1u);
+                    } else {
+                        for (uint32_t k = 0u; k < subCnt; ++k) {
+                            ops_.glDrawElementsBaseVertex(kGlTriangles, mdCounts[k], kGlUnsignedShort, mdPtrs[k], mdBaseVerts[k]);
+                            ++curFrameDraws_;
+                            ++curFrameBatchDraws_;
+                        }
+                        curFrameCoalescedDraws_ += mergedInRun;
+                    }
+                    wroteAnyThisFrame_ = true;
+                    if (pass > 0u) usedGpuPt = true;
+                } else {
+                    if (progMode != 1u) {
+                        ops_.glUseProgram(progBatch_);
+                        if (!batchUniUploadedFrame_) {
+                            UploadShadowBatchUniforms(locBatchBounds_, locBatchShadProj_,
+                                                      locBatchShadDyn_, locBatchCamRight_, cfg);
+                            batchUniUploadedFrame_ = true;
+                        }
+                        if (!cpuAttribsEnabled) {
+                            ops_.glEnableVertexAttribArray(5u);
+                            ops_.glEnableVertexAttribArray(6u);
+                            cpuAttribsEnabled = true;
+                        }
+                        progMode     = 1u;
+                        lastLightKey = -2;
+                        gpuAttribVbo = 0xFFFFFFFFu;
+                        cpuAttribVbo = 0xFFFFFFFFu;
+                    }
+                    if (boundVbo != b0.vboId) {
+                        ops_.glBindBuffer(kGlArrayBuffer, b0.vboId);
+                        boundVbo = b0.vboId;
+                    }
+                    if (boundIbo != b0.iboId) {
+                        ops_.glBindBuffer(kGlElementArrayBuffer, b0.iboId);
+                        boundIbo = b0.iboId;
+                    }
+                    if (cpuAttribVbo != b0.vboId || cpuAttribOff != b0.vertByteOffset) {
+                        constexpr int32_t kStride = 64;
+                        ops_.glVertexAttribPointer(0u, 4, kGlFloat, 0, kStride, reinterpret_cast<const void*>(b0.vertByteOffset + 0u));
+                        ops_.glVertexAttribPointer(7u, 4, kGlFloat, 0, kStride, reinterpret_cast<const void*>(b0.vertByteOffset + 16u));
+                        ops_.glVertexAttribPointer(5u, 4, kGlFloat, 0, kStride, reinterpret_cast<const void*>(b0.vertByteOffset + 32u));
+                        ops_.glVertexAttribPointer(6u, 4, kGlFloat, 0, kStride, reinterpret_cast<const void*>(b0.vertByteOffset + 48u));
+                        cpuAttribVbo = b0.vboId;
+                        cpuAttribOff = b0.vertByteOffset;
+                    }
+                    for (uint32_t s = 0u; s < b0.texCount; ++s) {
+                        if (boundSlotTex[s] != b0.texIds[s]) {
+                            ops_.glActiveTexture(kGlTexture0 + BatchSlotToTexUnit(s));
+                            ops_.glBindTexture(kGlTexture2D, b0.texIds[s]);
+                            boundSlotTex[s] = b0.texIds[s];
+                            touchedActiveTex = true;
+                        }
+                    }
+                    if (locBatchPointLight_ >= 0 && lastLightKey != curLightKey) {
+                        ops_.glUniform4fv(locBatchPointLight_, 1, lightU);
+                        lastLightKey = curLightKey;
+                    }
+
+                    // Coalesce consecutive contiguous CPU shadow batches sharing identical VBO/IBO/offset/textures
+                    uint32_t  accCount    = b0.indexCount;
+                    uintptr_t endByteOff  = b0.indexByteOffset + static_cast<uintptr_t>(b0.indexCount) * sizeof(uint16_t);
+                    uint32_t  mergedInRun = 0u;
+                    size_t j = i + 1u;
+                    while (j < n) {
+                        if ((batchLightMask[j] & passBit) == 0u) {
+                            ++j;
+                            continue;
+                        }
+                        if (batchIsGpu[j]) break;
+                        const auto& bj = deferredBatches_[j];
+                        if (bj.vboId != b0.vboId || bj.iboId != b0.iboId ||
+                            bj.vertByteOffset != b0.vertByteOffset || bj.texCount != b0.texCount ||
+                            bj.indexByteOffset != endByteOff ||
+                            static_cast<uint64_t>(accCount) + static_cast<uint64_t>(bj.indexCount) > 0x3FFFFFFFULL) {
+                            break;
+                        }
+                        bool sameTex = true;
+                        for (uint32_t s = 0u; s < b0.texCount; ++s) {
+                            if (bj.texIds[s] != b0.texIds[s]) { sameTex = false; break; }
+                        }
+                        if (!sameTex) break;
+                        accCount   += bj.indexCount;
+                        endByteOff += static_cast<uintptr_t>(bj.indexCount) * sizeof(uint16_t);
+                        ++mergedInRun;
+                        ++j;
+                    }
+                    i = j;
+
+                    ops_.glDrawElements(kGlTriangles, static_cast<int32_t>(accCount), kGlUnsignedShort,
+                                        reinterpret_cast<const void*>(b0.indexByteOffset));
+                    ++curFrameDraws_;
+                    ++curFrameBatchDraws_;
+                    curFrameCoalescedDraws_ += mergedInRun;
+                    wroteAnyThisFrame_ = true;
+                    if (pass > 0u) usedCpuPt = true;
+                }
+            }
+        }
+
+        const float resetU[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        if (usedCpuPt && locBatchPointLight_ >= 0) {
+            if (progMode != 1u) ops_.glUseProgram(progBatch_);
+            ops_.glUniform4fv(locBatchPointLight_, 1, resetU);
+        }
+        if (usedGpuPt && locBatchGpuPointLight_ >= 0 && progBatchGpu_ != 0u) {
+            ops_.glUseProgram(progBatchGpu_);
+            ops_.glUniform4fv(locBatchGpuPointLight_, 1, resetU);
+        }
+
+        // Restore host attribs, VBO/IBO, texture unit, program, FBO, viewport & raster state ONCE!
+        if (cpuAttribsEnabled) {
+            ops_.glDisableVertexAttribArray(5u);
+            ops_.glDisableVertexAttribArray(6u);
+        }
+        ops_.glDisableVertexAttribArray(7u);
+        if (!saved.attr0.enabled) {
+            ops_.glDisableVertexAttribArray(0u);
+        }
+        ops_.glBindBuffer(kGlArrayBuffer, saved.boundArrayBuf);
+        if (saved.attr0.valid) {
+            if (saved.attr0.buffer != saved.boundArrayBuf) {
+                ops_.glBindBuffer(kGlArrayBuffer, saved.attr0.buffer);
+                ops_.glVertexAttribPointer(0u, saved.attr0.size, saved.attr0.type,
+                                           saved.attr0.normalized, saved.attr0.stride, saved.attr0.pointer);
+                ops_.glBindBuffer(kGlArrayBuffer, saved.boundArrayBuf);
+            } else {
+                ops_.glVertexAttribPointer(0u, saved.attr0.size, saved.attr0.type,
+                                           saved.attr0.normalized, saved.attr0.stride, saved.attr0.pointer);
+            }
+        }
+        ops_.glBindBuffer(kGlElementArrayBuffer, saved.boundElemBuf);
+        if (touchedActiveTex) {
+            ops_.glActiveTexture(kGlTexture0 + saved.activeUnit);
+        }
+        ops_.glUseProgram(restoreProg);
+        ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
+        ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                           true /*restoreBlend*/, false /*restoreDepthFunc*/);
+
+        for (uint32_t s = 0u; s < kMaxBatchTexSlots; ++s) {
+            const uint32_t u = BatchSlotToTexUnit(s);
+            if (u < hs_gl_cache::kMaxTexUnits && boundSlotTex[s] != 0xFFFFFFFFu) {
+                glCache.boundTex2D[u] = hs_gl_cache::kInvalidId;
+            }
+        }
+        auto syncAttr = [&](uint32_t loc, bool en) {
+            if (loc < hs_gl_cache::kMaxVertexAttribs) {
+                const uint16_t bit = static_cast<uint16_t>(1u << loc);
+                glCache.attribKnownMask |= bit;
+                if (en) glCache.attribEnabledMask |= bit;
+                else    glCache.attribEnabledMask &= static_cast<uint16_t>(~bit);
+            }
+        };
+        syncAttr(0u, saved.attr0.enabled);
+        syncAttr(5u, false);
+        syncAttr(6u, false);
+        syncAttr(7u, false);
+        if (saved.glCacheTrusted) {
+            glCache.curProgram      = restoreProg;
+            if (touchedActiveTex) {
+                glCache.activeUnit  = static_cast<int32_t>(saved.activeUnit);
+            }
+            glCache.boundArrayBuf   = saved.boundArrayBuf;
+            glCache.boundElementBuf = saved.boundElemBuf;
+        } else if (touchedActiveTex) {
+            glCache.activeUnit = -1;
+        }
+
+        deferredBatches_.clear();
     }
 
     // Mirrors an unbatched standing draw (anim_skinned.ksh trees/grass/mobs OR unbatched anim*.ksh)
@@ -880,7 +1696,7 @@ public:
         }
         if (!drawDir && activePtCnt == 0u) return;
 
-        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted);
+        const SavedRasterState savedRaster = CaptureRasterState(glCache, saved.glCacheTrusted, saved.blendCacheTrusted);
 
         ops_.glBindFramebuffer(kGlFramebuffer, fbo_[writeSlot_]);
         ops_.glViewport(0, 0, static_cast<int32_t>(res_), static_cast<int32_t>(res_));
@@ -927,7 +1743,8 @@ public:
 
         ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
         ops_.glViewport(saved.vp[0], saved.vp[1], saved.vp[2], saved.vp[3]);
-        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
+        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted,
+                           isNativeGl_ /*restoreBlend*/, !isNativeGl_ /*restoreDepthFunc*/);
     }
 
     void OnEndFrame() noexcept {
@@ -938,14 +1755,26 @@ public:
                 readSlot_ = writeSlot_;
                 writeSlot_ ^= 1u;
                 hasPrevMap_ = true;
+                cachedSnapshot_ = pendingSnapshot_;
+                hasCachedSnapshot_ = true;
+                reuseStreak_ = 0u;
+                lastFrameReused_ = false;
+            } else if (reusedThisFrame_ && hasPrevMap_) {
+                // Keep completed shadow map in readSlot_ & prevCenterX_/Z_ strictly unchanged!
+                lastFrameReused_ = true;
             } else {
                 hasPrevMap_ = false;
+                hasCachedSnapshot_ = false;
+                reuseStreak_ = 0u;
+                lastFrameReused_ = false;
             }
-            lastFrameDraws_          = curFrameDraws_;
-            lastFrameBatchDraws_     = curFrameBatchDraws_;
-            lastFrameUnbatchedDraws_ = curFrameUnbatchedDraws_;
+            lastFrameDraws_           = curFrameDraws_;
+            lastFrameBatchDraws_      = curFrameBatchDraws_;
+            lastFrameUnbatchedDraws_  = curFrameUnbatchedDraws_;
+            lastFrameDeferredBatches_ = curFrameDeferredBatches_;
+            lastFrameCoalescedDraws_  = curFrameCoalescedDraws_;
         }
-        const bool hadShadowActivity = beganWriteThisFrame_ || compositedThisFrame_ || hasPrevMap_;
+        const bool hadShadowActivity = beganWriteThisFrame_ || compositedThisFrame_ || reusedThisFrame_ || hasPrevMap_;
         ResetFrameFlags();
         if (hadShadowActivity) {
             ++frameRecvGen_;
@@ -953,15 +1782,165 @@ public:
     }
 
 private:
+    struct ShadowRenderSnapshot {
+        uint32_t         res               = 0u;
+        float            halfExtent        = kShadowHalfExtent;
+        bool             hasDir            = false;
+        float            sunX              = 0.0f;
+        float            sunZ              = 0.0f;
+        float            stretch           = 0.0f;
+        float            dirStrength       = 0.0f;
+        float            heightFade        = 0.0f;
+        float            minHeight         = 0.0f;
+        float            pointStretchScale = 1.0f;
+        float            windTime          = 0.0f;
+        bool             skipNightmare     = true;
+        uint32_t         ptCount           = 0u;
+        PointShadowLight pts[kMaxPointShadowLights]{};
+    };
+
+    static void CaptureShadowSnapshot(const ShadowConfig& cfg, uint32_t res, ShadowRenderSnapshot& out) noexcept {
+        out = ShadowRenderSnapshot{};
+        out.res        = res;
+        out.halfExtent = kShadowHalfExtent;
+        out.hasDir     = HasActiveDirectionalShadow(cfg);
+        if (out.hasDir) {
+            const float lenSq = cfg.dirWx * cfg.dirWx + cfg.dirWz * cfg.dirWz;
+            if (std::isfinite(lenSq) && lenSq > 1e-8f) {
+                const float invL = 1.0f / std::sqrt(lenSq);
+                out.sunX = cfg.dirWx * invL;
+                out.sunZ = cfg.dirWz * invL;
+            }
+            out.stretch     = std::isfinite(cfg.stretch) ? cfg.stretch : 1.35f;
+            out.dirStrength = std::clamp(cfg.dirStrength, 0.0f, 1.0f);
+        }
+        out.heightFade        = std::isfinite(cfg.heightFade) ? cfg.heightFade : 0.55f;
+        out.minHeight         = std::isfinite(cfg.minHeight) ? cfg.minHeight : 0.0f;
+        out.pointStretchScale = std::isfinite(cfg.pointStretchScale)
+            ? std::clamp(cfg.pointStretchScale, 0.50f, 1.80f) : 1.0f;
+        out.windTime          = std::isfinite(cfg.windTime) ? cfg.windTime : 0.0f;
+        out.skipNightmare     = cfg.skipNightmare;
+        const uint32_t cnt = (cfg.pointLightCount < kMaxPointShadowLights)
+            ? cfg.pointLightCount : kMaxPointShadowLights;
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (IsPointLightValid(cfg.pointLights[i])) {
+                out.pts[out.ptCount++] = cfg.pointLights[i];
+            }
+        }
+    }
+
+    bool CanReuseCachedShadowMap(const ShadowConfig& cfg, float camX, float camZ) const noexcept {
+        const uint32_t stride = (cfg.temporalStride <= 1u) ? 1u : std::min(cfg.temporalStride, 8u);
+        if (stride <= 1u) return false;
+        if (!ready_ || !hasPrevMap_ || !hasCachedSnapshot_) return false;
+        if (reuseStreak_ >= (stride - 1u)) return false;
+        if (!std::isfinite(camX) || !std::isfinite(camZ)) return false;
+
+        // 1. Resolution & world-space half-extent must match exactly
+        if (res_ != cachedSnapshot_.res || kShadowHalfExtent != cachedSnapshot_.halfExtent) return false;
+
+        // 2. Camera center drift relative to the CACHED shadow map origin must stay strictly inside safety margin
+        //    (< 1.2 DST tiles = 4.8 world units, leaving > 7+ tiles of shadow-box border; teleport > 1.2 tiles refreshes immediately!)
+        const float dcam = std::fabs(camX - prevCenterX_) + std::fabs(camZ - prevCenterZ_);
+        if (dcam >= (1.2f * kWorldUnitsPerTile)) return false;
+
+        // 3. Directional sun vector & shadow projection parameters must match closely
+        const bool curHasDir = HasActiveDirectionalShadow(cfg);
+        if (curHasDir != cachedSnapshot_.hasDir) return false;
+        if (curHasDir) {
+            const float lenSq = cfg.dirWx * cfg.dirWx + cfg.dirWz * cfg.dirWz;
+            if (!std::isfinite(lenSq) || lenSq <= 1e-8f) return false;
+            const float invL = 1.0f / std::sqrt(lenSq);
+            const float sunX = cfg.dirWx * invL;
+            const float sunZ = cfg.dirWz * invL;
+            if (std::fabs(sunX - cachedSnapshot_.sunX) + std::fabs(sunZ - cachedSnapshot_.sunZ) >= 0.004f) {
+                return false;
+            }
+            const float stretch = std::isfinite(cfg.stretch) ? cfg.stretch : 1.35f;
+            if (std::fabs(stretch - cachedSnapshot_.stretch) >= 0.015f) return false;
+            const float dirStr = std::clamp(cfg.dirStrength, 0.0f, 1.0f);
+            if (std::fabs(dirStr - cachedSnapshot_.dirStrength) >= 0.04f) return false;
+        }
+
+        // 4. Filtering/height/wind/nightmare caster invariants
+        const float heightFade = std::isfinite(cfg.heightFade) ? cfg.heightFade : 0.55f;
+        const float minHeight  = std::isfinite(cfg.minHeight) ? cfg.minHeight : 0.0f;
+        const float ptScale    = std::isfinite(cfg.pointStretchScale)
+            ? std::clamp(cfg.pointStretchScale, 0.50f, 1.80f) : 1.0f;
+        if (std::fabs(heightFade - cachedSnapshot_.heightFade) >= 0.02f) return false;
+        if (std::fabs(minHeight - cachedSnapshot_.minHeight) >= 0.01f) return false;
+        if (cfg.skipNightmare != cachedSnapshot_.skipNightmare) return false;
+        if (std::fabs(ptScale - cachedSnapshot_.pointStretchScale) >= 0.02f) return false;
+        if (std::isfinite(cfg.swayAmp) && cfg.swayAmp > 0.01f) {
+            if (!std::isfinite(cfg.windTime) || std::fabs(cfg.windTime - cachedSnapshot_.windTime) > 0.25f) {
+                return false;
+            }
+        }
+
+        // 5. Active point-light count & positions must stay within 0.15 tiles (0.60 world units)
+        PointShadowLight curPts[kMaxPointShadowLights]{};
+        uint32_t curPtCount = 0u;
+        const uint32_t cnt = (cfg.pointLightCount < kMaxPointShadowLights)
+            ? cfg.pointLightCount : kMaxPointShadowLights;
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (IsPointLightValid(cfg.pointLights[i])) {
+                curPts[curPtCount++] = cfg.pointLights[i];
+            }
+        }
+        if (curPtCount != cachedSnapshot_.ptCount) return false;
+        for (uint32_t i = 0u; i < curPtCount; ++i) {
+            const float dpos = std::fabs(curPts[i].wx - cachedSnapshot_.pts[i].wx) +
+                               std::fabs(curPts[i].wz - cachedSnapshot_.pts[i].wz);
+            if (dpos >= (0.15f * kWorldUnitsPerTile)) return false;
+            if (std::fabs(curPts[i].radius - cachedSnapshot_.pts[i].radius) >= 0.50f) return false;
+            if (std::fabs(curPts[i].strength - cachedSnapshot_.pts[i].strength) >= 0.04f) return false;
+        }
+        return true;
+    }
+
+    struct DeferredShadowBatch {
+        uint32_t  vboId           = 0;
+        uint32_t  iboId           = 0;
+        uint32_t  ssboId          = 0;
+        uint32_t  indexCount      = 0;
+        int32_t   baseVertex      = 0;
+        uintptr_t vertByteOffset  = 0;
+        uintptr_t indexByteOffset = 0;
+        uint32_t  texCount        = 0;
+        uint32_t  texIds[kMaxBatchTexSlots] = {};
+        float     boundsXZ[4]     = {};
+        bool      hasBounds       = false;
+        bool      isGpuDriven     = false;
+    };
+
+    void UploadShadowBatchUniforms(int32_t locB, int32_t locP, int32_t locD, int32_t locR,
+                                   const ShadowConfig& cfg) noexcept {
+        const float proj[4] = { cfg.dirWx, cfg.dirWz, cfg.stretch, cfg.projOn };
+        const float dyn[4]  = { cfg.windTime, cfg.swayAmp, cfg.heightFade, cfg.penumbraBias };
+        const float ptScale = std::isfinite(cfg.pointStretchScale)
+            ? std::clamp(cfg.pointStretchScale, 0.50f, 1.80f) : 1.0f;
+        const float camR[4] = { camRightX_, camRightZ_, cfg.skipNightmare ? 1.0f : 0.0f, ptScale };
+        if (locB >= 0) ops_.glUniform4fv(locB, 1, writeBounds_);
+        if (locP >= 0) ops_.glUniform4fv(locP, 1, proj);
+        if (locD >= 0) ops_.glUniform4fv(locD, 1, dyn);
+        if (locR >= 0) ops_.glUniform4fv(locR, 1, camR);
+    }
+
     void ResetFrameFlags() noexcept {
-        sawGroundThisFrame_     = false;
-        compositedThisFrame_    = false;
-        beganWriteThisFrame_    = false;
-        wroteAnyThisFrame_      = false;
-        batchUniUploadedFrame_  = false;
-        curFrameDraws_          = 0;
-        curFrameBatchDraws_     = 0;
-        curFrameUnbatchedDraws_ = 0;
+        sawGroundThisFrame_       = false;
+        compositedThisFrame_      = false;
+        frameShadowHandled_       = false;
+        beganWriteThisFrame_      = false;
+        reusedThisFrame_          = false;
+        wroteAnyThisFrame_        = false;
+        batchUniUploadedFrame_    = false;
+        batchGpuUniUploadedFrame_ = false;
+        curFrameDraws_            = 0;
+        curFrameBatchDraws_       = 0;
+        curFrameUnbatchedDraws_   = 0;
+        curFrameDeferredBatches_  = 0;
+        curFrameCoalescedDraws_   = 0;
+        deferredBatches_.clear();
     }
 
     void ExtractCameraBasisFromMatrixV(const float* v) noexcept {
@@ -992,23 +1971,34 @@ private:
         }
     }
 
-    void ApplyShadowWriteRasterState() noexcept {
-        ops_.glDisable(kGlCullFace);
-        ops_.glDisable(kGlScissorTest);
-        ops_.glDisable(kGlStencilTest);
-        ops_.glColorMask(1, 1, 1, 1);
-        if (isNativeGl_) {
-            ops_.glDisable(kGlDepthTest);
-            ops_.glDepthMask(0);
-            ops_.glEnable(kGlBlend);
-            ops_.glBlendEquation(kGlMax);
-            ops_.glBlendFunc(kGlOne, kGlOne);
-        } else {
-            ops_.glDisable(kGlBlend);
-            ops_.glEnable(kGlDepthTest);
-            ops_.glDepthMask(1);
-            ops_.glDepthFunc(kGlLess);
+    struct DirShadowCullBox {
+        float minAnchorX = -1e30f;
+        float maxAnchorX =  1e30f;
+        float minAnchorZ = -1e30f;
+        float maxAnchorZ =  1e30f;
+
+        bool TouchesAabbXZ(const float boundsXZ[4]) const noexcept {
+            return boundsXZ[1] >= minAnchorX && boundsXZ[0] <= maxAnchorX &&
+                   boundsXZ[3] >= minAnchorZ && boundsXZ[2] <= maxAnchorZ;
         }
+    };
+
+    void BuildDirShadowCullBox(const ShadowConfig& cfg, DirShadowCullBox& out) const noexcept {
+        const float dLenSq = cfg.dirWx * cfg.dirWx + cfg.dirWz * cfg.dirWz;
+        float dx = 0.0f, dz = 0.0f;
+        if (dLenSq > 1e-8f) {
+            const float invD = 1.0f / std::sqrt(dLenSq);
+            dx = cfg.dirWx * invD;
+            dz = cfg.dirWz * invD;
+        }
+        const float stretch = std::isfinite(cfg.stretch) ? std::clamp(cfg.stretch, 0.0f, 4.0f) : 1.35f;
+        const float projX = dx * (7.5f * stretch);
+        const float projZ = dz * (7.5f * stretch);
+        constexpr float kPad = 6.5f; // generous sprite half-width + wind sway margin
+        out.minAnchorX = (writeCenterX_ - kShadowHalfExtent) - kPad - (projX > 0.0f ? projX : 0.0f);
+        out.maxAnchorX = (writeCenterX_ + kShadowHalfExtent) + kPad - (projX < 0.0f ? projX : 0.0f);
+        out.minAnchorZ = (writeCenterZ_ - kShadowHalfExtent) - kPad - (projZ > 0.0f ? projZ : 0.0f);
+        out.maxAnchorZ = (writeCenterZ_ + kShadowHalfExtent) + kPad - (projZ < 0.0f ? projZ : 0.0f);
     }
 
     struct SavedRasterState {
@@ -1030,6 +2020,25 @@ private:
         bool     colorMaskKnown   = false;
     };
 
+    void ApplyShadowWriteRasterState() noexcept {
+        ops_.glDisable(kGlCullFace);
+        ops_.glDisable(kGlScissorTest);
+        ops_.glDisable(kGlStencilTest);
+        ops_.glColorMask(1, 1, 1, 1);
+        if (isNativeGl_) {
+            ops_.glDisable(kGlDepthTest);
+            ops_.glDepthMask(0);
+            ops_.glEnable(kGlBlend);
+            ops_.glBlendEquation(kGlMax);
+            ops_.glBlendFunc(kGlOne, kGlOne);
+        } else {
+            ops_.glDisable(kGlBlend);
+            ops_.glEnable(kGlDepthTest);
+            ops_.glDepthMask(1);
+            ops_.glDepthFunc(kGlLess);
+        }
+    }
+
     uint32_t ResolveHostProgram(const ShadowPassState& saved,
                                 const hs_gl_cache::ThreadState& glCache) const noexcept {
         if ((!saved.glCacheTrusted || glCache.curProgram == hs_gl_cache::kInvalidId) && ops_.glGetIntegerv) {
@@ -1043,7 +2052,8 @@ private:
     }
 
     SavedRasterState CaptureRasterState(const hs_gl_cache::ThreadState& glCache,
-                                        bool glCacheTrusted) const noexcept {
+                                        bool glCacheTrusted,
+                                        bool blendCacheTrusted) const noexcept {
         SavedRasterState rs{};
         static constexpr uint32_t kCapEnums[5] = {
             kGlBlend, kGlDepthTest, kGlCullFace, kGlScissorTest, kGlStencilTest
@@ -1062,9 +2072,14 @@ private:
             }
         }
 
-        // Always query live GL blend equation/func (glCache only tracks symmetric glBlendFunc/Equation,
-        // so separate alpha blend setters can diverge from glCache!).
-        if (ops_.glGetIntegerv) {
+        // Fast zero-stall path when caller certifies symmetric-only host blend (e.g. DST IAT only imports
+        // glBlendEquation/glBlendFunc) AND glCache holds valid values. Falls back to live glGetIntegerv
+        // whenever blendCacheTrusted==false (e.g. separate-alpha hosts/tests) or cache is unknown!
+        if (glCacheTrusted && blendCacheTrusted && glCache.blendEq != hs_gl_cache::kInvalidId) {
+            rs.blendEqRgb   = glCache.blendEq;
+            rs.blendEqAlpha = glCache.blendEq;
+            rs.blendEqKnown = true;
+        } else if (ops_.glGetIntegerv) {
             int32_t eqRgb = -1, eqAlpha = -1;
             ops_.glGetIntegerv(kGlBlendEquationRgb, &eqRgb);
             ops_.glGetIntegerv(kGlBlendEquationAlpha, &eqAlpha);
@@ -1073,6 +2088,17 @@ private:
                 rs.blendEqAlpha = (eqAlpha > 0) ? static_cast<uint32_t>(eqAlpha) : rs.blendEqRgb;
                 rs.blendEqKnown = true;
             }
+        }
+
+        if (glCacheTrusted && blendCacheTrusted &&
+            glCache.blendSrc != hs_gl_cache::kInvalidId &&
+            glCache.blendDst != hs_gl_cache::kInvalidId) {
+            rs.blendSrcRgb   = glCache.blendSrc;
+            rs.blendDstRgb   = glCache.blendDst;
+            rs.blendSrcAlpha = glCache.blendSrc;
+            rs.blendDstAlpha = glCache.blendDst;
+            rs.blendFnKnown  = true;
+        } else if (ops_.glGetIntegerv) {
             int32_t sRgb = -1, dRgb = -1, sA = -1, dA = -1;
             ops_.glGetIntegerv(kGlBlendSrcRgb, &sRgb);
             ops_.glGetIntegerv(kGlBlendDstRgb, &dRgb);
@@ -1135,7 +2161,9 @@ private:
     void RestoreRasterState(const SavedRasterState& rs,
                             hs_gl_cache::ThreadState& glCache,
                             const int32_t dstVp[4],
-                            bool glCacheTrusted) noexcept {
+                            bool glCacheTrusted,
+                            bool restoreBlend = true,
+                            bool restoreDepthFunc = true) noexcept {
         static constexpr uint32_t kCapEnums[5] = {
             kGlBlend, kGlDepthTest, kGlCullFace, kGlScissorTest, kGlStencilTest
         };
@@ -1148,34 +2176,33 @@ private:
         }
 
         const bool splitEq = (rs.blendEqAlpha != rs.blendEqRgb);
-        if (splitEq && ops_.glBlendEquationSeparate) {
-            ops_.glBlendEquationSeparate(rs.blendEqRgb, rs.blendEqAlpha);
-            if (glCacheTrusted) {
-                glCache.blendEq = hs_gl_cache::kInvalidId;
+        if (restoreBlend) {
+            if (splitEq && ops_.glBlendEquationSeparate) {
+                ops_.glBlendEquationSeparate(rs.blendEqRgb, rs.blendEqAlpha);
+            } else {
+                ops_.glBlendEquation(rs.blendEqRgb);
             }
-        } else {
-            ops_.glBlendEquation(rs.blendEqRgb);
-            if (glCacheTrusted) {
-                glCache.blendEq = (rs.blendEqKnown && !splitEq) ? rs.blendEqRgb : hs_gl_cache::kInvalidId;
-            }
+        }
+        if (glCacheTrusted) {
+            glCache.blendEq = (rs.blendEqKnown && !splitEq) ? rs.blendEqRgb : hs_gl_cache::kInvalidId;
         }
 
         const bool splitFn = (rs.blendSrcAlpha != rs.blendSrcRgb || rs.blendDstAlpha != rs.blendDstRgb);
-        if (splitFn && ops_.glBlendFuncSeparate) {
-            ops_.glBlendFuncSeparate(rs.blendSrcRgb, rs.blendDstRgb, rs.blendSrcAlpha, rs.blendDstAlpha);
-            if (glCacheTrusted) {
-                glCache.blendSrc = hs_gl_cache::kInvalidId;
-                glCache.blendDst = hs_gl_cache::kInvalidId;
-            }
-        } else {
-            ops_.glBlendFunc(rs.blendSrcRgb, rs.blendDstRgb);
-            if (glCacheTrusted) {
-                glCache.blendSrc = (rs.blendFnKnown && !splitFn) ? rs.blendSrcRgb : hs_gl_cache::kInvalidId;
-                glCache.blendDst = (rs.blendFnKnown && !splitFn) ? rs.blendDstRgb : hs_gl_cache::kInvalidId;
+        if (restoreBlend) {
+            if (splitFn && ops_.glBlendFuncSeparate) {
+                ops_.glBlendFuncSeparate(rs.blendSrcRgb, rs.blendDstRgb, rs.blendSrcAlpha, rs.blendDstAlpha);
+            } else {
+                ops_.glBlendFunc(rs.blendSrcRgb, rs.blendDstRgb);
             }
         }
+        if (glCacheTrusted) {
+            glCache.blendSrc = (rs.blendFnKnown && !splitFn) ? rs.blendSrcRgb : hs_gl_cache::kInvalidId;
+            glCache.blendDst = (rs.blendFnKnown && !splitFn) ? rs.blendDstRgb : hs_gl_cache::kInvalidId;
+        }
 
-        ops_.glDepthFunc(rs.depthFunc);
+        if (restoreDepthFunc) {
+            ops_.glDepthFunc(rs.depthFunc);
+        }
         if (glCacheTrusted) {
             glCache.depthFunc = rs.depthFuncKnown ? rs.depthFunc : hs_gl_cache::kInvalidId;
         }
@@ -1204,7 +2231,6 @@ private:
 
     void CompositeGroundQuad(const ShadowConfig& cfg,
                              const ShadowPassState& saved,
-                             const SavedRasterState& savedRaster,
                              hs_gl_cache::ThreadState& glCache) noexcept {
         const uint32_t restoreProg = ResolveHostProgram(saved, glCache);
         ops_.glBindFramebuffer(kGlFramebuffer, saved.dstFbo);
@@ -1247,7 +2273,7 @@ private:
 
         ops_.glDrawArrays(kGlTriangleStrip, 0, 4);
 
-        // Restore exact DST vertex attrib 0, buffers, texture unit, program & raster state
+        // Restore exact DST vertex attrib 0, buffers, texture unit, program (raster state restored ONCE by caller!)
         if (!saved.attr0.enabled) {
             ops_.glDisableVertexAttribArray(0u);
         }
@@ -1265,7 +2291,6 @@ private:
         }
         ops_.glActiveTexture(kGlTexture0 + saved.activeUnit);
         ops_.glUseProgram(restoreProg);
-        RestoreRasterState(savedRaster, glCache, saved.vp, saved.glCacheTrusted);
         if (kCompositeTexUnit < hs_gl_cache::kMaxTexUnits) {
             glCache.boundTex2D[kCompositeTexUnit] = hs_gl_cache::kInvalidId;
         }
@@ -1283,7 +2308,7 @@ private:
 
     uint32_t CompileShader(uint32_t type, const char* rawSrc, const char* tag) noexcept {
         std::string src;
-        if (isNativeGl_) {
+        if (isNativeGl_ && std::strncmp(rawSrc, "#version", 8) != 0) {
             src = "#version 100\n";
             src += rawSrc;
         } else {
@@ -1427,14 +2452,15 @@ private:
 
         EnsureResourcesGuard guard{ ops_, saved, glCache };
         guard.restoreProg = ResolveHostProgram(saved, glCache);
+        int32_t maxUnits = 0;
         if (ops_.glGetIntegerv) {
-            int32_t maxUnits = 0;
             ops_.glGetIntegerv(kGlMaxTextureImageUnits, &maxUnits);
             if (maxUnits > 0 && maxUnits <= static_cast<int32_t>(kCompositeTexUnit)) {
                 failed_ = true;
                 return false;
             }
         }
+        const bool use16BatchSlots = isNativeGl_ && (maxUnits >= 24);
         if (!isNativeGl_ && ops_.glGetIntegerv) {
             int32_t rbo = 0;
             ops_.glGetIntegerv(kGlRenderbufferBinding, &rbo);
@@ -1445,7 +2471,7 @@ private:
 
         // 1. Build internal programs & static quad VBO once per context
         if (progBatch_ == 0u) {
-            progBatch_ = BuildProgram(kShadowBatchVs, kShadowBatchFs, "ShadowBatch", true);
+            progBatch_ = BuildProgram(kShadowBatchVs, use16BatchSlots ? kShadowBatchFs16 : kShadowBatchFs, "ShadowBatch", true);
             if (progBatch_ == 0u) {
                 guard.Restore();
                 DestroyResources();
@@ -1459,13 +2485,24 @@ private:
             locBatchPointLight_ = ops_.glGetUniformLocation(progBatch_, "u_pointLight");
             guard.touchedProg = true;
             ops_.glUseProgram(progBatch_);
-            for (uint32_t s = 0; s < kMaxBatchTexSlots; ++s) {
+            const uint32_t slotCnt = use16BatchSlots ? kMaxBatchTexSlots : kLegacyBatchTexSlots;
+            for (uint32_t s = 0; s < slotCnt; ++s) {
                 char uName[24];
                 std::snprintf(uName, sizeof(uName), "HS_BATCH_TEX%u", s);
                 const int32_t loc = ops_.glGetUniformLocation(progBatch_, uName);
                 if (loc >= 0) {
-                    ops_.glUniform1i(loc, static_cast<int32_t>(kBatchTexUnitBase + s));
+                    ops_.glUniform1i(loc, static_cast<int32_t>(BatchSlotToTexUnit(s)));
                 }
+            }
+        }
+        if (progBatchGpu_ == 0u && isNativeGl_ && ops_.glBindBufferBase && ops_.glDrawElementsBaseVertex) {
+            progBatchGpu_ = BuildProgram(kShadowBatchGpuVs, kShadowBatchGpuFs, "ShadowBatchGpu", true);
+            if (progBatchGpu_ != 0u) {
+                locBatchGpuBounds_     = ops_.glGetUniformLocation(progBatchGpu_, "u_bounds");
+                locBatchGpuShadProj_   = ops_.glGetUniformLocation(progBatchGpu_, "u_shadProj");
+                locBatchGpuShadDyn_    = ops_.glGetUniformLocation(progBatchGpu_, "u_shadDyn");
+                locBatchGpuCamRight_   = ops_.glGetUniformLocation(progBatchGpu_, "u_camRight");
+                locBatchGpuPointLight_ = ops_.glGetUniformLocation(progBatchGpu_, "u_pointLight");
             }
         }
         if (progComposite_ == 0u) {
@@ -1494,11 +2531,8 @@ private:
 
         // Upload precomputed 64x64 Void-and-Cluster Blue Noise texture once per context (16KB RGBA8)
         if (texBlueNoise_ == 0u) {
-            int32_t maxUnits = 16;
-            if (ops_.glGetIntegerv) {
-                ops_.glGetIntegerv(kGlMaxTextureImageUnits, &maxUnits);
-            }
-            if (maxUnits >= static_cast<int32_t>(kBlueNoiseTexUnit + 1u)) {
+            const int32_t bnUnits = (maxUnits > 0) ? maxUnits : 16;
+            if (bnUnits >= static_cast<int32_t>(kBlueNoiseTexUnit + 1u)) {
                 ops_.glGenTextures(1, &texBlueNoise_);
                 if (texBlueNoise_ != 0u) {
                     uint8_t rgba[kBlueNoiseSize * kBlueNoiseSize * 4u];
@@ -1543,13 +2577,21 @@ private:
         }
 
         // 2. Build 2-slot ping-pong RGBA8 ShadowMask FBOs (+ DEPTH16 RBO on ANGLE D3D9)
-        //    Gracefully degrades 2048 -> 1024 if a low-VRAM / legacy driver cannot allocate 2048 FBOs!
+        //    Gracefully degrades 4096 -> 2048 -> 1024 if a low-VRAM / legacy driver cannot allocate high-res FBOs!
         guard.touchedActiveTex = true;
         guard.touchedUnit14 = true;
         ops_.glActiveTexture(kGlTexture0 + kCompositeTexUnit);
         uint32_t tryRes = wantRes;
+        if (ops_.glGetIntegerv) {
+            int32_t maxTexSz = 0;
+            ops_.glGetIntegerv(0x0D33u /*GL_MAX_TEXTURE_SIZE*/, &maxTexSz);
+            if (maxTexSz >= 1024 && tryRes > static_cast<uint32_t>(maxTexSz)) {
+                tryRes = static_cast<uint32_t>(maxTexSz);
+                if (hdResCap_ > tryRes) hdResCap_ = tryRes;
+            }
+        }
         bool allOk = false;
-        for (int attempt = 0; attempt < 2; ++attempt) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
             ops_.glGenFramebuffers(2, fbo_);
             ops_.glGenTextures(2, tex_);
             if (!isNativeGl_) {
@@ -1594,7 +2636,10 @@ private:
             }
             if (allOk) break;
             DestroyFbosOnly();
-            if (tryRes > 1024u) {
+            if (tryRes > 2048u) {
+                tryRes = 2048u;
+                hdResCap_ = 2048u;
+            } else if (tryRes > 1024u) {
                 tryRes = 1024u;
                 hdResCap_ = 1024u;
             } else {
@@ -1639,12 +2684,16 @@ private:
         }
         res_ = 0;
         ready_ = false;
+        hasPrevMap_ = false;
+        hasCachedSnapshot_ = false;
+        reuseStreak_ = 0u;
     }
 
     void DestroyResources() noexcept {
         DestroyFbosOnly();
         if (texBlueNoise_)  { ops_.glDeleteTextures(1, &texBlueNoise_); texBlueNoise_ = 0; }
         if (progBatch_)     { ops_.glDeleteProgram(progBatch_);         progBatch_ = 0; }
+        if (progBatchGpu_)  { ops_.glDeleteProgram(progBatchGpu_);      progBatchGpu_ = 0; }
         if (progComposite_) { ops_.glDeleteProgram(progComposite_);     progComposite_ = 0; }
         if (quadVbo_)       { ops_.glDeleteBuffers(1, &quadVbo_);       quadVbo_ = 0; }
     }
@@ -1671,6 +2720,13 @@ private:
     int32_t     locBatchShadDyn_    = -1;
     int32_t     locBatchCamRight_   = -1;
     int32_t     locBatchPointLight_ = -1;
+
+    uint32_t    progBatchGpu_          = 0;
+    int32_t     locBatchGpuBounds_     = -1;
+    int32_t     locBatchGpuShadProj_   = -1;
+    int32_t     locBatchGpuShadDyn_    = -1;
+    int32_t     locBatchGpuCamRight_   = -1;
+    int32_t     locBatchGpuPointLight_ = -1;
 
     uint32_t    progComposite_    = 0;
     int32_t     locCompPV_        = -1;
@@ -1702,18 +2758,39 @@ private:
     float       writeCenterZ_ = 0.0f;
     float       writeBounds_[4] = { 0.0f, 0.0f, 1.0f / kShadowHalfExtent, 0.0f };
 
-    bool        sawGroundThisFrame_    = false;
-    bool        compositedThisFrame_   = false;
-    bool        beganWriteThisFrame_   = false;
-    bool        wroteAnyThisFrame_     = false;
-    bool        batchUniUploadedFrame_ = false;
+    bool        sawGroundThisFrame_       = false;
+    bool        compositedThisFrame_      = false;
+    bool        frameShadowHandled_       = false;
+    bool        beganWriteThisFrame_      = false;
+    bool        reusedThisFrame_          = false;
+    bool        wroteAnyThisFrame_        = false;
+    bool        batchUniUploadedFrame_    = false;
+    bool        batchGpuUniUploadedFrame_ = false;
 
-    uint32_t    curFrameDraws_          = 0;
-    uint32_t    curFrameBatchDraws_     = 0;
-    uint32_t    curFrameUnbatchedDraws_ = 0;
-    uint32_t    lastFrameDraws_         = 0;
-    uint32_t    lastFrameBatchDraws_    = 0;
-    uint32_t    lastFrameUnbatchedDraws_ = 0;
+    ShadowRenderSnapshot pendingSnapshot_{};
+    ShadowRenderSnapshot cachedSnapshot_{};
+    bool                 hasCachedSnapshot_     = false;
+    uint32_t             reuseStreak_           = 0u;
+    bool                 lastFrameReused_       = false;
+    uint64_t             totalShadowReuseSkips_ = 0ULL;
+
+    uint32_t    curFrameDraws_            = 0;
+    uint32_t    curFrameBatchDraws_       = 0;
+    uint32_t    curFrameUnbatchedDraws_   = 0;
+    uint32_t    curFrameDeferredBatches_  = 0;
+    uint32_t    curFrameCoalescedDraws_   = 0;
+    uint32_t    lastFrameDraws_           = 0;
+    uint32_t    lastFrameBatchDraws_      = 0;
+    uint32_t    lastFrameUnbatchedDraws_  = 0;
+    uint32_t    lastFrameDeferredBatches_ = 0;
+    uint32_t    lastFrameCoalescedDraws_  = 0;
+    mutable bool fastEntityReceive1Tap_   = false;
+    std::vector<DeferredShadowBatch> deferredBatches_;
+    std::vector<uint8_t>             batchLightMask_;
+    std::vector<uint8_t>             batchIsGpu_;
+    std::vector<int32_t>             mdCounts_;
+    std::vector<const void*>         mdPtrs_;
+    std::vector<int32_t>             mdBaseVerts_;
 };
 
 } // namespace hs_world_shadow

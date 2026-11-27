@@ -56,13 +56,13 @@
 ### 第一步：安装 / 更新客户端 Mod
 - **Steam 创意工坊**：订阅并启用 **HyperShade · 饥荒超帧与视觉引擎（原 HyperSmooth）**（或将压缩包内 `mods/dst_smooth_highfps` 复制至游戏 `mods/dst_smooth_highfps`）。
 
-### 第二步：安装 / 更新 `bin64/dinput8.dll`（工坊不会自动更新 DLL，大版本升级请务必同步）
+### 第二步：安装 / 更新 `bin64/dinput8.dll`（工坊不会自动更新 DLL，大版本升级请务必同步；亦可通过 `DNH` 伴侣自动拉取）
 - **方式 A（推荐 · 一键安装/更新）**：
-  1. 下载并解压最新版 `DST_HyperShade_v2.9.5_Release.zip`；
+  1. 下载并解压最新版 `DST_HyperShade_v2.9.7-beta1_Release.zip`；
   2. 先关闭饥荒游戏，双击根目录的 **`一键安装与更新.bat`**，按提示回车即自动完成路径识别、旧版备份、新版覆盖与 SHA-256 校验（选 `2` 可一键彻底卸载恢复纯净原版）。
 - **方式 B（手动安装）**：
   1. 将 `bin64/dinput8.dll` 复制到 `<Don't Starve Together>/bin64/`（与 `dontstarve_steam_x64.exe` 同目录）；
-  2. 进图按面板快捷键（或输入 `c_hsmenu()`），看到顶部绿条 `● 原生引擎已连接 v2.9.5（3D 光影可用）` 即全部就绪。
+  2. 进图按面板快捷键（或输入 `c_hsmenu()`），看到顶部绿条 `● 原生引擎已连接 v2.9.7（3D 光影可用）` 即全部就绪。
 
 > **兼容提示**：
 > - **`DontStarveLuaJIT2` (工坊 `3444078585`)**：自动识别并避让 `mimalloc lua_newstate`，零冲突开箱即用。
@@ -85,11 +85,11 @@
 
 ## 安全性与开源构建 / Safety & Build
 
-- **零磁盘篡改与严格隔离**：完整无锁透传 `System32\dinput8.dll` 全部 6 个导出函数；严格按进程名隔离，仅在 `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe` 生效；全部跳板执行 W^X 只读固化 (`PAGE_EXECUTE_READ`)，58/58 AOB 签名具备 Fail-Closed 熔断保护。
+- **零磁盘篡改与严格隔离**：完整无锁透传 `System32\dinput8.dll` 全部 6 个导出函数；严格按进程名隔离，仅在 `dontstarve_steam(_x64).exe` / `dontstarve_rail(_x64).exe` 生效；全部跳板执行 W^X 只读固化 (`PAGE_EXECUTE_READ`)，61/61 AOB 签名具备 Fail-Closed 熔断保护。
 - **纯开源构建与验证**：
-  - 原生 DLL：`tools/build_native.ps1`（Zig `x86_64-windows-gnu`, `-std=c++20 -O3`，纯 UCRT 零外部运行库依赖）+ `python tools/test_redteam_client.py` + `tools/test_redteam_client.exe`（29/29）+ `tools/test_world_shadow_gpu.exe`（Native OpenGL + ANGLE D3D9 双后端实机 GPU 校验）
+  - 原生 DLL：`tools/build_native.ps1`（Zig `x86_64-windows-gnu`, `-std=c++20 -O3`，纯 UCRT 零外部运行库依赖）+ `python tools/test_redteam_client.py` + `tools/test_redteam_client.exe`（41/41）+ `tools/test_world_shadow_gpu.exe`（13/13 Native OpenGL + ANGLE D3D9 双后端实机 GPU 校验）+ `tools/test_gpu_clarity.exe`（4/4 GPU Compute 清晰度验证）
   - 着色器包：`python tools/build_shaders.py`（74/74 原版与模组 `.ksh` 二进制逐字节校验 + 实机 OpenGL 编译验证）
-  - Lua 回归：`python tools/test_client_lua_v24.py`（真实 64 位 DST Lua 5.1 虚拟机 30/30 全链路自动化测试，含 3,141 控件压力乱点 0 报错）
+  - Lua 回归：`python tools/test_client_lua_v24.py`（真实 64 位 DST Lua 5.1 虚拟机 35/35 全链路自动化测试，含 3,141 控件压力乱点 0 报错）
 
 ---
 
@@ -99,6 +99,10 @@
 
 - **技术来源与独立开发演进白皮书**：[`docs/PROVENANCE_AND_ARCHITECTURE.md`](docs/PROVENANCE_AND_ARCHITECTURE.md)（[English Version](docs/PROVENANCE_AND_ARCHITECTURE_EN.md)）
   - 完整列出原生世界空间正交 ShadowMask FBO（SIGGRAPH 1978/2005 PCSS + SPIE 1993 蓝噪声）、平面水面倒影、Dual-Kawase/Karis 泛光、ACES/CDL/TPDF、AZDO 合批环、PCHIP 流体骨骼等每一模块对应的公开论文、教材、规范及架构演进决策（ADR），且 v2.9.x 原生投影/倒影零 Lua 实体克隆。
+- **v4.0 架构演进路线图与跨界技术参考卷**：
+  - [`docs/V4_0_ARCHITECTURE_ROADMAP.md`](docs/V4_0_ARCHITECTURE_ROADMAP.md) —— 基于真机实测校准的 v4.0 分阶段演进蓝图（Phase 1 同上下文持久 PBO 上传环与双线程卡顿采样、Phase 2 驱动隐式同步消除与 SIMD 合批、Phase 3+ 保留态场景与次世代光影规划）；
+  - [`docs/research/REF_VOL1_FACTORIO_FFF.md`](docs/research/REF_VOL1_FACTORIO_FFF.md) —— 技术参考卷 Vol.1：《异星工厂》（Factorio FFF）百万实体与 2D 渲染底层架构映射；
+  - [`docs/research/REF_VOL2_4_SODIUM_FOLIA_POE2.md`](docs/research/REF_VOL2_4_SODIUM_FOLIA_POE2.md) —— 技术参考卷 Vol.2–Vol.4：Sodium / Iris / Folia / Minestom / 《流放之路 2》洁净室原理研究与 DST 全栈映射。
 - **第三方依赖、开源适配与素材授权台账**：[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) & [`LICENSE`](LICENSE)
   - 静态链接库：`libdeflate v1.23`（MIT）、`mimalloc v2.1.7`（MIT）；
   - MIT 开源项目致谢与引用边界：`DST-BCAS-Studio`（Copyright 2026 Nanmianyi / 楠眠已，MIT License，含独立版自动共存礼让）、`DST-KeyBind-UI`（rtk0c / liolok，MIT License）；

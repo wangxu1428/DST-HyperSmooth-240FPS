@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -29,7 +30,7 @@ inline constexpr size_t   kPow2ThresholdBytes = 65536u;             // 64 KB
 inline constexpr size_t   kMaxPoolableBytes   = 2u * 1024u * 1024u; // 2 MB
 inline constexpr size_t   kMaxPooledBytes     = 32u * 1024u * 1024u;// 32 MB
 inline constexpr size_t   kMaxPooledCount     = 512u;
-inline constexpr uint64_t kMinRetireAgeFrames = 2u;
+inline constexpr uint64_t kMinRetireAgeFrames = 6u;
 inline constexpr uint64_t kIdleEvictFrames    = 600u;
 
 struct GlBufferOps {
@@ -56,13 +57,15 @@ struct GlBufferOps {
 };
 
 struct Stats {
-    int64_t  hits        = 0;
-    int64_t  misses      = 0;
-    int64_t  recycled    = 0;
-    int64_t  evicted     = 0;
-    size_t   activeCount = 0;
-    size_t   pooledCount = 0;
-    size_t   pooledBytes = 0;
+    int64_t  hits           = 0;
+    int64_t  misses         = 0;
+    int64_t  recycled       = 0;
+    int64_t  evicted        = 0;
+    int64_t  mapUploads     = 0;
+    int64_t  subDataUploads = 0;
+    size_t   activeCount    = 0;
+    size_t   pooledCount    = 0;
+    size_t   pooledBytes    = 0;
 };
 
 class VbPool {
@@ -103,6 +106,21 @@ public:
         AcquireSRWLockExclusive(&lock_);
         ops_ = ops;
         ReleaseSRWLockExclusive(&lock_);
+    }
+
+    void SetLimits(size_t maxBytes, size_t maxCount, uint64_t idleEvictFrames) noexcept {
+        AcquireSRWLockExclusive(&lock_);
+        maxPooledBytes_  = std::max<size_t>(maxBytes, 8u * 1024u * 1024u);
+        maxPooledCount_  = std::max<size_t>(maxCount, 128u);
+        idleEvictFrames_ = std::max<uint64_t>(idleEvictFrames, 120u);
+        ReleaseSRWLockExclusive(&lock_);
+    }
+
+    size_t MaxPooledBytes() noexcept {
+        AcquireSRWLockShared(&lock_);
+        const size_t mb = maxPooledBytes_;
+        ReleaseSRWLockShared(&lock_);
+        return mb;
     }
 
     bool AcquireAndUpload(uint32_t target, uint32_t glUsage, size_t size, const void* data,
@@ -152,11 +170,19 @@ public:
                         std::memcpy(ptr, data, size);
                         if (ops.glUnmapBuffer(target) != 0) {
                             uploaded = true;
+                            mapUploads_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }
                 if (!uploaded) {
-                    ops.glBufferSubData(target, 0, static_cast<ptrdiff_t>(size), data);
+                    // Mode 4: explicit driver-side orphan at bucket capacity before upload
+                    if (size == cap) {
+                        ops.glBufferData(target, static_cast<ptrdiff_t>(cap), data, glUsage);
+                    } else {
+                        ops.glBufferData(target, static_cast<ptrdiff_t>(cap), nullptr, glUsage);
+                        ops.glBufferSubData(target, 0, static_cast<ptrdiff_t>(size), data);
+                    }
+                    subDataUploads_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             outId = hitId;
@@ -198,7 +224,7 @@ public:
         const ActiveEntry entry = it->second;
         activeMap_.erase(it);
 
-        if (pooledBytes_ + entry.cap <= kMaxPooledBytes && pooledCount_ < kMaxPooledCount) {
+        if (pooledBytes_ + entry.cap <= maxPooledBytes_ && pooledCount_ < maxPooledCount_) {
             retiredRing_.push_back(RetiredEntry{id, entry.target, entry.glUsage, entry.cap, curFrame_});
             pooledBytes_ += entry.cap;
             ++pooledCount_;
@@ -236,7 +262,7 @@ public:
                 auto& vec = mapIt->second;
                 size_t writeIdx = 0;
                 for (size_t i = 0; i < vec.size(); ++i) {
-                    if (curFrame_ - vec[i].readySinceFrame > kIdleEvictFrames) {
+                    if (curFrame_ - vec[i].readySinceFrame > idleEvictFrames_) {
                         toDelete.push_back(vec[i].id);
                         pooledBytes_ -= std::min(pooledBytes_, mapIt->first.cap);
                         if (pooledCount_ > 0) --pooledCount_;
@@ -311,6 +337,8 @@ public:
         st.pooledCount = pooledCount_;
         st.pooledBytes = pooledBytes_;
         ReleaseSRWLockShared(&lock_);
+        st.mapUploads     = mapUploads_.load(std::memory_order_relaxed);
+        st.subDataUploads = subDataUploads_.load(std::memory_order_relaxed);
         return st;
     }
 
@@ -363,6 +391,9 @@ private:
     SRWLOCK                                                                  lock_{};
     GlBufferOps                                                              ops_{};
     uint64_t                                                                 curFrame_    = 0;
+    size_t                                                                   maxPooledBytes_  = kMaxPooledBytes;
+    size_t                                                                   maxPooledCount_  = kMaxPooledCount;
+    uint64_t                                                                 idleEvictFrames_ = kIdleEvictFrames;
     std::unordered_map<uint32_t, ActiveEntry>                                activeMap_;
     std::deque<RetiredEntry>                                                 retiredRing_;
     std::unordered_map<BucketKey, std::vector<ReadyEntry>, BucketKeyHash>    ready_;
@@ -372,6 +403,8 @@ private:
     int64_t                                                                  misses_      = 0;
     int64_t                                                                  recycled_    = 0;
     int64_t                                                                  evicted_     = 0;
+    std::atomic<int64_t>                                                     mapUploads_{0};
+    std::atomic<int64_t>                                                     subDataUploads_{0};
 };
 
 } // namespace hs_vb_pool

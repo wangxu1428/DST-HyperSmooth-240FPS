@@ -46,7 +46,7 @@ if (-not (Test-Path $miObj)) {
     if ($LASTEXITCODE -ne 0) { throw "Failed compiling mimalloc static.c" }
 }
 
-Write-Host "[3/3] Compiling & linking dinput8.dll (DST HyperSmooth Client Native Engine v2.9.6)..."
+Write-Host "[3/3] Compiling & linking dinput8.dll (DST HyperSmooth Client Native Engine v2.9.7-beta1)..."
 $mainObj = "$obj\dinput8.o"
 & $zig c++ -target $target -std=c++20 -O3 -march=x86_64 -DNDEBUG `
     -Wall -Wextra -Wno-unused-parameter `
