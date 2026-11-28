@@ -1622,9 +1622,11 @@ AddSimPostInit(function()
         for _, fn in ipairs(sim_post) do fn() end
         assert(fakeG11.DataDumper({ a = 1 }, "t", true, nil) == "fast" and fastdump_calls == 1,
                "Local Host FastDataDumper bridge failed!")
-        assert(fakeG11.DataDumper({ a = 1 }, "t", false, nil) == "orig_slow" and orig_dump_calls == 1,
+        assert(fakeG11.DataDumper({ a = 1 }, "t", nil, nil) == "orig_slow" and orig_dump_calls == 1 and fastdump_calls == 1 and last_orig_fastmode == nil,
+               "Local Host FastDataDumper must delegate fastmode=nil to orig_dumper!")
+        assert(fakeG11.DataDumper({ a = 1 }, "t", false, nil) == "orig_slow" and orig_dump_calls == 2,
                "Local Host FastDataDumper did not fall back on fastmode=false!")
-        assert(fakeG11.DataDumper({ a = 1 }, "t", true, 2) == "orig_fast" and orig_dump_calls == 2,
+        assert(fakeG11.DataDumper({ a = 1 }, "t", true, 2) == "orig_fast" and orig_dump_calls == 3,
                "Local Host FastDataDumper did not fall back on ident~=nil!")
         -- Normal unsupported type ("fallback") -> keeps fastmode=true
         fastdump_mode = "fallback"
@@ -2249,6 +2251,94 @@ AddSimPostInit(function()
         assert(tinst:HasOneOfTags({"v", "w", "x", "y", "a"}) == true, "5-tag HasOneOfTags failed")
         assert(tinst:HasTags("a", "b") == true and tinst:HasTags("a", "z") == false, "vararg HasTags failed")
         assert(tinst:HasOneOfTags("z", "c") == true and tinst:HasOneOfTags("y", "z") == false, "vararg HasOneOfTags failed")
+
+        -- 13c-guard. Verify debug.getinfo source guard yields to third-party EntityScript hooks (full + partial)
+        do
+            local function run_es_guard_case(src_map)
+                local es_pe = function() return "mod_pe" end
+                local es_ht = function() return "mod_ht" end
+                local es_hot = function() return "mod_hot" end
+                local es_ha = function() return "mod_ha" end
+                local es_hy = function() return "mod_hy" end
+                local custom_es = {
+                    PushEvent_Internal = es_pe,
+                    HasTags = es_ht,
+                    HasOneOfTags = es_hot,
+                    HasAllTags = es_ha,
+                    HasAnyTag = es_hy,
+                }
+                local g_sub = {}
+                for k, v in G.pairs(g13) do g_sub[k] = v end
+                g_sub._G = g_sub
+                g_sub.EntityScript = custom_es
+                g_sub.require = function(m)
+                    if m == "entityscript" then return custom_es end
+                    if m == "json" then return mock_json end
+                    return {}
+                end
+                g_sub.debug = {
+                    getinfo = function(f, what)
+                        local s = src_map[f]
+                        if s ~= nil then return { source = s } end
+                        return G.debug.getinfo(f, what)
+                    end,
+                    sethook = mock_debug.sethook,
+                }
+                local env_sub = {}
+                for k, v in G.pairs(env13) do env_sub[k] = v end
+                env_sub.GLOBAL = g_sub
+                setmetatable(env_sub, { __index = g_sub })
+                local f_sub = assert(G.kleiloadlua(modmain_path))
+                setfenv(f_sub, env_sub)
+                f_sub()
+                return custom_es, es_pe, es_ht, es_hot, es_ha, es_hy
+            end
+
+            -- Case A: all 3 wrapped by third-party mod -> all 3 yielded
+            local esA, peA, htA, hotA, haA, hyA = run_es_guard_case(setmetatable({}, { __index = function() return "../mods/workshop-999999/modmain.lua" end }))
+            assert(esA.PushEvent_Internal == peA and not esA._hs_fast_pushevent, "Third-party PushEvent_Internal was overwritten!")
+            assert(esA.HasTags == htA and esA.HasAllTags == haA and not esA._hs_fast_hastags, "Third-party HasTags was overwritten!")
+            assert(esA.HasOneOfTags == hotA and esA.HasAnyTag == hyA and not esA._hs_fast_hasoneoftags, "Third-party HasOneOfTags was overwritten!")
+
+            -- Case B: partial wrap (only HasTags wrapped by third-party mod; others vanilla scripts/entityscript.lua)
+            local esB_pe = function() return "v_pe" end
+            local esB_ht = function() return "mod_ht" end
+            local esB_hot = function() return "v_hot" end
+            local custom_B = {
+                PushEvent_Internal = esB_pe,
+                HasTags = esB_ht,
+                HasOneOfTags = esB_hot,
+                HasAllTags = esB_ht,
+                HasAnyTag = esB_hot,
+            }
+            local g_B = {}
+            for k, v in G.pairs(g13) do g_B[k] = v end
+            g_B._G = g_B
+            g_B.EntityScript = custom_B
+            g_B.require = function(m)
+                if m == "entityscript" then return custom_B end
+                if m == "json" then return mock_json end
+                return {}
+            end
+            g_B.debug = {
+                getinfo = function(f, what)
+                    if f == esB_pe or f == esB_hot then return { source = "@scripts/entityscript.lua" } end
+                    if f == esB_ht then return { source = "../mods/workshop-999999/modmain.lua" } end
+                    return G.debug.getinfo(f, what)
+                end,
+                sethook = mock_debug.sethook,
+            }
+            local env_B = {}
+            for k, v in G.pairs(env13) do env_B[k] = v end
+            env_B.GLOBAL = g_B
+            setmetatable(env_B, { __index = g_B })
+            local f_B = assert(G.kleiloadlua(modmain_path))
+            setfenv(f_B, env_B)
+            f_B()
+            assert(custom_B.PushEvent_Internal ~= esB_pe and custom_B._hs_fast_pushevent == true, "Vanilla PushEvent_Internal should be patched in partial case!")
+            assert(custom_B.HasTags == esB_ht and custom_B.HasAllTags == esB_ht and not custom_B._hs_fast_hastags, "Third-party HasTags must stay untouched in partial case!")
+            assert(custom_B.HasOneOfTags ~= esB_hot and custom_B.HasAnyTag == custom_B.HasOneOfTags and custom_B._hs_fast_hasoneoftags == true, "Vanilla HasOneOfTags should still be patched in partial case!")
+        end
 
         -- 13d. Verify c_hsprof(1) returns true and cleans up debug hook
         assert(type(g13.c_hsprof) == "function", "Expected GLOBAL.c_hsprof to be registered")
@@ -7230,6 +7320,325 @@ AddSimPostInit(function()
             string.format("Test 35.4d: Expected micro alpha jitter < 0.004 to skip OverrideMultColour (got calls=%d)", mult_calls35))
 
         print("[CLIENT_V24_TEST] 35. Phase 5 hs_vollight Tile Probe Caps + SetForceSinglePass + distancefade Snap/Memo PASS")
+    end
+
+    -- =========================================================================
+    -- TEST 36: Phase 6 TheInput.OnUpdate Smart Camera/Rotate Throttle & Native IME Auto-Suspend/Resume
+    -- =========================================================================
+    do
+        local tick36 = 100
+        local t36 = 10.0
+        local mx36, my36 = 400, 300
+        local cx36, cy36, cz36 = 0.0, 0.0, 0.0
+        local hd36, dist36 = 45.0, 30.0
+        local btnDown36 = false
+        local hovValid36 = true
+        local scrName36 = "HUD"
+        local updCalls36 = 0
+        local imeCalls36 = {}
+        local gameCbs36, simCbs36, playerCbs36 = {}, {}, {}
+        local tePost36 = nil
+
+        local fe36 = {
+            forceProcessText = false,
+            textProcessorWidget = nil,
+            GetHUDScale = function() return 1.0 end,
+            GetActiveScreen = function() return { name = scrName36 } end,
+            PushScreen = function(s, scr)
+                if scr and scr.name then scrName36 = scr.name end
+            end,
+            PopScreen = function(s)
+                scrName36 = "HUD"
+            end,
+            SetForceProcessTextInput = function(s, take, widget)
+                s.forceProcessText = (take == true)
+                s.textProcessorWidget = take and (widget or {}) or nil
+            end,
+        }
+        local cam36 = {
+            currentpos = { Get = function() return cx36, cy36, cz36 end },
+            GetDownVec = function() return { x = 0.0, y = 1.0, z = 0.0 } end,
+            heading = hd36,
+            distance = dist36,
+        }
+        local hovInst36 = { IsValid = function() return hovValid36 end }
+        local input36 = {
+            mouse_enabled = true,
+            entitiesundermouse = {},
+            hoverinst = hovInst36,
+            OnUpdate = function() updCalls36 = updCalls36 + 1 end,
+            IsMouseDown = function() return btnDown36 end,
+            IsKeyDown = function() return false end,
+            AddKeyUpHandler = function() end,
+        }
+        local fakeG36
+        fakeG36 = {
+            pcall = G.pcall, rawget = G.rawget, rawset = G.rawset,
+            getmetatable = G.getmetatable, type = G.type, pairs = G.pairs, ipairs = G.ipairs, next = G.next,
+            math = G.math, string = G.string, table = G.table,
+            tonumber = G.tonumber, tostring = G.tostring, print = G.print, error = G.error, debug = G.debug,
+            MOUSEBUTTON_LEFT = 1000, MOUSEBUTTON_RIGHT = 1001, MOUSEBUTTON_MIDDLE = 1002,
+            GetTick = function() return tick36 end,
+            GetTimeRealSeconds = function() return t36 end,
+            ThePlayer = nil,
+            TheWorld = nil,
+            TheFrontEnd = fe36,
+            TheSim = {
+                GetPersistentString = function(_, _, cb) cb(false, "") end,
+                SetPersistentString = function() end,
+                GetPosition = function() return mx36, my36 end,
+            },
+            TheInput = input36,
+            TheCamera = cam36,
+            HyperSmooth_SetImeEnabled = function(en)
+                imeCalls36[#imeCalls36 + 1] = en
+                return true
+            end,
+            SimReset = function() end,
+            DoRestart = function() end,
+            Shutdown = function() end,
+            require = function() return {} end,
+        }
+        local env36 = {
+            GLOBAL = fakeG36,
+            GetModConfigData = function() return true end,
+            AddSimPostInit = function(fn) simCbs36[#simCbs36 + 1] = fn end,
+            AddPlayerPostInit = function(fn) playerCbs36[#playerCbs36 + 1] = fn end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "widgets/textedit" then tePost36 = fn end
+            end,
+            AddGlobalClassPostConstruct = function() end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end, AddPrefabPostInitAny = function() end,
+            AddInputHandler = function() end,
+            AddGamePostInit = function(fn) gameCbs36[#gameCbs36 + 1] = fn end,
+            modimport = function() end, MODROOT = "../mods/client_v24_lua_test/", modname = "dst_smooth_highfps",
+        }
+        local fm36 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fm36, env36); fm36()
+
+        -- 36.1: Lossless TheInput.OnUpdate skips ONLY when completely stationary (<16ms same-tick),
+        --       and runs immediately (0ms) on walking, rotating, 1px mouse move, invalid hoverinst, or non-HUD screen
+        fakeG36.TheWorld = {}
+        local player36 = { DoTaskInTime = function(_, _, fn) if type(fn) == "function" then fn() end end }
+        fakeG36.ThePlayer = player36
+        for _, fn in ipairs(gameCbs36) do fn() end
+        for _, fn in ipairs(simCbs36) do fn() end
+        for _, fn in ipairs(playerCbs36) do fn(player36) end
+
+        -- Initial scan runs at 0ms
+        input36:OnUpdate()
+        assert(updCalls36 == 1, "Test 36.1a: Expected initial OnUpdate scan to run (got " .. tostring(updCalls36) .. ")")
+
+        -- Stationary same-tick < 16ms skips; >= 16ms runs
+        t36 = 10.010
+        input36:OnUpdate()
+        assert(updCalls36 == 1, "Test 36.1b: Stationary <16ms same-tick should skip")
+        t36 = 10.020
+        input36:OnUpdate()
+        assert(updCalls36 == 2, "Test 36.1c: Stationary >=16ms should run")
+
+        -- Walking (camera moving) must run immediately (0ms) even at +4ms!
+        cx36 = 0.2
+        t36 = 10.024
+        input36:OnUpdate()
+        assert(updCalls36 == 3, "Test 36.1d: Walking must pass through at 0ms without throttling")
+
+        -- Rotating (camera heading changing) must run immediately (0ms) even at +4ms!
+        cam36.heading = cam36.heading + 0.5
+        t36 = 10.028
+        input36:OnUpdate()
+        assert(updCalls36 == 4, "Test 36.1e: Camera rotation must pass through at 0ms without throttling")
+
+        -- 1px mouse move must run immediately (0ms) even at +4ms!
+        mx36 = mx36 + 1
+        t36 = 10.032
+        input36:OnUpdate()
+        assert(updCalls36 == 5, "Test 36.1f: 1px mouse move must pass through at 0ms")
+
+        -- Invalid hoverinst must run immediately (0ms) even when stationary at +4ms!
+        hovValid36 = false
+        t36 = 10.036
+        input36:OnUpdate()
+        assert(updCalls36 == 6, "Test 36.1g: Invalid hoverinst must pass through at 0ms")
+        hovValid36 = true
+
+        -- Non-HUD screen must run immediately (0ms) even when stationary at +4ms!
+        scrName36 = "PauseScreen"
+        t36 = 10.040
+        input36:OnUpdate()
+        assert(updCalls36 == 7, "Test 36.1h: Non-HUD screen must pass through at 0ms")
+        scrName36 = "HUD"
+
+        -- 36.2: Zero-UX-Compromise IME guarantee: modmain.lua NEVER invokes HyperSmooth_SetImeEnabled
+        if type(tePost36) == "function" then
+            local ed36 = {
+                editing = false,
+                inst = { IsValid = function() return true end },
+                SetEditing = function(self, en) self.editing = en end,
+                Kill = function() end,
+            }
+            tePost36(ed36)
+            ed36:SetEditing(true)
+            ed36:SetEditing(false)
+            ed36:Kill()
+        end
+        fe36:PushScreen({ name = "PauseScreen" })
+        fe36:PopScreen()
+        fe36:SetForceProcessTextInput(true, {})
+        fe36:SetForceProcessTextInput(false, nil)
+        fakeG36.SimReset()
+        assert(#imeCalls36 == 0,
+            "Test 36.2: modmain.lua must NOT toggle native IME (got " .. tostring(#imeCalls36) .. " calls)")
+
+        print("[CLIENT_V24_TEST] 36. Phase 6B Lossless TheInput.OnUpdate (0ms Walk/Rotate/1px) + Zero-IME Contract PASS")
+    end
+
+    -- =========================================================================
+    -- 37. Track 1D (Generic debug.getinfo PostProcessor CC Yield) +
+    --     Track 2C (Smart IME TextEdit Tracking & Focus Regain FlushInput)
+    -- =========================================================================
+    do
+        local imeCalls37 = {}
+        local flushCalls37 = 0
+        local pendingFlush37 = false
+        local scrName37 = "HUD"
+        local tePost37 = nil
+        local gameCbs37 = {}
+        local shInit37 = {}
+        local shSort37 = {}
+
+        local ppIdx37 = {
+            -- Lua closure (non-C) originating outside DST vanilla scripts/ -> generic external mod!
+            SetColourCubeData = function() end,
+            SetColourCubeLerp = function() end,
+            SetDistortionFactor = function() end,
+            AddUniformVariable = function(_, n) return "U_" .. tostring(n) end,
+            AddSamplerEffect = function(_, p) return "SE_" .. tostring(p) end,
+            AddSampler = function() end,
+            SetEffectUniformVariables = function() end,
+            SetSamplerEffectState = function() end,
+            SetSamplerEffectFilter = function() end,
+            AddPostProcessEffect = function(_, p) return "PPE_" .. tostring(p) end,
+            SetPostProcessEffectAfter = function() end,
+            IsBloomEnabled = function() return false end,
+            SetBloomEnabled = function() end,
+        }
+        local fakePp37 = G.setmetatable({}, { __index = ppIdx37 })
+
+        local fe37 = {
+            fadedir = nil,
+            Update = function() end,
+            PushScreen = function(_, scr) if scr and scr.name then scrName37 = scr.name end end,
+            PopScreen = function() scrName37 = "HUD" end,
+            GetActiveScreen = function() return { name = scrName37 } end,
+            GetFocusWidget = function() return nil end,
+        }
+        local fakeG37 = {
+            table = G.table, math = G.math, string = G.string, debug = G.debug,
+            ipairs = G.ipairs, pairs = G.pairs, pcall = G.pcall,
+            type = G.type, tostring = G.tostring, tonumber = G.tonumber,
+            rawget = G.rawget, rawset = G.rawset, getmetatable = G.getmetatable,
+            setmetatable = G.setmetatable, next = G.next, print = G.print,
+            IsPaused = function() return false end,
+            InGamePlay = function() return true end,
+            TheFrontEnd = fe37,
+            PostProcessor = fakePp37,
+            PostProcessorEffects = { Bloom = 1, ColourCube = 2 },
+            SamplerEffects = {},
+            UniformVariables = { SAMPLER_PARAMS = "SAMPLER_PARAMS" },
+            SamplerSizes = { Relative = 1 },
+            SamplerColourMode = { RGB = 1 },
+            SamplerEffectBase = { BloomSampler = 1, Shader = 2 },
+            FILTER_MODE = { LINEAR = 1 },
+            MIP_FILTER_MODE = { NONE = 1 },
+            WRAP_MODE = { CLAMP_TO_EDGE = 1 },
+            TheInput = {
+                OnUpdate = function() end,
+                GetWorldEntityUnderMouse = function() return nil end,
+            },
+            TheInputProxy = {
+                FlushInput = function() flushCalls37 = flushCalls37 + 1 end,
+            },
+            HyperSmooth_SetTextInputActive = function(txtActive, inGameplay)
+                imeCalls37[#imeCalls37 + 1] = { txt = txtActive, game = inGameplay }
+                local ret = pendingFlush37
+                pendingFlush37 = false
+                return ret
+            end,
+            SimReset = function() end,
+            DoRestart = function() end,
+            Shutdown = function() end,
+            require = function() return {} end,
+        }
+        local env37 = {
+            GLOBAL = fakeG37,
+            GetModConfigData = function() return true end,
+            AddSimPostInit = function() end,
+            AddPlayerPostInit = function() end,
+            AddModShadersInit = function(fn) shInit37[#shInit37 + 1] = fn end,
+            AddModShadersSortAndEnable = function(fn) shSort37[#shSort37 + 1] = fn end,
+            AddClassPostConstruct = function(cls, fn)
+                if cls == "widgets/textedit" then tePost37 = fn end
+            end,
+            AddGlobalClassPostConstruct = function() end,
+            AddComponentPostInit = function() end,
+            AddPrefabPostInit = function() end, AddPrefabPostInitAny = function() end,
+            AddInputHandler = function() end,
+            AddGamePostInit = function(fn) gameCbs37[#gameCbs37 + 1] = fn end,
+            modimport = function() end, MODROOT = "../mods/client_v24_lua_test/", modname = "dst_smooth_highfps",
+        }
+        local fm37 = assert(G.kleiloadlua("../mods/client_v24_lua_test/target_modmain.lua"))
+        setfenv(fm37, env37); fm37()
+        fakeG37.TheWorld = {}
+        for _, fn in ipairs(shInit37) do fn() end
+        for _, fn in ipairs(shSort37) do fn() end
+        for _, fn in ipairs(gameCbs37) do fn() end
+
+        -- 37.1: Generic debug.getinfo PostProcessor ColourCube yield (not tied to BCAS globals!)
+        assert(ppIdx37._hs_bloom_hooked == true,
+            "Test 37.1: Expected AddModShadersSortAndEnable path to run through Bloom hook")
+        assert(ppIdx37._hs_ccdata_hooked == nil and ppIdx37._hs_cclerp_hooked == nil,
+            "Test 37.1: HyperSmooth must yield and NOT double-wrap external non-C PostProcessor CC hook")
+
+        -- 37.2: Smart IME Shield Lua TextEdit + Focus Regain FlushInput sync
+        fe37:Update(0.016)
+        assert(#imeCalls37 >= 1 and imeCalls37[#imeCalls37].txt == false and imeCalls37[#imeCalls37].game == true,
+            "Test 37.2a: Expected gameplay HUD to suppress IME (txt=false, game=true)")
+
+        assert(type(tePost37) == "function", "Test 37.2: Expected widgets/textedit post-construct")
+        local ed37 = {
+            editing = false,
+            IsValid = function() return true end,
+            SetEditing = function(w, en) w.editing = en end,
+            OnBeginEditing = function(w) w.editing = true end,
+            OnStopEditing = function(w) w.editing = false end,
+            Kill = function() end,
+        }
+        tePost37(ed37)
+        ed37:SetEditing(true)
+        assert(imeCalls37[#imeCalls37].txt == true and imeCalls37[#imeCalls37].game == true,
+            "Test 37.2b: Opening TextEdit during gameplay must immediately restore IME (txt=true)")
+        ed37:SetEditing(false)
+        assert(imeCalls37[#imeCalls37].txt == false,
+            "Test 37.2c: Closing TextEdit must restore IME gameplay shield (txt=false)")
+        ed37:OnBeginEditing()
+        assert(imeCalls37[#imeCalls37].txt == true, "Test 37.2d: OnBeginEditing -> txt=true")
+        ed37:Kill()
+        assert(imeCalls37[#imeCalls37].txt == false, "Test 37.2e: Kill() active TextEdit -> txt=false")
+
+        fe37:PushScreen({ name = "PauseScreen" })
+        assert(imeCalls37[#imeCalls37].game == false, "Test 37.2f: PauseScreen must set inGameplay=false")
+        fe37:PopScreen()
+        assert(imeCalls37[#imeCalls37].game == true, "Test 37.2g: PopScreen back to HUD -> inGameplay=true")
+
+        pendingFlush37 = true
+        fe37:Update(0.016)
+        assert(flushCalls37 == 1, "Test 37.2h: Expected single FlushInput on Win32 focus regain (got " .. tostring(flushCalls37) .. ")")
+        fe37:Update(0.016)
+        assert(flushCalls37 == 1, "Test 37.2i: Focus regain FlushInput must only trigger once")
+
+        print("[CLIENT_V24_TEST] 37. Track 1D (debug.getinfo PostProcessor CC Yield) + Track 2C (Smart IME TextEdit & FlushInput) PASS")
     end
 
     print("[CLIENT_V24_TEST] ALL_PASS")

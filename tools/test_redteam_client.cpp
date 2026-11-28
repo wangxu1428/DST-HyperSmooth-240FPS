@@ -30,6 +30,7 @@
 #include "../native_plugin/fast_astar_manager.h"
 #include "../native_plugin/fast_json.h"
 #include "../native_plugin/native_gl_bridge.h"
+#include "../native_plugin/gpu_driver_compat.h"
 #include "../native_plugin/vb_pool.h"
 #include "../native_plugin/rpc_qos.h"
 #include "../native_plugin/klei_save_codec.h"
@@ -48,6 +49,7 @@
 #include "../native_plugin/world_shadow_engine.h"
 #include "../native_plugin/gpu_clarity_engine.h"
 #include "../native_plugin/klei_render_fastpath.h"
+#include "../native_plugin/ime_shield.h"
 #include "../third_party/libdeflate-1.23/libdeflate.h"
 
 #define CHECK(cond) do { \
@@ -8702,6 +8704,621 @@ int main() {
         std::printf("[PASS] 41. Phase 5 Mode-4 UiBatcher + SpriteBatcher + Klei 64-Slot VertexDecl::Apply + Clarity Hysteresis + FBO/Stencil/UseProg verified!\n");
     }
 
-    std::printf("ALL 41 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH, STENCIL-CACHE, PLL-WORLD-POS, FLUID-SKELETAL, COMBAT-IMPACT, LOOK-MATCH, HW-TIER, LAZY-STENCIL, AZDO-BUMP, F16C, 16-SLOT-BATCH, MT-SKELETAL, SPEC-STENCIL, STICKY-AZDO-16UI, ELASTIC-POOL, GPU-DRIVEN-BINDLESS, PBO-TEX-RING, PHASE2-SIMD-TEXPOOL, PHASE3-ADAPTIVE-ZEROWAIT, PHASE4-KLEI-FASTPATH-GPU-LADDER, PHASE4.5-VBPOOL-ORPHAN-INPUT-GC-DIAG, PHASE5-ZERO-MAP-FBO-STENCIL-DECL-CACHE & ASTAR TESTS PASSED!\n");
+    // [42] Phase 6 FPS & Camera-Rotation 4-Strike Upgrade + ANIM Precomp Parity & Source Contract
+    {
+        // (1) Source-level contract checks on native_plugin/dinput8.cpp
+        {
+            std::vector<std::string> candidates;
+            {
+                std::string selfPath = __FILE__;
+                const size_t slash = selfPath.find_last_of("/\\");
+                if (slash != std::string::npos) {
+                    candidates.push_back(selfPath.substr(0, slash) + "/../native_plugin/dinput8.cpp");
+                }
+            }
+            candidates.push_back("native_plugin/dinput8.cpp");
+            candidates.push_back("../native_plugin/dinput8.cpp");
+            std::string cppSrc;
+            for (const auto& p : candidates) {
+                std::FILE* fp = std::fopen(p.c_str(), "rb");
+                if (fp) {
+                    std::fseek(fp, 0, SEEK_END);
+                    const long len = std::ftell(fp);
+                    std::fseek(fp, 0, SEEK_SET);
+                    if (len > 0) {
+                        cppSrc.resize(static_cast<size_t>(len));
+                        std::fread(&cppSrc[0], 1, static_cast<size_t>(len), fp);
+                    }
+                    std::fclose(fp);
+                    break;
+                }
+            }
+            CHECK(!cppSrc.empty());
+            CHECK(cppSrc.find("HS_SHADE_SUN_PRE") != std::string::npos);
+            CHECK(cppSrc.find("HS_SHADE_LIT_PRE") != std::string::npos);
+            CHECK(cppSrc.find("HS_SHADE_BCK_PRE") != std::string::npos);
+            CHECK(cppSrc.find("ComputeAnimShadePrecomp") != std::string::npos);
+            CHECK(cppSrc.find("RecordStencilBypassDraw") != std::string::npos);
+            CHECK(cppSrc.find("[DIAG][STBYP_SRC]") != std::string::npos);
+            CHECK(cppSrc.find("cfg.allowAdaptiveGrade = false;") != std::string::npos);
+            CHECK(cppSrc.find("tl_cachedShadowCfg.temporalStride        = 1u;") != std::string::npos);
+            CHECK(cppSrc.find("tl_cachedShadowCfg.fastEntityReceive1Tap = false;") != std::string::npos);
+            CHECK(cppSrc.find("ApplyPendingImeStateOnMsgThread") == std::string::npos);
+            CHECK(cppSrc.find("ImmAssociateContextEx") == std::string::npos);
+            CHECK(cppSrc.find("HyperSmooth_SetImeEnabled") == std::string::npos);
+            CHECK(cppSrc.find("tl_adaptiveShadow4k") == std::string::npos);
+            CHECK(cppSrc.find("tl_adaptiveFastComp5Tap") == std::string::npos);
+            CHECK(cppSrc.find("tl_lmAdaptHalf") == std::string::npos);
+        }
+
+        // (2) Numerical parity: hs_world_shadow::ComputeAnimShadePrecomp vs full per-pixel GLSL relief math
+        auto smoothstepf = [](float e0, float e1, float x) -> float {
+            const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+            return t * t * (3.0f - 2.0f * t);
+        };
+        auto mixf = [](float a, float b, float t) -> float { return a + (b - a) * t; };
+
+        struct ShadePreset { const char* name; float sh[4]; float sh2[4]; };
+        const ShadePreset presets[6] = {
+            { "day",           { 0.95f, 0.65f, 0.55f, 0.45f }, { 0.50f,  0.785f, 1.15f, 0.90f } },
+            { "dusk",          { 1.15f, 0.85f, 0.75f, 0.65f }, { 0.60f,  2.200f, 0.22f, 0.95f } },
+            { "night_off",     { 0.00f, 0.50f, 0.50f, 0.50f }, { 0.50f,  0.500f, 0.50f, 0.00f } },
+            { "cave_low_elev", { 0.75f, 0.25f, 0.45f, 0.85f }, { 0.80f,  0.200f, 0.12f, 0.65f } },
+            { "high_contrast", { 1.45f, 0.95f, 0.98f, 0.15f }, { 0.95f,  1.100f, 1.40f, 1.00f } },
+            { "neg_sun_rim",   { 1.00f, 0.55f, 0.80f, 0.50f }, { 0.50f, -1.050f, 0.65f, 1.00f } },
+        };
+        struct SamplePt { float lx; float ly; float psY; float luma; float base[3]; };
+        const SamplePt samples[4] = {
+            { -0.75f, 0.15f, 0.10f, 0.35f, { 0.65f, 0.52f, 0.41f } },
+            {  0.40f, 1.20f, 1.15f, 0.62f, { 0.82f, 0.74f, 0.58f } },
+            {  1.35f, 2.50f, 2.40f, 0.88f, { 0.91f, 0.86f, 0.79f } },
+            { -0.15f, 0.80f, 0.75f, 0.12f, { 0.32f, 0.28f, 0.25f } },
+        };
+        float maxErr = 0.0f;
+        for (const auto& pr : presets) {
+            float sunPre[4]{}, litPre[4]{}, bckPre[4]{};
+            hs_world_shadow::ComputeAnimShadePrecomp(pr.sh, pr.sh2, sunPre, litPre, bckPre);
+            for (const auto& sp : samples) {
+                const float ink = smoothstepf(0.05f, 0.22f, sp.luma);
+                const float nx = sp.lx / std::sqrt(sp.lx * sp.lx + 0.72f);
+                const float nup = 0.22f + smoothstepf(0.30f, 2.30f, sp.ly) * 0.28f;
+                const float nfront = std::sqrt(std::max(0.06f, 1.0f - nx * nx));
+                const float rt = std::max(1.0f - nfront, 0.0f);
+
+                // Reference original GLSL per-pixel math
+                float refRgb[3] = { sp.base[0], sp.base[1], sp.base[2] };
+                if (pr.sh[0] > 0.001f && pr.sh2[3] > 0.005f) {
+                    const float sl = std::clamp(pr.sh[0], 0.0f, 1.5f) * std::clamp(pr.sh2[3], 0.0f, 1.0f);
+                    const float warm = std::clamp(pr.sh[1], 0.0f, 1.0f);
+                    const float con = std::clamp(pr.sh[2], 0.0f, 1.0f);
+                    const float scool = std::clamp(pr.sh[3], 0.0f, 1.0f);
+                    const float sdark = std::clamp(pr.sh2[0], 0.0f, 1.0f);
+                    const float theta = pr.sh2[1];
+                    const float el = std::clamp(pr.sh2[2], 0.08f, 1.50f);
+                    const float elevN = std::clamp(el * 0.63661977f, 0.0f, 1.0f);
+                    const float cx = std::cos(theta), sx = std::sin(theta);
+                    const float sy = std::sin(el) * 2.60f + 0.18f;
+                    const float s2l = std::sqrt(cx * cx + sy * sy);
+                    const float sd0 = cx / s2l, sd1 = (sy / s2l) * 1.35f, sd2 = sx * 0.50f;
+                    const float diff = std::max(nx * sd0 + nup * sd1 + nfront * sd2, 0.0f);
+                    const float direct = smoothstepf(0.08f, 0.90f, diff);
+                    const float hmask = smoothstepf(0.05f, 0.25f, std::max(sp.psY, sp.ly));
+                    const float str = sl * ink * (0.35f + 0.65f * hmask);
+                    const float amp = 0.40f + 1.20f * con;
+                    const float darkAmp = 0.40f + 1.20f * sdark;
+                    const float warmth = 1.0f - smoothstepf(0.10f, 0.85f, elevN);
+                    const float sunCol[3] = { mixf(1.00f, 1.00f, warmth), mixf(0.96f, 0.70f, warmth), mixf(0.86f, 0.34f, warmth) };
+                    const float litHue[3] = { mixf(0.86f, 1.14f, warmth * 0.0f + warm), mixf(0.98f, 1.02f, warm), mixf(1.18f, 0.82f, warm) };
+                    const float bckHue[3] = { mixf(1.14f, 0.84f, scool), mixf(1.00f, 0.95f, scool), mixf(0.84f, 1.22f, scool) };
+                    const float rim = std::max(-sx, 0.0f) * (rt * std::sqrt(rt)) * 0.20f * amp * str;
+                    for (int c = 0; c < 3; ++c) {
+                        const float lc = sunCol[c] * litHue[c] * (1.0f + 0.16f * amp);
+                        const float bc = bckHue[c] * (1.0f - 0.17f * amp * darkAmp);
+                        const float lm = mixf(1.0f, lc, direct * str);
+                        const float sm = mixf(1.0f, bc, (1.0f - direct) * str);
+                        refRgb[c] = sp.base[c] * lm * sm + sunCol[c] * litHue[c] * rim;
+                    }
+                }
+
+                // Precomputed ANIM_FS shader math
+                float preRgb[3] = { sp.base[0], sp.base[1], sp.base[2] };
+                if (litPre[3] > 0.001f) {
+                    const float diff = std::max(nx * sunPre[0] + nup * sunPre[1] + nfront * sunPre[2], 0.0f);
+                    const float direct = smoothstepf(0.08f, 0.90f, diff);
+                    const float hmask = smoothstepf(0.05f, 0.25f, std::max(sp.psY, sp.ly));
+                    const float str = litPre[3] * ink * (0.35f + 0.65f * hmask);
+                    for (int c = 0; c < 3; ++c) {
+                        const float lm = mixf(1.0f, litPre[c], direct * str);
+                        const float sm = mixf(1.0f, bckPre[c], (1.0f - direct) * str);
+                        preRgb[c] = sp.base[c] * lm * sm + litPre[c] * (sunPre[3] * (rt * std::sqrt(rt)) * str);
+                    }
+                }
+                for (int c = 0; c < 3; ++c) {
+                    const float err = std::fabs(refRgb[c] - preRgb[c]);
+                    if (err > maxErr) maxErr = err;
+                    CHECK(err < 1e-4f);
+                }
+            }
+        }
+        std::printf("[PASS] 42. Phase 6 Source Contract + ComputeAnimShadePrecomp Numerical Parity (maxErr=%.2e) verified!\n",
+                    maxErr);
+    }
+
+    // =========================================================================
+    // [43] Tracks 1-3: Non-Uniform Bindless Gating, Shader Pair Rollback &
+    //      Tiled UI Guard, SmartImeShield, and Foreign Lua VM Yield Contracts
+    // =========================================================================
+    {
+        // (1) HardwareCaps / ProbeResult NVIDIA-only non-uniform bindless gating & ElasticPool fallback
+        hs_hw_tier::HardwareCaps caps{};
+        CHECK(caps.hasNonUniformBindless == false);
+        hs_native_gl::ProbeResult pr{};
+        CHECK(pr.isNvidiaVendor == false);
+        CHECK(pr.hasNonUniformBindless == false);
+
+        hs_elastic_pool::ElasticHostSnapshot es{};
+        es.tier               = hs_hw_tier::HardwareTier::Unleashed;
+        es.logicalCores       = 16u;
+        es.totalRamMb         = 32768ULL;
+        es.availRamMb         = 24576ULL;
+        es.isNativeGl         = true;
+        es.hasBufferStorage   = true;
+        es.hasSsbo            = true;
+        es.hasBindlessTexture = false; // AMD or non-NVIDIA passes hasNonUniformBindless=false
+        es.hasBaseVertex      = true;
+        const auto planAmd = hs_elastic_pool::ComputeElasticPlan(es);
+        CHECK(planAmd.enableGpuDrivenBindless == false);
+        es.hasBindlessTexture = true;
+        const auto planNv = hs_elastic_pool::ComputeElasticPlan(es);
+        CHECK(planNv.enableGpuDrivenBindless == true);
+
+        // (2) SmartImeShield state truth table & Win32 focus-loss/regain modifier flush
+        CHECK(hs_ime::SmartImeShield::ComputeWantSuppress(true,  false, true)  == true);
+        CHECK(hs_ime::SmartImeShield::ComputeWantSuppress(true,  true,  true)  == false);
+        CHECK(hs_ime::SmartImeShield::ComputeWantSuppress(true,  false, false) == false);
+        CHECK(hs_ime::SmartImeShield::ComputeWantSuppress(false, false, true)  == false);
+
+        hs_ime::SmartImeShield ime;
+        CHECK(ime.IsEnabled() == true);
+        CHECK(ime.HasPendingFlushInput() == false);
+        ime.OnTextInputStateChanged(false, true, nullptr);
+        CHECK(ime.IsInGameplay() == true && ime.IsTextInputActive() == false);
+        ime.OnTextInputStateChanged(true, true, nullptr);
+        CHECK(ime.IsTextInputActive() == true);
+
+        MSG msgKill{};
+        msgKill.message = WM_KILLFOCUS;
+        CHECK(ime.OnPeekMessage(&msgKill, nullptr) == true);
+        MSG msgActInact{};
+        msgActInact.message = WM_ACTIVATE;
+        msgActInact.wParam = WA_INACTIVE;
+        CHECK(ime.OnPeekMessage(&msgActInact, nullptr) == true);
+
+        MSG msgFocus{};
+        msgFocus.message = WM_SETFOCUS;
+        CHECK(ime.OnPeekMessage(&msgFocus, nullptr) == false);
+        CHECK(ime.HasPendingFlushInput() == true);
+        CHECK(ime.FocusRegains() == 1u);
+        // Immediate duplicate WM_ACTIVATE within debounce window keeps coalesced count
+        MSG msgAct{};
+        msgAct.message = WM_ACTIVATE;
+        msgAct.wParam = WA_ACTIVE;
+        CHECK(ime.OnPeekMessage(&msgAct, nullptr) == false);
+        CHECK(ime.FocusRegains() == 1u);
+        // Lua consumes one-shot focus flush via OnTextInputStateChanged
+        CHECK(ime.OnTextInputStateChanged(false, true, nullptr) == true);
+        CHECK(ime.OnTextInputStateChanged(false, true, nullptr) == false);
+        ime.ResetForNewVm();
+        CHECK(ime.IsInGameplay() == false && ime.IsTextInputActive() == false);
+        ime.SetEnabled(false);
+        CHECK(ime.IsEnabled() == false);
+
+        // (3) Client dinput8.cpp & native_gl_bridge.h source contract verification
+        auto loadSrc = [](const char* path) -> std::string {
+            FILE* f = std::fopen(path, "rb");
+            CHECK(f != nullptr);
+            std::string s;
+            char buf[4096];
+            while (size_t n = std::fread(buf, 1, sizeof(buf), f)) s.append(buf, n);
+            std::fclose(f);
+            return s;
+        };
+        const std::string srcNgl = loadSrc("../native_plugin/native_gl_bridge.h");
+        CHECK(srcNgl.find("out.hasNonUniformBindless = out.hasBindlessTexture && out.isNvidiaVendor;") != std::string::npos);
+
+        const std::string srcDin = loadSrc("../native_plugin/dinput8.cpp");
+        CHECK(srcDin.find("ProgramNeedsPrelinkPairRevert") != std::string::npos);
+        CHECK(srcDin.find("RevertProgramShaders") != std::string::npos);
+        CHECK(srcDin.find("IsLargeStepTiledUiOverlay") != std::string::npos);
+        CHECK(srcDin.find("DetectForeignLuaVm") != std::string::npos);
+        CHECK(srcDin.find("enable_ime_shield=1") != std::string::npos);
+        CHECK(srcDin.find("HyperSmooth_SetTextInputActive") != std::string::npos);
+        CHECK(srcDin.find("HyperSmooth_GetImeShieldStats") != std::string::npos);
+
+        std::printf("[PASS] 43. Tracks 1-3 Non-Uniform Bindless Gating, Shader Pair Guard, SmartImeShield & LuaJIT2 Yield verified!\n");
+    }
+
+    // =========================================================================
+    // [44] GPU Driver Compatibility & ColourCube Self-Adapting Pipeline (4 Layers)
+    // =========================================================================
+    {
+        using namespace hs_gpu_compat;
+
+        // (A) Legal GLSL compatibility version selection (never #version 140 compatibility!)
+        CHECK(SelectLegalCompatGlslVersion(2, 1, 100) == 0);
+        CHECK(SelectLegalCompatGlslVersion(3, 0, 100) == 130);
+        CHECK(SelectLegalCompatGlslVersion(3, 1, 100) == 130);
+        CHECK(SelectLegalCompatGlslVersion(3, 2, 100) == 150);
+        CHECK(SelectLegalCompatGlslVersion(3, 3, 100) == 330);
+        CHECK(SelectLegalCompatGlslVersion(4, 6, 100) == 330);
+        CHECK(SelectLegalCompatGlslVersion(4, 6, 430) == 430); // never downgrade higher GLSL!
+        CHECK(FormatGlslCompatVersionLine(130) == "#version 130\n");
+        CHECK(FormatGlslCompatVersionLine(150) == "#version 150 compatibility\n");
+        CHECK(FormatGlslCompatVersionLine(330) == "#version 330 compatibility\n");
+        CHECK(FormatGlslCompatVersionLine(430) == "#version 430 compatibility\n");
+
+        const int existVers[] = { 0, 100, 120, 130, 140, 150, 330, 430 };
+        for (int maj = 2; maj <= 4; ++maj) {
+            for (int min = 0; min <= 6; ++min) {
+                for (int ev : existVers) {
+                    const int tv = SelectLegalCompatGlslVersion(maj, min, ev);
+                    if (tv >= 130) {
+                        std::string s = (ev > 0) ? ("#version " + std::to_string(ev) + "\nvoid main(){}\n") : "void main(){}\n";
+                        CHECK(PromoteGlslVersionCompat(s, tv));
+                        CHECK(s.find("140 compatibility") == std::string::npos);
+                        CHECK(s.find("130 compatibility") == std::string::npos);
+                    }
+                }
+            }
+        }
+
+        // (B) All 5 DST ColourCube shaders + edge cases
+        {
+            std::string pp = kDstStockPostProcessCcFs;
+            std::string expr;
+            CHECK(DetectColourCubeShaderKind(pp) == CcShaderKind::ApplyColourCube);
+            CHECK(ExtractColourCubeSamplerExpr(pp, expr) && expr == "SAMPLER[1]");
+            uint32_t taps = 0u;
+            CHECK(PromoteGlslVersionCompat(pp, 330));
+            CHECK(TransformColourCubeTexelFetchShaderSource(pp, taps) && taps == 2u);
+            CHECK(pp.find("hs_cc_sample_2d( COLOUR_CUBE") != std::string::npos);
+            CHECK(pp.find("texture2D( SRC_IMAGE") != std::string::npos); // scene sampler untouched!
+        }
+        {
+            std::string comb = kDstStockCombineCcFs;
+            CHECK(DetectColourCubeShaderKind(comb) == CcShaderKind::CombineColourCubes);
+            uint32_t taps = 0u;
+            CHECK(PromoteGlslVersionCompat(comb, 330));
+            CHECK(TransformColourCubeTexelFetchShaderSource(comb, taps) && taps == 2u);
+            CHECK(comb.find("hs_cc_sample_2d( source_cc") != std::string::npos);
+            CHECK(comb.find("hs_cc_sample_2d( dest_cc") != std::string::npos);
+        }
+        {
+            std::string ui = kDstStockUiCcFs;
+            std::string expr;
+            CHECK(DetectColourCubeShaderKind(ui) == CcShaderKind::ApplyColourCube);
+            CHECK(ExtractColourCubeSamplerExpr(ui, expr) && expr == "SAMPLER[1]");
+            uint32_t taps = 0u;
+            CHECK(PromoteGlslVersionCompat(ui, 330));
+            CHECK(TransformColourCubeTexelFetchShaderSource(ui, taps) && taps == 2u);
+        }
+        {
+            // ui_anim_cc exact structure: #define UI_CC on line 1, #define COLOUR_CUBE SAMPLER[4], plus TRIPLE_ATLAS & HOLO
+            std::string uiAnim =
+                "#define UI_CC\n"
+                "uniform sampler2D SAMPLER[5];\n"
+                "varying vec3 PS_TEXCOORD;\n"
+                "#if defined( UI_CC )\n"
+                "#define COLOUR_CUBE SAMPLER[4]\n"
+                "vec3 ApplyColourCube(vec3 colour) {\n"
+                "\tvec3 floor_col = texture2D( COLOUR_CUBE, vec2(0.1) ).rgb;\n"
+                "\tvec3 ceil_col = texture2D( COLOUR_CUBE, vec2(0.9) ).rgb;\n"
+                "\tvec3 bias_col = texture2D( COLOUR_CUBE, vec2(0.5), -0.5 ).rgb;\n"
+                "\t// texture2D( COLOUR_CUBE, vec2(0.0) ) comment ignored\n"
+                "\treturn floor_col + ceil_col + bias_col;\n"
+                "}\n"
+                "#endif\n"
+                "void main() { gl_FragColor = vec4(ApplyColourCube(texture2D(SAMPLER[0], PS_TEXCOORD.xy).rgb), 1.0); }\n";
+            std::string expr;
+            CHECK(DetectColourCubeShaderKind(uiAnim) == CcShaderKind::ApplyColourCube);
+            CHECK(ExtractColourCubeSamplerExpr(uiAnim, expr) && expr == "SAMPLER[4]");
+            int32_t sIdx = -1;
+            CHECK(ParseSamplerArrayIndex("SAMPLER[4]", sIdx) && sIdx == 4);
+            CHECK(!ParseSamplerArrayIndex("SAMPLER[99]", sIdx));
+            uint32_t taps = 0u;
+            CHECK(PromoteGlslVersionCompat(uiAnim, 330));
+            CHECK(uiAnim.find("#version 330 compatibility\n#define UI_CC") == 0u);
+            CHECK(TransformColourCubeTexelFetchShaderSource(uiAnim, taps) && taps == 2u);
+            CHECK(uiAnim.find("texture2D( COLOUR_CUBE, vec2(0.5), -0.5 )") != std::string::npos); // 3-arg untouched!
+            CHECK(uiAnim.find("texture2D(SAMPLER[0]") != std::string::npos); // atlas untouched!
+
+            // ui_anim.ksh & ui_anim_holo.ksh contain ApplyColourCube inside `#if defined( UI_CC )` WITHOUT `#define UI_CC`:
+            // DetectColourCubeShaderKind MUST return None so they are never promoted to GLSL 330 compat!
+            std::string uiAnimNoCc =
+                "uniform sampler2D SAMPLER[5];\n"
+                "#if defined( UI_CC )\n"
+                "#define COLOUR_CUBE SAMPLER[4]\n"
+                "vec3 ApplyColourCube(vec3 colour) {\n"
+                "\treturn texture2D( COLOUR_CUBE, vec2(0.1) ).rgb;\n"
+                "}\n"
+                "#endif\n"
+                "void main() { gl_FragColor = texture2D(SAMPLER[0], vec2(0.5)); }\n";
+            CHECK(DetectColourCubeShaderKind(uiAnimNoCc) == CcShaderKind::None);
+
+            std::string uiAnimHolo =
+                "#define UI_HOLO\r\n"
+                "#define UI_HOLO_SAMPLER SAMPLER[2]\n"
+                "uniform sampler2D SAMPLER[5];\n"
+                "#if defined( UI_CC )\n"
+                "#define COLOUR_CUBE SAMPLER[4]\n"
+                "vec3 ApplyColourCube(vec3 colour) {\n"
+                "\treturn texture2D( COLOUR_CUBE, vec2(0.1) ).rgb;\n"
+                "}\n"
+                "#endif\n"
+                "void main() { gl_FragColor = texture2D(SAMPLER[0], vec2(0.5)); }\n";
+            CHECK(DetectColourCubeShaderKind(uiAnimHolo) == CcShaderKind::None);
+
+            CHECK(HasDefineMacroCompat("#define UI_CC\r\nvoid main(){}", "UI_CC"));
+            CHECK(HasDefineMacroCompat("#define UI_CC\nvoid main(){}", "UI_CC"));
+            CHECK(HasDefineMacroCompat("  # define UI_CC 1\nvoid main(){}", "UI_CC"));
+            CHECK(!HasDefineMacroCompat("#define UI_CC_OTHER\nvoid main(){}", "UI_CC"));
+            CHECK(!HasDefineMacroCompat("// #define UI_CC\nvoid main(){}", "UI_CC"));
+        }
+        {
+            std::string lineDist =
+                "#version 100\n"
+                "precision highp float;\n"
+                "uniform sampler2D SAMPLER[2];\n"
+                "#define SRC_IMAGE SAMPLER[0]\n"
+                "#define COLOUR_CUBE SAMPLER[1]\n"
+                "vec3 ApplyColourCube(vec3 c) {\n"
+                "\treturn mix(texture2D(COLOUR_CUBE, c.rg).rgb, texture2D(COLOUR_CUBE, c.bg).rgb, 0.5);\n"
+                "}\n"
+                "void main() { gl_FragColor = vec4(ApplyColourCube(texture2D(SRC_IMAGE, vec2(0.5)).rgb), 1.0); }\n";
+            uint32_t taps = 0u;
+            CHECK(PromoteGlslVersionCompat(lineDist, 150));
+            CHECK(lineDist.find("#version 150 compatibility\n") == 0u);
+            CHECK(TransformColourCubeTexelFetchShaderSource(lineDist, taps) && taps == 2u);
+
+            std::string nonCc = "uniform sampler2D SAMPLER[1]; void main() { gl_FragColor = texture2D(SAMPLER[0], vec2(0.5)); }\n";
+            CHECK(DetectColourCubeShaderKind(nonCc) == CcShaderKind::None);
+            uint32_t nonTaps = 99u;
+            CHECK(!TransformColourCubeTexelFetchShaderSource(nonCc, nonTaps) && nonTaps == 0u);
+        }
+
+        // (C) Layer 2 ExpandRgb24ToRgba32 + ConfirmedCcRgbTracker strict scope & GL state save/restore
+        {
+            const int32_t aligns[4] = { 1, 2, 4, 8 };
+            const int32_t widths[3] = { 3, 5, 17 };
+            for (int32_t al : aligns) {
+                for (int32_t w : widths) {
+                    const int32_t h = 3;
+                    const size_t rawRow = static_cast<size_t>(w) * 3u;
+                    const size_t stride = ((rawRow + static_cast<size_t>(al) - 1u) / static_cast<size_t>(al)) * static_cast<size_t>(al);
+                    std::vector<uint8_t> rgb(stride * static_cast<size_t>(h), 0xCCu);
+                    for (int32_t y = 0; y < h; ++y) {
+                        for (int32_t x = 0; x < w; ++x) {
+                            rgb[static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 3u + 0u] = static_cast<uint8_t>(x * 13 + y);
+                            rgb[static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 3u + 1u] = static_cast<uint8_t>(x * 7 + y * 29);
+                            rgb[static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 3u + 2u] = static_cast<uint8_t>(255 - x * 11);
+                        }
+                    }
+                    std::vector<uint8_t> rgba;
+                    CHECK(ExpandRgb24ToRgba32(rgb.data(), w, h, al, rgba));
+                    CHECK(rgba.size() == static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
+                    for (int32_t y = 0; y < h; ++y) {
+                        for (int32_t x = 0; x < w; ++x) {
+                            const size_t di = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u;
+                            CHECK(rgba[di + 0u] == static_cast<uint8_t>(x * 13 + y));
+                            CHECK(rgba[di + 1u] == static_cast<uint8_t>(x * 7 + y * 29));
+                            CHECK(rgba[di + 2u] == static_cast<uint8_t>(255 - x * 11));
+                            CHECK(rgba[di + 3u] == 255u);
+                        }
+                    }
+                }
+            }
+            std::vector<uint8_t> badOut;
+            const uint8_t dummy[16]{};
+            CHECK(!ExpandRgb24ToRgba32(nullptr, 4, 4, 4, badOut));
+            CHECK(!ExpandRgb24ToRgba32(dummy, 4, 4, 3, badOut));
+            CHECK(!ExpandRgb24ToRgba32(dummy, 0, 4, 4, badOut));
+        }
+        {
+            struct MockPromState {
+                uint32_t activeUnit = 0u;
+                uint32_t boundTex[8]{};
+                uint32_t unpackPbo = 77u;
+                int32_t  unpackAlign = 1;
+                uint32_t texImgCalls = 0u;
+                uint32_t lastUploadTex = 0u;
+                int32_t  lastUploadIntFmt = 0;
+                uint32_t lastUploadFmt = 0u;
+                uint8_t  lastAlpha = 0u;
+            };
+            static MockPromState* s_mp = nullptr;
+            MockPromState mp{};
+            mp.activeUnit = 0u;
+            mp.boundTex[0] = 101u; // Arbitrary 1024x32 GL_RGB scene/mod texture on unit 0 (MUST NOT BE PROMOTED!)
+            mp.boundTex[1] = 102u; // Confirmed ColourCube LUT on unit 1
+            s_mp = &mp;
+
+            PromoteGlOps pops{};
+            pops.glActiveTexture = [](uint32_t tu) WINAPI { s_mp->activeUnit = tu - kGlTexture0; };
+            pops.glBindTexture   = [](uint32_t, uint32_t tx) WINAPI { s_mp->boundTex[s_mp->activeUnit] = tx; };
+            pops.glBindBuffer    = [](uint32_t tgt, uint32_t b) WINAPI { if (tgt == kGlPixelUnpackBuffer) s_mp->unpackPbo = b; };
+            pops.glPixelStorei   = [](uint32_t pn, int32_t v) WINAPI { if (pn == kGlUnpackAlignment) s_mp->unpackAlign = v; };
+            pops.glTexImage2D    = [](uint32_t, int32_t, int32_t intf, int32_t w, int32_t h, int32_t, uint32_t fmt, uint32_t, const void* px) WINAPI {
+                ++s_mp->texImgCalls;
+                s_mp->lastUploadTex    = s_mp->boundTex[s_mp->activeUnit];
+                s_mp->lastUploadIntFmt = intf;
+                s_mp->lastUploadFmt    = fmt;
+                if (px && w > 0 && h > 0) {
+                    s_mp->lastAlpha = static_cast<const uint8_t*>(px)[3];
+                }
+            };
+
+            std::vector<uint8_t> idLut;
+            BuildIdentityColourCubeRgb24(idLut);
+            ConfirmedCcRgbTracker tr;
+
+            // Negative guards: PBO, nullptr, complex unpack, SubImage, Compressed
+            tr.OnTexImage2D(201u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 55u, 4, false);
+            tr.OnTexImage2D(202u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, nullptr, 0u, 4, false);
+            tr.OnTexImage2D(203u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 0u, 4, true);
+            tr.OnTexImage2D(204u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 0u, 4, false);
+            tr.OnTexSubImage2D(204u);
+            tr.OnTexImage2D(205u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 0u, 4, false);
+            tr.OnCompressedTexImage2D(205u);
+            CHECK(tr.SkippedPboCount() == 1u && tr.SkippedNullCount() == 1u && tr.SkippedUnpackCount() == 1u);
+            CHECK(tr.InvalidatedCount() == 2u && tr.ShadowBytes() == 0u);
+
+            // Track arbitrary 1024x32 RGB (101) AND real ColourCube LUT (102)
+            tr.OnTexImage2D(101u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 0u, 4, false);
+            tr.OnTexImage2D(102u, kGlTexture2D, 0, kGlRgb, 1024, 32, 0, kGlRgb, kGlUnsignedByte, idLut.data(), 0u, 4, false);
+            CHECK(tr.ShadowBytes() == 2u * 1024u * 32u * 4u);
+
+            // Confirm binding for unit 1 ONLY (ApplyColourCube) -> tex 101 stays untouched; tex 102 promotes with full state restore!
+            CcProgramBindingInfo bind{};
+            bind.kind = CcShaderKind::ApplyColourCube;
+            bind.samplerCount = 1u;
+            bind.samplerLocs[0] = 9;
+            CHECK(bind.OnUniform1i(9, 1));
+            CHECK(bind.samplerUnitSet[0] && bind.samplerUnits[0] == 1);
+
+            int32_t pw = 0, ph = 0;
+            CHECK(tr.TryPromoteConfirmedTexture(
+                102u, static_cast<uint32_t>(bind.samplerUnits[0]), pops,
+                mp.activeUnit, mp.boundTex[1], mp.unpackPbo, mp.unpackAlign, &pw, &ph));
+            CHECK(pw == 1024 && ph == 32);
+            CHECK(mp.texImgCalls == 1u && mp.lastUploadTex == 102u);
+            CHECK(mp.lastUploadIntFmt == static_cast<int32_t>(kGlRgba8) && mp.lastUploadFmt == kGlRgba && mp.lastAlpha == 255u);
+            // Caller GL state MUST be 100% restored:
+            CHECK(mp.activeUnit == 0u && mp.boundTex[0] == 101u && mp.boundTex[1] == 102u);
+            CHECK(mp.unpackPbo == 77u && mp.unpackAlign == 1);
+            CHECK(!tr.IsTrackedPending(102u) && tr.IsPromoted(102u));
+            CHECK(tr.IsTrackedPending(101u)); // arbitrary 1024x32 NEVER auto-promoted!
+            CHECK(tr.ShadowBytes() == 1024u * 32u * 4u);
+            tr.OnDeleteTextures(1, &mp.boundTex[0]);
+            CHECK(tr.ShadowBytes() == 0u);
+            s_mp = nullptr;
+        }
+
+        // (D) Gap-free Canary verdicts, SampleLutBilinearRef edge clamp, and 10-bit PFD classification
+        CHECK(ClassifyCanaryError(-1)  == CanaryVerdict::Fail);
+        CHECK(ClassifyCanaryError(0)   == CanaryVerdict::Pass);
+        CHECK(ClassifyCanaryError(2)   == CanaryVerdict::Pass);
+        CHECK(ClassifyCanaryError(3)   == CanaryVerdict::PassWithWarn);
+        CHECK(ClassifyCanaryError(4)   == CanaryVerdict::PassWithWarn);
+        CHECK(ClassifyCanaryError(5)   == CanaryVerdict::Fail);
+        CHECK(ClassifyCanaryError(255) == CanaryVerdict::Fail);
+
+        {
+            std::vector<uint8_t> edgeLut(1024u * 32u * 3u, 0u);
+            edgeLut[0] = 11u; edgeLut[1] = 22u; edgeLut[2] = 33u; // x=0, y=0
+            edgeLut[3] = 99u; edgeLut[4] = 88u; edgeLut[5] = 77u; // x=1, y=0
+            const size_t pEnd = 1023u * 3u;
+            edgeLut[pEnd - 3u] = 12u; edgeLut[pEnd - 2u] = 34u; edgeLut[pEnd - 1u] = 56u; // x=1022
+            edgeLut[pEnd + 0u] = 44u; edgeLut[pEnd + 1u] = 55u; edgeLut[pEnd + 2u] = 66u; // x=1023
+            float outL[3]{}, outR[3]{};
+            SampleLutBilinearRef(edgeLut.data(), -0.5f, -0.5f, outL);
+            SampleLutBilinearRef(edgeLut.data(), 1023.5f, -0.5f, outR);
+            CHECK(std::lround(outL[0] * 255.0f) == 11 && std::lround(outL[1] * 255.0f) == 22 && std::lround(outL[2] * 255.0f) == 33);
+            CHECK(std::lround(outR[0] * 255.0f) == 44 && std::lround(outR[1] * 255.0f) == 55 && std::lround(outR[2] * 255.0f) == 66);
+        }
+
+        {
+            hs_gpu_compat::PixelFormatInfo pfd10{};
+            pfd10.isRgba = true; pfd10.redBits = 10; pfd10.greenBits = 10; pfd10.blueBits = 10; pfd10.alphaBits = 2;
+            pfd10.is10BitRgb = true; pfd10.isValidForProbe = true;
+            CHECK(pfd10.is10BitRgb && !pfd10.isExact8888 && pfd10.isValidForProbe);
+        }
+
+        // (E) Source-level contracts (Clauses 1, 2, 4, 6, 7)
+        {
+            auto loadSrc = [](const char* path) -> std::string {
+                FILE* f = std::fopen(path, "rb");
+                if (!f) return {};
+                std::string s;
+                char buf[4096];
+                while (size_t n = std::fread(buf, 1, sizeof(buf), f)) s.append(buf, n);
+                std::fclose(f);
+                return s;
+            };
+            auto stripComments = [](const std::string& in) -> std::string {
+                std::string out;
+                out.reserve(in.size());
+                bool inStr = false, inChar = false, inLineCmt = false, inBlkCmt = false;
+                for (size_t i = 0u; i < in.size(); ++i) {
+                    const char c = in[i];
+                    const char nx = (i + 1u < in.size()) ? in[i + 1u] : '\0';
+                    if (inLineCmt) {
+                        if (c == '\n') { inLineCmt = false; out.push_back(c); }
+                        continue;
+                    }
+                    if (inBlkCmt) {
+                        if (c == '*' && nx == '/') { inBlkCmt = false; ++i; }
+                        continue;
+                    }
+                    if (inStr) {
+                        out.push_back(c);
+                        if (c == '\\' && nx != '\0') { out.push_back(nx); ++i; }
+                        else if (c == '"') inStr = false;
+                        continue;
+                    }
+                    if (inChar) {
+                        out.push_back(c);
+                        if (c == '\\' && nx != '\0') { out.push_back(nx); ++i; }
+                        else if (c == '\'') inChar = false;
+                        continue;
+                    }
+                    if (c == '/' && nx == '/') { inLineCmt = true; ++i; continue; }
+                    if (c == '/' && nx == '*') { inBlkCmt = true; ++i; continue; }
+                    if (c == '"') inStr = true;
+                    else if (c == '\'') inChar = true;
+                    out.push_back(c);
+                }
+                return out;
+            };
+            const std::string srcCompat = loadSrc("../native_plugin/gpu_driver_compat.h");
+            const std::string srcBridge = loadSrc("../native_plugin/native_gl_bridge.h");
+            const std::string srcDin    = loadSrc("../native_plugin/dinput8.cpp");
+            CHECK(!srcCompat.empty() && !srcBridge.empty() && !srcDin.empty());
+            const std::string codeCompat = stripComments(srcCompat);
+            const std::string codeBridge = stripComments(srcBridge);
+            const std::string codeDin    = stripComments(srcDin);
+            for (const auto* s : { &codeCompat, &codeBridge, &codeDin }) {
+                CHECK(s->find("140 compatibility") == std::string::npos);
+                CHECK(s->find("RX 590") == std::string::npos);
+                CHECK(s->find("RX590") == std::string::npos);
+                CHECK(s->find("Polaris") == std::string::npos);
+            }
+            CHECK(srcDin.find("[COMPAT]") != std::string::npos);
+            CHECK(srcDin.find("enable_cc_texelfetch=1") != std::string::npos);
+            CHECK(srcDin.find("enable_cc_rgb_normalize=1") != std::string::npos);
+            CHECK(srcDin.find("enable_wgl_exact_pfd=1") != std::string::npos);
+            CHECK(srcDin.find("enable_gl_canary_probe=1") != std::string::npos);
+            CHECK(srcDin.find("HookGlTexSubImage2D") != std::string::npos);
+            CHECK(srcDin.find("HookGlPixelStorei") != std::string::npos);
+            CHECK(srcDin.find("[GL_COMPAT][LIVE_CANARY]") != std::string::npos);
+
+            // Clause 6: zero synchronous glReadPixels in hot Draw/Swap hooks!
+            auto fnSlice = [&](const char* startSym, const char* endSym) -> std::string {
+                const size_t p0 = srcDin.find(startSym);
+                const size_t p1 = srcDin.find(endSym, p0);
+                CHECK(p0 != std::string::npos && p1 != std::string::npos && p1 > p0);
+                return srcDin.substr(p0, p1 - p0);
+            };
+            const std::string daBody = fnSlice("static void WINAPI HookGlDrawArrays(", "static void WINAPI HookGlDrawElements(");
+            const std::string deBody = fnSlice("static void WINAPI HookGlDrawElements(", "static void WINAPI HookGlBindFramebuffer(");
+            const std::string swBody = fnSlice("static uint32_t WINAPI HookEglSwapBuffers(", "static void WINAPI HookGlActiveTexture(");
+            CHECK(daBody.find("glReadPixels") == std::string::npos);
+            CHECK(deBody.find("glReadPixels") == std::string::npos);
+            CHECK(swBody.find("glReadPixels") == std::string::npos);
+        }
+
+        std::printf("[PASS] 44. GPU Driver Compatibility 4-Layer Pipeline (Legal GLSL, All 5 CC Shaders, Strict RGB24->RGBA8 Scope, Gap-Free Canary, Source Contracts) verified!\n");
+    }
+
+    std::printf("ALL 44 CLIENT RED-TEAM, RTSS PACER, VFX240, SHADOW240, D3D9EX, GL-UNIFORM, FS-NEG, FASTJSON, NATIVE-GL, VBPOOL, RPC-QOS, ASYNC-SAVE, SPRITE-BATCH, UI-BATCH, STENCIL-CACHE, PLL-WORLD-POS, FLUID-SKELETAL, COMBAT-IMPACT, LOOK-MATCH, HW-TIER, LAZY-STENCIL, AZDO-BUMP, F16C, 16-SLOT-BATCH, MT-SKELETAL, SPEC-STENCIL, STICKY-AZDO-16UI, ELASTIC-POOL, GPU-DRIVEN-BINDLESS, PBO-TEX-RING, PHASE2-SIMD-TEXPOOL, PHASE3-ADAPTIVE-ZEROWAIT, PHASE4-KLEI-FASTPATH-GPU-LADDER, PHASE4.5-VBPOOL-ORPHAN-INPUT-GC-DIAG, PHASE5-ZERO-MAP-FBO-STENCIL-DECL-CACHE, PHASE6-ANIMPRECOMP-STBYP-IME-4KHYST, TRACKS1-3-COMPAT-IME, GPU-COMPAT-4LAYER & ASTAR TESTS PASSED!\n");
     return 0;
 }

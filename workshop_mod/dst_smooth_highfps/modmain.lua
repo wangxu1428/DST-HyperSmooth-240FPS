@@ -553,12 +553,43 @@ local function IsSpecialVisionCc(tex)
         or string.find(lo, "ruins_", 1, true) ~= nil
 end
 
--- Detect standalone DST-BCAS-Studio Workshop mod so HyperSmooth yields post-process/ColourCube cleanly
+-- Detect standalone DST-BCAS-Studio OR any external Lua mod hooking PostProcessor ColourCube
+-- so HyperSmooth yields post-process/ColourCube adjustments cleanly without fighting filters.
+local function IsExternalLuaCcHookFn(fn)
+    if type(fn) ~= "function" then return false end
+    local dbg = rawget(GLOBAL, "debug")
+    if type(dbg) ~= "table" or type(dbg.getinfo) ~= "function" then return false end
+    local ok, info = pcall(dbg.getinfo, fn, "S")
+    if not ok or type(info) ~= "table" then return false end
+    if info.what == "C" then return false end
+    local src = info.source or ""
+    if src:find("scripts/", 1, true) and not src:find("mods/", 1, true) then
+        return false
+    end
+    return true
+end
+
 local function IsExternalBcasActive()
+    if HS_VF and HS_VF.external_cc_mod_detected then return true end
     if rawget(GLOBAL, "BCAS_State") ~= nil then return true end
     local ppe = rawget(GLOBAL, "PostProcessorEffects")
     if type(ppe) == "table" and (ppe.BCAS_Merged ~= nil or ppe.BCAS_Studio ~= nil or ppe.BCAS_Cinema ~= nil) then
         return true
+    end
+    local pp = rawget(GLOBAL, "PostProcessor")
+    if pp and type(getmetatable) == "function" then
+        local mt = getmetatable(pp)
+        local idx = mt and mt.__index
+        if type(idx) == "table" then
+            if (not idx._hs_ccdata_hooked) and IsExternalLuaCcHookFn(idx.SetColourCubeData) then
+                if HS_VF then HS_VF.external_cc_mod_detected = true end
+                return true
+            end
+            if (not idx._hs_cclerp_hooked) and IsExternalLuaCcHookFn(idx.SetColourCubeLerp) then
+                if HS_VF then HS_VF.external_cc_mod_detected = true end
+                return true
+            end
+        end
     end
     return false
 end
@@ -660,9 +691,10 @@ function HS_VF.HookWorldSnowMap(world_inst)
 end
 
 function HS_VF.InstallVanillaFilterHooks()
+    if IsExternalBcasActive() then return false end
     if HS_VF.vanilla_filter_hooked then return true end
     local pp = rawget(GLOBAL, "PostProcessor")
-    if not pp then return false end
+    if not pp or type(getmetatable) ~= "function" then return false end
     local mt = getmetatable(pp)
     local idx = mt and mt.__index
     if type(idx) ~= "table" then return false end
@@ -6478,7 +6510,7 @@ if HS_CFG.REDUCE_240HZ_CHURN then
                 return old_InputOnUpdate(inp)
             end
             local fe = GLOBAL.TheFrontEnd
-            local screen = fe and fe:GetActiveScreen()
+            local screen = (fe and type(fe.GetActiveScreen) == "function") and fe:GetActiveScreen() or nil
             local world = GLOBAL.TheWorld
             local cam = GLOBAL.TheCamera
             if world and cam and cam.currentpos and screen and screen.name == "HUD" and GetTick and GetTimeRealSeconds then
@@ -7929,7 +7961,7 @@ AddSimPostInit(function()
     end
     rawset(GLOBAL, "_HS_FastDumperBridged", true)
     rawset(GLOBAL, "DataDumper", function(value, varname, fastmode, ident)
-        if fastmode ~= false and ident == nil then
+        if fastmode and ident == nil then
             local dumped, err = native_dump(value, varname)
             if dumped ~= nil then
                 latency_stats.host_fastdumps = latency_stats.host_fastdumps + 1
@@ -8014,7 +8046,24 @@ do
         end
     end
     if type(EntityScript) == "table" then
-        if not EntityScript._hs_fast_pushevent and type(EntityScript.PushEvent_Internal) == "function" then
+        local _dbg_getinfo_es = (type(GLOBAL.debug) == "table" and type(GLOBAL.debug.getinfo) == "function") and GLOBAL.debug.getinfo or nil
+        local function CanReplaceEntityScriptFn(fn)
+            if fn == nil then
+                return true
+            end
+            if type(fn) ~= "function" then
+                return false
+            end
+            if _dbg_getinfo_es == nil then
+                return true
+            end
+            local info = _dbg_getinfo_es(fn, "S")
+            local src = info ~= nil and info.source or nil
+            return type(src) ~= "string" or src:find("entityscript%.lua") ~= nil
+        end
+
+        if not EntityScript._hs_fast_pushevent and type(EntityScript.PushEvent_Internal) == "function" and
+           CanReplaceEntityScriptFn(EntityScript.PushEvent_Internal) then
             EntityScript._hs_fast_pushevent = true
             local pe_pool = {}
             local pe_pool_n = 0
@@ -8092,52 +8141,56 @@ do
             end
         end
 
-        if rawget(GLOBAL, "BRANCH") ~= "dev" and not EntityScript._hs_fast_hastags then
-            EntityScript._hs_fast_hastags = true
+        if rawget(GLOBAL, "BRANCH") ~= "dev" then
             local _unpack = rawget(GLOBAL, "unpack") or unpack
 
-            function EntityScript:HasTags(t1, ...)
-                if t1 == nil then
-                    return self.entity:HasAllTags(...)
-                elseif type(t1) == "table" then
-                    local a, b, c = t1[1], t1[2], t1[3]
-                    if a == nil then
-                        return self.entity:HasAllTags()
-                    elseif b == nil then
-                        return self.entity:HasTag(a)
-                    elseif c == nil then
-                        return self.entity:HasAllTags(a, b)
-                    elseif t1[4] == nil then
-                        return self.entity:HasAllTags(a, b, c)
-                    else
-                        return self.entity:HasAllTags(_unpack(t1))
+            if not EntityScript._hs_fast_hastags and CanReplaceEntityScriptFn(EntityScript.HasTags) then
+                EntityScript._hs_fast_hastags = true
+                function EntityScript:HasTags(t1, ...)
+                    if t1 == nil then
+                        return self.entity:HasAllTags(...)
+                    elseif type(t1) == "table" then
+                        local a, b, c = t1[1], t1[2], t1[3]
+                        if a == nil then
+                            return self.entity:HasAllTags()
+                        elseif b == nil then
+                            return self.entity:HasTag(a)
+                        elseif c == nil then
+                            return self.entity:HasAllTags(a, b)
+                        elseif t1[4] == nil then
+                            return self.entity:HasAllTags(a, b, c)
+                        else
+                            return self.entity:HasAllTags(_unpack(t1))
+                        end
                     end
+                    return self.entity:HasAllTags(t1, ...)
                 end
-                return self.entity:HasAllTags(t1, ...)
+                EntityScript.HasAllTags = EntityScript.HasTags
             end
 
-            function EntityScript:HasOneOfTags(t1, ...)
-                if t1 == nil then
-                    return self.entity:HasAnyTag(...)
-                elseif type(t1) == "table" then
-                    local a, b, c = t1[1], t1[2], t1[3]
-                    if a == nil then
-                        return self.entity:HasAnyTag()
-                    elseif b == nil then
-                        return self.entity:HasTag(a)
-                    elseif c == nil then
-                        return self.entity:HasAnyTag(a, b)
-                    elseif t1[4] == nil then
-                        return self.entity:HasAnyTag(a, b, c)
-                    else
-                        return self.entity:HasAnyTag(_unpack(t1))
+            if not EntityScript._hs_fast_hasoneoftags and CanReplaceEntityScriptFn(EntityScript.HasOneOfTags) then
+                EntityScript._hs_fast_hasoneoftags = true
+                function EntityScript:HasOneOfTags(t1, ...)
+                    if t1 == nil then
+                        return self.entity:HasAnyTag(...)
+                    elseif type(t1) == "table" then
+                        local a, b, c = t1[1], t1[2], t1[3]
+                        if a == nil then
+                            return self.entity:HasAnyTag()
+                        elseif b == nil then
+                            return self.entity:HasTag(a)
+                        elseif c == nil then
+                            return self.entity:HasAnyTag(a, b)
+                        elseif t1[4] == nil then
+                            return self.entity:HasAnyTag(a, b, c)
+                        else
+                            return self.entity:HasAnyTag(_unpack(t1))
+                        end
                     end
+                    return self.entity:HasAnyTag(t1, ...)
                 end
-                return self.entity:HasAnyTag(t1, ...)
+                EntityScript.HasAnyTag = EntityScript.HasOneOfTags
             end
-
-            EntityScript.HasAllTags = EntityScript.HasTags
-            EntityScript.HasAnyTag = EntityScript.HasOneOfTags
         end
     end
 end
@@ -9837,6 +9890,109 @@ local function InstallOptionsScreenLazyControls()
     end
 end
 
+-- Track 2C: Smart IME Shield + Focus Modifier Self-Heal
+-- Tracks active TextEdit widgets & HUD gameplay state so C++ detaches IME during WASD gameplay
+-- (preventing fullscreen CJK IME key swallowing) and restores IME cleanly in chat/console/menus.
+local hs_active_textedits = (type(setmetatable) == "function") and setmetatable({}, { __mode = "k" }) or {}
+
+local function ComputeTextEditActive(fe)
+    if type(pairs) == "function" then
+        for w, _ in pairs(hs_active_textedits) do
+            local valid = true
+            if type(w.IsValid) == "function" then
+                local ok, v = pcall(w.IsValid, w)
+                if ok and not v then valid = false end
+            end
+            if not valid or w.editing ~= true then
+                hs_active_textedits[w] = nil
+            else
+                return true
+            end
+        end
+    end
+    if fe and type(fe.GetFocusWidget) == "function" then
+        local ok, fw = pcall(fe.GetFocusWidget, fe)
+        if ok and type(fw) == "table" and fw.editing == true then
+            return true
+        end
+    end
+    return false
+end
+
+local function SyncImeTextInputState(opt_fe)
+    local fnIme = rawget(GLOBAL, "HyperSmooth_SetTextInputActive")
+    if type(fnIme) ~= "function" then return end
+    local fe = opt_fe or rawget(GLOBAL, "TheFrontEnd")
+    local scr = (fe and fe.GetActiveScreen) and fe:GetActiveScreen() or nil
+    local is_hud = (scr ~= nil and scr.name == "HUD")
+    local is_fading = (fe ~= nil and fe.fadedir ~= nil)
+    local fnPaused = rawget(GLOBAL, "IsPaused")
+    local is_paused = (type(fnPaused) == "function" and fnPaused() == true)
+    local fnInGame = rawget(GLOBAL, "InGamePlay")
+    local in_world = (type(fnInGame) == "function" and fnInGame() == true) or is_hud
+    local in_gameplay = (in_world and is_hud and not is_fading and not is_paused) and true or false
+    local text_active = ComputeTextEditActive(fe)
+    local ok, need_flush = pcall(fnIme, text_active, in_gameplay)
+    if ok and need_flush then
+        local ip = rawget(GLOBAL, "TheInputProxy")
+        if ip and type(ip.FlushInput) == "function" then
+            pcall(ip.FlushInput, ip)
+        end
+    end
+end
+
+if type(AddClassPostConstruct) == "function" then
+    AddClassPostConstruct("widgets/textedit", function(self)
+        if type(self) ~= "table" then return end
+        local function UpdateWidgetEditing(w, fallback)
+            local is_ed
+            if type(w.editing) == "boolean" then
+                is_ed = w.editing
+            else
+                is_ed = (fallback == true)
+            end
+            hs_active_textedits[w] = is_ed and true or nil
+            SyncImeTextInputState()
+        end
+        if type(self.SetEditing) == "function" and not self._hs_ime_setedit_hooked then
+            self._hs_ime_setedit_hooked = true
+            local orig_set = self.SetEditing
+            self.SetEditing = function(w, editing, ...)
+                local r1, r2, r3 = orig_set(w, editing, ...)
+                UpdateWidgetEditing(w, editing)
+                return r1, r2, r3
+            end
+        end
+        if type(self.OnBeginEditing) == "function" and not self._hs_ime_begin_hooked then
+            self._hs_ime_begin_hooked = true
+            local orig_begin = self.OnBeginEditing
+            self.OnBeginEditing = function(w, ...)
+                local r1, r2, r3 = orig_begin(w, ...)
+                UpdateWidgetEditing(w, true)
+                return r1, r2, r3
+            end
+        end
+        if type(self.OnStopEditing) == "function" and not self._hs_ime_stop_hooked then
+            self._hs_ime_stop_hooked = true
+            local orig_stop = self.OnStopEditing
+            self.OnStopEditing = function(w, ...)
+                local r1, r2, r3 = orig_stop(w, ...)
+                UpdateWidgetEditing(w, false)
+                return r1, r2, r3
+            end
+        end
+        if type(self.Kill) == "function" and not self._hs_ime_kill_hooked then
+            self._hs_ime_kill_hooked = true
+            local orig_kill = self.Kill
+            self.Kill = function(w, ...)
+                hs_active_textedits[w] = nil
+                SyncImeTextInputState()
+                return orig_kill(w, ...)
+            end
+        end
+    end)
+end
+
 local function InstallStatsTransitionGuard()
     local fe = rawget(GLOBAL, "TheFrontEnd")
     if not (fe and type(fe.Update) == "function") or fe._hs_stats_hold_hooked then
@@ -9846,18 +10002,19 @@ local function InstallStatsTransitionGuard()
     local last_hold = nil
     local function SyncHold(self_fe)
         local fnHold = rawget(GLOBAL, "HyperSmooth_SetStatsHold")
-        if type(fnHold) ~= "function" then return end
         local scr = self_fe.GetActiveScreen and self_fe:GetActiveScreen() or nil
-        if not scr then return end
-        local is_hud = (scr.name == "HUD")
-        local is_fading = (self_fe.fadedir ~= nil)
-        local fnPaused = rawget(GLOBAL, "IsPaused")
-        local is_paused = (type(fnPaused) == "function" and fnPaused() == true)
-        local want_hold = not (is_hud and not is_fading and not is_paused)
-        if want_hold ~= last_hold then
-            last_hold = want_hold
-            pcall(fnHold, want_hold)
+        if scr and type(fnHold) == "function" then
+            local is_hud = (scr.name == "HUD")
+            local is_fading = (self_fe.fadedir ~= nil)
+            local fnPaused = rawget(GLOBAL, "IsPaused")
+            local is_paused = (type(fnPaused) == "function" and fnPaused() == true)
+            local want_hold = not (is_hud and not is_fading and not is_paused)
+            if want_hold ~= last_hold then
+                last_hold = want_hold
+                pcall(fnHold, want_hold)
+            end
         end
+        SyncImeTextInputState(self_fe)
     end
 
     local orig_update = fe.Update

@@ -416,7 +416,7 @@ inline constexpr const char* kShadowBatchVs =
     "\t\tfloat hs_dist = length(hs_d);\n"
     "\t\tfloat hs_rad = max(u_pointLight.z, 1.0);\n"
     "\t\tfloat hs_near = smoothstep(0.42, 1.15, hs_dist);\n"
-    "\t\tfloat hs_far = smoothstep(hs_rad, hs_rad * 0.25, hs_dist);\n"
+    "\t\tfloat hs_far = (1.0 - smoothstep(hs_rad * 0.25, hs_rad, hs_dist));\n"
     "\t\ths_lw = hs_near * hs_far * hs_lw;\n"
     "\t\tif (hs_lw <= 0.008) {\n"
     "\t\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
@@ -619,7 +619,7 @@ inline constexpr const char* kShadowBatchGpuVs =
     "\t\tfloat hs_dist = length(hs_d);\n"
     "\t\tfloat hs_rad = max(u_pointLight.z, 1.0);\n"
     "\t\tfloat hs_near = smoothstep(0.42, 1.15, hs_dist);\n"
-    "\t\tfloat hs_far = smoothstep(hs_rad, hs_rad * 0.25, hs_dist);\n"
+    "\t\tfloat hs_far = (1.0 - smoothstep(hs_rad * 0.25, hs_rad, hs_dist));\n"
     "\t\ths_lw = hs_near * hs_far * hs_lw;\n"
     "\t\tif (hs_lw <= 0.008) {\n"
     "\t\t\tgl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
@@ -730,16 +730,20 @@ inline constexpr const char* kShadowCompositeFs =
     "\t\tvec2 rx = vec2(ca, sa) * rad;\n"
     "\t\tvec2 ry = vec2(-sa, ca) * rad;\n"
     "\t\tfloat s0 = c0.r;\n"
-    "\t\tfloat s1 = texture2D(u_shadowMap, v_uv + rx *  0.3536               ).r;\n"
-    "\t\tfloat s2 = texture2D(u_shadowMap, v_uv + rx * -0.3688 + ry *  0.3375).r;\n"
-    "\t\tfloat s3 = texture2D(u_shadowMap, v_uv + rx *  0.0437 + ry * -0.6108).r;\n"
-    "\t\tfloat s4 = texture2D(u_shadowMap, v_uv + rx *  0.4535 + ry *  0.5513).r;\n"
     "\t\tfloat s5 = texture2D(u_shadowMap, v_uv + rx * -0.7900 + ry * -0.0566).r;\n"
     "\t\tfloat s6 = texture2D(u_shadowMap, v_uv + rx *  0.6250 + ry * -0.6020).r;\n"
     "\t\tfloat s7 = texture2D(u_shadowMap, v_uv + rx * -0.0728 + ry *  0.9325).r;\n"
     "\t\tfloat s8 = texture2D(u_shadowMap, v_uv + rx * -0.6644 + ry * -0.7474).r;\n"
-    "\t\tcov = (s0 * 2.2 + (s1 + s2 + s3 + s4) * 1.15 + (s5 + s6 + s7 + s8) * 0.80) * 0.10;\n"
-    "\t\tcov = clamp(cov, 0.0, 1.0) * boxFade;\n"
+    "\t\tif (max(s0, max(max(s5, s6), max(s7, s8))) <= 0.002) {\n"
+    "\t\t\tcov = 0.0;\n"
+    "\t\t} else {\n"
+    "\t\t\tfloat s1 = texture2D(u_shadowMap, v_uv + rx *  0.3536               ).r;\n"
+    "\t\t\tfloat s2 = texture2D(u_shadowMap, v_uv + rx * -0.3688 + ry *  0.3375).r;\n"
+    "\t\t\tfloat s3 = texture2D(u_shadowMap, v_uv + rx *  0.0437 + ry * -0.6108).r;\n"
+    "\t\t\tfloat s4 = texture2D(u_shadowMap, v_uv + rx *  0.4535 + ry *  0.5513).r;\n"
+    "\t\t\tcov = (s0 * 2.2 + (s1 + s2 + s3 + s4) * 1.15 + (s5 + s6 + s7 + s8) * 0.80) * 0.10;\n"
+    "\t\t\tcov = clamp(cov, 0.0, 1.0) * boxFade;\n"
+    "\t\t}\n"
     "\t}\n"
     "\tfloat eff = cov * clamp(u_shadowCfg.w, 0.0, 1.0);\n"
     "\tvec3 mulCol = mix(vec3(1.0), clamp(u_shadowCfg.rgb, vec3(0.0), vec3(1.0)), eff);\n"
@@ -750,6 +754,69 @@ inline bool IsStandingMatrix(const float* m) noexcept {
     if (!m) return false;
     const float c1LenSq = m[4] * m[4] + m[5] * m[5] + m[6] * m[6];
     return (c1LenSq > 1e-8f) && ((m[5] * m[5]) > 0.1225f * c1LenSq);
+}
+
+// CPU precomputation for ANIM fragment relief shading (moves trig, smoothsteps & colour mixes off every pixel).
+inline void ComputeAnimShadePrecomp(const float shade[4],
+                                    const float shade2[4],
+                                    float outSunPre[4],
+                                    float outLitPre[4],
+                                    float outBckPre[4]) noexcept {
+    outSunPre[0] = 0.0f; outSunPre[1] = 0.0f; outSunPre[2] = 0.0f; outSunPre[3] = 0.0f;
+    outLitPre[0] = 1.0f; outLitPre[1] = 1.0f; outLitPre[2] = 1.0f; outLitPre[3] = 0.0f;
+    outBckPre[0] = 1.0f; outBckPre[1] = 1.0f; outBckPre[2] = 1.0f; outBckPre[3] = 0.0f;
+    if (!shade || !shade2) return;
+    if (!std::isfinite(shade[0]) || !std::isfinite(shade2[3]) ||
+        shade[0] <= 0.001f || shade2[3] <= 0.005f) {
+        return;
+    }
+    const float sl     = std::clamp(shade[0], 0.0f, 1.5f) * std::clamp(shade2[3], 0.0f, 1.0f);
+    const float warm   = std::isfinite(shade[1]) ? std::clamp(shade[1], 0.0f, 1.0f) : 0.5f;
+    const float con    = std::isfinite(shade[2]) ? std::clamp(shade[2], 0.0f, 1.0f) : 0.5f;
+    const float scool  = std::isfinite(shade[3]) ? std::clamp(shade[3], 0.0f, 1.0f) : 0.5f;
+    const float sdark  = std::isfinite(shade2[0]) ? std::clamp(shade2[0], 0.0f, 1.0f) : 0.5f;
+    const float theta  = std::isfinite(shade2[1]) ? shade2[1] : 0.785f;
+    const float el     = std::isfinite(shade2[2]) ? std::clamp(shade2[2], 0.08f, 1.50f) : 0.75f;
+    const float elevN  = std::clamp(el * 0.63661977f, 0.0f, 1.0f);
+    const float sunX   = std::cos(theta);
+    const float sunF   = std::sin(theta);
+    const float sy     = std::sin(el) * 2.60f + 0.18f;
+    const float sLenSq = sunX * sunX + sy * sy;
+    const float invS2  = (sLenSq > 1e-12f) ? (1.0f / std::sqrt(sLenSq)) : 0.0f;
+    const float amp    = 0.40f + 1.20f * con;
+    const float darkAmp = 0.40f + 1.20f * sdark;
+    const float wt     = std::clamp((elevN - 0.10f) / (0.85f - 0.10f), 0.0f, 1.0f);
+    const float warmth = 1.0f - (wt * wt * (3.0f - 2.0f * wt));
+    auto mixf = [](float a, float b, float t) noexcept { return a + (b - a) * t; };
+    const float sunCol[3] = {
+        mixf(1.00f, 1.00f, warmth),
+        mixf(0.96f, 0.70f, warmth),
+        mixf(0.86f, 0.34f, warmth)
+    };
+    const float litHue[3] = {
+        mixf(0.86f, 1.14f, warm),
+        mixf(0.98f, 1.02f, warm),
+        mixf(1.18f, 0.82f, warm)
+    };
+    const float bckHue[3] = {
+        mixf(1.14f, 0.84f, scool),
+        mixf(1.00f, 0.95f, scool),
+        mixf(0.84f, 1.22f, scool)
+    };
+    const float litGain = 1.0f + 0.16f * amp;
+    const float bckGain = 1.0f - 0.17f * amp * darkAmp;
+    outSunPre[0] = sunX * invS2;
+    outSunPre[1] = (sy * invS2) * 1.35f;
+    outSunPre[2] = sunF * 0.50f;
+    outSunPre[3] = (std::clamp(-sunF, 0.0f, 1.0f) * (0.20f * amp)) / litGain;
+    outLitPre[0] = sunCol[0] * litHue[0] * litGain;
+    outLitPre[1] = sunCol[1] * litHue[1] * litGain;
+    outLitPre[2] = sunCol[2] * litHue[2] * litGain;
+    outLitPre[3] = sl;
+    outBckPre[0] = bckHue[0] * bckGain;
+    outBckPre[1] = bckHue[1] * bckGain;
+    outBckPre[2] = bckHue[2] * bckGain;
+    outBckPre[3] = 0.0f;
 }
 
 inline void MultiplyMat4ColMajor(const float* a, const float* b, float* out) noexcept {
@@ -945,7 +1012,7 @@ public:
         }
 
         // Update camera basis from Lua fallback if MatrixV hasn't populated it yet
-        if (!hasCamRight_ && cfg.hasLuaCam) {
+        if ((!hasCamRight_ || !hasMatrixV_) && cfg.hasLuaCam) {
             const float len = std::sqrt(cfg.luaCamRightX * cfg.luaCamRightX + cfg.luaCamRightZ * cfg.luaCamRightZ);
             if (len > 1e-4f) {
                 camRightX_ = cfg.luaCamRightX / len;

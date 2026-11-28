@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,8 @@
 #include "combat_impact.h"
 #include "pbo_tex_ring.h"
 #include "gpu_clarity_engine.h"
+#include "native_gl_bridge.h"
+#include "../third_party/libdeflate-1.23/libdeflate.h"
 
 static void TestLog(const char* msg) {
     printf("  [LOG] %s\n", msg);
@@ -7187,6 +7190,1351 @@ static bool TestPhase4LiveGpuSuite() {
     return partAOk && partBOk && partCOk;
 }
 
+static bool TestPhase6LiveGpuSuite() {
+    printf("\n=== Phase 6B Lossless Live GPU Verification: 9-Tap Outer-Ring Early-Out + ANIM Precomp Parity + ShadowConfig Defaults ===\n");
+    using namespace hs_world_shadow;
+
+    auto runBackendComposite = [](const GlShadowOps& ops,
+                                  GlReadPixels_t fnReadPixels,
+                                  bool isNativeGl,
+                                  const char* backendName) -> bool {
+        uint32_t primaryFbo = 0u, primaryTex = 0u, spriteTex = 0u, vbo = 0u, ibo = 0u;
+        ops.glGenFramebuffers(1, &primaryFbo);
+        ops.glGenTextures(1, &primaryTex);
+        ops.glActiveTexture(kGlTexture0);
+        ops.glBindTexture(kGlTexture2D, primaryTex);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, kGlLinear);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, kGlLinear);
+        ops.glTexImage2D(kGlTexture2D, 0, kGlRgba, 256, 256, 0, kGlRgba, kGlUnsignedByte, nullptr);
+        ops.glBindFramebuffer(kGlFramebuffer, primaryFbo);
+        ops.glFramebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, kGlTexture2D, primaryTex, 0);
+        if (ops.glCheckFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete) {
+            printf("  [FAIL] %s PrimaryRT incomplete!\n", backendName);
+            return false;
+        }
+
+        uint8_t white4x4[4 * 4 * 4];
+        memset(white4x4, 255, sizeof(white4x4));
+        ops.glGenTextures(1, &spriteTex);
+        ops.glActiveTexture(kGlTexture0 + 6u);
+        ops.glBindTexture(kGlTexture2D, spriteTex);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, kGlLinear);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, kGlLinear);
+        ops.glTexImage2D(kGlTexture2D, 0, kGlRgba, 4, 4, 0, kGlRgba, kGlUnsignedByte, white4x4);
+        ops.glActiveTexture(kGlTexture0);
+
+        std::vector<hs_sprite_batch::BatchedVertex> verts;
+        std::vector<uint16_t> idxs;
+        auto mk = [&](float lx, float wy, float u, float v) {
+            hs_sprite_batch::BatchedVertex bv{};
+            bv.x = 1.0f; bv.y = 0.0f; bv.u = u; bv.v = v;
+            bv.wx = lx; bv.wy = wy; bv.wz = 0.0f; bv.slot = 0.0f;
+            bv.mr = 1.0f; bv.mg = 1.0f; bv.mb = 1.0f; bv.ma = 1.0f;
+            bv.ar = 0.0f; bv.ag = 0.0f; bv.ab = 0.0f; bv.pad = lx;
+            return bv;
+        };
+        verts.push_back(mk(-2.5f, 0.0f, 0.1f, 0.1f));
+        verts.push_back(mk(+2.5f, 0.0f, 0.9f, 0.1f));
+        verts.push_back(mk(-2.5f, 6.0f, 0.1f, 0.9f));
+        verts.push_back(mk(+2.5f, 6.0f, 0.9f, 0.9f));
+        idxs.push_back(0); idxs.push_back(1); idxs.push_back(2);
+        idxs.push_back(1); idxs.push_back(3); idxs.push_back(2);
+
+        ops.glGenBuffers(1, &vbo);
+        ops.glGenBuffers(1, &ibo);
+        ops.glBindBuffer(kGlArrayBuffer, vbo);
+        ops.glBufferData(kGlArrayBuffer, verts.size() * sizeof(hs_sprite_batch::BatchedVertex), verts.data(), kGlStaticDraw);
+        ops.glBindBuffer(kGlElementArrayBuffer, ibo);
+        ops.glBufferData(kGlElementArrayBuffer, idxs.size() * sizeof(uint16_t), idxs.data(), kGlStaticDraw);
+
+        const float pv[16] = {
+            1.0f / 20.0f, 0, 0, 0,
+            0,            0, 0, 0,
+            0, 1.0f / 20.0f, 0, 0,
+            0,            0, 0, 1
+        };
+        const int32_t vp[4] = { 0, 0, 256, 256 };
+
+        auto drawBatchShadow = [&](WorldShadowEngine& eng, const ShadowConfig& cfg,
+                                   const ShadowPassState& saved, hs_gl_cache::ThreadState& glCache) {
+            ops.glBindBuffer(kGlArrayBuffer, vbo);
+            ops.glBindBuffer(kGlElementArrayBuffer, ibo);
+            ops.glEnableVertexAttribArray(0);
+            ops.glVertexAttribPointer(0, 4, kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, x)));
+            ops.glEnableVertexAttribArray(7);
+            ops.glVertexAttribPointer(7, 4, kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, wx)));
+            ops.glEnableVertexAttribArray(5);
+            ops.glVertexAttribPointer(5, 4, kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, mr)));
+            ops.glEnableVertexAttribArray(6);
+            ops.glVertexAttribPointer(6, 4, kGlFloat, 0, sizeof(hs_sprite_batch::BatchedVertex),
+                                      reinterpret_cast<const void*>(offsetof(hs_sprite_batch::BatchedVertex, ar)));
+            eng.MirrorBatchedSprites(static_cast<uint32_t>(idxs.size()), cfg, saved, glCache);
+            ops.glDisableVertexAttribArray(5);
+            ops.glDisableVertexAttribArray(6);
+            ops.glDisableVertexAttribArray(7);
+        };
+
+        std::vector<uint8_t> img9;
+        bool okRender = false;
+        {
+            WorldShadowEngine eng;
+            eng.SetOps(ops, isNativeGl);
+            hs_gl_cache::ThreadState glCache;
+            glCache.caps[0] = 1;
+            glCache.blendSrc = kGlSrcAlpha;
+            glCache.blendDst = kGlOneMinusSrcAlpha;
+            glCache.blendEq = kGlFuncAdd;
+            glCache.colorMask = 15;
+
+            ShadowConfig cfg{};
+            cfg.dirWx = 1.0f; cfg.dirWz = 0.0f; cfg.stretch = 2.0f; cfg.projOn = 1.0f;
+            cfg.heightFade = 0.0f; cfg.penumbraBias = 1.0f; cfg.density = 0.65f; cfg.soft = 0.90f;
+            cfg.tintR = 0.12f; cfg.tintG = 0.16f; cfg.tintB = 0.38f;
+            cfg.hdMode = true; cfg.skipNightmare = true;
+            cfg.hasLuaCam = true; cfg.luaCamX = 0.0f; cfg.luaCamZ = 0.0f;
+            cfg.luaCamRightX = 1.0f; cfg.luaCamRightZ = 0.0f;
+
+            ShadowPassState saved{};
+            saved.dstFbo = primaryFbo;
+            memcpy(saved.vp, vp, sizeof(vp));
+            saved.boundArrayBuf = vbo; saved.boundElemBuf = ibo;
+
+            // Frame 1: Render caster into ShadowMask FBO
+            eng.OnGroundOrOceanDraw(primaryFbo, vp);
+            eng.OnMatrixPV(pv);
+            if (!eng.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+            drawBatchShadow(eng, cfg, saved, glCache);
+            eng.OnEndFrame();
+
+            // Frame 2: Clear PrimaryRT white & composite 9-tap outer-ring early-out shadow map
+            ops.glBindFramebuffer(kGlFramebuffer, primaryFbo);
+            ops.glViewport(0, 0, 256, 256);
+            ops.glColorMask(1, 1, 1, 1);
+            ops.glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+            ops.glClear(kGlColorBufferBit);
+            eng.OnGroundOrOceanDraw(primaryFbo, vp);
+            eng.OnMatrixPV(pv);
+            if (!eng.OnBeforeFirstStandingEntity(cfg, saved, glCache)) return false;
+            eng.OnEndFrame();
+
+            img9.resize(256u * 256u * 4u);
+            ops.glBindFramebuffer(kGlFramebuffer, primaryFbo);
+            fnReadPixels(0, 0, 256, 256, kGlRgba, kGlUnsignedByte, img9.data());
+            eng.ResetContext(true);
+            okRender = ops.glGetError ? (ops.glGetError() == 0u) : true;
+        }
+
+        ops.glDeleteBuffers(1, &vbo);
+        ops.glDeleteBuffers(1, &ibo);
+        ops.glDeleteTextures(1, &spriteTex);
+        ops.glDeleteTextures(1, &primaryTex);
+        ops.glDeleteFramebuffers(1, &primaryFbo);
+
+        if (!okRender) {
+            printf("  [FAIL] %s 9-tap composite render failed\n", backendName);
+            return false;
+        }
+        const size_t litIdx = (240u * 256u + 240u) * 4u;
+        uint8_t minG = 255u;
+        int shPx = 0;
+        for (int y = 64; y < 192; ++y) {
+            for (int x = 110; x < 230; ++x) {
+                const uint8_t g = img9[(static_cast<size_t>(y) * 256u + static_cast<size_t>(x)) * 4u + 1u];
+                if (g < minG) minG = g;
+                if (g < 220u) ++shPx;
+            }
+        }
+        const bool ok = (img9[litIdx + 1u] > 245u) && (minG < 220u) && (shPx > 100);
+        printf("  %s [9-tap-earlyout]: litG=%u minShadowG=%u shPx=%d -> %s\n",
+               backendName, static_cast<unsigned>(img9[litIdx + 1u]),
+               static_cast<unsigned>(minG), shPx, ok ? "PASS" : "FAIL");
+        return ok;
+    };
+
+    // --- 1. Native GL 4.6 (Part A + Part B) ---
+    bool okGlComp = false, okGlAnimPrecomp = false;
+    {
+        HMODULE hGl = LoadLibraryW(L"opengl32.dll");
+        HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_p6_gl", 0, 0, 0, 256, 256, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HDC hdc = GetDC(hwnd);
+        PIXELFORMATDESCRIPTOR pfd{};
+        pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.cColorBits = 32; pfd.cDepthBits = 24;
+        SetPixelFormat(hdc, ChoosePixelFormat(hdc, &pfd), &pfd);
+        using WglCreate_t = HGLRC (WINAPI*)(HDC);
+        using WglMake_t   = BOOL (WINAPI*)(HDC, HGLRC);
+        using WglGet_t    = PROC (WINAPI*)(LPCSTR);
+        using WglDel_t    = BOOL (WINAPI*)(HGLRC);
+        auto wCreate = reinterpret_cast<WglCreate_t>(GetProcAddress(hGl, "wglCreateContext"));
+        auto wMake   = reinterpret_cast<WglMake_t>(GetProcAddress(hGl, "wglMakeCurrent"));
+        auto wGet    = reinterpret_cast<WglGet_t>(GetProcAddress(hGl, "wglGetProcAddress"));
+        auto wDel    = reinterpret_cast<WglDel_t>(GetProcAddress(hGl, "wglDeleteContext"));
+        HGLRC rc = wCreate(hdc);
+        wMake(hdc, rc);
+
+        auto res = [&](const char* n) -> void* {
+            void* p = reinterpret_cast<void*>(wGet(n));
+            if (!p || reinterpret_cast<uintptr_t>(p) <= 3u) p = reinterpret_cast<void*>(GetProcAddress(hGl, n));
+            return p;
+        };
+        GlShadowOps ops{};
+        ops.glGenFramebuffers          = reinterpret_cast<decltype(ops.glGenFramebuffers)>(res("glGenFramebuffers"));
+        ops.glDeleteFramebuffers       = reinterpret_cast<decltype(ops.glDeleteFramebuffers)>(res("glDeleteFramebuffers"));
+        ops.glBindFramebuffer          = reinterpret_cast<decltype(ops.glBindFramebuffer)>(res("glBindFramebuffer"));
+        ops.glFramebufferTexture2D     = reinterpret_cast<decltype(ops.glFramebufferTexture2D)>(res("glFramebufferTexture2D"));
+        ops.glCheckFramebufferStatus   = reinterpret_cast<decltype(ops.glCheckFramebufferStatus)>(res("glCheckFramebufferStatus"));
+        ops.glGenRenderbuffers         = reinterpret_cast<decltype(ops.glGenRenderbuffers)>(res("glGenRenderbuffers"));
+        ops.glDeleteRenderbuffers      = reinterpret_cast<decltype(ops.glDeleteRenderbuffers)>(res("glDeleteRenderbuffers"));
+        ops.glBindRenderbuffer         = reinterpret_cast<decltype(ops.glBindRenderbuffer)>(res("glBindRenderbuffer"));
+        ops.glRenderbufferStorage      = reinterpret_cast<decltype(ops.glRenderbufferStorage)>(res("glRenderbufferStorage"));
+        ops.glFramebufferRenderbuffer  = reinterpret_cast<decltype(ops.glFramebufferRenderbuffer)>(res("glFramebufferRenderbuffer"));
+        ops.glGenTextures              = reinterpret_cast<decltype(ops.glGenTextures)>(res("glGenTextures"));
+        ops.glDeleteTextures           = reinterpret_cast<decltype(ops.glDeleteTextures)>(res("glDeleteTextures"));
+        ops.glActiveTexture            = reinterpret_cast<decltype(ops.glActiveTexture)>(res("glActiveTexture"));
+        ops.glBindTexture              = reinterpret_cast<decltype(ops.glBindTexture)>(res("glBindTexture"));
+        ops.glTexImage2D               = reinterpret_cast<decltype(ops.glTexImage2D)>(res("glTexImage2D"));
+        ops.glTexParameteri            = reinterpret_cast<decltype(ops.glTexParameteri)>(res("glTexParameteri"));
+        ops.glCreateShader             = reinterpret_cast<decltype(ops.glCreateShader)>(res("glCreateShader"));
+        ops.glShaderSource             = reinterpret_cast<decltype(ops.glShaderSource)>(res("glShaderSource"));
+        ops.glCompileShader            = reinterpret_cast<decltype(ops.glCompileShader)>(res("glCompileShader"));
+        ops.glGetShaderiv              = reinterpret_cast<decltype(ops.glGetShaderiv)>(res("glGetShaderiv"));
+        ops.glGetShaderInfoLog         = reinterpret_cast<decltype(ops.glGetShaderInfoLog)>(res("glGetShaderInfoLog"));
+        ops.glDeleteShader             = reinterpret_cast<decltype(ops.glDeleteShader)>(res("glDeleteShader"));
+        ops.glCreateProgram            = reinterpret_cast<decltype(ops.glCreateProgram)>(res("glCreateProgram"));
+        ops.glAttachShader             = reinterpret_cast<decltype(ops.glAttachShader)>(res("glAttachShader"));
+        ops.glBindAttribLocation       = reinterpret_cast<decltype(ops.glBindAttribLocation)>(res("glBindAttribLocation"));
+        ops.glLinkProgram              = reinterpret_cast<decltype(ops.glLinkProgram)>(res("glLinkProgram"));
+        ops.glGetProgramiv             = reinterpret_cast<decltype(ops.glGetProgramiv)>(res("glGetProgramiv"));
+        ops.glGetProgramInfoLog        = reinterpret_cast<decltype(ops.glGetProgramInfoLog)>(res("glGetProgramInfoLog"));
+        ops.glDeleteProgram            = reinterpret_cast<decltype(ops.glDeleteProgram)>(res("glDeleteProgram"));
+        ops.glUseProgram               = reinterpret_cast<decltype(ops.glUseProgram)>(res("glUseProgram"));
+        ops.glGetUniformLocation       = reinterpret_cast<decltype(ops.glGetUniformLocation)>(res("glGetUniformLocation"));
+        ops.glUniform1f                = reinterpret_cast<decltype(ops.glUniform1f)>(res("glUniform1f"));
+        ops.glUniform1i                = reinterpret_cast<decltype(ops.glUniform1i)>(res("glUniform1i"));
+        ops.glUniform4fv               = reinterpret_cast<decltype(ops.glUniform4fv)>(res("glUniform4fv"));
+        ops.glUniformMatrix4fv         = reinterpret_cast<decltype(ops.glUniformMatrix4fv)>(res("glUniformMatrix4fv"));
+        ops.glGenBuffers               = reinterpret_cast<decltype(ops.glGenBuffers)>(res("glGenBuffers"));
+        ops.glDeleteBuffers            = reinterpret_cast<decltype(ops.glDeleteBuffers)>(res("glDeleteBuffers"));
+        ops.glBindBuffer               = reinterpret_cast<decltype(ops.glBindBuffer)>(res("glBindBuffer"));
+        ops.glBufferData               = reinterpret_cast<decltype(ops.glBufferData)>(res("glBufferData"));
+        ops.glEnableVertexAttribArray  = reinterpret_cast<decltype(ops.glEnableVertexAttribArray)>(res("glEnableVertexAttribArray"));
+        ops.glDisableVertexAttribArray = reinterpret_cast<decltype(ops.glDisableVertexAttribArray)>(res("glDisableVertexAttribArray"));
+        ops.glVertexAttribPointer      = reinterpret_cast<decltype(ops.glVertexAttribPointer)>(res("glVertexAttribPointer"));
+        ops.glDrawArrays               = reinterpret_cast<decltype(ops.glDrawArrays)>(res("glDrawArrays"));
+        ops.glDrawElements             = reinterpret_cast<decltype(ops.glDrawElements)>(res("glDrawElements"));
+        ops.glViewport                 = reinterpret_cast<decltype(ops.glViewport)>(res("glViewport"));
+        ops.glClearColor               = reinterpret_cast<decltype(ops.glClearColor)>(res("glClearColor"));
+        ops.glClear                    = reinterpret_cast<decltype(ops.glClear)>(res("glClear"));
+        ops.glEnable                   = reinterpret_cast<decltype(ops.glEnable)>(res("glEnable"));
+        ops.glDisable                  = reinterpret_cast<decltype(ops.glDisable)>(res("glDisable"));
+        ops.glBlendFunc                = reinterpret_cast<decltype(ops.glBlendFunc)>(res("glBlendFunc"));
+        ops.glBlendFuncSeparate        = reinterpret_cast<decltype(ops.glBlendFuncSeparate)>(res("glBlendFuncSeparate"));
+        ops.glBlendEquation            = reinterpret_cast<decltype(ops.glBlendEquation)>(res("glBlendEquation"));
+        ops.glBlendEquationSeparate    = reinterpret_cast<decltype(ops.glBlendEquationSeparate)>(res("glBlendEquationSeparate"));
+        ops.glDepthFunc                = reinterpret_cast<decltype(ops.glDepthFunc)>(res("glDepthFunc"));
+        ops.glDepthMask                = reinterpret_cast<decltype(ops.glDepthMask)>(res("glDepthMask"));
+        ops.glColorMask                = reinterpret_cast<decltype(ops.glColorMask)>(res("glColorMask"));
+        ops.glGetIntegerv              = reinterpret_cast<decltype(ops.glGetIntegerv)>(res("glGetIntegerv"));
+        ops.glGetError                 = reinterpret_cast<decltype(ops.glGetError)>(res("glGetError"));
+        ops.logFn                      = &TestLog;
+        auto fnReadPixels = reinterpret_cast<GlReadPixels_t>(res("glReadPixels"));
+
+        okGlComp = runBackendComposite(ops, fnReadPixels, true, "Native GL 4.6");
+
+        // Part B: Live Native GL ANIM_FS HS_SHADE_SUN_PRE / LIT_PRE / BCK_PRE shader pixel parity!
+        const char* animVs =
+            "#version 100\n"
+            "attribute vec2 a_pos;\n"
+            "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
+        const char* animFs =
+            "#version 100\n"
+            "precision highp float;\n"
+            "uniform vec4 HS_SHADE_SUN_PRE;\n"
+            "uniform vec4 HS_SHADE_LIT_PRE;\n"
+            "uniform vec4 HS_SHADE_BCK_PRE;\n"
+            "uniform vec4 u_base;\n"
+            "uniform vec4 u_lm;\n"
+            "uniform vec4 u_ps;\n"
+            "uniform float u_luma;\n"
+            "void main() {\n"
+            "\tvec3 hs_res = u_base.rgb;\n"
+            "\tfloat hs_ink = smoothstep(0.05, 0.22, u_luma);\n"
+            "\tif (HS_SHADE_LIT_PRE.w > 0.001) {\n"
+            "\t\tfloat hs_lx = u_lm.x;\n"
+            "\t\tfloat hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
+            "\t\tfloat hs_nup = 0.22 + smoothstep(0.30, 2.30, u_lm.y) * 0.28;\n"
+            "\t\tfloat hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
+            "\t\tfloat hs_diff = max(hs_nx * HS_SHADE_SUN_PRE.x + hs_nup * HS_SHADE_SUN_PRE.y + hs_nfront * HS_SHADE_SUN_PRE.z, 0.0);\n"
+            "\t\tfloat hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
+            "\t\tfloat hs_h_mask = smoothstep(0.05, 0.25, max(u_ps.y, u_lm.y));\n"
+            "\t\tfloat hs_str = HS_SHADE_LIT_PRE.w * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
+            "\t\tvec3 hs_lit_mul = mix(vec3(1.0), HS_SHADE_LIT_PRE.rgb, hs_direct * hs_str);\n"
+            "\t\tvec3 hs_shd_mul = mix(vec3(1.0), HS_SHADE_BCK_PRE.rgb, (1.0 - hs_direct) * hs_str);\n"
+            "\t\tfloat hs_rt = max(1.0 - hs_nfront, 0.0);\n"
+            "\t\ths_res = hs_res * hs_lit_mul * hs_shd_mul + HS_SHADE_LIT_PRE.rgb * (HS_SHADE_SUN_PRE.w * (hs_rt * sqrt(hs_rt)) * hs_str);\n"
+            "\t}\n"
+            "\tgl_FragColor = vec4(clamp(hs_res, vec3(0.0), vec3(1.0)), 1.0);\n"
+            "}\n";
+        auto compileS = [&](uint32_t stype, const char* src) -> uint32_t {
+            uint32_t sh = ops.glCreateShader(stype);
+            int32_t len = static_cast<int32_t>(strlen(src));
+            ops.glShaderSource(sh, 1, &src, &len);
+            ops.glCompileShader(sh);
+            int32_t ok = 0; ops.glGetShaderiv(sh, 0x8B81u, &ok);
+            if (!ok) { ops.glDeleteShader(sh); return 0u; }
+            return sh;
+        };
+        uint32_t sv = compileS(kGlVertexShader, animVs), sf = compileS(kGlFragmentShader, animFs);
+        uint32_t animProg = (sv && sf) ? ops.glCreateProgram() : 0u;
+        if (animProg) {
+            ops.glAttachShader(animProg, sv); ops.glAttachShader(animProg, sf);
+            ops.glBindAttribLocation(animProg, 0u, "a_pos");
+            ops.glLinkProgram(animProg);
+            int32_t lok = 0; ops.glGetProgramiv(animProg, 0x8B82u, &lok);
+            if (!lok) { ops.glDeleteProgram(animProg); animProg = 0u; }
+        }
+        if (sv) ops.glDeleteShader(sv);
+        if (sf) ops.glDeleteShader(sf);
+
+        uint32_t fboA = 0u, texA = 0u, qvbo = 0u;
+        ops.glGenFramebuffers(1, &fboA); ops.glGenTextures(1, &texA);
+        ops.glBindTexture(kGlTexture2D, texA);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, kGlNearest);
+        ops.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, kGlNearest);
+        ops.glTexImage2D(kGlTexture2D, 0, kGlRgba, 32, 32, 0, kGlRgba, kGlUnsignedByte, nullptr);
+        ops.glBindFramebuffer(kGlFramebuffer, fboA);
+        ops.glFramebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, kGlTexture2D, texA, 0);
+        const float quad[8] = { -1,-1, 1,-1, -1,1, 1,1 };
+        ops.glGenBuffers(1, &qvbo);
+        ops.glBindBuffer(kGlArrayBuffer, qvbo);
+        ops.glBufferData(kGlArrayBuffer, sizeof(quad), quad, kGlStaticDraw);
+
+        if (animProg && ops.glCheckFramebufferStatus(kGlFramebuffer) == kGlFramebufferComplete) {
+            auto smoothstepf = [](float e0, float e1, float x) -> float {
+                const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+                return t * t * (3.0f - 2.0f * t);
+            };
+            auto mixf = [](float a, float b, float t) -> float { return a + (b - a) * t; };
+
+            const float sh[4] = { 1.15f, 0.72f, 0.80f, 0.45f };
+            const float sh2[4] = { 0.55f, -0.95f, 0.62f, 0.92f }; // negative sin(theta) activates backlight rim too
+            float sunPre[4]{}, litPre[4]{}, bckPre[4]{};
+            ComputeAnimShadePrecomp(sh, sh2, sunPre, litPre, bckPre);
+            const float baseU[4] = { 0.62f, 0.50f, 0.41f, 1.0f };
+            const float lmU[4]   = { -0.85f, 1.25f, 0.0f, 0.0f };
+            const float psU[4]   = { 0.0f, 1.15f, 0.0f, 0.0f };
+            const float lumaVal  = 0.58f;
+
+            ops.glBindFramebuffer(kGlFramebuffer, fboA);
+            ops.glViewport(0, 0, 32, 32);
+            ops.glDisable(kGlBlend);
+            ops.glDisable(kGlDepthTest);
+            ops.glColorMask(1, 1, 1, 1);
+            ops.glUseProgram(animProg);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "HS_SHADE_SUN_PRE"), 1, sunPre);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "HS_SHADE_LIT_PRE"), 1, litPre);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "HS_SHADE_BCK_PRE"), 1, bckPre);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "u_base"), 1, baseU);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "u_lm"), 1, lmU);
+            ops.glUniform4fv(ops.glGetUniformLocation(animProg, "u_ps"), 1, psU);
+            ops.glUniform1f(ops.glGetUniformLocation(animProg, "u_luma"), lumaVal);
+            ops.glBindBuffer(kGlArrayBuffer, qvbo);
+            ops.glEnableVertexAttribArray(0u);
+            ops.glVertexAttribPointer(0u, 2, kGlFloat, 0, 8, nullptr);
+            ops.glDrawArrays(kGlTriangleStrip, 0, 4);
+
+            uint8_t px[32 * 32 * 4]{};
+            fnReadPixels(0, 0, 32, 32, kGlRgba, kGlUnsignedByte, px);
+
+            // Exact reference RGB
+            const float ink = smoothstepf(0.05f, 0.22f, lumaVal);
+            const float nx = lmU[0] / std::sqrt(lmU[0] * lmU[0] + 0.72f);
+            const float nup = 0.22f + smoothstepf(0.30f, 2.30f, lmU[1]) * 0.28f;
+            const float nfront = std::sqrt(std::max(0.06f, 1.0f - nx * nx));
+            const float rt = std::max(1.0f - nfront, 0.0f);
+            const float sl = std::clamp(sh[0], 0.0f, 1.5f) * std::clamp(sh2[3], 0.0f, 1.0f);
+            const float warm = std::clamp(sh[1], 0.0f, 1.0f), con = std::clamp(sh[2], 0.0f, 1.0f);
+            const float scool = std::clamp(sh[3], 0.0f, 1.0f), sdark = std::clamp(sh2[0], 0.0f, 1.0f);
+            const float el = std::clamp(sh2[2], 0.08f, 1.50f), elevN = std::clamp(el * 0.63661977f, 0.0f, 1.0f);
+            const float cx = std::cos(sh2[1]), sx = std::sin(sh2[1]), sy = std::sin(el) * 2.60f + 0.18f;
+            const float s2l = std::sqrt(cx * cx + sy * sy);
+            const float diff = std::max(nx * (cx / s2l) + nup * ((sy / s2l) * 1.35f) + nfront * (sx * 0.50f), 0.0f);
+            const float direct = smoothstepf(0.08f, 0.90f, diff);
+            const float hmask = smoothstepf(0.05f, 0.25f, std::max(psU[1], lmU[1]));
+            const float str = sl * ink * (0.35f + 0.65f * hmask);
+            const float amp = 0.40f + 1.20f * con, darkAmp = 0.40f + 1.20f * sdark;
+            const float warmth = 1.0f - smoothstepf(0.10f, 0.85f, elevN);
+            const float sunC[3] = { 1.00f, mixf(0.96f, 0.70f, warmth), mixf(0.86f, 0.34f, warmth) };
+            const float litH[3] = { mixf(0.86f, 1.14f, warm), mixf(0.98f, 1.02f, warm), mixf(1.18f, 0.82f, warm) };
+            const float bckH[3] = { mixf(1.14f, 0.84f, scool), mixf(1.00f, 0.95f, scool), mixf(0.84f, 1.22f, scool) };
+            const float rim = std::max(-sx, 0.0f) * (rt * std::sqrt(rt)) * 0.20f * amp * str;
+            int maxByteDiff = 0;
+            uint8_t expPx[3]{};
+            for (int c = 0; c < 3; ++c) {
+                const float lc = sunC[c] * litH[c] * (1.0f + 0.16f * amp);
+                const float bc = bckH[c] * (1.0f - 0.17f * amp * darkAmp);
+                const float ref = std::clamp(baseU[c] * mixf(1.0f, lc, direct * str) * mixf(1.0f, bc, (1.0f - direct) * str) + sunC[c] * litH[c] * rim, 0.0f, 1.0f);
+                expPx[c] = static_cast<uint8_t>(std::lround(ref * 255.0f));
+                const int d = std::abs(static_cast<int>(px[(16u * 32u + 16u) * 4u + c]) - static_cast<int>(expPx[c]));
+                if (d > maxByteDiff) maxByteDiff = d;
+            }
+            okGlAnimPrecomp = (maxByteDiff <= 2);
+            printf("  Native GL ANIM_FS Precomp pixel check: gpu=(%u,%u,%u) exp=(%u,%u,%u) maxDiff=%d -> %s\n",
+                   px[(16u*32u+16u)*4u+0], px[(16u*32u+16u)*4u+1], px[(16u*32u+16u)*4u+2],
+                   expPx[0], expPx[1], expPx[2], maxByteDiff, okGlAnimPrecomp ? "PASS" : "FAIL");
+        }
+        ops.glDeleteBuffers(1, &qvbo);
+        ops.glDeleteTextures(1, &texA);
+        ops.glDeleteFramebuffers(1, &fboA);
+        if (animProg) ops.glDeleteProgram(animProg);
+
+        wMake(nullptr, nullptr);
+        wDel(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+    }
+
+    // --- 2. ANGLE D3D9 (Part A: 5-tap Vogel + 9-tap early-out) ---
+    bool okAngleComp = false;
+    {
+        SetDllDirectoryW(L"D:\\steam\\steamapps\\common\\Don't Starve Together\\bin64");
+        HMODULE hEgl = LoadLibraryW(L"libEGL.dll");
+        HMODULE hGl  = LoadLibraryW(L"libGLESv2.dll");
+        if (!hEgl || !hGl) {
+            printf("  [FAIL] Could not load ANGLE DLLs for Phase 6 GPU test\n");
+            return false;
+        }
+        using EglGetDisplay_t   = void* (WINAPI*)(HDC);
+        using EglInit_t         = uint32_t (WINAPI*)(void*, int*, int*);
+        using EglChoose_t       = uint32_t (WINAPI*)(void*, const int*, void**, int, int*);
+        using EglCreateSurf_t   = void* (WINAPI*)(void*, void*, HWND, const int*);
+        using EglCreateCtx_t    = void* (WINAPI*)(void*, void*, void*, const int*);
+        using EglMakeCur_t      = uint32_t (WINAPI*)(void*, void*, void*, void*);
+        using EglDestroyCtx_t   = uint32_t (WINAPI*)(void*, void*);
+        using EglDestroySurf_t  = uint32_t (WINAPI*)(void*, void*);
+        using EglTerminate_t    = uint32_t (WINAPI*)(void*);
+
+        HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_p6_angle", 0, 0, 0, 256, 256, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HDC hdc = GetDC(hwnd);
+        void* dpy = reinterpret_cast<EglGetDisplay_t>(GetProcAddress(hEgl, "eglGetDisplay"))(hdc);
+        int maj = 0, min = 0;
+        reinterpret_cast<EglInit_t>(GetProcAddress(hEgl, "eglInitialize"))(dpy, &maj, &min);
+        const int cfgA[] = { 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3021, 8, 0x3040, 4, 0x3038 };
+        void* cfg = nullptr; int n = 0;
+        reinterpret_cast<EglChoose_t>(GetProcAddress(hEgl, "eglChooseConfig"))(dpy, cfgA, &cfg, 1, &n);
+        void* surf = reinterpret_cast<EglCreateSurf_t>(GetProcAddress(hEgl, "eglCreateWindowSurface"))(dpy, cfg, hwnd, nullptr);
+        const int ctxA[] = { 0x3098, 2, 0x3038 };
+        void* ctx = reinterpret_cast<EglCreateCtx_t>(GetProcAddress(hEgl, "eglCreateContext"))(dpy, cfg, nullptr, ctxA);
+        reinterpret_cast<EglMakeCur_t>(GetProcAddress(hEgl, "eglMakeCurrent"))(dpy, surf, surf, ctx);
+
+        auto res = [&](const char* nm) -> void* { return reinterpret_cast<void*>(GetProcAddress(hGl, nm)); };
+        GlShadowOps ops{};
+        ops.glGenFramebuffers          = reinterpret_cast<decltype(ops.glGenFramebuffers)>(res("glGenFramebuffers"));
+        ops.glDeleteFramebuffers       = reinterpret_cast<decltype(ops.glDeleteFramebuffers)>(res("glDeleteFramebuffers"));
+        ops.glBindFramebuffer          = reinterpret_cast<decltype(ops.glBindFramebuffer)>(res("glBindFramebuffer"));
+        ops.glFramebufferTexture2D     = reinterpret_cast<decltype(ops.glFramebufferTexture2D)>(res("glFramebufferTexture2D"));
+        ops.glCheckFramebufferStatus   = reinterpret_cast<decltype(ops.glCheckFramebufferStatus)>(res("glCheckFramebufferStatus"));
+        ops.glGenRenderbuffers         = reinterpret_cast<decltype(ops.glGenRenderbuffers)>(res("glGenRenderbuffers"));
+        ops.glDeleteRenderbuffers      = reinterpret_cast<decltype(ops.glDeleteRenderbuffers)>(res("glDeleteRenderbuffers"));
+        ops.glBindRenderbuffer         = reinterpret_cast<decltype(ops.glBindRenderbuffer)>(res("glBindRenderbuffer"));
+        ops.glRenderbufferStorage      = reinterpret_cast<decltype(ops.glRenderbufferStorage)>(res("glRenderbufferStorage"));
+        ops.glFramebufferRenderbuffer  = reinterpret_cast<decltype(ops.glFramebufferRenderbuffer)>(res("glFramebufferRenderbuffer"));
+        ops.glGenTextures              = reinterpret_cast<decltype(ops.glGenTextures)>(res("glGenTextures"));
+        ops.glDeleteTextures           = reinterpret_cast<decltype(ops.glDeleteTextures)>(res("glDeleteTextures"));
+        ops.glActiveTexture            = reinterpret_cast<decltype(ops.glActiveTexture)>(res("glActiveTexture"));
+        ops.glBindTexture              = reinterpret_cast<decltype(ops.glBindTexture)>(res("glBindTexture"));
+        ops.glTexImage2D               = reinterpret_cast<decltype(ops.glTexImage2D)>(res("glTexImage2D"));
+        ops.glTexParameteri            = reinterpret_cast<decltype(ops.glTexParameteri)>(res("glTexParameteri"));
+        ops.glCreateShader             = reinterpret_cast<decltype(ops.glCreateShader)>(res("glCreateShader"));
+        ops.glShaderSource             = reinterpret_cast<decltype(ops.glShaderSource)>(res("glShaderSource"));
+        ops.glCompileShader            = reinterpret_cast<decltype(ops.glCompileShader)>(res("glCompileShader"));
+        ops.glGetShaderiv              = reinterpret_cast<decltype(ops.glGetShaderiv)>(res("glGetShaderiv"));
+        ops.glGetShaderInfoLog         = reinterpret_cast<decltype(ops.glGetShaderInfoLog)>(res("glGetShaderInfoLog"));
+        ops.glDeleteShader             = reinterpret_cast<decltype(ops.glDeleteShader)>(res("glDeleteShader"));
+        ops.glCreateProgram            = reinterpret_cast<decltype(ops.glCreateProgram)>(res("glCreateProgram"));
+        ops.glAttachShader             = reinterpret_cast<decltype(ops.glAttachShader)>(res("glAttachShader"));
+        ops.glBindAttribLocation       = reinterpret_cast<decltype(ops.glBindAttribLocation)>(res("glBindAttribLocation"));
+        ops.glLinkProgram              = reinterpret_cast<decltype(ops.glLinkProgram)>(res("glLinkProgram"));
+        ops.glGetProgramiv             = reinterpret_cast<decltype(ops.glGetProgramiv)>(res("glGetProgramiv"));
+        ops.glGetProgramInfoLog        = reinterpret_cast<decltype(ops.glGetProgramInfoLog)>(res("glGetProgramInfoLog"));
+        ops.glDeleteProgram            = reinterpret_cast<decltype(ops.glDeleteProgram)>(res("glDeleteProgram"));
+        ops.glUseProgram               = reinterpret_cast<decltype(ops.glUseProgram)>(res("glUseProgram"));
+        ops.glGetUniformLocation       = reinterpret_cast<decltype(ops.glGetUniformLocation)>(res("glGetUniformLocation"));
+        ops.glUniform1f                = reinterpret_cast<decltype(ops.glUniform1f)>(res("glUniform1f"));
+        ops.glUniform1i                = reinterpret_cast<decltype(ops.glUniform1i)>(res("glUniform1i"));
+        ops.glUniform4fv               = reinterpret_cast<decltype(ops.glUniform4fv)>(res("glUniform4fv"));
+        ops.glUniformMatrix4fv         = reinterpret_cast<decltype(ops.glUniformMatrix4fv)>(res("glUniformMatrix4fv"));
+        ops.glGenBuffers               = reinterpret_cast<decltype(ops.glGenBuffers)>(res("glGenBuffers"));
+        ops.glDeleteBuffers            = reinterpret_cast<decltype(ops.glDeleteBuffers)>(res("glDeleteBuffers"));
+        ops.glBindBuffer               = reinterpret_cast<decltype(ops.glBindBuffer)>(res("glBindBuffer"));
+        ops.glBufferData               = reinterpret_cast<decltype(ops.glBufferData)>(res("glBufferData"));
+        ops.glEnableVertexAttribArray  = reinterpret_cast<decltype(ops.glEnableVertexAttribArray)>(res("glEnableVertexAttribArray"));
+        ops.glDisableVertexAttribArray = reinterpret_cast<decltype(ops.glDisableVertexAttribArray)>(res("glDisableVertexAttribArray"));
+        ops.glVertexAttribPointer      = reinterpret_cast<decltype(ops.glVertexAttribPointer)>(res("glVertexAttribPointer"));
+        ops.glDrawArrays               = reinterpret_cast<decltype(ops.glDrawArrays)>(res("glDrawArrays"));
+        ops.glDrawElements             = reinterpret_cast<decltype(ops.glDrawElements)>(res("glDrawElements"));
+        ops.glViewport                 = reinterpret_cast<decltype(ops.glViewport)>(res("glViewport"));
+        ops.glClearColor               = reinterpret_cast<decltype(ops.glClearColor)>(res("glClearColor"));
+        ops.glClear                    = reinterpret_cast<decltype(ops.glClear)>(res("glClear"));
+        ops.glEnable                   = reinterpret_cast<decltype(ops.glEnable)>(res("glEnable"));
+        ops.glDisable                  = reinterpret_cast<decltype(ops.glDisable)>(res("glDisable"));
+        ops.glBlendFunc                = reinterpret_cast<decltype(ops.glBlendFunc)>(res("glBlendFunc"));
+        ops.glBlendFuncSeparate        = reinterpret_cast<decltype(ops.glBlendFuncSeparate)>(res("glBlendFuncSeparate"));
+        ops.glBlendEquation            = reinterpret_cast<decltype(ops.glBlendEquation)>(res("glBlendEquation"));
+        ops.glBlendEquationSeparate    = reinterpret_cast<decltype(ops.glBlendEquationSeparate)>(res("glBlendEquationSeparate"));
+        ops.glDepthFunc                = reinterpret_cast<decltype(ops.glDepthFunc)>(res("glDepthFunc"));
+        ops.glDepthMask                = reinterpret_cast<decltype(ops.glDepthMask)>(res("glDepthMask"));
+        ops.glColorMask                = reinterpret_cast<decltype(ops.glColorMask)>(res("glColorMask"));
+        ops.glGetIntegerv              = reinterpret_cast<decltype(ops.glGetIntegerv)>(res("glGetIntegerv"));
+        ops.glGetError                 = reinterpret_cast<decltype(ops.glGetError)>(res("glGetError"));
+        ops.logFn                      = &TestLog;
+        auto fnReadPixels = reinterpret_cast<GlReadPixels_t>(res("glReadPixels"));
+
+        okAngleComp = runBackendComposite(ops, fnReadPixels, false, "ANGLE D3D9");
+
+        reinterpret_cast<EglMakeCur_t>(GetProcAddress(hEgl, "eglMakeCurrent"))(dpy, nullptr, nullptr, nullptr);
+        reinterpret_cast<EglDestroyCtx_t>(GetProcAddress(hEgl, "eglDestroyContext"))(dpy, ctx);
+        reinterpret_cast<EglDestroySurf_t>(GetProcAddress(hEgl, "eglDestroySurface"))(dpy, surf);
+        reinterpret_cast<EglTerminate_t>(GetProcAddress(hEgl, "eglTerminate"))(dpy);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+    }
+
+    // Part C: ShadowConfig default invariants (strictly lossless temporalStride == 1u & 5-tap entity recv)
+    ShadowConfig defCfg{};
+    const bool cfgDefaultOk = (defCfg.temporalStride == 1u) && !defCfg.fastEntityReceive1Tap;
+    printf("  ShadowConfig defaults (temporalStride=%u fastEntityReceive1Tap=%d): %s\n",
+           defCfg.temporalStride, defCfg.fastEntityReceive1Tap ? 1 : 0, cfgDefaultOk ? "PASS" : "FAIL");
+
+    const bool okAll = okGlComp && okGlAnimPrecomp && okAngleComp && cfgDefaultOk;
+    printf("[PASS] Phase 6B Lossless Live GPU Suite (glComp=%d animPre=%d angleComp=%d cfgDef=%d) -> %s\n",
+           okGlComp ? 1 : 0, okGlAnimPrecomp ? 1 : 0, okAngleComp ? 1 : 0, cfgDefaultOk ? 1 : 0,
+           okAll ? "PASS" : "FAIL");
+    return okAll;
+}
+
+// =============================================================================
+// Test 15: Generic 4-Layer GPU Driver Compat & ColourCube Live Verification
+//   + Real DST shaders.zip (.ksh) Compile/Link across all 5 CC shaders
+//   + Clean Vanilla vs texelFetch Equivalence, Edge/Slice Clamp, 16x AF + LOD Bias Stress
+//   + Compile/Link Failure Rollback, Independent 4-Layer Matrix
+//   + Real Measured CPU/GPU/VRAM Benchmarks (Clause 6)
+// =============================================================================
+static bool LoadZipFileBytes(const std::vector<uint8_t>& zipData,
+                             const char* targetName,
+                             std::vector<uint8_t>& outBytes) {
+    outBytes.clear();
+    if (zipData.size() < 22u) return false;
+    auto rd16 = [&](size_t p) -> uint16_t {
+        return static_cast<uint16_t>(zipData[p]) | (static_cast<uint16_t>(zipData[p + 1u]) << 8);
+    };
+    auto rd32 = [&](size_t p) -> uint32_t {
+        return static_cast<uint32_t>(zipData[p]) |
+               (static_cast<uint32_t>(zipData[p + 1u]) << 8) |
+               (static_cast<uint32_t>(zipData[p + 2u]) << 16) |
+               (static_cast<uint32_t>(zipData[p + 3u]) << 24);
+    };
+
+    size_t eocd = std::string::npos;
+    const size_t minSearch = (zipData.size() > 65557u) ? (zipData.size() - 65557u) : 0u;
+    for (size_t i = zipData.size() - 22u;; --i) {
+        if (rd32(i) == 0x06054B50u) {
+            eocd = i;
+            break;
+        }
+        if (i == minSearch) break;
+    }
+    if (eocd == std::string::npos) return false;
+
+    const uint16_t cdCount = rd16(eocd + 10u);
+    const uint32_t cdOff   = rd32(eocd + 16u);
+    if (static_cast<size_t>(cdOff) >= zipData.size()) return false;
+
+    const size_t targetLen = std::strlen(targetName);
+    size_t cur = cdOff;
+    for (uint16_t idx = 0u; idx < cdCount; ++idx) {
+        if (cur + 46u > zipData.size() || rd32(cur) != 0x02014B50u) return false;
+        const uint16_t method  = rd16(cur + 10u);
+        const uint32_t compSz  = rd32(cur + 20u);
+        const uint32_t uncompSz = rd32(cur + 24u);
+        const uint16_t nameLen = rd16(cur + 28u);
+        const uint16_t exLen   = rd16(cur + 30u);
+        const uint16_t cmtLen  = rd16(cur + 32u);
+        const uint32_t lfhOff  = rd32(cur + 42u);
+        if (cur + 46u + nameLen > zipData.size()) return false;
+        const bool match = (nameLen == targetLen) &&
+                           (std::memcmp(zipData.data() + cur + 46u, targetName, targetLen) == 0);
+        cur += 46u + nameLen + exLen + cmtLen;
+        if (!match) continue;
+
+        if (static_cast<size_t>(lfhOff) + 30u > zipData.size() || rd32(lfhOff) != 0x04034B50u) {
+            return false;
+        }
+        const uint16_t lNameLen = rd16(lfhOff + 26u);
+        const uint16_t lExLen   = rd16(lfhOff + 28u);
+        const size_t dataOff = static_cast<size_t>(lfhOff) + 30u + lNameLen + lExLen;
+        if (dataOff + compSz > zipData.size()) return false;
+
+        if (method == 0u) {
+            outBytes.assign(zipData.begin() + static_cast<ptrdiff_t>(dataOff),
+                            zipData.begin() + static_cast<ptrdiff_t>(dataOff + compSz));
+            return true;
+        }
+        if (method == 8u) {
+            outBytes.resize(uncompSz);
+            libdeflate_decompressor* dec = libdeflate_alloc_decompressor();
+            if (!dec) return false;
+            size_t actualOut = 0u;
+            const auto res = libdeflate_deflate_decompress(
+                dec, zipData.data() + dataOff, compSz, outBytes.data(), outBytes.size(), &actualOut);
+            libdeflate_free_decompressor(dec);
+            if (res != LIBDEFLATE_SUCCESS || actualOut != outBytes.size()) {
+                outBytes.clear();
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static bool UnpackKleiKshSources(const std::vector<uint8_t>& blob,
+                                 std::string& outVs,
+                                 std::string& outFs) {
+    outVs.clear();
+    outFs.clear();
+    size_t off = 0u;
+    auto rdU32 = [&](uint32_t& v) -> bool {
+        if (off + 4u > blob.size()) return false;
+        std::memcpy(&v, blob.data() + off, 4u);
+        off += 4u;
+        return true;
+    };
+    auto rdStr = [&](std::string& s) -> bool {
+        uint32_t n = 0u;
+        if (!rdU32(n) || off + n > blob.size()) return false;
+        size_t slen = n;
+        while (slen > 0u && blob[off + slen - 1u] == 0u) --slen;
+        s.assign(reinterpret_cast<const char*>(blob.data() + off), slen);
+        off += n;
+        return true;
+    };
+    std::string effectName, vsName, fsName;
+    uint32_t nu = 0u;
+    if (!rdStr(effectName) || !rdU32(nu)) return false;
+    for (uint32_t i = 0u; i < nu; ++i) {
+        std::string un, sem;
+        uint32_t ut = 0u, cnt = 0u;
+        if (!rdStr(un) || !rdStr(sem) || !rdU32(ut) || !rdU32(cnt)) return false;
+        if (ut != 0x2Bu) {
+            uint32_t nf = 0u;
+            if (!rdU32(nf) || off + static_cast<size_t>(nf) * 4u > blob.size()) return false;
+            off += static_cast<size_t>(nf) * 4u;
+        }
+    }
+    if (!rdStr(vsName) || !rdStr(outVs) || !rdStr(fsName) || !rdStr(outFs)) return false;
+    return !outVs.empty() && !outFs.empty();
+}
+
+static bool TestGpuDriverCompatLiveSuite() {
+    printf("\n=== Test 15: Generic 4-Layer GPU Driver Compat & Live DST ColourCube Suite ===\n");
+    using namespace hs_gpu_compat;
+    using namespace hs_native_gl;
+
+    // 1. Real ProbeNativeEs2Support independent 4-layer matrix
+    bool okProbeMatrix = true;
+    double startupCanaryMs = 0.0;
+    {
+        WglRuntime rt{};
+        CompatConfig cAll{};
+        const auto pAll = ProbeNativeEs2Support(BackendMode::Auto, rt, cAll);
+        startupCanaryMs = pAll.canary.elapsedMs;
+        const bool m1 = pAll.supported && pAll.canary.ran && pAll.canary.passed &&
+                        pAll.ccTexelFetchReady && (pAll.canary.decision == "native_gl_texelfetch");
+        printf("  Matrix[All ON]: sup=%d ran=%d pass=%d tf=%d pf=%d(arb=%d,rgba=%d/%d/%d/%d,ds=%d/%d,10b=%d) maxErr=%d ms=%.2f dec=%s\n",
+               pAll.supported ? 1 : 0, pAll.canary.ran ? 1 : 0, pAll.canary.passed ? 1 : 0,
+               pAll.ccTexelFetchReady ? 1 : 0, pAll.pfdInfo.pixelFormat, pAll.pfdInfo.usedArbChoose ? 1 : 0,
+               pAll.pfdInfo.redBits, pAll.pfdInfo.greenBits, pAll.pfdInfo.blueBits, pAll.pfdInfo.alphaBits,
+               pAll.pfdInfo.depthBits, pAll.pfdInfo.stencilBits, pAll.pfdInfo.is10BitRgb ? 1 : 0,
+               pAll.canary.maxErr, pAll.canary.elapsedMs, pAll.canary.decision.c_str());
+
+        CompatConfig cNoTf{}; cNoTf.enableCcTexelFetch = false;
+        const auto pNoTf = ProbeNativeEs2Support(BackendMode::Auto, rt, cNoTf);
+        const bool m2 = pNoTf.supported && pNoTf.canary.ran && pNoTf.canary.passed && !pNoTf.ccTexelFetchReady;
+        printf("  Matrix[Layer1 OFF]: sup=%d pass=%d tf=%d dec=%s\n",
+               pNoTf.supported ? 1 : 0, pNoTf.canary.passed ? 1 : 0, pNoTf.ccTexelFetchReady ? 1 : 0, pNoTf.canary.decision.c_str());
+
+        CompatConfig cNoRgb{}; cNoRgb.enableCcRgbNormalize = false;
+        const auto pNoRgb = ProbeNativeEs2Support(BackendMode::Auto, rt, cNoRgb);
+        const bool m3 = pNoRgb.supported && pNoRgb.canary.ran && pNoRgb.canary.passed;
+        printf("  Matrix[Layer2 OFF (raw GL_RGB)]: sup=%d pass=%d maxErr=%d dec=%s\n",
+               pNoRgb.supported ? 1 : 0, pNoRgb.canary.passed ? 1 : 0, pNoRgb.canary.maxErr, pNoRgb.canary.decision.c_str());
+
+        CompatConfig cNoArb{}; cNoArb.enableWglExactPfd = false;
+        const auto pNoArb = ProbeNativeEs2Support(BackendMode::Auto, rt, cNoArb);
+        const bool m4 = pNoArb.supported && !pNoArb.pfdInfo.usedArbChoose && (pNoArb.pfdInfo.pixelFormat > 0);
+        printf("  Matrix[Layer3 OFF (legacy PFD)]: sup=%d pf=%d arb=%d pass=%d\n",
+               pNoArb.supported ? 1 : 0, pNoArb.pfdInfo.pixelFormat, pNoArb.pfdInfo.usedArbChoose ? 1 : 0, pNoArb.canary.passed ? 1 : 0);
+
+        CompatConfig cNoCan{}; cNoCan.enableGlCanaryProbe = false;
+        const auto pNoCan = ProbeNativeEs2Support(BackendMode::Auto, rt, cNoCan);
+        const bool m5 = pNoCan.supported && !pNoCan.canary.ran && pNoCan.ccTexelFetchReady && (pNoCan.canary.decision == "disabled_by_config");
+        printf("  Matrix[Layer4 OFF]: sup=%d ran=%d tf=%d dec=%s\n",
+               pNoCan.supported ? 1 : 0, pNoCan.canary.ran ? 1 : 0, pNoCan.ccTexelFetchReady ? 1 : 0, pNoCan.canary.decision.c_str());
+
+        okProbeMatrix = m1 && m2 && m3 && m4 && m5;
+        if (!okProbeMatrix) {
+            printf("  [FAIL] Probe matrix failed: m1=%d m2=%d m3=%d m4=%d m5=%d\n", m1?1:0, m2?1:0, m3?1:0, m4?1:0, m5?1:0);
+            return false;
+        }
+    }
+
+    // 2. Load real DST shaders.zip (read-only) and verify all 5 ColourCube .ksh shaders compile/link live
+    std::vector<uint8_t> zipBytes;
+    {
+        FILE* f = _wfopen(L"D:\\steam\\steamapps\\common\\Don't Starve Together\\data\\databundles\\shaders.zip", L"rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            const long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz > 0) {
+                zipBytes.resize(static_cast<size_t>(sz));
+                const size_t rd = fread(zipBytes.data(), 1, zipBytes.size(), f);
+                zipBytes.resize(rd);
+            }
+            fclose(f);
+        }
+    }
+
+    struct CcKshCase {
+        const char* zipEntry;
+        bool        fromZip;
+        std::string vs;
+        std::string fs;
+    };
+    std::vector<CcKshCase> kshCases = {
+        { "shaders/postprocess_colourcube.ksh",            false, {}, {} },
+        { "shaders/postprocess_colourcube_linedistort.ksh",false, {}, {} },
+        { "shaders/combine_colour_cubes.ksh",              false, {}, {} },
+        { "shaders/ui_cc.ksh",                             false, {}, {} },
+        { "shaders/ui_anim_cc.ksh",                        false, {}, {} },
+    };
+    int zipLoadedCount = 0;
+    for (auto& kc : kshCases) {
+        std::vector<uint8_t> raw;
+        if (!zipBytes.empty() && LoadZipFileBytes(zipBytes, kc.zipEntry, raw) &&
+            UnpackKleiKshSources(raw, kc.vs, kc.fs)) {
+            kc.fromZip = true;
+            ++zipLoadedCount;
+        }
+    }
+    printf("  Real DST shaders.zip ColourCube .ksh loaded: %d/5\n", zipLoadedCount);
+    if (!zipBytes.empty() && zipLoadedCount != 5) {
+        printf("  [FAIL] shaders.zip found on disk but failed extracting all 5 ColourCube .ksh shaders!\n");
+        return false;
+    }
+
+    // Open live Native WGL context using production CreateGameEs2Context + ResolveLiveGlesTable
+    WglRuntime rt{};
+    const auto p0 = ProbeNativeEs2Support(BackendMode::Auto, rt, CompatConfig{});
+    if (!p0.supported) {
+        printf("  [FAIL] Native GL probe unsupported: %s\n", p0.reason.c_str());
+        return false;
+    }
+    HWND hwnd = CreateWindowExW(0, L"STATIC", L"hs_compat_gpu", WS_POPUP, 0, 0, 64, 64,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HDC hdc = nullptr;
+    HGLRC rc = nullptr;
+    if (!hwnd || !CreateGameEs2Context(rt, hwnd, hdc, rc) || !rt.pWglMakeCurrent(hdc, rc)) {
+        printf("  [FAIL] CreateGameEs2Context failed\n");
+        return false;
+    }
+    void* procs[76]{};
+    OptionalGlProcs opt{};
+    ResolveLiveGlesTable(rt, procs, opt);
+    const CanaryGlOps gl = BuildCanaryGlOps(rt);
+    auto fnGenQ = reinterpret_cast<void (WINAPI*)(int32_t, uint32_t*)>(opt.glGenQueries);
+    auto fnDelQ = reinterpret_cast<void (WINAPI*)(int32_t, const uint32_t*)>(opt.glDeleteQueries);
+    auto fnBegQ = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t)>(opt.glBeginQuery);
+    auto fnEndQ = reinterpret_cast<void (WINAPI*)(uint32_t)>(opt.glEndQuery);
+    auto fnGetQ = reinterpret_cast<void (WINAPI*)(uint32_t, uint32_t, uint64_t*)>(opt.glGetQueryObjectui64v);
+
+    const char* ven = rt.pGlGetString(0x1F00u);
+    const char* ren = rt.pGlGetString(0x1F01u);
+    const char* ver = rt.pGlGetString(0x1F02u);
+    int glMaj = 0, glMin = 0;
+    ParseEsVersion(ver ? ver : "", glMaj, glMin);
+    const int legalVer = SelectLegalCompatGlslVersion(glMaj, glMin, 100);
+    printf("  Live GPU: vendor='%s' renderer='%s' version='%s' legalGlsl=%d\n",
+           ven ? ven : "", ren ? ren : "", ver ? ver : "", legalVer);
+
+    auto compileAndLinkPair = [&](const std::string& vsSrc, const std::string& fsSrc, uint32_t& outProg, std::string& outErr) -> bool {
+        outProg = 0u;
+        outErr.clear();
+        auto comp = [&](uint32_t type, const std::string& src, const char* lbl) -> uint32_t {
+            uint32_t s = gl.glCreateShader(type);
+            const char* p = src.c_str();
+            int32_t len = static_cast<int32_t>(src.size());
+            gl.glShaderSource(s, 1, &p, &len);
+            gl.glCompileShader(s);
+            int32_t ok = 0;
+            gl.glGetShaderiv(s, 0x8B81u, &ok);
+            if (!ok) {
+                char log[512]{};
+                int32_t l = 0;
+                if (gl.glGetShaderInfoLog) gl.glGetShaderInfoLog(s, 511, &l, log);
+                outErr = std::string(lbl) + ": " + log;
+                gl.glDeleteShader(s);
+                return 0u;
+            }
+            return s;
+        };
+        uint32_t vs = comp(kGlVertexShader, vsSrc, "VS");
+        if (!vs) return false;
+        uint32_t fs = comp(kGlFragmentShader, fsSrc, "FS");
+        if (!fs) { gl.glDeleteShader(vs); return false; }
+        uint32_t p = gl.glCreateProgram();
+        gl.glAttachShader(p, vs);
+        gl.glAttachShader(p, fs);
+        gl.glBindAttribLocation(p, 0u, "POSITION");
+        gl.glBindAttribLocation(p, 1u, "TEXCOORD0");
+        gl.glLinkProgram(p);
+        gl.glDeleteShader(vs);
+        gl.glDeleteShader(fs);
+        int32_t lok = 0;
+        gl.glGetProgramiv(p, 0x8B82u, &lok);
+        if (!lok) {
+            char log[512]{};
+            int32_t l = 0;
+            if (gl.glGetProgramInfoLog) gl.glGetProgramInfoLog(p, 511, &l, log);
+            outErr = std::string("LINK: ") + log;
+            gl.glDeleteProgram(p);
+            return false;
+        }
+        outProg = p;
+        return true;
+    };
+
+    // Compile & link ALL 5 real DST ColourCube shaders promoted to legalVer + texelFetch
+    bool all5Compiled = true;
+    std::string ppRealVs = kDstStockPostProcessCcVs, ppRealFs = kDstStockPostProcessCcFs;
+    for (const auto& kc : kshCases) {
+        if (!kc.fromZip) continue;
+        std::string vs = kc.vs, fs = kc.fs;
+        uint32_t taps = 0u;
+        const bool pOk = PromoteGlslVersionCompat(vs, legalVer) &&
+                         PromoteGlslVersionCompat(fs, legalVer) &&
+                         TransformColourCubeTexelFetchShaderSource(fs, taps) && (taps > 0u);
+        uint32_t prog = 0u;
+        std::string err;
+        const bool lOk = pOk && compileAndLinkPair(vs, fs, prog, err);
+        if (std::strcmp(kc.zipEntry, "shaders/postprocess_colourcube.ksh") == 0) {
+            ppRealVs = kc.vs;
+            ppRealFs = kc.fs;
+        }
+        printf("  5-Shader Live Compile/Link [%s]: pOk=%d lOk=%d taps=%u err=%s\n",
+               kc.zipEntry, pOk ? 1 : 0, lOk ? 1 : 0, taps, err.empty() ? "none" : err.c_str());
+        if (prog) gl.glDeleteProgram(prog);
+        if (!lOk) all5Compiled = false;
+    }
+    if (!all5Compiled) {
+        rt.pWglMakeCurrent(nullptr, nullptr);
+        rt.pWglDeleteContext(rc);
+        ReleaseDC(hwnd, hdc);
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    // 3. Clean Vanilla (AF=1x, LOD bias=0) vs Promoted texelFetch Equivalence + Edge/Seam Grid + Hostile 16x AF + +4.0 LOD Bias Stress + Rollback
+    uint32_t progVanilla = 0u, progFetch = 0u;
+    std::string errMsg;
+    {
+        std::string vVs = ppRealVs, vFs = ppRealFs;
+        vVs.insert(0u, "#version 100\n");
+        vFs.insert(0u, "#version 100\n");
+        if (!compileAndLinkPair(vVs, vFs, progVanilla, errMsg)) {
+            printf("  [FAIL] compile vanilla CC failed: %s\n", errMsg.c_str());
+            return false;
+        }
+        std::string fVs = ppRealVs, fFs = ppRealFs;
+        uint32_t taps = 0u;
+        PromoteGlslVersionCompat(fVs, legalVer);
+        PromoteGlslVersionCompat(fFs, legalVer);
+        TransformColourCubeTexelFetchShaderSource(fFs, taps);
+        if (!compileAndLinkPair(fVs, fFs, progFetch, errMsg)) {
+            printf("  [FAIL] compile texelFetch CC failed: %s\n", errMsg.c_str());
+            return false;
+        }
+
+        // Compile/link failure rollback verification on live driver
+        std::string brokenVs = fVs, brokenFs = fFs + "\nTHIS_IS_A_DELIBERATE_SYNTAX_ERROR;\n";
+        uint32_t badProg = 0u;
+        std::string badErr;
+        const bool brokenFailed = !compileAndLinkPair(brokenVs, brokenFs, badProg, badErr);
+        uint32_t recovProg = 0u;
+        std::string recovErr;
+        const bool recoveredOk = compileAndLinkPair(vVs, vFs, recovProg, recovErr);
+        if (recovProg) gl.glDeleteProgram(recovProg);
+        printf("  Rollback check: syntaxErrorFailed=%d vanillaRecovered=%d\n", brokenFailed ? 1 : 0, recoveredOk ? 1 : 0);
+        if (!brokenFailed || !recoveredOk) return false;
+    }
+
+    // Edge/slice/half-texel/quad-jump 32x16 test scene
+    std::vector<uint8_t> scene32x16(32u * 16u * 4u);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 32; ++x) {
+            const size_t i = (static_cast<size_t>(y) * 32u + static_cast<size_t>(x)) * 4u;
+            if (y == 0) {
+                // Exact LUT R indices 0..31 on G=0, B=0
+                scene32x16[i+0] = static_cast<uint8_t>(std::lround(static_cast<double>(x) * 255.0 / 31.0));
+                scene32x16[i+1] = 0u;
+                scene32x16[i+2] = 0u;
+            } else if (y == 1) {
+                // Exact LUT B slice boundaries 0..31 + alternating extreme slice seam
+                scene32x16[i+0] = static_cast<uint8_t>((x * 13) & 0xFF);
+                scene32x16[i+1] = static_cast<uint8_t>(255 - x * 7);
+                scene32x16[i+2] = static_cast<uint8_t>(std::lround(static_cast<double>(x) * 255.0 / 31.0));
+            } else if (y == 2) {
+                // Mid-slice (k + 0.5) * (255/31) to exercise trilinear B mix & intra-quad slice ping-pong
+                scene32x16[i+0] = static_cast<uint8_t>(std::lround((static_cast<double>(x % 31) + 0.5) * 255.0 / 31.0));
+                scene32x16[i+1] = static_cast<uint8_t>(std::lround((static_cast<double>((x * 7) % 31) + 0.5) * 255.0 / 31.0));
+                scene32x16[i+2] = (x & 1) ? 255u : 0u;
+            } else {
+                scene32x16[i+0] = static_cast<uint8_t>((x * 29 + y * 17) & 0xFF);
+                scene32x16[i+1] = static_cast<uint8_t>((x * 11 + y * 43) & 0xFF);
+                scene32x16[i+2] = static_cast<uint8_t>((x * 53 + y * 19) & 0xFF);
+            }
+            scene32x16[i+3] = 255u;
+        }
+    }
+
+    std::vector<uint8_t> styleRgb24, styleRgba;
+    BuildStylizedNonIdentityColourCubeRgb24(styleRgb24);
+    ExpandRgb24ToRgba32(styleRgb24.data(), 1024, 32, 4, styleRgba);
+
+    uint32_t texScene = 0u, texLut = 0u, texOut = 0u, fbo = 0u, vbo = 0u;
+    gl.glGenTextures(1, &texScene);
+    gl.glGenTextures(1, &texLut);
+    gl.glGenTextures(1, &texOut);
+    gl.glGenFramebuffers(1, &fbo);
+    gl.glGenBuffers(1, &vbo);
+
+    static constexpr float kQuadPosUv[4 * 5] = {
+        -1.0f,-1.0f,0.0f, 0.0f,0.0f,
+         1.0f,-1.0f,0.0f, 1.0f,0.0f,
+        -1.0f, 1.0f,0.0f, 0.0f,1.0f,
+         1.0f, 1.0f,0.0f, 1.0f,1.0f,
+    };
+    gl.glBindBuffer(kGlArrayBuffer, vbo);
+    gl.glBufferData(kGlArrayBuffer, sizeof(kQuadPosUv), kQuadPosUv, kGlStaticDraw);
+    gl.glEnableVertexAttribArray(0u);
+    gl.glEnableVertexAttribArray(1u);
+    gl.glVertexAttribPointer(0u, 3, kGlFloat, 0u, 20, reinterpret_cast<const void*>(0));
+    gl.glVertexAttribPointer(1u, 2, kGlFloat, 0u, 20, reinterpret_cast<const void*>(12));
+
+    gl.glActiveTexture(kGlTexture0);
+    gl.glBindTexture(kGlTexture2D, texScene);
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlNearest));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlNearest));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<int32_t>(kGlClampToEdge));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<int32_t>(kGlClampToEdge));
+    gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 32, 16, 0, kGlRgba, kGlUnsignedByte, scene32x16.data());
+
+    gl.glBindTexture(kGlTexture2D, texOut);
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlNearest));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlNearest));
+    gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 32, 16, 0, kGlRgba, kGlUnsignedByte, nullptr);
+
+    gl.glBindTexture(kGlTexture2D, texLut);
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlLinear));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlLinear));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureWrapS, static_cast<int32_t>(kGlClampToEdge));
+    gl.glTexParameteri(kGlTexture2D, kGlTextureWrapT, static_cast<int32_t>(kGlClampToEdge));
+    gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 1024, 32, 0, kGlRgba, kGlUnsignedByte, styleRgba.data());
+
+    gl.glBindFramebuffer(kGlFramebuffer, fbo);
+    gl.glFramebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, kGlTexture2D, texOut, 0);
+    gl.glDisable(kGlBlend);
+    gl.glDisable(kGlDepthTest);
+    gl.glViewport(0, 0, 32, 16);
+
+    auto runPp = [&](uint32_t prog, std::vector<uint8_t>& outRgba) {
+        gl.glUseProgram(prog);
+        gl.glActiveTexture(kGlTexture0);
+        gl.glBindTexture(kGlTexture2D, texScene);
+        gl.glActiveTexture(kGlTexture0 + 1u);
+        gl.glBindTexture(kGlTexture2D, texLut);
+        gl.glUniform1i(gl.glGetUniformLocation(prog, "SAMPLER[0]"), 0);
+        gl.glUniform1i(gl.glGetUniformLocation(prog, "SAMPLER[1]"), 1);
+        gl.glDrawArrays(kGlTriangleStrip, 0, 4);
+        gl.glFinish();
+        outRgba.resize(32u * 16u * 4u);
+        gl.glReadPixels(0, 0, 32, 16, kGlRgba, kGlUnsignedByte, outRgba.data());
+    };
+
+    std::vector<uint8_t> outVanClean, outFetchClean, outFetchHostile;
+    runPp(progVanilla, outVanClean);
+    runPp(progFetch,   outFetchClean);
+
+    // Hostile driver override stress: force max hardware Anisotropic Filtering + +4.0 LOD bias on LUT
+    gl.glActiveTexture(kGlTexture0 + 1u);
+    gl.glBindTexture(kGlTexture2D, texLut);
+    if (p0.hasAniso && gl.glTexParameterf) {
+        float hwMax = 1.0f;
+        if (gl.glGetFloatv) gl.glGetFloatv(kGlMaxTexMaxAnisotropyExt, &hwMax);
+        if (hwMax > 1.0f && hwMax <= 64.0f) {
+            gl.glTexParameterf(kGlTexture2D, kGlTextureMaxAnisotropyExt, hwMax);
+        }
+    }
+    if (gl.glTexParameterf) {
+        gl.glTexParameterf(kGlTexture2D, 0x8501u /*GL_TEXTURE_LOD_BIAS*/, 4.0f);
+    }
+    runPp(progFetch, outFetchHostile);
+
+    int maxCleanVsVan = 0, maxHostileVsVan = 0, maxFetchVsCpu = 0;
+    for (int i = 0; i < 32 * 16; ++i) {
+        const size_t idx = static_cast<size_t>(i) * 4u;
+        float refRgb[3]{};
+        EvalReferenceApplyColourCubeRgb(
+            styleRgb24.data(),
+            scene32x16[idx+0] / 255.0f, scene32x16[idx+1] / 255.0f, scene32x16[idx+2] / 255.0f, refRgb);
+        for (int c = 0; c < 4; ++c) {
+            maxCleanVsVan   = std::max(maxCleanVsVan,   std::abs(int(outFetchClean[idx+c])   - int(outVanClean[idx+c])));
+            maxHostileVsVan = std::max(maxHostileVsVan, std::abs(int(outFetchHostile[idx+c]) - int(outVanClean[idx+c])));
+            if (c < 3) {
+                const int expV = static_cast<int>(std::lround(refRgb[c] * 255.0f));
+                maxFetchVsCpu = std::max(maxFetchVsCpu, std::abs(int(outFetchClean[idx+c]) - expV));
+            }
+        }
+    }
+    printf("  Equivalence (512 edge/seam/quad px): texelFetch vs CleanVanilla maxDiff=%d, Hostile16xAF+LOD4 maxDiff=%d, texelFetch vs CPU maxDiff=%d\n",
+           maxCleanVsVan, maxHostileVsVan, maxFetchVsCpu);
+
+    // 4. Real Measured Performance Benchmarks (Clause 6)
+    // (a) CPU ExpandRgb24ToRgba32(1024x32) median / P95 (us)
+    double expandMedUs = 0.0, expandP95Us = 0.0;
+    {
+        LARGE_INTEGER freq{}, q0{}, q1{};
+        QueryPerformanceFrequency(&freq);
+        std::vector<double> samplesUs;
+        std::vector<uint8_t> tmpOut;
+        for (int it = 0; it < 110; ++it) {
+            QueryPerformanceCounter(&q0);
+            ExpandRgb24ToRgba32(styleRgb24.data(), 1024, 32, 4, tmpOut);
+            QueryPerformanceCounter(&q1);
+            if (it >= 10) {
+                samplesUs.push_back(static_cast<double>(q1.QuadPart - q0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart));
+            }
+        }
+        std::sort(samplesUs.begin(), samplesUs.end());
+        expandMedUs = samplesUs[samplesUs.size() / 2u];
+        expandP95Us = samplesUs[(samplesUs.size() * 95u) / 100u];
+    }
+
+    // (b) 1920x1080 fullscreen PostProcess ColourCube GPU GL_TIME_ELAPSED (Vanilla vs texelFetch, 120 frames after 20 warmup)
+    auto bench1080p = [&](uint32_t prog, double& outAvgMs, double& outP95Ms, double& outP99Ms) {
+        outAvgMs = outP95Ms = outP99Ms = 0.0;
+        if (!fnGenQ || !fnDelQ || !fnBegQ || !fnEndQ || !fnGetQ) return;
+
+        // Allocate temporary 1920x1080 scene & output textures
+        uint32_t t1080In = 0u, t1080Out = 0u, fbo1080 = 0u;
+        gl.glGenTextures(1, &t1080In);
+        gl.glGenTextures(1, &t1080Out);
+        gl.glGenFramebuffers(1, &fbo1080);
+        std::vector<uint8_t> pat(1920u * 1080u * 4u, 128u);
+        for (size_t i = 0; i < 1920u * 1080u; ++i) {
+            pat[i*4+0] = static_cast<uint8_t>((i * 17u) & 0xFFu);
+            pat[i*4+1] = static_cast<uint8_t>((i * 31u) & 0xFFu);
+            pat[i*4+2] = static_cast<uint8_t>(((i >> 8) * 23u) & 0xFFu);
+            pat[i*4+3] = 255u;
+        }
+        gl.glActiveTexture(kGlTexture0);
+        gl.glBindTexture(kGlTexture2D, t1080In);
+        gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlNearest));
+        gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlNearest));
+        gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 1920, 1080, 0, kGlRgba, kGlUnsignedByte, pat.data());
+        gl.glBindTexture(kGlTexture2D, t1080Out);
+        gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlNearest));
+        gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlNearest));
+        gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 1920, 1080, 0, kGlRgba, kGlUnsignedByte, nullptr);
+
+        gl.glBindFramebuffer(kGlFramebuffer, fbo1080);
+        gl.glFramebufferTexture2D(kGlFramebuffer, kGlColorAttachment0, kGlTexture2D, t1080Out, 0);
+        gl.glViewport(0, 0, 1920, 1080);
+
+        gl.glUseProgram(prog);
+        gl.glActiveTexture(kGlTexture0);
+        gl.glBindTexture(kGlTexture2D, t1080In);
+        gl.glActiveTexture(kGlTexture0 + 1u);
+        gl.glBindTexture(kGlTexture2D, texLut);
+        gl.glUniform1i(gl.glGetUniformLocation(prog, "SAMPLER[0]"), 0);
+        gl.glUniform1i(gl.glGetUniformLocation(prog, "SAMPLER[1]"), 1);
+
+        uint32_t qid = 0u;
+        fnGenQ(1, &qid);
+        std::vector<double> ms;
+        ms.reserve(120u);
+        for (int fIdx = 0; fIdx < 140; ++fIdx) {
+            if (fIdx >= 20) fnBegQ(0x88BFu /*GL_TIME_ELAPSED*/, qid);
+            gl.glDrawArrays(kGlTriangleStrip, 0, 4);
+            if (fIdx >= 20) {
+                fnEndQ(0x88BFu);
+                uint64_t ns = 0ULL;
+                fnGetQ(qid, 0x8866u /*GL_QUERY_RESULT*/, &ns);
+                ms.push_back(static_cast<double>(ns) * 1e-6);
+            } else {
+                gl.glFinish();
+            }
+        }
+        fnDelQ(1, &qid);
+        gl.glBindFramebuffer(kGlFramebuffer, 0u);
+        gl.glDeleteFramebuffers(1, &fbo1080);
+        gl.glDeleteTextures(1, &t1080In);
+        gl.glDeleteTextures(1, &t1080Out);
+
+        double sum = 0.0;
+        for (double v : ms) sum += v;
+        std::sort(ms.begin(), ms.end());
+        outAvgMs = sum / static_cast<double>(ms.size());
+        outP95Ms = ms[(ms.size() * 95u) / 100u];
+        outP99Ms = ms[(ms.size() * 99u) / 100u];
+    };
+
+    double vanAvgMs = 0.0, vanP95Ms = 0.0, vanP99Ms = 0.0;
+    double fetAvgMs = 0.0, fetP95Ms = 0.0, fetP99Ms = 0.0;
+    bench1080p(progVanilla, vanAvgMs, vanP95Ms, vanP99Ms);
+    bench1080p(progFetch,   fetAvgMs, fetP95Ms, fetP99Ms);
+    const size_t rgbBytes  = 1024u * 32u * 3u;
+    const size_t rgbaBytes = 1024u * 32u * 4u;
+    printf("  [BENCHMARK Measured Local GPU]\n");
+    printf("    - Startup Canary (ProbeNativeEs2Support): %.3f ms\n", startupCanaryMs);
+    printf("    - CPU ExpandRgb24ToRgba32(1024x32):       median=%.2f us, P95=%.2f us\n", expandMedUs, expandP95Us);
+    printf("    - 1920x1080 PostProcess Vanilla texture2D: avg=%.4f ms, P95=%.4f ms, P99=%.4f ms\n", vanAvgMs, vanP95Ms, vanP99Ms);
+    printf("    - 1920x1080 PostProcess texelFetch 2D:     avg=%.4f ms, P95=%.4f ms, P99=%.4f ms (delta=%.4f ms)\n",
+           fetAvgMs, fetP95Ms, fetP99Ms, fetAvgMs - vanAvgMs);
+    printf("    - Extra VRAM per promoted 1024x32 LUT:    +%zu bytes (+%.1f KB; %zu -> %zu bytes), post-promote ShadowRAM=0 bytes\n",
+           rgbaBytes - rgbBytes, static_cast<double>(rgbaBytes - rgbBytes) / 1024.0, rgbBytes, rgbaBytes);
+
+    // 5. Real-GPU Winona Hologram (anim_holo.ksh & ui_anim_holo.ksh) Regression Check
+    bool okHolo = true;
+    {
+        auto patchHoloForEs100 = [](const std::string& rawVs, const std::string& rawFs,
+                                    std::string& outVs, std::string& outFs) {
+            auto prep = [](std::string s) {
+                static constexpr const char* kMed = "precision mediump float;";
+                static constexpr const char* kHi  = "precision highp float;";
+                size_t p = 0u;
+                while ((p = s.find(kMed, p)) != std::string::npos) { s.replace(p, strlen(kMed), kHi); p += strlen(kHi); }
+                static constexpr const char* kU1 = "smoothstep(1., .75, texture2D( HOLO_SAMPLER, lineUV ).g)";
+                static constexpr const char* kF1 = "(1.0 - smoothstep(.75, 1., texture2D( HOLO_SAMPLER, lineUV ).g))";
+                static constexpr const char* kU2 = "smoothstep(1., .75, texture2D( UI_HOLO_SAMPLER, lineUV ).g)";
+                static constexpr const char* kF2 = "(1.0 - smoothstep(.75, 1., texture2D( UI_HOLO_SAMPLER, lineUV ).g))";
+                p = 0u;
+                while ((p = s.find(kU1, p)) != std::string::npos) { s.replace(p, strlen(kU1), kF1); p += strlen(kF1); }
+                p = 0u;
+                while ((p = s.find(kU2, p)) != std::string::npos) { s.replace(p, strlen(kU2), kF2); p += strlen(kF2); }
+                size_t vs = 0u, ve = 0u; int vv = 0;
+                if (!FindGlslVersionLineRange(s, vs, ve, vv)) s.insert(0u, "#version 100\n");
+                return s;
+            };
+            outVs = prep(rawVs);
+            outFs = prep(rawFs);
+        };
+
+        std::string animHoloVs, animHoloFs, uiHoloVs, uiHoloFs;
+        if (!zipBytes.empty()) {
+            std::vector<uint8_t> rawA, rawU;
+            if (LoadZipFileBytes(zipBytes, "shaders/anim_holo.ksh", rawA)) UnpackKleiKshSources(rawA, animHoloVs, animHoloFs);
+            if (LoadZipFileBytes(zipBytes, "shaders/ui_anim_holo.ksh", rawU)) UnpackKleiKshSources(rawU, uiHoloVs, uiHoloFs);
+        }
+        if (animHoloVs.empty() || animHoloFs.empty() || uiHoloVs.empty() || uiHoloFs.empty()) {
+            printf("  [FAIL] Could not load anim_holo.ksh / ui_anim_holo.ksh from shaders.zip!\n");
+            okHolo = false;
+        } else {
+            if (DetectColourCubeShaderKind(animHoloFs) != CcShaderKind::None ||
+                DetectColourCubeShaderKind(uiHoloFs) != CcShaderKind::None) {
+                printf("  [FAIL] DetectColourCubeShaderKind false-positive on anim_holo/ui_anim_holo!\n");
+                okHolo = false;
+            }
+            std::string aVs, aFs, uVs, uFs, aErr, uErr;
+            patchHoloForEs100(animHoloVs, animHoloFs, aVs, aFs);
+            patchHoloForEs100(uiHoloVs, uiHoloFs, uVs, uFs);
+
+            auto compileHolo = [&](const std::string& vsS, const std::string& fsS, uint32_t& outP, std::string& outE) -> bool {
+                outP = 0u; outE.clear();
+                auto comp = [&](uint32_t ty, const std::string& src, const char* lbl) -> uint32_t {
+                    uint32_t s = gl.glCreateShader(ty);
+                    const char* ptr = src.c_str();
+                    int32_t len = static_cast<int32_t>(src.size());
+                    gl.glShaderSource(s, 1, &ptr, &len);
+                    gl.glCompileShader(s);
+                    int32_t ok = 0; gl.glGetShaderiv(s, kGlCompileStatus, &ok);
+                    if (!ok) {
+                        char buf[512]{}; int32_t il = 0;
+                        if (gl.glGetShaderInfoLog) gl.glGetShaderInfoLog(s, 511, &il, buf);
+                        outE = std::string(lbl) + ": " + buf;
+                        gl.glDeleteShader(s);
+                        return 0u;
+                    }
+                    return s;
+                };
+                uint32_t vs = comp(kGlVertexShader, vsS, "VS"); if (!vs) return false;
+                uint32_t fs = comp(kGlFragmentShader, fsS, "FS"); if (!fs) { gl.glDeleteShader(vs); return false; }
+                uint32_t p = gl.glCreateProgram();
+                gl.glAttachShader(p, vs); gl.glAttachShader(p, fs);
+                gl.glBindAttribLocation(p, 0u, "POS2D_UV");
+                gl.glLinkProgram(p);
+                gl.glDeleteShader(vs); gl.glDeleteShader(fs);
+                int32_t lok = 0; gl.glGetProgramiv(p, kGlLinkStatus, &lok);
+                if (!lok) {
+                    char buf[512]{}; int32_t il = 0;
+                    if (gl.glGetProgramInfoLog) gl.glGetProgramInfoLog(p, 511, &il, buf);
+                    outE = std::string("LINK: ") + buf;
+                    gl.glDeleteProgram(p);
+                    return false;
+                }
+                outP = p; return true;
+            };
+
+            uint32_t progAnimHolo = 0u, progUiHolo = 0u;
+            const bool aOk = compileHolo(aVs, aFs, progAnimHolo, aErr);
+            const bool uOk = compileHolo(uVs, uFs, progUiHolo, uErr);
+            if (!aOk || !uOk) {
+                printf("  [FAIL] Holo compile/link failed (anim=%d:%s ui=%d:%s)\n",
+                       aOk ? 1 : 0, aErr.c_str(), uOk ? 1 : 0, uErr.c_str());
+                okHolo = false;
+            } else {
+                uint32_t texAtlas = 0u, texHoloMask = 0u, texWhite = 0u, vboHolo = 0u;
+                gl.glGenTextures(1, &texAtlas);
+                gl.glGenTextures(1, &texHoloMask);
+                gl.glGenTextures(1, &texWhite);
+                gl.glGenBuffers(1, &vboHolo);
+
+                const uint8_t atlasPx[4] = { 200u, 220u, 255u, 255u };
+                const uint8_t holoPx[4]  = { 128u, 230u, 200u, 255u }; // G=0.90 inside [.75, 1.0]
+                const uint8_t whitePx[4] = { 255u, 255u, 255u, 255u };
+                auto initTex1x1 = [&](uint32_t tex, const uint8_t* rgba) {
+                    gl.glActiveTexture(kGlTexture0);
+                    gl.glBindTexture(kGlTexture2D, tex);
+                    gl.glTexParameteri(kGlTexture2D, kGlTextureMinFilter, static_cast<int32_t>(kGlNearest));
+                    gl.glTexParameteri(kGlTexture2D, kGlTextureMagFilter, static_cast<int32_t>(kGlNearest));
+                    gl.glTexImage2D(kGlTexture2D, 0, static_cast<int32_t>(kGlRgba8), 1, 1, 0, kGlRgba, kGlUnsignedByte, rgba);
+                };
+                initTex1x1(texAtlas, atlasPx);
+                initTex1x1(texHoloMask, holoPx);
+                initTex1x1(texWhite, whitePx);
+
+                static constexpr float kHoloQuad[16] = {
+                    -1.0f,-1.0f, 0.0f,0.0f,
+                     1.0f,-1.0f, 1.0f,0.0f,
+                    -1.0f, 1.0f, 0.0f,1.0f,
+                     1.0f, 1.0f, 1.0f,1.0f,
+                };
+                gl.glBindBuffer(kGlArrayBuffer, vboHolo);
+                gl.glBufferData(kGlArrayBuffer, sizeof(kHoloQuad), kHoloQuad, kGlStaticDraw);
+                gl.glEnableVertexAttribArray(0u);
+                gl.glDisableVertexAttribArray(1u);
+                gl.glVertexAttribPointer(0u, 4, kGlFloat, 0u, 16, reinterpret_cast<const void*>(0));
+
+                gl.glBindFramebuffer(kGlFramebuffer, fbo);
+                gl.glViewport(0, 0, 32, 16);
+                static constexpr float kIdent[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+                static constexpr float kMatW[16]  = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,1,0,1 };
+
+                auto runHoloProg = [&](uint32_t prog, const char* label, bool isUiHolo, uint8_t outPx[4]) -> bool {
+                    gl.glUseProgram(prog);
+                    auto setM4 = [&](const char* nm, const float* m) {
+                        int32_t loc = gl.glGetUniformLocation(prog, nm);
+                        if (loc >= 0) gl.glUniformMatrix4fv(loc, 1, 0u, m);
+                    };
+                    auto setV4 = [&](const char* nm, float x, float y, float z, float w) {
+                        int32_t loc = gl.glGetUniformLocation(prog, nm);
+                        if (loc >= 0) { const float v[4] = { x, y, z, w }; gl.glUniform4fv(loc, 1, v); }
+                    };
+                    auto setV3 = [&](const char* nm, float x, float y, float z) {
+                        int32_t loc = gl.glGetUniformLocation(prog, nm);
+                        if (loc >= 0) { const float v[3] = { x, y, z }; gl.glUniform3fv(loc, 1, v); }
+                    };
+                    setM4("MatrixP", kIdent); setM4("MatrixV", kIdent);
+                    setM4("MatrixW", kMatW);  setM4("STATIC_WORLD_MATRIX", kMatW);
+                    setM4("COLOUR_XFORM", kIdent);
+                    setV4("TIMEPARAMS", 1.23f, 0.0f, 0.0f, 0.0f);
+                    if (isUiHolo) {
+                        setV3("EROSION_PARAMS", 0.0f, 1.23f, -1.0f);
+                    } else {
+                        setV4("EROSION_PARAMS", 0.0f, -0.15f, -1.0f, 0.0f);
+                    }
+                    setV4("LIGHTMAP_WORLD_EXTENTS", 0.0f, 0.0f, 1.0f, 1.0f);
+                    setV4("OCEAN_WORLD_EXTENTS", 0.0f, 0.0f, 1.0f, 1.0f);
+                    setV4("OCEAN_BLEND_PARAMS", 0.0f, 0.0f, 0.0f, 0.0f);
+                    setV3("PARAMS", 0.0f, 1.0f, 0.0f);
+                    setV3("FLOAT_PARAMS", 0.0f, 0.0f, 0.0f);
+                    const uint32_t numSamplers = isUiHolo ? 3u : 5u;
+                    for (uint32_t u = 0u; u < numSamplers; ++u) {
+                        gl.glActiveTexture(kGlTexture0 + u);
+                        gl.glBindTexture(kGlTexture2D, (u == 0u) ? texAtlas : ((u == 2u) ? texHoloMask : texWhite));
+                        char sn[16]{};
+                        std::snprintf(sn, sizeof(sn), "SAMPLER[%u]", u);
+                        int32_t sl = gl.glGetUniformLocation(prog, sn);
+                        if (sl >= 0) gl.glUniform1i(sl, static_cast<int32_t>(u));
+                    }
+                    while (gl.glGetError() != 0u) {}
+                    gl.glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    gl.glClear(kGlColorBufferBit);
+                    gl.glDrawArrays(kGlTriangleStrip, 0, 4);
+                    gl.glFinish();
+                    const uint32_t err = gl.glGetError();
+                    gl.glReadPixels(16, 8, 1, 1, kGlRgba, kGlUnsignedByte, outPx);
+                    printf("  Winona Holo [%s]: RGBA=(%u,%u,%u,%u) glErr=0x%X\n",
+                           label, outPx[0], outPx[1], outPx[2], outPx[3], err);
+                    return (err == 0u) && (outPx[0] > 0u || outPx[1] > 0u || outPx[2] > 0u) && (outPx[3] >= 250u);
+                };
+
+                uint8_t pxA[4]{}, pxU[4]{};
+                if (!runHoloProg(progAnimHolo, "shaders/anim_holo.ksh", false, pxA) ||
+                    !runHoloProg(progUiHolo,   "shaders/ui_anim_holo.ksh", true, pxU)) {
+                    okHolo = false;
+                }
+
+                gl.glBindBuffer(kGlArrayBuffer, 0u);
+                gl.glDeleteBuffers(1, &vboHolo);
+                gl.glDeleteTextures(1, &texAtlas);
+                gl.glDeleteTextures(1, &texHoloMask);
+                gl.glDeleteTextures(1, &texWhite);
+            }
+            if (progAnimHolo) gl.glDeleteProgram(progAnimHolo);
+            if (progUiHolo)   gl.glDeleteProgram(progUiHolo);
+        }
+    }
+
+    gl.glBindFramebuffer(kGlFramebuffer, 0u);
+    gl.glDisableVertexAttribArray(0u);
+    gl.glDisableVertexAttribArray(1u);
+    gl.glDeleteBuffers(1, &vbo);
+    gl.glDeleteFramebuffers(1, &fbo);
+    gl.glDeleteTextures(1, &texScene);
+    gl.glDeleteTextures(1, &texLut);
+    gl.glDeleteTextures(1, &texOut);
+    gl.glDeleteProgram(progVanilla);
+    gl.glDeleteProgram(progFetch);
+
+    rt.pWglMakeCurrent(nullptr, nullptr);
+    rt.pWglDeleteContext(rc);
+    ReleaseDC(hwnd, hdc);
+    DestroyWindow(hwnd);
+
+    const bool okEquiv = (maxCleanVsVan <= 1) && (maxHostileVsVan <= 1) && (maxFetchVsCpu <= 2);
+    const bool okAll = okProbeMatrix && all5Compiled && okEquiv && okHolo;
+    printf("[PASS] Test 15 GPU Driver Compat Live Suite (matrix=%d all5=%d equiv=%d holo=%d) -> %s\n",
+           okProbeMatrix ? 1 : 0, all5Compiled ? 1 : 0, okEquiv ? 1 : 0, okHolo ? 1 : 0, okAll ? "PASS" : "FAIL");
+    return okAll;
+}
+
 int main() {
     bool okGl    = TestNativeOpenGl();
     bool okAngle = TestAngleD3d9();
@@ -7201,11 +8549,13 @@ int main() {
     bool okPhase2 = TestPhase2LiveGpuSuite();
     bool okPhase3 = TestPhase3LiveGpuSuite();
     bool okPhase4 = TestPhase4LiveGpuSuite();
-    if (okGl && okAngle && okMock && okSave && okAba && okM124 && okFlip && okAzdo && okGpuDriven && okPboTex && okPhase2 && okPhase3 && okPhase4) {
-        printf("\n[PASS] ALL 13 DUAL-BACKEND GPU (SHADOW + WATER_REFL + DXGI-FLIP + AZDO-RING + GPU-DRIVEN-BINDLESS + PBO-TEX-RING + PHASE2 + PHASE3 + PHASE4-ANIM-EARLYOUT/1TAP-RECV/64-STENCIL-FLUSH/CLARITY-3-2-1-0-3) + MOCK-GL + CONCURRENT-SAVE + DUAL-CTX + M1/M2/M4 TESTS VERIFIED!\n");
+    bool okPhase6 = TestPhase6LiveGpuSuite();
+    bool okCompat = TestGpuDriverCompatLiveSuite();
+    if (okGl && okAngle && okMock && okSave && okAba && okM124 && okFlip && okAzdo && okGpuDriven && okPboTex && okPhase2 && okPhase3 && okPhase4 && okPhase6 && okCompat) {
+        printf("\n[PASS] ALL 15 DUAL-BACKEND GPU (SHADOW + WATER_REFL + DXGI-FLIP + AZDO-RING + GPU-DRIVEN-BINDLESS + PBO-TEX-RING + PHASE2 + PHASE3 + PHASE4-ANIM-EARLYOUT/1TAP-RECV/64-STENCIL-FLUSH/CLARITY-3-2-1-0-3 + PHASE6B-9TAP-EARLYOUT/ANIMPRECOMP + TEST15-GPU-COMPAT-4LAYER) + MOCK-GL + CONCURRENT-SAVE + DUAL-CTX + M1/M2/M4 TESTS VERIFIED!\n");
         return 0;
     }
-    printf("\n[FAIL] gl=%d angle=%d mock=%d save=%d aba=%d m124=%d flip=%d azdo=%d gpuDriven=%d pboTex=%d phase2=%d phase3=%d phase4=%d\n",
-           okGl ? 1 : 0, okAngle ? 1 : 0, okMock ? 1 : 0, okSave ? 1 : 0, okAba ? 1 : 0, okM124 ? 1 : 0, okFlip ? 1 : 0, okAzdo ? 1 : 0, okGpuDriven ? 1 : 0, okPboTex ? 1 : 0, okPhase2 ? 1 : 0, okPhase3 ? 1 : 0, okPhase4 ? 1 : 0);
+    printf("\n[FAIL] gl=%d angle=%d mock=%d save=%d aba=%d m124=%d flip=%d azdo=%d gpuDriven=%d pboTex=%d phase2=%d phase3=%d phase4=%d phase6=%d compat=%d\n",
+           okGl ? 1 : 0, okAngle ? 1 : 0, okMock ? 1 : 0, okSave ? 1 : 0, okAba ? 1 : 0, okM124 ? 1 : 0, okFlip ? 1 : 0, okAzdo ? 1 : 0, okGpuDriven ? 1 : 0, okPboTex ? 1 : 0, okPhase2 ? 1 : 0, okPhase3 ? 1 : 0, okPhase4 ? 1 : 0, okPhase6 ? 1 : 0, okCompat ? 1 : 0);
     return 1;
 }

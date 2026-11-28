@@ -74,6 +74,8 @@
 #include "gpu_clarity_engine.h"
 #include "pbo_tex_ring.h"
 #include "klei_render_fastpath.h"
+#include "ime_shield.h"
+#include "gpu_driver_compat.h"
 
 namespace {
 
@@ -477,6 +479,9 @@ struct Hd2dProgSlot {
     int32_t       locTint;
     int32_t       locShade;
     int32_t       locShade2;
+    int32_t       locShadeSunPre;
+    int32_t       locShadeLitPre;
+    int32_t       locShadeBckPre;
     int32_t       locOcean;
     int32_t       locOceanPbr;
     int32_t       locShadProj;
@@ -521,6 +526,9 @@ std::atomic<uint32_t>         g_combatVfxDraws{0};
 // v2.9.5 M2 Crash Detective + Dual-Monitor Safe Cursor Clip
 hs_crash_util::CursorClipGuard g_cursorClip;
 hs_crash_util::CrashDetective  g_crashDetective;
+std::atomic<bool>              g_optImeShield{true};
+hs_ime::SmartImeShield         g_imeShield;
+std::atomic<bool>              g_foreignLuaVmDetected{false};
 std::atomic<uint32_t> g_hd2dStateGen{1};
 std::atomic<bool>     g_optHd2dWorldShaders{true};
 std::atomic<float>    g_hd2dMasterStr{0.0f};
@@ -712,6 +720,14 @@ std::atomic<bool> g_nativeGlActive{false};
 std::atomic<bool> g_nativeGlProbed{false};
 std::atomic<bool> g_dxgiFlipProbedOk{false};
 std::atomic<bool> g_nativeIatBound{false};
+// Generic GPU Driver Compatibility & ColourCube Self-Adapter controls (4 independent layers)
+std::atomic<bool> g_compatEnableCcTexelFetch{true};
+std::atomic<bool> g_compatEnableCcRgbNormalize{true};
+std::atomic<bool> g_compatEnableWglExactPfd{true};
+std::atomic<bool> g_compatEnableGlCanaryProbe{true};
+std::atomic<bool> g_ccTexelFetchReady{false};
+std::atomic<bool> g_ccRgbNormalizeLiveDisabled{false};
+std::atomic<uint32_t> g_ccRgbPromotedCount{0};
 std::atomic<bool> g_optVbPool{true};
 std::atomic<bool> g_vbPoolHooked{false};
 hs_native_gl::WglRuntime g_wglRt{};
@@ -722,7 +738,14 @@ hs_dxgi_flip::DxgiFlipPresenter& GetDxgiFlip() {
 }
 SRWLOCK  g_nativeGlLock = SRWLOCK_INIT;
 HWND     g_nativeGameHwnd = nullptr;
+std::atomic<HWND> g_lastGameHwnd{nullptr};
 HDC      g_nativeGameHdc  = nullptr;
+
+inline HWND GetActiveGameHwnd() noexcept {
+    if (g_nativeGameHwnd && IsWindow(g_nativeGameHwnd)) return g_nativeGameHwnd;
+    HWND last = g_lastGameHwnd.load(std::memory_order_acquire);
+    return (last && IsWindow(last)) ? last : nullptr;
+}
 std::atomic<int32_t> g_pendingSwapInterval{0};
 std::atomic<uint32_t> g_lastEglError{hs_native_gl::kEglSuccess};
 std::string g_activeGlRendererName = "ANGLE D3D9";
@@ -810,6 +833,9 @@ GlGetShaderInfoLog_t         g_fnGlGetShaderInfoLog = nullptr;
 GlGetProgramInfoLog_t        g_fnGlGetProgramInfoLog = nullptr;
 GlReadPixels_t               g_origGlReadPixels = nullptr;
 GlPixelStorei_t              g_fnGlPixelStorei = nullptr;
+GlPixelStorei_t              g_origGlPixelStorei = nullptr;
+using GlTexSubImage2D_t      = void (WINAPI*)(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset, int32_t width, int32_t height, uint32_t format, uint32_t type, const void* pixels);
+GlTexSubImage2D_t            g_origGlTexSubImage2D = nullptr;
 GlBlitFramebuffer_t          g_fnGlBlitFramebuffer = nullptr;
 GlFenceSync_t                g_fnGlFenceSync = nullptr;
 GlClientWaitSync_t           g_fnGlClientWaitSync = nullptr;
@@ -1445,7 +1471,7 @@ static void ApplyElasticPoolPlan(bool forceLog = false) {
     snap.isNativeGl         = g_nativeGlActive.load(std::memory_order_acquire);
     snap.hasBufferStorage   = g_hwCaps.hasBufferStorage;
     snap.hasSsbo            = g_hwCaps.hasSsbo;
-    snap.hasBindlessTexture = g_hwCaps.hasBindlessTexture;
+    snap.hasBindlessTexture = g_hwCaps.hasNonUniformBindless;
     snap.hasBaseVertex      = g_hwCaps.hasBaseVertex;
     snap.lastAnimEnts       = g_lastAnimEnts.load(std::memory_order_relaxed);
 
@@ -2422,6 +2448,61 @@ static inline bool IsStormScrollOverlayAnim(const Animation* anim) noexcept {
     return (sh0 == 0x95B3FF72u || sh0 == 0xFB87AC44u);
 }
 
+// General geometric detector for any mod/vanilla multi-tile scrolling UI overlay sheet:
+// If >=4 elements in frame[0] share the same symbol_hash and their nearest same-symbol
+// frame[0]->frame[1] translation exceeds 30px (900 sq-px), cross-frame interpolation would
+// tear wrapped seam tiles; keep vanilla discrete stepping (cached per Animation* in TLS).
+static inline bool IsLargeStepTiledUiOverlay(const Animation* anim) noexcept {
+    if (anim == nullptr || anim->num_frames < 2u || anim->frames == nullptr) return false;
+    struct CacheSlot { const Animation* anim = nullptr; bool result = false; };
+    static thread_local CacheSlot tl_cache[8]{};
+    static thread_local uint32_t tl_cursor = 0u;
+    for (const auto& s : tl_cache) {
+        if (s.anim == anim) return s.result;
+    }
+    bool detected = false;
+    const AnimFrame& f0 = anim->frames[0];
+    const AnimFrame& f1 = anim->frames[1];
+    if (f0.num_elements >= 4u && f1.num_elements >= 4u && f0.elements && f1.elements) {
+        const uint32_t lim0 = std::min<uint32_t>(f0.num_elements, 64u);
+        const uint32_t lim1 = std::min<uint32_t>(f1.num_elements, 64u);
+        uint32_t repSym = 0u;
+        uint32_t repCnt = 0u;
+        for (uint32_t i = 0u; i < lim0; ++i) {
+            const uint32_t sh = f0.elements[i].symbol_hash;
+            if (sh == 0u) continue;
+            uint32_t c = 0u;
+            for (uint32_t j = 0u; j < lim0; ++j) {
+                if (f0.elements[j].symbol_hash == sh) ++c;
+            }
+            if (c >= 4u) { repSym = sh; repCnt = c; break; }
+        }
+        if (repCnt >= 4u) {
+            for (uint32_t i = 0u; i < lim0; ++i) {
+                if (f0.elements[i].symbol_hash != repSym) continue;
+                const float x0 = hs_skeletal::HalfToFloat(f0.elements[i].m[4]);
+                const float y0 = hs_skeletal::HalfToFloat(f0.elements[i].m[5]);
+                float minD2 = 1e30f;
+                bool matched = false;
+                for (uint32_t j = 0u; j < lim1; ++j) {
+                    if (f1.elements[j].symbol_hash != repSym) continue;
+                    const float dx = hs_skeletal::HalfToFloat(f1.elements[j].m[4]) - x0;
+                    const float dy = hs_skeletal::HalfToFloat(f1.elements[j].m[5]) - y0;
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < minD2) { minD2 = d2; matched = true; }
+                }
+                if (matched && minD2 > 900.0f) {
+                    detected = true;
+                    break;
+                }
+            }
+        }
+    }
+    tl_cache[tl_cursor & 7u] = { anim, detected };
+    ++tl_cursor;
+    return detected;
+}
+
 static void InterpolateAnimCmdWorldPos(uint8_t* cmd, const void* animPtr, uintptr_t key,
                                        ThreadLocalAnimState& tls, int64_t nowQpc, bool forceRtClock = false) {
     if (!cmd || key == 0) return;
@@ -2554,7 +2635,8 @@ static const void* InterpGetFrameCore(const void* animPtr, int32_t playMode, flo
     if (nframes <= 1 || !anim->frames || !std::isfinite(fps) || !std::isfinite(time) || fps <= 0.0f || fps > 240.0f) {
         return bailOrig();
     }
-    if (IsStormScrollOverlayAnim(anim)) {
+    if (IsStormScrollOverlayAnim(anim) ||
+        (channel == AnimChannel::UI && IsLargeStepTiledUiOverlay(anim))) {
         return bailOrig();
     }
 
@@ -3903,6 +3985,7 @@ void PrepareFastInflatePatch(std::vector<PendingCodePatch>& patches, uint8_t* te
 //     of rhythmic "defer 2 -> slam 0.90ms" sawtooth hitches, preventing STW memory cliffs!
 //------------------------------------------------------------------------------
 extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
+    if (g_foreignLuaVmDetected.load(std::memory_order_relaxed)) return;
     if (!sim || !g_luaGc || !g_setGcBudget) return;
     void* L = *reinterpret_cast<void**>(sim + 0xB0);
     if (!L) return;
@@ -4023,6 +4106,10 @@ extern "C" void FastSmoothCollectGarbage(uint8_t* sim) {
 }
 
 void PrepareSmoothLuaGcHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    if (g_foreignLuaVmDetected.load(std::memory_order_acquire)) {
+        LogMsg("[COMPAT] Foreign Lua VM active -> skipped Simulation::CollectGarbage hook (zero LuaJIT heap conflict).");
+        return;
+    }
     // Simulation::CollectGarbage (0x140102070) masked AOB (verified unique 1-match)
     constexpr uint8_t kPreGc[] = {
         0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x45, 0x33, 0xC0,
@@ -4109,6 +4196,23 @@ void* HyperClientWgLuaAlloc(void* /*ud*/, void* ptr, size_t /*osize*/, size_t ns
     return out;
 }
 
+static bool IsEntryPatchedByExternalHook(const uint8_t* fn) noexcept {
+    if (!fn) return false;
+    // Detect standard x86-64 trampoline / detour prologues placed by external VMs (LuaJIT2/Frida/MinHook):
+    //   E9 rel32                 (near jmp)
+    //   EB rel8                  (short jmp)
+    //   FF 25 rel32              (rip-relative indirect jmp)
+    //   48 B8 imm64 FF E0        (mov rax, imm64; jmp rax)
+    //   49 BB imm64 41 FF E3     (mov r11, imm64; jmp r11)
+    //   68 imm32 C3              (push imm32; ret)
+    if (fn[0] == 0xE9 || fn[0] == 0xEB) return true;
+    if (fn[0] == 0xFF && fn[1] == 0x25) return true;
+    if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) return true;
+    if (fn[0] == 0x49 && fn[1] == 0xBB && fn[10] == 0x41 && fn[11] == 0xFF && fn[12] == 0xE3) return true;
+    if (fn[0] == 0x68 && fn[5] == 0xC3) return true;
+    return false;
+}
+
 static bool IsLuaJitEnvironmentPresent() {
     if (GetModuleHandleW(L"lua51DS.dll") != nullptr ||
         GetModuleHandleW(L"lua51.dll") != nullptr ||
@@ -4137,6 +4241,72 @@ static bool IsLuaJitEnvironmentPresent() {
     return false;
 }
 
+// Unified foreign Lua VM / LuaJIT2 detector (Track 3D):
+// Checks loaded modules + local Winmm.dll proxy + external entry trampolines on Lua VM core
+// functions (lua_newstate, Simulation::CollectGarbage, lua_gc). Intentionally NEVER triggers on
+// luaL_openlibs alone so benign native loaders like DNH (wsock32.dll) keep full Lua Bridge speed!
+static bool DetectForeignLuaVm(uint8_t* textStart, size_t textSize, const char** outReason = nullptr) {
+    auto retReason = [&](const char* r) -> bool {
+        if (outReason) *outReason = r;
+        return true;
+    };
+    if (IsLuaJitEnvironmentPresent()) {
+        return retReason("foreign_lua_module_or_local_winmm");
+    }
+    if (!textStart || textSize < 64u) return false;
+    const uintptr_t textLo = reinterpret_cast<uintptr_t>(textStart);
+    const uintptr_t textHi = textLo + textSize;
+
+    // 1. Probe lua_newstate tail (kSigLuaNewState + 15) if prologue bytes [0..14] were hooked
+    if (FindPatternInText(textStart, textSize, kSigLuaNewState, sizeof(kSigLuaNewState)) == nullptr) {
+        constexpr size_t kTailOff = 15u;
+        if (uint8_t* pTail = FindPatternInText(textStart, textSize,
+                                               kSigLuaNewState + kTailOff,
+                                               sizeof(kSigLuaNewState) - kTailOff)) {
+            if (pTail >= textStart + kTailOff && IsEntryPatchedByExternalHook(pTail - kTailOff)) {
+                return retReason("trampoline_on_lua_newstate");
+            }
+        }
+    }
+
+    // 2. Probe Simulation::CollectGarbage tail & resolved lua_gc entry
+    constexpr uint8_t kPreGc[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x45, 0x33, 0xC0,
+        0x48, 0x8B, 0xF9, 0x48, 0x8B, 0x89, 0xB0, 0x00, 0x00, 0x00, 0x41, 0x8D, 0x50, 0x03, 0xE8
+    };
+    constexpr uint8_t kPostGc[] = {
+        0x3B, 0x87, 0x4C, 0x02, 0x00, 0x00, 0x7E, 0x54, 0x48, 0x8B, 0x8F, 0xB0, 0x00, 0x00, 0x00, 0x45
+    };
+    uint8_t* cs = FindMaskedCallsite(textStart, textSize, kPreGc, sizeof(kPreGc), kPostGc, sizeof(kPostGc));
+    if (!cs) {
+        constexpr size_t kGcTailOff = 13u;
+        if (uint8_t* csTail = FindMaskedCallsite(textStart, textSize,
+                                                 kPreGc + kGcTailOff, sizeof(kPreGc) - kGcTailOff,
+                                                 kPostGc, sizeof(kPostGc))) {
+            if (csTail >= textStart + (sizeof(kPreGc) - 1u)) {
+                uint8_t* fnStart = csTail - (sizeof(kPreGc) - 1u);
+                if (IsEntryPatchedByExternalHook(fnStart)) {
+                    return retReason("trampoline_on_sim_collect_garbage");
+                }
+                cs = csTail;
+            }
+        }
+    }
+    if (cs && cs >= textStart + (sizeof(kPreGc) - 1u)) {
+        uint8_t* fnStart = cs - (sizeof(kPreGc) - 1u);
+        if (fnStart[0x1B] == 0xE8) {
+            int32_t relGc = 0;
+            memcpy(&relGc, fnStart + 0x1C, 4);
+            uint8_t* pLuaGc = fnStart + 0x20 + relGc;
+            const uintptr_t pAddr = reinterpret_cast<uintptr_t>(pLuaGc);
+            if (pAddr >= textLo && pAddr + 16u <= textHi && IsEntryPatchedByExternalHook(pLuaGc)) {
+                return retReason("trampoline_on_lua_gc");
+            }
+        }
+    }
+    return false;
+}
+
 void* HookClientLuaNewState(LuaAlloc_t f, void* ud) {
     if (g_optMimallocLua.load(std::memory_order_relaxed) &&
         GetModuleHandleW(L"lua51DS.dll") == nullptr) {
@@ -4151,7 +4321,7 @@ void* HookClientLuaNewState(LuaAlloc_t f, void* ud) {
 }
 
 void PrepareClientMimallocHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
-    if (IsLuaJitEnvironmentPresent()) {
+    if (g_foreignLuaVmDetected.load(std::memory_order_acquire) || IsLuaJitEnvironmentPresent()) {
         g_optMimallocLua.store(false, std::memory_order_relaxed);
         LogMsg("[COMPAT] Detected LuaJIT2 / local Winmm.dll proxy -> auto-skipped mimalloc lua_newstate hook for 100%% LuaJIT compatibility.");
         return;
@@ -4740,7 +4910,7 @@ extern "C" void HookFrameLimiterWait(FrameLimiterObj* fl, uint8_t /*bSleep*/) {
                         }
                     }
                     s_appFocused = focusedNow;
-                    g_cursorClip.Update(g_nativeGameHwnd);
+                    g_cursorClip.Update(GetActiveGameHwnd());
                 }
                 const bool holdStats = (!s_appFocused) ||
                                        (g_statsTransitionHold.load(std::memory_order_relaxed) != 0) ||
@@ -6562,14 +6732,16 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
     // -------------------------------------------------------------------------
     if (src.find("gl_FragColor") == std::string::npos) {
         // V1. World ANIM vertex shaders (anim, anim_skinned):
-        //     Excludes anim_fade, anim_haunted, anim_fade_haunted, and anim_holo so special
-        //     erosion/hologram/haunted shaders remain 100% vanilla pass-through and never cast
-        //     or mirror world-space shadow/reflection passes.
+        //     Excludes anim_fade, anim_haunted, anim_fade_haunted, anim_holo, ui_anim_holo, and ui_anim_cc
+        //     so special erosion/hologram/haunted/UI-CC shaders remain 100% vanilla pass-through and never
+        //     cast or mirror world-space shadow/reflection passes.
         //     a) Computes per-entity local relief metres (HS_LOCAL_METRES) with 0% batching loss!
         //     b) v2.9.0 World-Space ShadowMask FBO pass (HS_SHADOW_PASS > 0.5) for anim_skinned & unbatched anim:
         //        height-blended 360-deg side-light billboard reorientation + canopy breeze -> ortho NDC!
         if (!hs_sprite_batch::HasDefineLine(src, "FADE_OUT") &&
             !hs_sprite_batch::HasDefineLine(src, "HOLO") &&
+            !hs_sprite_batch::HasDefineLine(src, "UI_HOLO") &&
+            !hs_sprite_batch::HasDefineLine(src, "UI_CC") &&
             !hs_sprite_batch::HasDefineLine(src, "HAUNT") &&
             src.find("attribute vec4 POS2D_UV;") != std::string::npos &&
             src.find("PS_POS = world_pos.xyz;") != std::string::npos &&
@@ -6635,7 +6807,7 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                             "\t\t\t\tvec2 hs_pd = hs_anch - HS_SHADOW_PT.xy;\n"
                             "\t\t\t\tfloat hs_pdist = length(hs_pd);\n"
                             "\t\t\t\tfloat hs_prad = max(HS_SHADOW_PT.z, 1.0);\n"
-                            "\t\t\t\ths_lw = smoothstep(0.42, 1.15, hs_pdist) * smoothstep(hs_prad, hs_prad * 0.25, hs_pdist) * hs_lw;\n"
+                            "\t\t\t\ths_lw = smoothstep(0.42, 1.15, hs_pdist) * (1.0 - smoothstep(hs_prad * 0.25, hs_prad, hs_pdist)) * hs_lw;\n"
                             "\t\t\t\tif (hs_lw <= 0.008) { hs_cull = true; }\n"
                             "\t\t\t\telse {\n"
                             "\t\t\t\t\ths_dir = hs_pd / max(hs_pdist, 0.42);\n"
@@ -6729,7 +6901,7 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                             "\t\t\tvec2 hs_pd = hs_anch - HS_SHADOW_PT.xy;\n"
                             "\t\t\tfloat hs_pdist = length(hs_pd);\n"
                             "\t\t\tfloat hs_prad = max(HS_SHADOW_PT.z, 1.0);\n"
-                            "\t\t\ths_lw = smoothstep(0.42, 1.15, hs_pdist) * smoothstep(hs_prad, hs_prad * 0.25, hs_pdist) * hs_lw;\n"
+                            "\t\t\ths_lw = smoothstep(0.42, 1.15, hs_pdist) * (1.0 - smoothstep(hs_prad * 0.25, hs_prad, hs_pdist)) * hs_lw;\n"
                             "\t\t\tif (hs_lw <= 0.008) { hs_cull = true; }\n"
                             "\t\t\telse {\n"
                             "\t\t\t\ths_dir = hs_pd / max(hs_pdist, 0.42);\n"
@@ -7195,8 +7367,9 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
             "\nuniform vec4 HS_HD2D_PARAMS;\n"
             "uniform vec4 HS_HD2D_SUN;\n"
             "uniform vec4 HS_HD2D_TINT;\n"
-            "uniform vec4 HS_HD2D_SHADE;\n"
-            "uniform vec4 HS_HD2D_SHADE2;\n"
+            "uniform vec4 HS_SHADE_SUN_PRE;\n"
+            "uniform vec4 HS_SHADE_LIT_PRE;\n"
+            "uniform vec4 HS_SHADE_BCK_PRE;\n"
             "uniform vec4 HS_DETAIL_PARAMS;\n"
             "uniform float HS_SHADOW_PASS;\n"
             "uniform vec4 HS_SHADOW_BOUNDS;\n"
@@ -7230,7 +7403,7 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\t\treturn;\n"
                 "\t\t}\n\t\t";
             static constexpr const char* kAnimBody =
-                "\n\t\tif (HS_HD2D_PARAMS.x > 0.001 || HS_HD2D_SHADE.x > 0.001 || HS_RECV_TINT.a > 0.001 || HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
+                "\n\t\tif (HS_HD2D_PARAMS.x > 0.001 || HS_SHADE_LIT_PRE.w > 0.001 || HS_RECV_TINT.a > 0.001 || HS_DETAIL_PARAMS.y > 0.001 || HS_DETAIL_PARAMS.z > 0.001) {\n"
                 "\t\t\tfloat hs_a = gl_FragColor.a;\n"
                 "\t\t\tfloat hs_effMask = step(0.08, hs_a) * (1.0 - smoothstep(0.05, 0.35, LIGHT_OVERRIDE));\n"
                 "\t\t\tfloat hs_aSafe = max(hs_a, 0.001);\n"
@@ -7268,42 +7441,23 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\t\t\t\tvec3 hs_over = max(hs_res - vec3(0.86), vec3(0.0));\n"
                 "\t\t\t\t\ths_res -= hs_over * (0.35 * min(hs_s, 1.0));\n"
                 "\t\t\t\t}\n"
-                "\t\t\t\tif (HS_HD2D_SHADE.x > 0.001 && HS_HD2D_SHADE2.w > 0.005) {\n"
-                "\t\t\t\t\tfloat hs_sl = clamp(HS_HD2D_SHADE.x, 0.0, 1.5) * clamp(HS_HD2D_SHADE2.w, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_warm = clamp(HS_HD2D_SHADE.y, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_con = clamp(HS_HD2D_SHADE.z, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_scool = clamp(HS_HD2D_SHADE.w, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_sdark = clamp(HS_HD2D_SHADE2.x, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_theta = HS_HD2D_SHADE2.y;\n"
-                "\t\t\t\t\tfloat hs_el = clamp(HS_HD2D_SHADE2.z, 0.08, 1.50);\n"
-                "\t\t\t\t\tfloat hs_elev_n = clamp(hs_el * 0.63661977, 0.0, 1.0);\n"
-                "\t\t\t\t\tfloat hs_sun_x = cos(hs_theta);\n"
-                "\t\t\t\t\tfloat hs_sun_f = sin(hs_theta);\n"
+                "\t\t\t\tif (HS_SHADE_LIT_PRE.w > 0.001) {\n"
                 "\t\t\t\t\tfloat hs_lx = HS_LOCAL_METRES.x;\n"
                 "\t\t\t\t\tfloat hs_nx = hs_lx / sqrt(hs_lx * hs_lx + 0.72);\n"
-                "\t\t\t\t\tfloat hs_roof = smoothstep(0.30, 2.30, HS_LOCAL_METRES.y);\n"
-                "\t\t\t\t\tfloat hs_nup = 0.22 + hs_roof * 0.28;\n"
+                "\t\t\t\t\tfloat hs_nup = 0.22 + smoothstep(0.30, 2.30, HS_LOCAL_METRES.y) * 0.28;\n"
                 "\t\t\t\t\tfloat hs_nfront = sqrt(max(0.06, 1.0 - hs_nx * hs_nx));\n"
-                "\t\t\t\t\tvec2 hs_sun2 = normalize(vec2(hs_sun_x, sin(hs_el) * 2.60 + 0.18));\n"
-                "\t\t\t\t\tfloat hs_diff = max(hs_nx * hs_sun2.x + hs_nup * 1.35 * hs_sun2.y + hs_nfront * 0.50 * hs_sun_f, 0.0);\n"
+                "\t\t\t\t\tfloat hs_diff = max(hs_nx * HS_SHADE_SUN_PRE.x + hs_nup * HS_SHADE_SUN_PRE.y + hs_nfront * HS_SHADE_SUN_PRE.z, 0.0);\n"
                 "\t\t\t\t\tfloat hs_direct = smoothstep(0.08, 0.90, hs_diff);\n"
-                "\t\t\t\t\tfloat hs_back = 1.0 - hs_direct;\n"
-                "\t\t\t\t\tfloat hs_amp = 0.40 + 1.20 * hs_con;\n"
-                "\t\t\t\t\tfloat hs_warmth = 1.0 - smoothstep(0.10, 0.85, hs_elev_n);\n"
-                "\t\t\t\t\tvec3 hs_sun_col = mix(vec3(1.0, 0.96, 0.86), vec3(1.0, 0.70, 0.34), hs_warmth);\n"
-                "\t\t\t\t\tvec3 hs_lit_hue = mix(vec3(0.86, 0.98, 1.18), vec3(1.14, 1.02, 0.82), hs_warm);\n"
-                "\t\t\t\t\tvec3 hs_back_hue = mix(vec3(1.14, 1.00, 0.84), vec3(0.84, 0.95, 1.22), hs_scool);\n"
-                "\t\t\t\t\tfloat hs_dark_amp = 0.40 + 1.20 * hs_sdark;\n"
                 "\t\t\t\t\tfloat hs_h_mask = smoothstep(0.05, 0.25, max(PS_POS.y, HS_LOCAL_METRES.y));\n"
-                "\t\t\t\t\tfloat hs_str = hs_sl * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
-                "\t\t\t\t\tvec3 hs_lit_mul = mix(vec3(1.0), hs_sun_col * hs_lit_hue * (1.0 + 0.16 * hs_amp), hs_direct * hs_str);\n"
-                "\t\t\t\t\tvec3 hs_shd_mul = mix(vec3(1.0), hs_back_hue * (1.0 - 0.17 * hs_amp * hs_dark_amp), hs_back * hs_str);\n"
-                "\t\t\t\t\tfloat hs_rim = clamp(-hs_sun_f, 0.0, 1.0) * pow(1.0 - hs_nfront, 1.6) * (0.20 * hs_amp * hs_str);\n"
-                "\t\t\t\t\ths_res = hs_res * hs_lit_mul * hs_shd_mul + hs_sun_col * hs_lit_hue * hs_rim;\n"
+                "\t\t\t\t\tfloat hs_str = HS_SHADE_LIT_PRE.w * hs_ink * (0.35 + 0.65 * hs_h_mask);\n"
+                "\t\t\t\t\tvec3 hs_lit_mul = mix(vec3(1.0), HS_SHADE_LIT_PRE.rgb, hs_direct * hs_str);\n"
+                "\t\t\t\t\tvec3 hs_shd_mul = mix(vec3(1.0), HS_SHADE_BCK_PRE.rgb, (1.0 - hs_direct) * hs_str);\n"
+                "\t\t\t\t\tfloat hs_rt = max(1.0 - hs_nfront, 0.0);\n"
+                "\t\t\t\t\ths_res = hs_res * hs_lit_mul * hs_shd_mul + HS_SHADE_LIT_PRE.rgb * (HS_SHADE_SUN_PRE.w * (hs_rt * sqrt(hs_rt)) * hs_str);\n"
                 "\t\t\t\t}\n"
                 "\t\t\t\tif (HS_RECV_TINT.a > 0.001 && HS_RECV_BOUNDS.w > 0.5) {\n"
                 "\t\t\t\t\tfloat hs_py = max(PS_POS.y, 0.0);\n"
-                "\t\t\t\t\tvec2 hs_rdir = normalize(HS_HD2D_SHAD_PROJ.xy + vec2(1e-6, 0.0));\n"
+                "\t\t\t\t\tvec2 hs_rdir = HS_HD2D_SHAD_PROJ.xy;\n"
                 "\t\t\t\t\tvec2 hs_rg = PS_POS.xz + hs_rdir * (hs_py * HS_HD2D_SHAD_PROJ.z);\n"
                 "\t\t\t\t\tvec2 hs_ruv = (hs_rg - HS_RECV_BOUNDS.xy) * (HS_RECV_BOUNDS.z * 0.5) + 0.5;\n"
                 "\t\t\t\t\tvec2 hs_redge = abs(hs_ruv * 2.0 - 1.0);\n"
@@ -7311,23 +7465,23 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\t\t\t\tif (hs_rin > 0.001) {\n"
                 "\t\t\t\t\t\tfloat hs_occ = 0.0;\n"
                 "\t\t\t\t\t\tif (HS_RECV_BOUNDS.w < 0.75) {\n"
-                "\t\t\t\t\t\t\tvec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
-                "\t\t\t\t\t\t\ths_occ = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+                "\t\t\t\t\t\t\ths_occ = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
                 "\t\t\t\t\t\t} else {\n"
                 "\t\t\t\t\t\t\tvec2 hs_rperp = vec2(-hs_rdir.y, hs_rdir.x);\n"
                 "\t\t\t\t\t\t\tfloat hs_uvs = HS_RECV_BOUNDS.z * 0.5;\n"
                 "\t\t\t\t\t\t\tvec2 hs_dp1 = hs_rperp * (((HS_RECV_BOUNDS.w > 1.5) ? 0.62 : 0.28) * hs_uvs);\n"
                 "\t\t\t\t\t\t\tvec2 hs_dp2 = (HS_RECV_BOUNDS.w > 1.5) ? (hs_rperp * (0.95 * hs_uvs)) : (hs_rdir * (0.22 * hs_uvs));\n"
-                "\t\t\t\t\t\t\tvec4 hs_t0 = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
-                "\t\t\t\t\t\t\tvec4 hs_t1 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
-                "\t\t\t\t\t\t\tvec4 hs_t2 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
-                "\t\t\t\t\t\t\tvec4 hs_t3 = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
-                "\t\t\t\t\t\t\tvec4 hs_t4 = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
-                "\t\t\t\t\t\t\tfloat hs_o0 = hs_t0.r * smoothstep(0.45, 1.15, hs_t0.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\t\t\tfloat hs_o1 = hs_t1.r * smoothstep(0.45, 1.15, hs_t1.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\t\t\tfloat hs_o2 = hs_t2.r * smoothstep(0.45, 1.15, hs_t2.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\t\t\tfloat hs_o3 = hs_t3.r * smoothstep(0.45, 1.15, hs_t3.b * 7.5 - hs_py);\n"
-                "\t\t\t\t\t\t\tfloat hs_o4 = hs_t4.r * smoothstep(0.45, 1.15, hs_t4.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\tvec4 hs_t = texture2D(HS_SHADOW_MASK, hs_ruv);\n"
+                "\t\t\t\t\t\t\tfloat hs_o0 = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\ths_t = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp1);\n"
+                "\t\t\t\t\t\t\tfloat hs_o1 = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\ths_t = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp1);\n"
+                "\t\t\t\t\t\t\tfloat hs_o2 = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\ths_t = texture2D(HS_SHADOW_MASK, hs_ruv + hs_dp2);\n"
+                "\t\t\t\t\t\t\tfloat hs_o3 = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
+                "\t\t\t\t\t\t\ths_t = texture2D(HS_SHADOW_MASK, hs_ruv - hs_dp2);\n"
+                "\t\t\t\t\t\t\tfloat hs_o4 = hs_t.r * smoothstep(0.45, 1.15, hs_t.b * 7.5 - hs_py);\n"
                 "\t\t\t\t\t\t\ths_occ = (HS_RECV_BOUNDS.w > 1.5) ? max(hs_o0, max((hs_o1 + hs_o2) * 0.50, min(hs_o3, hs_o4))) : (hs_o0 * 0.40 + (hs_o1 + hs_o2 + hs_o3 + hs_o4) * 0.15);\n"
                 "\t\t\t\t\t\t}\n"
                 "\t\t\t\t\t\tfloat hs_rstr = clamp(hs_occ, 0.0, 1.0) * hs_rin * clamp(HS_RECV_TINT.a, 0.0, 1.0);\n"
@@ -7446,17 +7600,17 @@ static bool TransformHd2dShaderSource(const std::string& src, std::string& outSr
                 "\t\tfloat hs_loc = clamp(HS_HD2D_SHAD_PROJ.x, 0.0, 1.0);\n"
                 "\t\tif (HS_SPLAT_PT0.z > 0.5) {\n"
                 "\t\t\tfloat hs_d0 = length(PS_POS.xz - HS_SPLAT_PT0.xy);\n"
-                "\t\t\tfloat hs_w0 = smoothstep(0.35, 1.05, hs_d0) * smoothstep(HS_SPLAT_PT0.z, HS_SPLAT_PT0.z * 0.25, hs_d0) * HS_SPLAT_PT0.w;\n"
+                "\t\t\tfloat hs_w0 = smoothstep(0.35, 1.05, hs_d0) * (1.0 - smoothstep(HS_SPLAT_PT0.z * 0.25, HS_SPLAT_PT0.z, hs_d0)) * HS_SPLAT_PT0.w;\n"
                 "\t\t\ths_loc = max(hs_loc, hs_w0);\n"
                 "\t\t}\n"
                 "\t\tif (HS_SPLAT_PT1.z > 0.5) {\n"
                 "\t\t\tfloat hs_d1 = length(PS_POS.xz - HS_SPLAT_PT1.xy);\n"
-                "\t\t\tfloat hs_w1 = smoothstep(0.35, 1.05, hs_d1) * smoothstep(HS_SPLAT_PT1.z, HS_SPLAT_PT1.z * 0.25, hs_d1) * HS_SPLAT_PT1.w;\n"
+                "\t\t\tfloat hs_w1 = smoothstep(0.35, 1.05, hs_d1) * (1.0 - smoothstep(HS_SPLAT_PT1.z * 0.25, HS_SPLAT_PT1.z, hs_d1)) * HS_SPLAT_PT1.w;\n"
                 "\t\t\ths_loc = max(hs_loc, hs_w1);\n"
                 "\t\t}\n"
                 "\t\tif (HS_SPLAT_PT2.z > 0.5) {\n"
                 "\t\t\tfloat hs_d2 = length(PS_POS.xz - HS_SPLAT_PT2.xy);\n"
-                "\t\t\tfloat hs_w2 = smoothstep(0.35, 1.05, hs_d2) * smoothstep(HS_SPLAT_PT2.z, HS_SPLAT_PT2.z * 0.25, hs_d2) * HS_SPLAT_PT2.w;\n"
+                "\t\t\tfloat hs_w2 = smoothstep(0.35, 1.05, hs_d2) * (1.0 - smoothstep(HS_SPLAT_PT2.z * 0.25, HS_SPLAT_PT2.z, hs_d2)) * HS_SPLAT_PT2.w;\n"
                 "\t\t\ths_loc = max(hs_loc, hs_w2);\n"
                 "\t\t}\n"
                 "\t\tfloat hs_vis = smoothstep(0.02, 0.28, hs_loc * HS_HD2D_SHAD_PROJ.y);\n"
@@ -7481,6 +7635,45 @@ static thread_local std::unordered_map<uint32_t, uint8_t> tl_sbGpuShaders;
 static thread_local std::unordered_map<uint32_t, uint8_t> tl_sbGpuProgMask;
 static thread_local std::unordered_map<uint32_t, WorldProgRole> tl_shaderWorldRole;
 static thread_local std::unordered_map<uint32_t, WorldProgRole> tl_progWorldRole;
+enum class ShaderBatchRole : uint8_t {
+    None        = 0,
+    AnimVs      = 1,
+    AnimFs      = 2,
+    AnimBloomVs = 3,
+    AnimBloomFs = 4,
+};
+enum class ShaderHd2dRole : uint8_t {
+    None        = 0,
+    AnimVs      = 1,
+    AnimFs      = 2,
+    AnimBloomVs = 3,
+    AnimBloomFs = 4,
+    Other       = 5,
+};
+struct ShaderSourceRecord {
+    bool                        modifiedByHs        = false;
+    bool                        injectedStage       = false;
+    bool                        ccTexelFetchApplied = false;
+    hs_gpu_compat::CcShaderKind ccKind              = hs_gpu_compat::CcShaderKind::None;
+    int                         versionNum          = 0;
+    ShaderBatchRole             batchRole           = ShaderBatchRole::None;
+    ShaderHd2dRole              hd2dRole            = ShaderHd2dRole::None;
+    std::string                 ccSamplerExpr;
+    std::string                 rawOriginalSource;
+    std::string                 baseSafeSource;
+    std::string                 preCcCompatSource;
+    std::string                 currentSource;
+};
+static thread_local std::unordered_map<uint32_t, ShaderSourceRecord> tl_shaderSources;
+static thread_local std::unordered_map<uint32_t, std::vector<uint32_t>> tl_progAttachedShaders;
+static thread_local std::unordered_map<uint32_t, hs_gpu_compat::CcProgramBindingInfo> tl_ccProgBindings;
+static thread_local hs_gpu_compat::CcProgramBindingInfo* tl_curCcProgBinding = nullptr;
+static thread_local hs_gpu_compat::ConfirmedCcRgbTracker tl_ccRgbTracker;
+static thread_local int32_t  tl_unpackAlignment   = 4;
+static thread_local int32_t  tl_unpackRowLength   = 0;
+static thread_local int32_t  tl_unpackSkipRows    = 0;
+static thread_local int32_t  tl_unpackSkipPixels  = 0;
+static thread_local uint32_t tl_boundUnpackPbo    = 0u;
 static thread_local std::unordered_map<uint32_t, uint8_t>       tl_hauntShaders;
 static thread_local std::unordered_map<uint32_t, uint8_t>       tl_hauntProgs;
 // Look Matcher RenderThread shader/program role map: 1=COLOURCUBE, 2=UI/Font, 3=HS_VISUAL_FINAL
@@ -7840,6 +8033,51 @@ static bool ExtractExtIdTag(const std::string& src, std::string& outId) {
     return true;
 }
 
+static int ParseGlslVersionNumber(const std::string& src) noexcept {
+    size_t i = 0;
+    const size_t n = src.size();
+    bool inBlockComment = false;
+    while (i < n) {
+        if (inBlockComment) {
+            if (i + 1 < n && src[i] == '*' && src[i + 1] == '/') {
+                inBlockComment = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        while (i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n')) ++i;
+        if (i >= n) break;
+        if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
+            while (i < n && src[i] != '\n') ++i;
+            continue;
+        }
+        if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
+            inBlockComment = true;
+            i += 2;
+            continue;
+        }
+        if (src[i] == '#') {
+            size_t j = i + 1;
+            while (j < n && (src[j] == ' ' || src[j] == '\t')) ++j;
+            if (j + 7 <= n && memcmp(src.data() + j, "version", 7) == 0 &&
+                (j + 7 == n || src[j + 7] == ' ' || src[j + 7] == '\t')) {
+                j += 7;
+                while (j < n && (src[j] == ' ' || src[j] == '\t')) ++j;
+                int v = 0;
+                while (j < n && src[j] >= '0' && src[j] <= '9') {
+                    v = v * 10 + (src[j] - '0');
+                    ++j;
+                }
+                return v;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static bool HasActiveGlslVersionDirective(const std::string& src) noexcept {
     size_t i = 0;
     const size_t n = src.size();
@@ -7879,179 +8117,6 @@ static bool HasActiveGlslVersionDirective(const std::string& src) noexcept {
     return false;
 }
 
-static size_t FindAfterGlslVersionDirectiveOffset(const std::string& src) noexcept {
-    size_t i = 0;
-    const size_t n = src.size();
-    bool inBlockComment = false;
-    while (i < n) {
-        if (inBlockComment) {
-            if (i + 1 < n && src[i] == '*' && src[i + 1] == '/') {
-                inBlockComment = false;
-                i += 2;
-            } else {
-                ++i;
-            }
-            continue;
-        }
-        while (i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n')) ++i;
-        if (i >= n) break;
-        if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
-            while (i < n && src[i] != '\n') ++i;
-            continue;
-        }
-        if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
-            inBlockComment = true;
-            i += 2;
-            continue;
-        }
-        if (src[i] == '#') {
-            size_t j = i + 1;
-            while (j < n && (src[j] == ' ' || src[j] == '\t')) ++j;
-            if (j + 7 <= n && memcmp(src.data() + j, "version", 7) == 0 &&
-                (j + 7 == n || src[j + 7] == ' ' || src[j + 7] == '\t')) {
-                const size_t nl = src.find('\n', j + 7);
-                return (nl == std::string::npos) ? n : (nl + 1u);
-            }
-        }
-        return 0;
-    }
-    return 0;
-}
-
-static inline bool IsGlslIdentChar(char c) noexcept {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_';
-}
-
-static bool TransformColourCubeAntiAnisoShaderSource(std::string& src, uint32_t& outReplacedCalls) {
-    outReplacedCalls = 0u;
-    if (src.find("gl_FragColor") == std::string::npos ||
-        src.find("HS_CC_SAMPLE_2D") != std::string::npos) {
-        return false;
-    }
-    const bool hasColourCube = (src.find("COLOUR_CUBE") != std::string::npos);
-    const bool isCombineCc = (src.find("SampleSourceDest") != std::string::npos &&
-                              src.find("CUBE_DIMENSION") != std::string::npos);
-    if (!hasColourCube && !isCombineCc) {
-        return false;
-    }
-
-    const char* targets[3]{};
-    uint32_t targetCount = 0u;
-    if (hasColourCube) {
-        targets[targetCount++] = "COLOUR_CUBE";
-    }
-    if (isCombineCc) {
-        targets[targetCount++] = "source_cc";
-        targets[targetCount++] = "dest_cc";
-    }
-
-    auto skipWs = [&](size_t& p) noexcept {
-        while (p < src.size() &&
-               (src[p] == ' ' || src[p] == '\t' || src[p] == '\r' || src[p] == '\n')) {
-            ++p;
-        }
-    };
-
-    for (size_t i = 0; i < src.size();) {
-        if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '/') {
-            i += 2;
-            while (i < src.size() && src[i] != '\n') ++i;
-            continue;
-        }
-        if (i + 1 < src.size() && src[i] == '/' && src[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
-            i = (i + 1 < src.size()) ? (i + 2) : src.size();
-            continue;
-        }
-        if (i + 9 <= src.size() &&
-            src.compare(i, 9, "texture2D") == 0 &&
-            (i == 0 || !IsGlslIdentChar(src[i - 1])) &&
-            (i + 9 == src.size() || !IsGlslIdentChar(src[i + 9]))) {
-            size_t j = i + 9;
-            skipWs(j);
-            if (j < src.size() && src[j] == '(') {
-                ++j;
-                skipWs(j);
-                const char* matched = nullptr;
-                size_t matchedLen = 0u;
-                for (uint32_t ti = 0u; ti < targetCount; ++ti) {
-                    const size_t tlen = strlen(targets[ti]);
-                    if (j + tlen <= src.size() &&
-                        src.compare(j, tlen, targets[ti]) == 0 &&
-                        (j + tlen == src.size() || !IsGlslIdentChar(src[j + tlen]))) {
-                        matched = targets[ti];
-                        matchedLen = tlen;
-                        break;
-                    }
-                }
-                if (matched != nullptr) {
-                    j += matchedLen;
-                    skipWs(j);
-                    if (j < src.size() && src[j] == ',') {
-                        ++j;
-                        int depth = 0;
-                        bool twoArgCall = false;
-                        while (j < src.size()) {
-                            if (j + 1 < src.size() && src[j] == '/' && src[j + 1] == '/') {
-                                j += 2;
-                                while (j < src.size() && src[j] != '\n') ++j;
-                                continue;
-                            }
-                            if (j + 1 < src.size() && src[j] == '/' && src[j + 1] == '*') {
-                                j += 2;
-                                while (j + 1 < src.size() && !(src[j] == '*' && src[j + 1] == '/')) ++j;
-                                j = (j + 1 < src.size()) ? (j + 2) : src.size();
-                                continue;
-                            }
-                            const char c = src[j];
-                            if (c == '(') {
-                                ++depth;
-                            } else if (c == ')') {
-                                if (depth == 0) {
-                                    twoArgCall = true;
-                                    break;
-                                }
-                                --depth;
-                            } else if (c == ',' && depth == 0) {
-                                // 3-argument texture2D(s, uv, bias) -> leave untouched
-                                break;
-                            }
-                            ++j;
-                        }
-                        if (twoArgCall) {
-                            src.replace(i, 9, "HS_CC_SAMPLE_2D");
-                            ++outReplacedCalls;
-                            i += 15;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        ++i;
-    }
-
-    if (outReplacedCalls == 0u) {
-        return false;
-    }
-
-    const size_t insPos = FindAfterGlslVersionDirectiveOffset(src);
-    static constexpr const char* kCcAntiAnisoHdr =
-        "#extension GL_EXT_shader_texture_lod : enable\n"
-        "#extension GL_ARB_shader_texture_lod : enable\n"
-        "#if defined(GL_EXT_shader_texture_lod)\n"
-        "#define HS_CC_SAMPLE_2D(s, uv) texture2DGradEXT((s), (uv), vec2(0.0), vec2(0.0))\n"
-        "#elif defined(GL_ARB_shader_texture_lod)\n"
-        "#define HS_CC_SAMPLE_2D(s, uv) texture2DGradARB((s), (uv), vec2(0.0), vec2(0.0))\n"
-        "#else\n"
-        "#define HS_CC_SAMPLE_2D(s, uv) texture2D((s), (uv))\n"
-        "#endif\n";
-    src.insert(insPos, kCcAntiAnisoHdr);
-    return true;
-}
-
 static thread_local bool tl_inCacheRenderUi = false;
 
 static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char* const* string, const int32_t* length) {
@@ -8083,6 +8148,10 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
             } else {
                 cur.append(string[i]);
             }
+        }
+        std::string rawOriginal;
+        if (shader != 0u) {
+            rawOriginal = cur;
         }
         if (shader != 0u) {
             std::string extId;
@@ -8136,7 +8205,34 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
                 pos += strlen(kHi);
                 modified = true;
             }
+            static constexpr const char* kHoloUb1  = "smoothstep(1., .75, texture2D( HOLO_SAMPLER, lineUV ).g)";
+            static constexpr const char* kHoloFix1 = "(1.0 - smoothstep(.75, 1., texture2D( HOLO_SAMPLER, lineUV ).g))";
+            static constexpr const char* kHoloUb2  = "smoothstep(1., .75, texture2D( UI_HOLO_SAMPLER, lineUV ).g)";
+            static constexpr const char* kHoloFix2 = "(1.0 - smoothstep(.75, 1., texture2D( UI_HOLO_SAMPLER, lineUV ).g))";
+            size_t hpos = 0;
+            while ((hpos = cur.find(kHoloUb1, hpos)) != std::string::npos) {
+                cur.replace(hpos, strlen(kHoloUb1), kHoloFix1);
+                hpos += strlen(kHoloFix1);
+                modified = true;
+            }
+            hpos = 0;
+            while ((hpos = cur.find(kHoloUb2, hpos)) != std::string::npos) {
+                cur.replace(hpos, strlen(kHoloUb2), kHoloFix2);
+                hpos += strlen(kHoloFix2);
+                modified = true;
+            }
         }
+        // Track 1B: snapshot ES100-compatible base source BEFORE SpriteBatcher/HD2D injections
+        // so pre-link pairing rollback preserves Native GL `#version 100` + FP32 highp safely.
+        std::string baseSafePreInject;
+        if (shader != 0u) {
+            baseSafePreInject = cur;
+            if (wantHighp && !HasActiveGlslVersionDirective(baseSafePreInject)) {
+                baseSafePreInject.insert(0, "#version 100\n");
+            }
+        }
+        ShaderBatchRole batchRole = ShaderBatchRole::None;
+        ShaderHd2dRole  hd2dRole  = ShaderHd2dRole::None;
         // CRITICAL ORDER: Run 2D SpriteBatcher injection FIRST so TransformHd2dShaderSource's
         // ANIM_VS branch sees HS_BATCH_ACTIVE & packs HS_LOCAL_METRES cleanly from HS_BATCH_CADD.w!
         if (wantBatch) {
@@ -8152,7 +8248,7 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
             const bool allowGpuDriven = isNatGl &&
                                         g_hwCaps.hasBufferStorage &&
                                         g_hwCaps.hasSsbo &&
-                                        g_hwCaps.hasBindlessTexture &&
+                                        g_hwCaps.hasNonUniformBindless &&
                                         g_hwCaps.hasBaseVertex &&
                                         g_fnGlBindBufferBase != nullptr &&
                                         g_fnGlGetTextureHandleARB != nullptr &&
@@ -8165,11 +8261,17 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
                 const uint32_t n = g_sbShadersInjected.fetch_add(1, std::memory_order_relaxed) + 1;
                 LogMsg("[PERF][SBATCH] Injected 2D batch shader #%u (%s, shader=%u, gpu=%d, %zu -> %zu bytes)",
                        n, sbTag ? sbTag : "?", shader, allowGpuDriven ? 1 : 0, cur.size(), sbSrc.size());
+                if (sbTag != nullptr) {
+                    if (strcmp(sbTag, "ANIM_BATCH_VS") == 0)            batchRole = ShaderBatchRole::AnimVs;
+                    else if (strcmp(sbTag, "ANIM_BATCH_FS") == 0)       batchRole = ShaderBatchRole::AnimFs;
+                    else if (strcmp(sbTag, "ANIM_BLOOM_BATCH_VS") == 0) batchRole = ShaderBatchRole::AnimBloomVs;
+                    else if (strcmp(sbTag, "ANIM_BLOOM_BATCH_FS") == 0) batchRole = ShaderBatchRole::AnimBloomFs;
+                }
                 if (shader != 0u && sbTag != nullptr) {
                     uint8_t mask = 0u;
-                    const bool isVs = (strcmp(sbTag, "ANIM_BATCH_VS") == 0 || strcmp(sbTag, "ANIM_BLOOM_BATCH_VS") == 0);
-                    const bool isFs = (strcmp(sbTag, "ANIM_BATCH_FS") == 0 || strcmp(sbTag, "ANIM_BLOOM_BATCH_FS") == 0);
-                    const bool isBloom = (strncmp(sbTag, "ANIM_BLOOM_", 11) == 0);
+                    const bool isVs = (batchRole == ShaderBatchRole::AnimVs || batchRole == ShaderBatchRole::AnimBloomVs);
+                    const bool isFs = (batchRole == ShaderBatchRole::AnimFs || batchRole == ShaderBatchRole::AnimBloomFs);
+                    const bool isBloom = (batchRole == ShaderBatchRole::AnimBloomVs || batchRole == ShaderBatchRole::AnimBloomFs);
                     if (allowGpuDriven && (isVs || isFs)) mask |= isVs ? 1u : 2u;
                     if (isBloom && (isVs || isFs))        mask |= isVs ? 4u : 8u;
                     if (mask != 0u) tl_sbGpuShaders[shader] = mask;
@@ -8179,6 +8281,8 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
                 }
                 cur = std::move(sbSrc);
                 modified = true;
+            } else if (shader != 0u) {
+                tl_sbGpuShaders.erase(shader);
             }
         }
         if (wantHd2d) {
@@ -8188,6 +8292,13 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
                 const uint32_t n = g_hd2dShadersInjected.fetch_add(1, std::memory_order_relaxed) + 1;
                 LogMsg("[VISUAL][HD2D] Injected world shader #%u (%s, shader=%u, %zu -> %zu bytes)",
                        n, hdTag ? hdTag : "?", shader, cur.size(), hdSrc.size());
+                if (hdTag != nullptr) {
+                    if (strcmp(hdTag, "ANIM_VS") == 0)            hd2dRole = ShaderHd2dRole::AnimVs;
+                    else if (strcmp(hdTag, "ANIM") == 0)          hd2dRole = ShaderHd2dRole::AnimFs;
+                    else if (strcmp(hdTag, "ANIM_BLOOM_VS") == 0) hd2dRole = ShaderHd2dRole::AnimBloomVs;
+                    else if (strcmp(hdTag, "ANIM_BLOOM_FS") == 0) hd2dRole = ShaderHd2dRole::AnimBloomFs;
+                    else                                          hd2dRole = ShaderHd2dRole::Other;
+                }
                 if (shader != 0u && hdTag != nullptr) {
                     if (strcmp(hdTag, "GROUND") == 0) {
                         tl_shaderWorldRole[shader] = WorldProgRole::Ground;
@@ -8214,29 +8325,27 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
             cur.insert(0, "#version 100\n");
             modified = true;
         }
-        if (wantHighp) {
-            uint32_t ccTaps = 0u;
-            if (TransformColourCubeAntiAnisoShaderSource(cur, ccTaps)) {
-                const uint32_t n = g_ccAntiAnisoShadersPatched.fetch_add(1, std::memory_order_relaxed) + 1u;
-                LogMsg("[VISUAL][CC-AF] Patched ColourCube LUT zero-grad #%u (shader=%u, taps=%u)", n, shader, ccTaps);
-                modified = true;
+        if (shader != 0u) {
+            const auto ccKind = wantHighp
+                ? hs_gpu_compat::DetectColourCubeShaderKind(cur)
+                : hs_gpu_compat::CcShaderKind::None;
+            ShaderSourceRecord rec{};
+            rec.modifiedByHs        = modified;
+            rec.injectedStage       = (batchRole != ShaderBatchRole::None) || (hd2dRole != ShaderHd2dRole::None);
+            rec.ccTexelFetchApplied = false;
+            rec.ccKind              = ccKind;
+            rec.versionNum          = ParseGlslVersionNumber(cur);
+            rec.batchRole           = batchRole;
+            rec.hd2dRole            = hd2dRole;
+            if (ccKind == hs_gpu_compat::CcShaderKind::ApplyColourCube) {
+                hs_gpu_compat::ExtractColourCubeSamplerExpr(cur, rec.ccSamplerExpr);
             }
-            static constexpr const char* kHoloUb1 = "smoothstep(1., .75, texture2D( HOLO_SAMPLER, lineUV ).g)";
-            static constexpr const char* kHoloFix1 = "(1.0 - smoothstep(.75, 1., texture2D( HOLO_SAMPLER, lineUV ).g))";
-            static constexpr const char* kHoloUb2 = "smoothstep(1., .75, texture2D( UI_HOLO_SAMPLER, lineUV ).g)";
-            static constexpr const char* kHoloFix2 = "(1.0 - smoothstep(.75, 1., texture2D( UI_HOLO_SAMPLER, lineUV ).g))";
-            size_t hpos = 0;
-            while ((hpos = cur.find(kHoloUb1, hpos)) != std::string::npos) {
-                cur.replace(hpos, strlen(kHoloUb1), kHoloFix1);
-                hpos += strlen(kHoloFix1);
-                modified = true;
+            if (wantHighp || modified) {
+                rec.currentSource     = cur;
+                rec.rawOriginalSource = std::move(rawOriginal);
+                rec.baseSafeSource    = std::move(baseSafePreInject);
             }
-            hpos = 0;
-            while ((hpos = cur.find(kHoloUb2, hpos)) != std::string::npos) {
-                cur.replace(hpos, strlen(kHoloUb2), kHoloFix2);
-                hpos += strlen(kHoloFix2);
-                modified = true;
-            }
+            tl_shaderSources[shader] = std::move(rec);
         }
         if (modified) {
             const char* ptr = cur.c_str();
@@ -8250,6 +8359,10 @@ static void WINAPI HookGlShaderSource(uint32_t shader, int32_t count, const char
 
 static void WINAPI HookGlAttachShader(uint32_t program, uint32_t shader) {
     if (program != 0u && shader != 0u) {
+        auto& attachedVec = tl_progAttachedShaders[program];
+        if (std::find(attachedVec.begin(), attachedVec.end(), shader) == attachedVec.end()) {
+            attachedVec.push_back(shader);
+        }
         auto git = tl_sbGpuShaders.find(shader);
         if (git != tl_sbGpuShaders.end() && git->second != 0u) {
             tl_sbGpuProgMask[program] |= git->second;
@@ -8442,6 +8555,9 @@ struct GlContextProgTables {
     std::unordered_map<uint32_t, hs_ui_batch::UiShaderTag>      uiShaderTags;
     std::unordered_map<uint32_t, uint8_t>                       sbGpuShaders;
     std::unordered_map<uint32_t, uint8_t>                       sbGpuProgMask;
+    std::unordered_map<uint32_t, ShaderSourceRecord>            shaderSources;
+    std::unordered_map<uint32_t, std::vector<uint32_t>>         progAttachedShaders;
+    std::unordered_map<uint32_t, hs_gpu_compat::CcProgramBindingInfo> ccProgBindings;
 };
 static thread_local std::unordered_map<const void*, GlContextProgTables> tl_ctxProgTables;
 
@@ -8462,6 +8578,9 @@ static inline void SaveActiveContextProgTables(const void* ctx) {
     dst.uiShaderTags    = std::move(tl_uiShaderTags);
     dst.sbGpuShaders    = std::move(tl_sbGpuShaders);
     dst.sbGpuProgMask   = std::move(tl_sbGpuProgMask);
+    dst.shaderSources       = std::move(tl_shaderSources);
+    dst.progAttachedShaders = std::move(tl_progAttachedShaders);
+    dst.ccProgBindings      = std::move(tl_ccProgBindings);
     tl_worldProgs.clear();
     tl_shaderWorldRole.clear();
     tl_progWorldRole.clear();
@@ -8473,6 +8592,10 @@ static inline void SaveActiveContextProgTables(const void* ctx) {
     tl_uiShaderTags.clear();
     tl_sbGpuShaders.clear();
     tl_sbGpuProgMask.clear();
+    tl_shaderSources.clear();
+    tl_progAttachedShaders.clear();
+    tl_ccProgBindings.clear();
+    tl_curCcProgBinding = nullptr;
     ++tl_sbProgsGen;
     ++tl_uiProgsGen;
     ++tl_worldProgsGen;
@@ -8490,6 +8613,10 @@ static inline void LoadContextProgTables(const void* ctx) {
     tl_uiShaderTags.clear();
     tl_sbGpuShaders.clear();
     tl_sbGpuProgMask.clear();
+    tl_shaderSources.clear();
+    tl_progAttachedShaders.clear();
+    tl_ccProgBindings.clear();
+    tl_curCcProgBinding = nullptr;
     if (!ctx) return;
     auto it = tl_ctxProgTables.find(ctx);
     if (it != tl_ctxProgTables.end()) {
@@ -8504,6 +8631,9 @@ static inline void LoadContextProgTables(const void* ctx) {
         tl_uiShaderTags    = std::move(it->second.uiShaderTags);
         tl_sbGpuShaders    = std::move(it->second.sbGpuShaders);
         tl_sbGpuProgMask   = std::move(it->second.sbGpuProgMask);
+        tl_shaderSources       = std::move(it->second.shaderSources);
+        tl_progAttachedShaders = std::move(it->second.progAttachedShaders);
+        tl_ccProgBindings      = std::move(it->second.ccProgBindings);
         tl_ctxProgTables.erase(it);
         for (auto& kv : tl_worldProgs) {
             kv.second.shadowMaskUnitBound = false;
@@ -8583,69 +8713,11 @@ static inline const hs_world_shadow::ShadowConfig& GetCachedShadowConfig() {
         tl_cachedReflCfg.luaCamRightZ  = st.luaCam[3];
         tl_cachedShadowCfgGen = gen;
     }
-    // Dynamic temporal shadow reuse stride & 1-tap fast entity receive (hysteresis-guarded, Native GL only):
-    //   stride: 1x when GPU < 4.5ms; 2x when GPU >= 5.0ms or shDef >= 64; 3x at >= 8.5ms.
-    //   1-tap receive: enable at GPU >= 6.2ms for >= 45 frames; recover to 5-tap at < 4.7ms for >= 120 frames.
-    const uint32_t rtSeq = g_rtSwapSeq.load(std::memory_order_relaxed);
-    static thread_local uint32_t tl_shadowStrideSeq = 0xFFFFFFFFu;
-    static thread_local uint32_t tl_adaptiveShadowStride = 1u;
-    static thread_local bool     tl_adaptiveFastRecv1Tap = false;
-    static thread_local uint32_t tl_fastRecvHiStreak = 0u;
-    static thread_local uint32_t tl_fastRecvLoStreak = 0u;
-    if (tl_shadowStrideSeq != rtSeq) {
-        tl_shadowStrideSeq = rtSeq;
-        if (!g_nativeGlActive.load(std::memory_order_relaxed)) {
-            tl_adaptiveShadowStride = 1u;
-            tl_adaptiveFastRecv1Tap = false;
-            tl_fastRecvHiStreak = 0u;
-            tl_fastRecvLoStreak = 0u;
-        } else {
-            const float emaGpuMs = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
-            const uint32_t shDef = g_worldShadowDeferredBatches.load(std::memory_order_relaxed);
-            if (!std::isfinite(emaGpuMs) || emaGpuMs <= 0.0f) {
-                tl_adaptiveShadowStride = 1u;
-                tl_adaptiveFastRecv1Tap = false;
-                tl_fastRecvHiStreak = 0u;
-                tl_fastRecvLoStreak = 0u;
-            } else {
-                uint32_t nextStride = tl_adaptiveShadowStride;
-                if (nextStride <= 1u) {
-                    if (emaGpuMs >= 8.5f) nextStride = 3u;
-                    else if (emaGpuMs >= 5.0f || shDef >= 64u) nextStride = 2u;
-                } else if (nextStride == 2u) {
-                    if (emaGpuMs >= 8.5f) nextStride = 3u;
-                    else if (emaGpuMs < 4.5f && shDef < 48u) nextStride = 1u;
-                } else {
-                    if (emaGpuMs < 4.5f && shDef < 48u) nextStride = 1u;
-                    else if (emaGpuMs < 7.2f) nextStride = 2u;
-                }
-                tl_adaptiveShadowStride = nextStride;
-                if (!tl_adaptiveFastRecv1Tap) {
-                    if (emaGpuMs >= 6.2f) {
-                        if (++tl_fastRecvHiStreak >= 45u) {
-                            tl_adaptiveFastRecv1Tap = true;
-                            tl_fastRecvHiStreak = 0u;
-                            tl_fastRecvLoStreak = 0u;
-                        }
-                    } else {
-                        tl_fastRecvHiStreak = 0u;
-                    }
-                } else {
-                    if (emaGpuMs < 4.7f) {
-                        if (++tl_fastRecvLoStreak >= 120u) {
-                            tl_adaptiveFastRecv1Tap = false;
-                            tl_fastRecvLoStreak = 0u;
-                            tl_fastRecvHiStreak = 0u;
-                        }
-                    } else {
-                        tl_fastRecvLoStreak = 0u;
-                    }
-                }
-            }
-        }
-    }
-    tl_cachedShadowCfg.temporalStride        = tl_adaptiveShadowStride;
-    tl_cachedShadowCfg.fastEntityReceive1Tap = tl_adaptiveFastRecv1Tap;
+    tl_cachedShadowCfg.maxHdRes              = (g_visualClarityGrade.load(std::memory_order_relaxed) >= 3 &&
+                                                g_nativeGlActive.load(std::memory_order_acquire))
+        ? 4096u : 2048u;
+    tl_cachedShadowCfg.temporalStride        = 1u;
+    tl_cachedShadowCfg.fastEntityReceive1Tap = false;
     return tl_cachedShadowCfg;
 }
 
@@ -8950,7 +9022,7 @@ static inline void RunGpuClarityPreUiIfNeeded(bool fromSwap = false) {
     hs_gpu_clarity::ClarityConfig cfg{};
     cfg.grade              = grade;
     cfg.strength           = g_visualClarityStrength.load(std::memory_order_relaxed);
-    cfg.allowAdaptiveGrade = true;
+    cfg.allowAdaptiveGrade = false;
     cfg.emaFrameGpuMs      = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
     cfg.targetGpuBudgetMs  = 5.5f;
     cfg.adaptiveUpFrames   = 360u;
@@ -10033,6 +10105,9 @@ static inline bool IsGlUniformCacheOperational() {
 }
 
 static void ActivateNativeOpenGlOnFirstMakeCurrent();
+static void WINAPI HookGlPixelStorei(uint32_t pname, int32_t param);
+static void WINAPI HookGlTexSubImage2D(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset,
+                                       int32_t width, int32_t height, uint32_t format, uint32_t type, const void* pixels);
 
 static void OnVbPoolBindBuffer(uint32_t target, uint32_t buffer, void*) {
     tl_spriteBatcher.OnBindBuffer(target, buffer);
@@ -10072,23 +10147,50 @@ static void* WINAPI HookEglGetDisplay(void* display_id) {
         AcquireSRWLockExclusive(&g_nativeGlLock);
         if (!g_nativeGlProbed.load(std::memory_order_acquire)) {
             const auto mode = static_cast<hs_native_gl::BackendMode>(g_cfgRenderBackend.load(std::memory_order_relaxed));
-            const auto res = hs_native_gl::ProbeNativeEs2Support(mode, g_wglRt);
-            g_hwCaps.glMajor            = res.glMajor;
-            g_hwCaps.glMinor            = res.glMinor;
-            g_hwCaps.hasBufferStorage   = res.hasBufferStorage;
-            g_hwCaps.hasSsbo            = res.hasSsbo;
-            g_hwCaps.hasBindlessTexture = res.hasBindlessTexture;
-            g_hwCaps.hasBaseVertex      = res.hasBaseVertex;
-            g_hwCaps.isNativeGl         = res.supported;
+            hs_gpu_compat::CompatConfig compatCfg{};
+            compatCfg.enableCcTexelFetch   = g_compatEnableCcTexelFetch.load(std::memory_order_relaxed);
+            compatCfg.enableCcRgbNormalize = g_compatEnableCcRgbNormalize.load(std::memory_order_relaxed);
+            compatCfg.enableWglExactPfd    = g_compatEnableWglExactPfd.load(std::memory_order_relaxed);
+            compatCfg.enableGlCanaryProbe  = g_compatEnableGlCanaryProbe.load(std::memory_order_relaxed);
+            const auto res = hs_native_gl::ProbeNativeEs2Support(mode, g_wglRt, compatCfg);
+            g_hwCaps.glMajor               = res.glMajor;
+            g_hwCaps.glMinor               = res.glMinor;
+            g_hwCaps.hasBufferStorage      = res.hasBufferStorage;
+            g_hwCaps.hasSsbo               = res.hasSsbo;
+            g_hwCaps.hasBindlessTexture    = res.hasBindlessTexture;
+            g_hwCaps.hasNonUniformBindless = res.hasNonUniformBindless;
+            g_hwCaps.hasBaseVertex         = res.hasBaseVertex;
+            g_hwCaps.isNativeGl            = res.supported;
+            g_ccTexelFetchReady.store(res.supported && res.ccTexelFetchReady, std::memory_order_release);
+            g_ccRgbNormalizeLiveDisabled.store(false, std::memory_order_release);
+            if (res.pfdInfo.pixelFormat > 0) {
+                LogMsg("[GL_COMPAT][PFD] pf=%d arb=%d rgba=%d/%d/%d/%d ds=%d/%d hw=%d is10bit=%d",
+                       res.pfdInfo.pixelFormat, res.pfdInfo.usedArbChoose ? 1 : 0,
+                       res.pfdInfo.redBits, res.pfdInfo.greenBits, res.pfdInfo.blueBits, res.pfdInfo.alphaBits,
+                       res.pfdInfo.depthBits, res.pfdInfo.stencilBits,
+                       res.pfdInfo.isHardwareAccelerated ? 1 : 0, res.pfdInfo.is10BitRgb ? 1 : 0);
+            }
+            if (res.canary.ran || mode != hs_native_gl::BackendMode::D3D9) {
+                LogMsg("[GL_COMPAT][STARTUP_CANARY] ran=%d passed=%d verdict=%d stage=%s maxErr=%d worst=(%d,%d,%c) exp=(%u,%u,%u,%u) got=(%u,%u,%u,%u) glErr=0x%X texelFetch=%d ms=%.2f decision=%s reason=%s gpu=%s|%s|%s",
+                       res.canary.ran ? 1 : 0, res.canary.passed ? 1 : 0,
+                       static_cast<int>(res.canary.verdict), res.canary.stage.c_str(),
+                       res.canary.maxErr, res.canary.worstX, res.canary.worstY, res.canary.worstChannel,
+                       res.canary.expRgba[0], res.canary.expRgba[1], res.canary.expRgba[2], res.canary.expRgba[3],
+                       res.canary.gotRgba[0], res.canary.gotRgba[1], res.canary.gotRgba[2], res.canary.gotRgba[3],
+                       res.canary.glError, res.canary.texelFetchReady ? 1 : 0, res.canary.elapsedMs,
+                       res.canary.decision.c_str(), res.canary.fallbackReason.c_str(),
+                       res.vendor.c_str(), res.renderer.c_str(), res.version.c_str());
+            }
             if (res.supported) {
                 g_activeGlRendererName = !res.renderer.empty() ? res.renderer : "Native OpenGL Compat";
                 g_nativeGlActive.store(true, std::memory_order_release);
                 const bool computeCapable = res.hasComputeShader && res.hasImageLoadStore;
                 g_gpuClaritySupported.store(computeCapable, std::memory_order_release);
-                LogMsg("[GL_NATIVE] Probe PASS -> activating Native WGL OpenGL Compat (ES2+SteamOverlay, mode=%s, vendor=%s, renderer=%s, version=%s, procs=%d/76, aniso=%d, bufStorage=%d, mapRange=%d, compute43=%d, ssbo=%d, bindless=%d, baseVtx=%d)",
+                LogMsg("[GL_NATIVE] Probe PASS -> activating Native WGL OpenGL Compat (ES2+SteamOverlay, mode=%s, vendor=%s, renderer=%s, version=%s, procs=%d/76, aniso=%d, bufStorage=%d, mapRange=%d, compute43=%d, ssbo=%d, bindless=%d, nonUniformBindless=%d, baseVtx=%d)",
                        hs_native_gl::BackendModeName(mode), res.vendor.c_str(), res.renderer.c_str(), res.version.c_str(),
                        res.resolvedProcs, res.hasAniso ? 1 : 0, res.hasBufferStorage ? 1 : 0, res.hasMapBufferRange ? 1 : 0,
-                       computeCapable ? 1 : 0, res.hasSsbo ? 1 : 0, res.hasBindlessTexture ? 1 : 0, res.hasBaseVertex ? 1 : 0);
+                       computeCapable ? 1 : 0, res.hasSsbo ? 1 : 0, res.hasBindlessTexture ? 1 : 0,
+                       res.hasNonUniformBindless ? 1 : 0, res.hasBaseVertex ? 1 : 0);
 
                 const auto flipMode = static_cast<hs_dxgi_flip::FlipMode>(g_cfgDxgiFlipPresent.load(std::memory_order_relaxed));
                 const auto flipRes = hs_dxgi_flip::ProbeDxgiFlipSupport(flipMode, g_wglRt);
@@ -10172,6 +10274,9 @@ static uint32_t WINAPI HookEglGetConfigAttrib(void* dpy, void* config, int32_t a
 }
 
 static void* WINAPI HookEglCreateWindowSurface(void* dpy, void* config, HWND win, const int32_t* attrib_list) {
+    if (win && IsWindow(win)) {
+        g_lastGameHwnd.store(win, std::memory_order_release);
+    }
     if (g_nativeGlActive.load(std::memory_order_acquire)) {
         if (!win) {
             g_lastEglError.store(hs_native_gl::kEglBadNativeWindow, std::memory_order_relaxed);
@@ -10290,6 +10395,19 @@ static void* WINAPI HookEglGetProcAddress(const char* procname) {
         }
         if (!g_wglRt.pWglGetCurrentContext || g_wglRt.pWglGetCurrentContext() == nullptr) {
             return nullptr;
+        }
+        if (strcmp(procname, "glTexSubImage2D") == 0) {
+            if (!g_origGlTexSubImage2D) {
+                g_origGlTexSubImage2D = reinterpret_cast<GlTexSubImage2D_t>(g_wglRt.ResolveGlProc("glTexSubImage2D"));
+            }
+            return g_origGlTexSubImage2D ? reinterpret_cast<void*>(&HookGlTexSubImage2D) : nullptr;
+        }
+        if (strcmp(procname, "glPixelStorei") == 0) {
+            if (!g_origGlPixelStorei) {
+                void* p = g_wglRt.ResolveGlProc("glPixelStorei");
+                if (p) g_origGlPixelStorei = reinterpret_cast<GlPixelStorei_t>(p);
+            }
+            return (g_origGlPixelStorei || g_fnGlPixelStorei) ? reinterpret_cast<void*>(&HookGlPixelStorei) : nullptr;
         }
         return g_wglRt.ResolveGlProc(procname);
     }
@@ -10458,6 +10576,13 @@ static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, voi
         tl_glCache.OnMakeCurrent(ctx);
         if (prevCtx != ctx) {
             ResetMipTexTracker(ctx);
+            tl_curCcProgBinding = nullptr;
+            tl_ccRgbTracker.Reset();
+            tl_unpackAlignment   = 4;
+            tl_unpackRowLength   = 0;
+            tl_unpackSkipRows    = 0;
+            tl_unpackSkipPixels  = 0;
+            tl_boundUnpackPbo    = 0u;
             if (prevCtx != nullptr) {
                 SaveActiveContextProgTables(prevCtx);
             }
@@ -10504,6 +10629,10 @@ static uint32_t WINAPI HookEglMakeCurrent(void* dpy, void* draw, void* read, voi
                     auto wit = tl_worldProgs.find(tl_curBoundProg);
                     if (wit != tl_worldProgs.end()) {
                         tl_curWorldProg = &wit->second;
+                    }
+                    auto cit = tl_ccProgBindings.find(tl_curBoundProg);
+                    if (cit != tl_ccProgBindings.end()) {
+                        tl_curCcProgBinding = &cit->second;
                     }
                 }
             }
@@ -10782,6 +10911,7 @@ static void WINAPI HookGlDeleteTextures(int32_t n, const uint32_t* textures) {
     }
     if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
     tl_spriteBatcher.OnDeleteTextures(n, textures);
+    tl_ccRgbTracker.OnDeleteTextures(n, textures);
     if (tl_uiBatcher.HasPending()) SyncUiBatcher();
     tl_uiBatcher.OnDeleteTextures(n, textures);
     tl_glCache.OnDeleteTextures(n, textures);
@@ -10870,6 +11000,9 @@ static void WINAPI HookGlDisable(uint32_t cap) {
 }
 
 static void WINAPI HookGlBindBuffer(uint32_t target, uint32_t buffer) {
+    if (target == 0x88ECu /*GL_PIXEL_UNPACK_BUFFER*/) {
+        tl_boundUnpackPbo = buffer;
+    }
     const auto& tls = HotTls();
     auto& sb = *tls.sb;
     sb.OnBindBuffer(target, buffer);
@@ -10900,6 +11033,14 @@ static void WINAPI HookGlDeleteBuffers(int32_t n, const uint32_t* buffers) {
     if (n <= 0 || !buffers) return;
     g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
     CommitLazyBatchBindings();
+    if (tl_boundUnpackPbo != 0u) {
+        for (int32_t i = 0; i < n; ++i) {
+            if (buffers[i] == tl_boundUnpackPbo) {
+                tl_boundUnpackPbo = 0u;
+                break;
+            }
+        }
+    }
     tl_spriteBatcher.OnDeleteBuffers(n, buffers);
     tl_uiBatcher.OnDeleteBuffers(n, buffers);
     tl_glCache.OnDeleteBuffers(n, buffers);
@@ -11132,6 +11273,9 @@ static void WINAPI HookGlUniform1i(int32_t location, int32_t x) {
         }
     }
     EnsureUiDstProgramBoundAndSyncCache();
+    if (tl_curCcProgBinding && location >= 0) {
+        tl_curCcProgBinding->OnUniform1i(location, x);
+    }
     bool call = true;
     if (IsGlUniformCacheOperational()) {
         auto& st = GetSyncedGlCache();
@@ -11572,6 +11716,144 @@ static inline bool IsColorWriteFullyMasked(const RtHotTlsPointers& tls) noexcept
     return IsGlCacheOperational() && tls.glc->colorMask == 0;
 }
 
+static inline void RecordStencilBypassDraw(const RtHotTlsPointers& tls, uint32_t vertCount) noexcept {
+    g_sbStencilBypassDraws.fetch_add(1ULL, std::memory_order_relaxed);
+
+    struct StbypSrcEntry {
+        uint32_t progId;
+        uint16_t func;
+        uint16_t opZpass;
+        int32_t  lastRef;
+        uint8_t  colorMask;
+        uint32_t drawCount;
+        uint64_t vertSum;
+    };
+    static thread_local StbypSrcEntry tl_stbypTable[8]{};
+    static thread_local uint32_t tl_stbypUsed = 0u;
+    static thread_local uint32_t tl_stbypTotal = 0u;
+    static thread_local int64_t  tl_stbypLastReportQpc = 0;
+
+    const auto& glc = *tls.glc;
+    const uint16_t func = glc.stencilFuncValid ? glc.stencilFunc : 0xFFFFu;
+    const uint16_t opZpass = glc.stencilOpValid ? glc.stencilOpZpass : 0xFFFFu;
+    const int32_t ref = glc.stencilFuncValid ? glc.stencilRef : -1;
+    const uint8_t cm = glc.colorMask;
+    const uint32_t prog = tl_curBoundProg;
+
+    uint32_t matchIdx = 8u;
+    for (uint32_t i = 0u; i < tl_stbypUsed; ++i) {
+        if (tl_stbypTable[i].progId == prog &&
+            tl_stbypTable[i].func == func &&
+            tl_stbypTable[i].opZpass == opZpass &&
+            tl_stbypTable[i].colorMask == cm) {
+            matchIdx = i;
+            break;
+        }
+    }
+    if (matchIdx < 8u) {
+        tl_stbypTable[matchIdx].lastRef = ref;
+        ++tl_stbypTable[matchIdx].drawCount;
+        tl_stbypTable[matchIdx].vertSum += static_cast<uint64_t>(vertCount);
+    } else if (tl_stbypUsed < 8u) {
+        tl_stbypTable[tl_stbypUsed++] = StbypSrcEntry{
+            prog, func, opZpass, ref, cm, 1u, static_cast<uint64_t>(vertCount)
+        };
+    }
+    ++tl_stbypTotal;
+
+    if ((tl_stbypTotal & 63u) == 0u) {
+        const int64_t nowQpc = NowQpc();
+        if (tl_stbypLastReportQpc == 0) {
+            tl_stbypLastReportQpc = nowQpc;
+        } else if (g_qpcFreq > 0 && (nowQpc - tl_stbypLastReportQpc) >= g_qpcFreq * 10) {
+            if (tl_stbypTotal >= 200u) {
+                uint32_t order[8]{0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u};
+                for (uint32_t i = 0u; i < tl_stbypUsed; ++i) {
+                    for (uint32_t j = i + 1u; j < tl_stbypUsed; ++j) {
+                        if (tl_stbypTable[order[j]].drawCount > tl_stbypTable[order[i]].drawCount) {
+                            const uint32_t tmp = order[i];
+                            order[i] = order[j];
+                            order[j] = tmp;
+                        }
+                    }
+                }
+                char topBuf[512]{};
+                size_t pos = 0u;
+                const uint32_t limit = (tl_stbypUsed < 4u) ? tl_stbypUsed : 4u;
+                for (uint32_t k = 0u; k < limit; ++k) {
+                    const auto& e = tl_stbypTable[order[k]];
+                    const double avgV = (e.drawCount > 0u)
+                        ? (static_cast<double>(e.vertSum) / static_cast<double>(e.drawCount))
+                        : 0.0;
+                    const int n = snprintf(topBuf + pos, sizeof(topBuf) - pos,
+                                           "%sp=%u fn=0x%X opZ=0x%X ref=%d cm=0x%X cnt=%u avgV=%.0f",
+                                           (k > 0u ? " | " : ""),
+                                           e.progId,
+                                           static_cast<uint32_t>(e.func),
+                                           static_cast<uint32_t>(e.opZpass),
+                                           e.lastRef,
+                                           static_cast<uint32_t>(e.colorMask),
+                                           e.drawCount, avgV);
+                    if (n <= 0) break;
+                    pos += static_cast<size_t>(n);
+                    if (pos + 4u >= sizeof(topBuf)) break;
+                }
+                LogMsg("[DIAG][STBYP_SRC] 10sDraws=%u top=[%s]", tl_stbypTotal, topBuf);
+            }
+            std::memset(tl_stbypTable, 0, sizeof(tl_stbypTable));
+            tl_stbypUsed = 0u;
+            tl_stbypTotal = 0u;
+            tl_stbypLastReportQpc = nowQpc;
+        }
+    }
+}
+
+static __declspec(noinline) void PromoteConfirmedColourCubeSamplersSlow(const hs_gpu_compat::CcProgramBindingInfo* cc) noexcept {
+    if (!cc || tl_ccRgbTracker.ShadowBytes() == 0u) return;
+    if (!g_nativeGlActive.load(std::memory_order_acquire) ||
+        !g_compatEnableCcRgbNormalize.load(std::memory_order_relaxed) ||
+        g_ccRgbNormalizeLiveDisabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (tl_unpackRowLength != 0 || tl_unpackSkipRows != 0 || tl_unpackSkipPixels != 0) {
+        return;
+    }
+    hs_gpu_compat::PromoteGlOps ops{};
+    ops.glActiveTexture = g_origGlActiveTexture;
+    ops.glBindTexture   = g_origGlBindTexture;
+    ops.glBindBuffer    = g_origGlBindBuffer;
+    ops.glPixelStorei   = g_origGlPixelStorei ? g_origGlPixelStorei : g_fnGlPixelStorei;
+    ops.glTexImage2D    = g_origGlTexImage2D;
+    if (!ops.IsComplete()) return;
+
+    const uint32_t curUnit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+    for (uint32_t i = 0u; i < cc->samplerCount && i < 6u; ++i) {
+        if (!cc->samplerUnitSet[i]) continue; // Strict identity gate: NEVER guess unbound sampler units!
+        const int32_t unitInt = cc->samplerUnits[i];
+        if (unitInt < 0 || unitInt >= 32) continue;
+        const uint32_t unit  = static_cast<uint32_t>(unitInt);
+        const uint32_t texId = tl_boundTex2d[unit];
+        if (texId == 0u || !tl_ccRgbTracker.IsTrackedPending(texId)) continue;
+        int32_t pw = 0, ph = 0;
+        if (tl_ccRgbTracker.TryPromoteConfirmedTexture(
+                texId, unit, ops, curUnit, texId,
+                tl_boundUnpackPbo, tl_unpackAlignment, &pw, &ph)) {
+            tl_spriteBatcher.OnTexImageMutated(texId, false);
+            const uint32_t n = g_ccRgbPromotedCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u) {
+                LogMsg("[GL_COMPAT][CC_RGB8] Promoted confirmed ColourCube LUT #%u (tex=%u, %dx%d, unit=%u, prog=%u, kind=%u) -> GL_RGBA8",
+                       n, texId, pw, ph, unit, tl_curBoundProg, static_cast<unsigned>(cc->kind));
+            }
+        }
+    }
+}
+
+static inline void PromoteConfirmedColourCubeSamplers(const hs_gpu_compat::CcProgramBindingInfo* cc) noexcept {
+    if (cc != nullptr && tl_ccRgbTracker.ShadowBytes() > 0u) {
+        PromoteConfirmedColourCubeSamplersSlow(cc);
+    }
+}
+
 static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count) {
     if (tl_curLookProgRole == 2u && tl_curBoundFbo == 0u && tl_worldPostSeenThisFrame && !tl_gpuClarityAppliedThisFrame) {
         RunGpuClarityPreUiIfNeeded(false);
@@ -11595,7 +11877,7 @@ static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count)
     auto& sb = *tls.sb;
     if (sb.IsEnabled() && sb.IsCurrentProgramEligible()) {
         if (IsStencilDirectBypassActive(tls)) {
-            g_sbStencilBypassDraws.fetch_add(1ULL, std::memory_order_relaxed);
+            RecordStencilBypassDraw(tls, (count > 0) ? static_cast<uint32_t>(count) : 0u);
         } else if (TryHandleSpriteBatchDraw(
                 tls,
                 [&](uint8_t fCls, float swayBase, float wakeBase) {
@@ -11616,6 +11898,7 @@ static void WINAPI HookGlDrawArrays(uint32_t mode, int32_t first, int32_t count)
     sb.PrepareForUnbatchedDraw();
     tls.ui->PrepareForUnbatchedDraw();
     CommitLazyBatchBindings();
+    PromoteConfirmedColourCubeSamplers(tl_curCcProgBinding);
     bool mirrorShadow = false;
     bool mirrorRefl   = false;
     float mirrorEntX = 0.0f, mirrorEntZ = 0.0f;
@@ -11748,7 +12031,7 @@ static void WINAPI HookGlDrawElements(uint32_t mode, int32_t count, uint32_t typ
     auto& sb = *tls.sb;
     if (sb.IsEnabled() && sb.IsCurrentProgramEligible()) {
         if (IsStencilDirectBypassActive(tls)) {
-            g_sbStencilBypassDraws.fetch_add(1ULL, std::memory_order_relaxed);
+            RecordStencilBypassDraw(tls, (count > 0) ? static_cast<uint32_t>(count) : 0u);
         } else if (TryHandleSpriteBatchDraw(
                 tls,
                 [&](uint8_t fCls, float swayBase, float wakeBase) {
@@ -11769,6 +12052,7 @@ static void WINAPI HookGlDrawElements(uint32_t mode, int32_t count, uint32_t typ
     sb.PrepareForUnbatchedDraw();
     tls.ui->PrepareForUnbatchedDraw();
     CommitLazyBatchBindings();
+    PromoteConfirmedColourCubeSamplers(tl_curCcProgBinding);
     bool mirrorShadow = false;
     bool mirrorRefl   = false;
     float mirrorEntX = 0.0f, mirrorEntZ = 0.0f;
@@ -12326,14 +12610,23 @@ static void WINAPI HookGlTexImage2D(uint32_t target, int32_t level, int32_t inte
     FlushSpriteBatchStateCause(StateFlushCause::TexImg);
     CommitLazyBatchBindings();
     if (!g_origGlTexImage2D) return;
+    const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
     if (target == 0x0DE1u) {
         const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
         const uint32_t boundTex = tl_boundTex2d[unit];
         if (boundTex != 0u) {
             tl_spriteBatcher.OnTexImageMutated(boundTex, pixels == nullptr);
+            if (isNat &&
+                g_compatEnableCcRgbNormalize.load(std::memory_order_relaxed) &&
+                !g_ccRgbNormalizeLiveDisabled.load(std::memory_order_acquire)) {
+                const bool complexUnpack =
+                    (tl_unpackRowLength != 0 || tl_unpackSkipRows != 0 || tl_unpackSkipPixels != 0);
+                tl_ccRgbTracker.OnTexImage2D(
+                    boundTex, target, level, internalformat, width, height, border, format, type,
+                    pixels, tl_boundUnpackPbo, tl_unpackAlignment, complexUnpack);
+            }
         }
     }
-    const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
 
     // 16-bit half-float HDR LightMap (RGBA16F) upgrade inside LightMap::InitRenderTarget (Native OpenGL only)
     if (tl_inLightMapRender && isNat &&
@@ -12401,6 +12694,7 @@ static void WINAPI HookGlCompressedTexImage2D(uint32_t target, int32_t level, ui
         const uint32_t boundTex = tl_boundTex2d[unit];
         if (boundTex != 0u) {
             tl_spriteBatcher.OnTexImageMutated(boundTex, data == nullptr);
+            tl_ccRgbTracker.OnCompressedTexImage2D(boundTex);
         }
     }
     if (g_origGlCompressedTexImage2D) {
@@ -12425,6 +12719,47 @@ static void WINAPI HookGlCompressedTexImage2D(uint32_t target, int32_t level, ui
             if (height > tl_texJobMaxH) tl_texJobMaxH = height;
             tl_texJobFmt = internalformat;
         }
+    }
+}
+
+static void WINAPI HookGlPixelStorei(uint32_t pname, int32_t param) {
+    switch (pname) {
+        case 0x0CF5u /*GL_UNPACK_ALIGNMENT*/:
+            tl_unpackAlignment = param;
+            break;
+        case 0x0CF2u /*GL_UNPACK_ROW_LENGTH*/:
+            tl_unpackRowLength = param;
+            break;
+        case 0x0CF3u /*GL_UNPACK_SKIP_ROWS*/:
+            tl_unpackSkipRows = param;
+            break;
+        case 0x0CF4u /*GL_UNPACK_SKIP_PIXELS*/:
+            tl_unpackSkipPixels = param;
+            break;
+        default:
+            break;
+    }
+    if (g_origGlPixelStorei) {
+        g_origGlPixelStorei(pname, param);
+    } else if (g_fnGlPixelStorei) {
+        g_fnGlPixelStorei(pname, param);
+    }
+}
+
+static void WINAPI HookGlTexSubImage2D(uint32_t target, int32_t level, int32_t xoffset, int32_t yoffset,
+                                       int32_t width, int32_t height, uint32_t format, uint32_t type, const void* pixels) {
+    FlushSpriteBatchStateCause(StateFlushCause::TexImg);
+    CommitLazyBatchBindings();
+    if (target == 0x0DE1u) {
+        const uint32_t unit = (tl_activeTexUnit < 32u) ? tl_activeTexUnit : 0u;
+        const uint32_t boundTex = tl_boundTex2d[unit];
+        if (boundTex != 0u) {
+            tl_spriteBatcher.OnTexImageMutated(boundTex, false);
+            tl_ccRgbTracker.OnTexSubImage2D(boundTex);
+        }
+    }
+    if (g_origGlTexSubImage2D) {
+        g_origGlTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
     }
 }
 
@@ -12481,6 +12816,268 @@ static void EraseProgSlotLocked(void* ctx, uint32_t program) {
     }
 }
 
+static uint32_t RevertProgramShaders(uint32_t program, bool toRawOriginal, const char* reason) {
+    if (program == 0u || !g_origGlShaderSource || !g_fnGlCompileShader) return 0u;
+    auto attIt = tl_progAttachedShaders.find(program);
+    if (attIt == tl_progAttachedShaders.end() || attIt->second.empty()) return 0u;
+
+    uint32_t reverted = 0u;
+    for (uint32_t sh : attIt->second) {
+        auto sit = tl_shaderSources.find(sh);
+        if (sit == tl_shaderSources.end()) continue;
+        ShaderSourceRecord& rec = sit->second;
+        const bool eligible = toRawOriginal ? rec.modifiedByHs : rec.injectedStage;
+        if (!eligible) continue;
+        const std::string& fallbackSrc = toRawOriginal ? rec.rawOriginalSource : rec.baseSafeSource;
+        if (fallbackSrc.empty()) continue;
+
+        const char* ptr = fallbackSrc.c_str();
+        const int32_t len = static_cast<int32_t>(fallbackSrc.size());
+        g_origGlShaderSource(sh, 1, &ptr, &len);
+        g_fnGlCompileShader(sh);
+        if (g_fnGlGetShaderiv) {
+            int32_t compiled = 1;
+            g_fnGlGetShaderiv(sh, 0x8B81u /*GL_COMPILE_STATUS*/, &compiled);
+            if (!compiled && !toRawOriginal && !rec.rawOriginalSource.empty()) {
+                const char* rawPtr = rec.rawOriginalSource.c_str();
+                const int32_t rawLen = static_cast<int32_t>(rec.rawOriginalSource.size());
+                g_origGlShaderSource(sh, 1, &rawPtr, &rawLen);
+                g_fnGlCompileShader(sh);
+                rec.modifiedByHs  = false;
+                rec.currentSource = rec.rawOriginalSource;
+                rec.versionNum    = ParseGlslVersionNumber(rec.rawOriginalSource);
+            } else {
+                rec.modifiedByHs  = !toRawOriginal;
+                rec.currentSource = fallbackSrc;
+                rec.versionNum    = ParseGlslVersionNumber(fallbackSrc);
+            }
+        } else {
+            rec.modifiedByHs  = !toRawOriginal;
+            rec.currentSource = fallbackSrc;
+            rec.versionNum    = ParseGlslVersionNumber(fallbackSrc);
+        }
+
+        rec.injectedStage       = false;
+        rec.ccTexelFetchApplied = false;
+        rec.batchRole           = ShaderBatchRole::None;
+        rec.hd2dRole            = ShaderHd2dRole::None;
+        rec.preCcCompatSource.clear();
+        tl_sbGpuShaders.erase(sh);
+        tl_shaderWorldRole.erase(sh);
+        if (toRawOriginal) {
+            tl_uiShaderTags.erase(sh);
+            tl_hauntShaders.erase(sh);
+            tl_lookShaderRole.erase(sh);
+        }
+        ++reverted;
+    }
+
+    if (reverted > 0u) {
+        // Rebuild per-program cached masks/roles from remaining attached shaders
+        tl_sbGpuProgMask.erase(program);
+        tl_progWorldRole.erase(program);
+        if (toRawOriginal) {
+            tl_uiProgAttached.erase(program);
+            tl_hauntProgs.erase(program);
+            tl_lookProgRole.erase(program);
+            tl_ccProgBindings.erase(program);
+            if (tl_curBoundProg == program) {
+                tl_curCcProgBinding = nullptr;
+            }
+        }
+        for (uint32_t sh : attIt->second) {
+            auto git = tl_sbGpuShaders.find(sh);
+            if (git != tl_sbGpuShaders.end() && git->second != 0u) {
+                tl_sbGpuProgMask[program] |= git->second;
+            }
+            auto wit = tl_shaderWorldRole.find(sh);
+            if (wit != tl_shaderWorldRole.end() && wit->second != WorldProgRole::None) {
+                tl_progWorldRole[program] = wit->second;
+            }
+        }
+        ++tl_sbProgsGen;
+        ++tl_worldProgsGen;
+        g_hd2dProgLayoutGen.fetch_add(1u, std::memory_order_release);
+        LogMsg("[WARN][GL] Program %u %s -> reverted %u shader(s) cleanly (%s)",
+               program, reason ? reason : "guard", reverted, toRawOriginal ? "rawOriginal" : "baseSafe");
+    }
+    return reverted;
+}
+
+static bool ProgramNeedsPrelinkPairRevert(uint32_t program) noexcept {
+    auto attIt = tl_progAttachedShaders.find(program);
+    if (attIt == tl_progAttachedShaders.end() || attIt->second.empty()) return false;
+    bool hasBatchAnimVs = false, hasBatchAnimFs = false;
+    bool hasBatchBloomVs = false, hasBatchBloomFs = false;
+    bool hasHd2dAnimVs = false, hasHd2dAnimFs = false;
+    bool hasHd2dBloomVs = false, hasHd2dBloomFs = false;
+    bool anyInjected = false;
+    int firstEffVer = 0;
+    bool versionMismatch = false;
+    for (uint32_t sh : attIt->second) {
+        auto sit = tl_shaderSources.find(sh);
+        if (sit == tl_shaderSources.end()) continue;
+        const ShaderSourceRecord& r = sit->second;
+        if (r.injectedStage) anyInjected = true;
+        switch (r.batchRole) {
+            case ShaderBatchRole::AnimVs:      hasBatchAnimVs = true;  break;
+            case ShaderBatchRole::AnimFs:      hasBatchAnimFs = true;  break;
+            case ShaderBatchRole::AnimBloomVs: hasBatchBloomVs = true; break;
+            case ShaderBatchRole::AnimBloomFs: hasBatchBloomFs = true; break;
+            default: break;
+        }
+        switch (r.hd2dRole) {
+            case ShaderHd2dRole::AnimVs:      hasHd2dAnimVs = true;  break;
+            case ShaderHd2dRole::AnimFs:      hasHd2dAnimFs = true;  break;
+            case ShaderHd2dRole::AnimBloomVs: hasHd2dBloomVs = true; break;
+            case ShaderHd2dRole::AnimBloomFs: hasHd2dBloomFs = true; break;
+            default: break;
+        }
+        const int effVer = (r.versionNum == 0) ? 100 : r.versionNum;
+        if (firstEffVer == 0) firstEffVer = effVer;
+        else if (effVer != firstEffVer) versionMismatch = true;
+    }
+    if (!anyInjected) return false;
+    return (hasBatchAnimVs != hasBatchAnimFs) ||
+           (hasBatchBloomVs != hasBatchBloomFs) ||
+           (hasHd2dAnimVs != hasHd2dAnimFs) ||
+           (hasHd2dBloomVs != hasHd2dBloomFs) ||
+           versionMismatch;
+}
+
+static bool TryPromoteColourCubeProgramToTexelFetch(uint32_t program) {
+    if (program == 0u ||
+        !g_nativeGlActive.load(std::memory_order_acquire) ||
+        !g_compatEnableCcTexelFetch.load(std::memory_order_relaxed) ||
+        !g_ccTexelFetchReady.load(std::memory_order_acquire) ||
+        !g_origGlShaderSource || !g_fnGlCompileShader || !g_fnGlGetShaderiv) {
+        return false;
+    }
+    auto attIt = tl_progAttachedShaders.find(program);
+    if (attIt == tl_progAttachedShaders.end() || attIt->second.empty()) return false;
+
+    bool hasCcShader = false;
+    hs_gpu_compat::CcShaderKind progCcKind = hs_gpu_compat::CcShaderKind::None;
+    int maxExistingVer = 100;
+    for (uint32_t sh : attIt->second) {
+        auto sit = tl_shaderSources.find(sh);
+        if (sit == tl_shaderSources.end()) return false;
+        const ShaderSourceRecord& r = sit->second;
+        if (r.ccTexelFetchApplied) return false;
+        if (r.ccKind != hs_gpu_compat::CcShaderKind::None) {
+            hasCcShader = true;
+            progCcKind  = r.ccKind;
+        }
+        const int effVer = (r.versionNum > 0) ? r.versionNum : 100;
+        if (effVer > maxExistingVer) maxExistingVer = effVer;
+    }
+    if (!hasCcShader) return false;
+
+    const int targetVer = hs_gpu_compat::SelectLegalCompatGlslVersion(
+        g_hwCaps.glMajor, g_hwCaps.glMinor, maxExistingVer);
+    if (targetVer < 130) return false;
+
+    struct PendingShaderPromo {
+        uint32_t                    sh = 0u;
+        hs_gpu_compat::CcShaderKind kind = hs_gpu_compat::CcShaderKind::None;
+        std::string                 preSrc;
+        std::string                 nextSrc;
+    };
+    std::vector<PendingShaderPromo> plan;
+    plan.reserve(attIt->second.size());
+    uint32_t totalTaps = 0u;
+
+    for (uint32_t sh : attIt->second) {
+        const ShaderSourceRecord& r = tl_shaderSources[sh];
+        std::string preSrc = !r.currentSource.empty()
+            ? r.currentSource
+            : (!r.baseSafeSource.empty() ? r.baseSafeSource : r.rawOriginalSource);
+        if (preSrc.empty()) return false;
+        std::string nextSrc = preSrc;
+        if (!hs_gpu_compat::PromoteGlslVersionCompat(nextSrc, targetVer)) {
+            return false;
+        }
+        if (r.ccKind != hs_gpu_compat::CcShaderKind::None) {
+            uint32_t taps = 0u;
+            if (!hs_gpu_compat::TransformColourCubeTexelFetchShaderSource(nextSrc, taps) || taps == 0u) {
+                return false;
+            }
+            totalTaps += taps;
+        }
+        plan.push_back(PendingShaderPromo{ sh, r.ccKind, std::move(preSrc), std::move(nextSrc) });
+    }
+    if (totalTaps == 0u) return false;
+
+    for (size_t i = 0u; i < plan.size(); ++i) {
+        const char* ptr = plan[i].nextSrc.c_str();
+        const int32_t len = static_cast<int32_t>(plan[i].nextSrc.size());
+        g_origGlShaderSource(plan[i].sh, 1, &ptr, &len);
+        g_fnGlCompileShader(plan[i].sh);
+        int32_t compiled = 0;
+        g_fnGlGetShaderiv(plan[i].sh, 0x8B81u /*GL_COMPILE_STATUS*/, &compiled);
+        if (!compiled) {
+            if (g_fnGlGetShaderInfoLog) {
+                char buf[256]{};
+                int32_t ilen = 0;
+                g_fnGlGetShaderInfoLog(plan[i].sh, static_cast<int32_t>(sizeof(buf) - 1u), &ilen, buf);
+                LogMsg("[WARN][GL_COMPAT][CC_TEXELFETCH] Program %u shader %u compile failed (ver=%d): %.200s -> atomically rolling back to vanilla",
+                       program, plan[i].sh, targetVer, buf);
+            }
+            for (size_t rIdx = 0u; rIdx <= i; ++rIdx) {
+                const char* pOld = plan[rIdx].preSrc.c_str();
+                const int32_t lOld = static_cast<int32_t>(plan[rIdx].preSrc.size());
+                g_origGlShaderSource(plan[rIdx].sh, 1, &pOld, &lOld);
+                g_fnGlCompileShader(plan[rIdx].sh);
+            }
+            return false;
+        }
+    }
+
+    for (auto& item : plan) {
+        ShaderSourceRecord& r = tl_shaderSources[item.sh];
+        r.preCcCompatSource   = std::move(item.preSrc);
+        r.currentSource       = std::move(item.nextSrc);
+        r.versionNum          = ParseGlslVersionNumber(r.currentSource);
+        r.ccTexelFetchApplied = true;
+        r.modifiedByHs        = true;
+    }
+    const uint32_t n = g_ccAntiAnisoShadersPatched.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    LogMsg("[GL_COMPAT][CC_TEXELFETCH] Promoted ColourCube prog #%u (prog=%u, ver=%d, kind=%u, taps=%u)",
+           n, program, targetVer, static_cast<unsigned>(progCcKind), totalTaps);
+    return true;
+}
+
+static uint32_t RevertColourCubeTexelFetchOnly(uint32_t program) {
+    if (program == 0u || !g_origGlShaderSource || !g_fnGlCompileShader) return 0u;
+    auto attIt = tl_progAttachedShaders.find(program);
+    if (attIt == tl_progAttachedShaders.end() || attIt->second.empty()) return 0u;
+    uint32_t reverted = 0u;
+    for (uint32_t sh : attIt->second) {
+        auto sit = tl_shaderSources.find(sh);
+        if (sit == tl_shaderSources.end()) continue;
+        ShaderSourceRecord& r = sit->second;
+        if (!r.ccTexelFetchApplied) continue;
+        const std::string& restore = !r.preCcCompatSource.empty()
+            ? r.preCcCompatSource
+            : (!r.baseSafeSource.empty() ? r.baseSafeSource : r.rawOriginalSource);
+        if (restore.empty()) continue;
+        const char* ptr = restore.c_str();
+        const int32_t len = static_cast<int32_t>(restore.size());
+        g_origGlShaderSource(sh, 1, &ptr, &len);
+        g_fnGlCompileShader(sh);
+        r.ccTexelFetchApplied = false;
+        r.currentSource       = restore;
+        r.versionNum          = ParseGlslVersionNumber(restore);
+        r.preCcCompatSource.clear();
+        ++reverted;
+    }
+    if (reverted > 0u) {
+        LogMsg("[WARN][GL_COMPAT][CC_TEXELFETCH] Program %u link failed -> reverted texelFetch on %u shader(s) cleanly",
+               program, reverted);
+    }
+    return reverted;
+}
+
 static void WINAPI HookGlLinkProgram(uint32_t program) {
     g_kleiRenderCacheEpoch.fetch_add(1u, std::memory_order_release);
     if (tl_spriteBatcher.HasPending()) SyncSpriteBatcher();
@@ -12488,6 +13085,10 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
     if (tl_uiBatcher.HasPending()) SyncUiBatcher();
     tl_uiBatcher.OnDeleteOrLinkProgram(program);
     tl_glCache.OnDeleteOrLinkProgram(program);
+    if (ProgramNeedsPrelinkPairRevert(program)) {
+        RevertProgramShaders(program, false, "prelink_pair_or_version_mismatch");
+    }
+    TryPromoteColourCubeProgramToTexelFetch(program);
     if (program != 0u && g_fnGlBindAttribLocation &&
         g_sbShadersInjected.load(std::memory_order_relaxed) > 0u) {
         // Pin POS2D_UV to slot 0 (matching DST VertexDecl) and batch attribs to slots 5/6/7 (<8 GLES2 safe)
@@ -12514,6 +13115,21 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
     if (program != 0 && g_fnGlGetProgramiv) {
         g_fnGlGetProgramiv(program, kGlLinkStatus, &linkStatus);
         linkedOk = (linkStatus != 0);
+        if (!linkedOk && g_origGlLinkProgram && RevertColourCubeTexelFetchOnly(program) > 0u) {
+            g_origGlLinkProgram(program);
+            linkStatus = 0;
+            g_fnGlGetProgramiv(program, kGlLinkStatus, &linkStatus);
+            linkedOk = (linkStatus != 0);
+        }
+        if (!linkedOk && g_origGlLinkProgram && RevertProgramShaders(program, true, "postlink_rollback") > 0u) {
+            g_origGlLinkProgram(program);
+            linkStatus = 0;
+            g_fnGlGetProgramiv(program, kGlLinkStatus, &linkStatus);
+            linkedOk = (linkStatus != 0);
+            if (linkedOk) {
+                LogMsg("[INFO][GL] Program %u recovered cleanly after vanilla shader rollback.", program);
+            }
+        }
         if (!linkedOk && g_fnGlGetProgramInfoLog) {
             static std::atomic<uint32_t> s_linkErrLogs{0};
             if (s_linkErrLogs.fetch_add(1, std::memory_order_relaxed) < 16u) {
@@ -12527,15 +13143,19 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
     }
 
     int32_t locP = -1, locS = -1, locT = -1;
-    int32_t locSh = -1, locSh2 = -1, locOc = -1, locOcPbr = -1, locSp = -1, locSd = -1, locDet = -1;
+    int32_t locSh = -1, locSh2 = -1, locShSunPre = -1, locShLitPre = -1, locShBckPre = -1;
+    int32_t locOc = -1, locOcPbr = -1, locSp = -1, locSd = -1, locDet = -1;
     int32_t locSplatPt[hs_world_shadow::kMaxPointShadowLights] = { -1, -1, -1 };
     if (linkedOk && g_fnGlGetUniformLocation) {
-        locP     = g_fnGlGetUniformLocation(program, "HS_HD2D_PARAMS");
-        locS     = g_fnGlGetUniformLocation(program, "HS_HD2D_SUN");
-        locT     = g_fnGlGetUniformLocation(program, "HS_HD2D_TINT");
-        locSh    = g_fnGlGetUniformLocation(program, "HS_HD2D_SHADE");
-        locSh2   = g_fnGlGetUniformLocation(program, "HS_HD2D_SHADE2");
-        locOc    = g_fnGlGetUniformLocation(program, "HS_HD2D_OCEAN");
+        locP        = g_fnGlGetUniformLocation(program, "HS_HD2D_PARAMS");
+        locS        = g_fnGlGetUniformLocation(program, "HS_HD2D_SUN");
+        locT        = g_fnGlGetUniformLocation(program, "HS_HD2D_TINT");
+        locSh       = g_fnGlGetUniformLocation(program, "HS_HD2D_SHADE");
+        locSh2      = g_fnGlGetUniformLocation(program, "HS_HD2D_SHADE2");
+        locShSunPre = g_fnGlGetUniformLocation(program, "HS_SHADE_SUN_PRE");
+        locShLitPre = g_fnGlGetUniformLocation(program, "HS_SHADE_LIT_PRE");
+        locShBckPre = g_fnGlGetUniformLocation(program, "HS_SHADE_BCK_PRE");
+        locOc       = g_fnGlGetUniformLocation(program, "HS_HD2D_OCEAN");
         locOcPbr = g_fnGlGetUniformLocation(program, "HS_OCEAN_PBR");
         locSp    = g_fnGlGetUniformLocation(program, "HS_HD2D_SHAD_PROJ");
         locSd    = g_fnGlGetUniformLocation(program, "HS_HD2D_SHAD_DYN");
@@ -12664,7 +13284,7 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
             wRole = writ->second;
         }
         if (wRole == WorldProgRole::None) {
-            if (locSh >= 0) wRole = WorldProgRole::AnimWorld;
+            if (locSh >= 0 || locShLitPre >= 0) wRole = WorldProgRole::AnimWorld;
             else if (locOc >= 0) wRole = WorldProgRole::Ocean;
         }
         WorldProgInfo winfo{};
@@ -12712,6 +13332,64 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
         if (tl_curBoundProg == program) tl_curWorldProg = nullptr;
         tl_worldProgs.erase(program);
     }
+
+    if (program != 0u) {
+        tl_ccProgBindings.erase(program);
+        if (tl_curBoundProg == program) {
+            tl_curCcProgBinding = nullptr;
+        }
+        if (linkedOk && g_fnGlGetUniformLocation) {
+            auto attIt = tl_progAttachedShaders.find(program);
+            if (attIt != tl_progAttachedShaders.end()) {
+                hs_gpu_compat::CcShaderKind progCcKind = hs_gpu_compat::CcShaderKind::None;
+                std::string samplerExpr;
+                for (uint32_t sh : attIt->second) {
+                    auto sit = tl_shaderSources.find(sh);
+                    if (sit != tl_shaderSources.end() && sit->second.ccKind != hs_gpu_compat::CcShaderKind::None) {
+                        progCcKind = sit->second.ccKind;
+                        if (!sit->second.ccSamplerExpr.empty()) {
+                            samplerExpr = sit->second.ccSamplerExpr;
+                        }
+                    }
+                }
+                if (progCcKind == hs_gpu_compat::CcShaderKind::CombineColourCubes) {
+                    hs_gpu_compat::CcProgramBindingInfo cinfo{};
+                    cinfo.kind = progCcKind;
+                    for (uint32_t i = 0u; i < 6u; ++i) {
+                        char nm[16]{};
+                        snprintf(nm, sizeof(nm), "SAMPLER[%u]", i);
+                        const int32_t loc = g_fnGlGetUniformLocation(program, nm);
+                        if (loc >= 0) {
+                            cinfo.samplerLocs[cinfo.samplerCount++] = loc;
+                        }
+                    }
+                    if (cinfo.samplerCount > 0u) {
+                        tl_ccProgBindings[program] = cinfo;
+                        if (tl_curBoundProg == program) tl_curCcProgBinding = &tl_ccProgBindings[program];
+                    }
+                } else if (progCcKind == hs_gpu_compat::CcShaderKind::ApplyColourCube) {
+                    hs_gpu_compat::CcProgramBindingInfo cinfo{};
+                    cinfo.kind = progCcKind;
+                    int32_t ccLoc = -1;
+                    if (!samplerExpr.empty()) {
+                        ccLoc = g_fnGlGetUniformLocation(program, samplerExpr.c_str());
+                        if (ccLoc < 0 && samplerExpr.compare(0u, 8u, "SAMPLER[") != 0) {
+                            ccLoc = g_fnGlGetUniformLocation(program, "COLOUR_CUBE");
+                        }
+                    } else {
+                        ccLoc = g_fnGlGetUniformLocation(program, "COLOUR_CUBE");
+                        if (ccLoc < 0) ccLoc = g_fnGlGetUniformLocation(program, "SAMPLER[1]");
+                    }
+                    if (ccLoc >= 0) {
+                        cinfo.samplerLocs[0] = ccLoc;
+                        cinfo.samplerCount = 1u;
+                        tl_ccProgBindings[program] = cinfo;
+                        if (tl_curBoundProg == program) tl_curCcProgBinding = &tl_ccProgBindings[program];
+                    }
+                }
+            }
+        }
+    }
     ++tl_worldProgsGen;
 
     bool newlyLinkedHd2d = false;
@@ -12723,19 +13401,22 @@ static void WINAPI HookGlLinkProgram(uint32_t program) {
     slot.linkedOk  = linkedOk;
     slot.role      = wRole;
     slot.locParams   = locP;
-    slot.locSun      = locS;
-    slot.locTint     = locT;
-    slot.locShade    = locSh;
-    slot.locShade2   = locSh2;
-    slot.locOcean    = locOc;
-    slot.locOceanPbr = locOcPbr;
-    slot.locShadProj = locSp;
-    slot.locShadDyn  = locSd;
-    slot.locDetail   = locDet;
+    slot.locSun         = locS;
+    slot.locTint        = locT;
+    slot.locShade       = locSh;
+    slot.locShade2      = locSh2;
+    slot.locShadeSunPre = locShSunPre;
+    slot.locShadeLitPre = locShLitPre;
+    slot.locShadeBckPre = locShBckPre;
+    slot.locOcean       = locOc;
+    slot.locOceanPbr    = locOcPbr;
+    slot.locShadProj    = locSp;
+    slot.locShadDyn     = locSd;
+    slot.locDetail      = locDet;
     for (uint32_t si = 0u; si < hs_world_shadow::kMaxPointShadowLights; ++si) {
         slot.locSplatPt[si] = locSplatPt[si];
     }
-    slot.hasAny      = linkedOk && (locP >= 0 || locS >= 0 || locT >= 0 || locSh >= 0 || locSh2 >= 0 || locOc >= 0 || locOcPbr >= 0 || locSp >= 0 || locSd >= 0 || locDet >= 0 || locSplatPt[0] >= 0);
+    slot.hasAny      = linkedOk && (locP >= 0 || locS >= 0 || locT >= 0 || locSh >= 0 || locSh2 >= 0 || locShSunPre >= 0 || locShLitPre >= 0 || locShBckPre >= 0 || locOc >= 0 || locOcPbr >= 0 || locSp >= 0 || locSd >= 0 || locDet >= 0 || locSplatPt[0] >= 0);
     slot.lastGen     = 0;
     if (slot.hasAny && !hadAny) {
         newlyLinkedHd2d = true;
@@ -12821,6 +13502,9 @@ struct UseProgCacheEntry {
     int32_t                         locT          = -1;
     int32_t                         locSh         = -1;
     int32_t                         locSh2        = -1;
+    int32_t                         locShSunPre   = -1;
+    int32_t                         locShLitPre   = -1;
+    int32_t                         locShBckPre   = -1;
     int32_t                         locOc         = -1;
     int32_t                         locOcPbr      = -1;
     int32_t                         locSp         = -1;
@@ -12831,6 +13515,7 @@ struct UseProgCacheEntry {
     hs_sprite_batch::BatchProgInfo* sbInfo        = nullptr;
     hs_ui_batch::UiProgInfo*        uiInfo        = nullptr;
     WorldProgInfo*                  worldProg     = nullptr;
+    hs_gpu_compat::CcProgramBindingInfo* ccProg   = nullptr;
 };
 static thread_local UseProgCacheEntry tl_useProgCache[256]{};
 
@@ -12841,12 +13526,14 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
     bool hasHd2d = false;
     WorldProgRole slotRole = WorldProgRole::None;
     int32_t locP = -1, locS = -1, locT = -1;
-    int32_t locSh = -1, locSh2 = -1, locOc = -1, locOcPbr = -1, locSp = -1, locSd = -1, locDet = -1;
+    int32_t locSh = -1, locSh2 = -1, locShSunPre = -1, locShLitPre = -1, locShBckPre = -1;
+    int32_t locOc = -1, locOcPbr = -1, locSp = -1, locSd = -1, locDet = -1;
     int32_t locSplatPt[hs_world_shadow::kMaxPointShadowLights] = { -1, -1, -1 };
     uint32_t slotLastGen = 0u;
     hs_sprite_batch::BatchProgInfo* sbInfo = nullptr;
     hs_ui_batch::UiProgInfo*        uiInfo = nullptr;
     WorldProgInfo*                  worldProg = nullptr;
+    hs_gpu_compat::CcProgramBindingInfo* ccProg = nullptr;
     uint8_t                         lookProgRole = 0u;
     UseProgCacheEntry*              cacheEntry = nullptr;
 
@@ -12868,6 +13555,9 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             locT         = ce.locT;
             locSh        = ce.locSh;
             locSh2       = ce.locSh2;
+            locShSunPre  = ce.locShSunPre;
+            locShLitPre  = ce.locShLitPre;
+            locShBckPre  = ce.locShBckPre;
             locOc        = ce.locOc;
             locOcPbr     = ce.locOcPbr;
             locSp        = ce.locSp;
@@ -12880,6 +13570,7 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             sbInfo       = ce.sbInfo;
             uiInfo       = ce.uiInfo;
             worldProg    = ce.worldProg;
+            ccProg       = ce.ccProg;
             lookProgRole = ce.lookProgRole;
             if (g_extProfCount.load(std::memory_order_relaxed) > 0u) {
                 tl_extProf.curExtSlot  = ce.extSlot;
@@ -12910,6 +13601,9 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
                 locT         = slot->locTint;
                 locSh        = slot->locShade;
                 locSh2       = slot->locShade2;
+                locShSunPre  = slot->locShadeSunPre;
+                locShLitPre  = slot->locShadeLitPre;
+                locShBckPre  = slot->locShadeBckPre;
                 locOc        = slot->locOcean;
                 locOcPbr     = slot->locOceanPbr;
                 locSp        = slot->locShadProj;
@@ -12934,6 +13628,8 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
 
             auto wit = tl_worldProgs.find(program);
             worldProg = (wit != tl_worldProgs.end()) ? &wit->second : nullptr;
+            auto cit = tl_ccProgBindings.find(program);
+            ccProg = (cit != tl_ccProgBindings.end()) ? &cit->second : nullptr;
             auto lrit = tl_lookProgRole.find(program);
             lookProgRole = (lrit != tl_lookProgRole.end()) ? lrit->second : 0u;
 
@@ -12954,6 +13650,9 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             ce.locT          = locT;
             ce.locSh         = locSh;
             ce.locSh2        = locSh2;
+            ce.locShSunPre   = locShSunPre;
+            ce.locShLitPre   = locShLitPre;
+            ce.locShBckPre   = locShBckPre;
             ce.locOc         = locOc;
             ce.locOcPbr      = locOcPbr;
             ce.locSp         = locSp;
@@ -12966,6 +13665,7 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             ce.sbInfo        = sbInfo;
             ce.uiInfo        = uiInfo;
             ce.worldProg     = worldProg;
+            ce.ccProg        = ccProg;
         }
         cacheEntry = &ce;
     } else {
@@ -12987,9 +13687,10 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
     SyncUiBatcher();
     const bool uiDeferred = tl_uiBatcher.OnUseProgram(program, uiInfo);
 
-    tl_curBoundProg    = program;
-    tl_curWorldProg    = worldProg;
-    tl_curLookProgRole = lookProgRole;
+    tl_curBoundProg     = program;
+    tl_curWorldProg     = worldProg;
+    tl_curCcProgBinding = ccProg;
+    tl_curLookProgRole  = lookProgRole;
 
     if (uiDeferred) {
         // UI program switch was absorbed without calling glUseProgram on the GPU:
@@ -13034,6 +13735,22 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
                 g_fnGlUniform4fv(locSh2, 1, st.shade2);
                 tl_glCache.InvalidateUniform(program, locSh2);
             }
+            if (locShSunPre >= 0 || locShLitPre >= 0 || locShBckPre >= 0) {
+                float sunPre[4]{}, litPre[4]{}, bckPre[4]{};
+                hs_world_shadow::ComputeAnimShadePrecomp(st.shade, st.shade2, sunPre, litPre, bckPre);
+                if (locShSunPre >= 0) {
+                    g_fnGlUniform4fv(locShSunPre, 1, sunPre);
+                    tl_glCache.InvalidateUniform(program, locShSunPre);
+                }
+                if (locShLitPre >= 0) {
+                    g_fnGlUniform4fv(locShLitPre, 1, litPre);
+                    tl_glCache.InvalidateUniform(program, locShLitPre);
+                }
+                if (locShBckPre >= 0) {
+                    g_fnGlUniform4fv(locShBckPre, 1, bckPre);
+                    tl_glCache.InvalidateUniform(program, locShBckPre);
+                }
+            }
             if (locOc >= 0) {
                 g_fnGlUniform4fv(locOc, 1, st.ocean);
                 tl_glCache.InvalidateUniform(program, locOc);
@@ -13044,11 +13761,7 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
             }
             if (locSp >= 0) {
                 float spVal[4] = { st.shadProj[0], st.shadProj[1], st.shadProj[2], st.shadProj[3] };
-                if (slotRole == WorldProgRole::AnimBloom &&
-                    g_worldShadowReady.load(std::memory_order_acquire) &&
-                    !g_worldShadowFailed.load(std::memory_order_acquire)) {
-                    spVal[3] = 0.0f; // World-Space ShadowMask FBO owns shadows; keep BloomSampler 100% pure!
-                } else if (slotRole == WorldProgRole::Splat) {
+                if (slotRole == WorldProgRole::Splat) {
                     const float keep = std::clamp(st.shadowOvalKeep, 0.0f, 1.0f);
                     const float dirProj = (st.shadProj[3] > 0.5f) ? std::clamp(st.shadowDirStrength, 0.0f, 1.0f) : 0.0f;
                     const float den = std::clamp(st.shadowDensity, 0.0f, 1.0f);
@@ -13065,6 +13778,22 @@ static void WINAPI HookGlUseProgram(uint32_t program) {
                             g_fnGlUniform4fv(locSplatPt[si], 1, pDat);
                             tl_glCache.InvalidateUniform(program, locSplatPt[si]);
                         }
+                    }
+                } else {
+                    const float dx = spVal[0] + 1e-6f;
+                    const float dy = spVal[1];
+                    const float len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 1e-12f && std::isfinite(len)) {
+                        spVal[0] = dx / len;
+                        spVal[1] = dy / len;
+                    } else {
+                        spVal[0] = 1.0f;
+                        spVal[1] = 0.0f;
+                    }
+                    if (slotRole == WorldProgRole::AnimBloom &&
+                        g_worldShadowReady.load(std::memory_order_acquire) &&
+                        !g_worldShadowFailed.load(std::memory_order_acquire)) {
+                        spVal[3] = 0.0f; // World-Space ShadowMask FBO owns shadows; keep BloomSampler 100% pure!
                     }
                 }
                 g_fnGlUniform4fv(locSp, 1, spVal);
@@ -13121,10 +13850,17 @@ static void WINAPI HookGlDeleteProgram(uint32_t program) {
     tl_uiBatcher.OnDeleteOrLinkProgram(program);
     tl_uiProgs.erase(program);
     tl_uiProgAttached.erase(program);
+    tl_progAttachedShaders.erase(program);
     tl_progWorldRole.erase(program);
     tl_hauntProgs.erase(program);
     tl_lookProgRole.erase(program);
     if (tl_curBoundProg == program) tl_curLookProgRole = 0u;
+    auto cpit = tl_ccProgBindings.find(program);
+    if (cpit != tl_ccProgBindings.end()) {
+        if (tl_curCcProgBinding == &cpit->second) tl_curCcProgBinding = nullptr;
+        tl_ccProgBindings.erase(cpit);
+    }
+    if (tl_curBoundProg == program) tl_curCcProgBinding = nullptr;
     auto wpit = tl_worldProgs.find(program);
     if (wpit != tl_worldProgs.end()) {
         if (tl_curWorldProg == &wpit->second) tl_curWorldProg = nullptr;
@@ -13444,49 +14180,10 @@ static void HookLightMapRender(void* lightMap, uint8_t* renderData) {
     const bool isNat = g_nativeGlActive.load(std::memory_order_acquire);
     const bool userFullLm = g_visualFullresLightmap.load(std::memory_order_relaxed);
 
-    // Phase 4: Adaptive 0ms LightMap 1.0x <-> 0.5x hot-swap under sustained GPU pressure (Native GL only).
-    // Strictly respects user FullResLightmap=0 (NEVER forces 1.0x!).
-    static thread_local uint32_t tl_lmAdaptSeq = 0xFFFFFFFFu;
-    static thread_local bool     tl_lmAdaptHalf = false;
-    static thread_local uint32_t tl_lmHiStreak = 0u;
-    static thread_local uint32_t tl_lmLoStreak = 0u;
-    const uint32_t rtSeq = g_rtSwapSeq.load(std::memory_order_relaxed);
-    if (!userFullLm || !isNat || !g_lightmapScaleSlot) {
-        tl_lmAdaptHalf = false;
-        tl_lmHiStreak = 0u;
-        tl_lmLoStreak = 0u;
-        tl_lmAdaptSeq = rtSeq;
-    } else if (tl_lmAdaptSeq != rtSeq) {
-        tl_lmAdaptSeq = rtSeq;
-        const float emaGpuMs = g_emaGpuDrainUs.load(std::memory_order_relaxed) * 0.001f;
-        if (!std::isfinite(emaGpuMs) || emaGpuMs <= 0.0f) {
-            tl_lmHiStreak = 0u;
-            tl_lmLoStreak = 0u;
-        } else if (!tl_lmAdaptHalf) {
-            if (emaGpuMs >= 7.5f) {
-                if (++tl_lmHiStreak >= 60u) {
-                    tl_lmAdaptHalf = true;
-                    tl_lmHiStreak = 0u;
-                    tl_lmLoStreak = 0u;
-                }
-            } else {
-                tl_lmHiStreak = 0u;
-            }
-        } else {
-            if (emaGpuMs < 5.2f) {
-                if (++tl_lmLoStreak >= 120u) {
-                    tl_lmAdaptHalf = false;
-                    tl_lmLoStreak = 0u;
-                    tl_lmHiStreak = 0u;
-                }
-            } else {
-                tl_lmLoStreak = 0u;
-            }
-        }
-    }
-    g_lightmapAdaptiveHalf.store(tl_lmAdaptHalf, std::memory_order_relaxed);
+    // Strictly zero-compromise LightMap scale: always honor user FullResLightmap setting (1.0x vs 0.5x).
+    g_lightmapAdaptiveHalf.store(false, std::memory_order_relaxed);
 
-    const float wantScale = (userFullLm && !tl_lmAdaptHalf) ? 1.0f : 0.5f;
+    const float wantScale = userFullLm ? 1.0f : 0.5f;
     if (g_lightmapScaleSlot) {
         if (s_appliedLmScale < 0.0f) {
             s_appliedLmScale = *g_lightmapScaleSlot;
@@ -13506,10 +14203,9 @@ static void HookLightMapRender(void* lightMap, uint8_t* renderData) {
         renderData[0] = 1; // Triggers Klei's native LightMap RT destroy + InitRenderTarget() rebuild!
         g_origLightMapRender(lightMap, renderData);
         renderData[0] = savedFlag;
-        LogMsg("[VISUAL] Live 0ms LightMap RT hot-swapped -> %.1fx (%s, lmAd=%d, no reload needed!)",
+        LogMsg("[VISUAL] Live 0ms LightMap RT hot-swapped -> %.1fx (%s, lmAd=0, no reload needed!)",
                g_lightmapScaleSlot ? static_cast<double>(*g_lightmapScaleSlot) : 0.5,
-               g_visualHdrLightmapActive.load(std::memory_order_relaxed) ? "RGBA16F" : "RGBA8",
-               tl_lmAdaptHalf ? 1 : 0);
+               g_visualHdrLightmapActive.load(std::memory_order_relaxed) ? "RGBA16F" : "RGBA8");
         return;
     }
     g_origLightMapRender(lightMap, renderData);
@@ -13920,6 +14616,7 @@ static uint64_t HookClientLuaUpdate(void* sim, uint32_t a2, uint32_t a3) {
     } hookGuard;
     const uint32_t curProbes = s_luaHookProbes.load(std::memory_order_relaxed);
     if (g_inGameplay.load(std::memory_order_relaxed) != 0 &&
+        !g_foreignLuaVmDetected.load(std::memory_order_relaxed) &&
         s_luaSpikeLogs.load(std::memory_order_relaxed) < 8u &&
         curProbes < 240u &&
         (curProbes < 60u || tl_lastLuaProbeQpc == 0 ||
@@ -14824,7 +15521,9 @@ static bool IsOurGlHookPointer(void* p) noexcept {
            p == reinterpret_cast<void*>(&HookGlStencilOp) ||
            p == reinterpret_cast<void*>(&HookGlPolygonOffset) ||
            p == reinterpret_cast<void*>(&HookGlTexImage2D) ||
-           p == reinterpret_cast<void*>(&HookGlCompressedTexImage2D);
+           p == reinterpret_cast<void*>(&HookGlTexSubImage2D) ||
+           p == reinterpret_cast<void*>(&HookGlCompressedTexImage2D) ||
+           p == reinterpret_cast<void*>(&HookGlPixelStorei);
 }
 
 static void ActivateNativeOpenGlOnFirstMakeCurrent() {
@@ -14917,7 +15616,10 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
             case  72: g_fnGlGetString                    = reinterpret_cast<GlGetString_t>(p); break;
             case  77: g_fnGlGetUniformLocation           = reinterpret_cast<GlGetUniformLocation_t>(p); break;
             case  90: g_origGlLinkProgram                = reinterpret_cast<GlLinkProgram_t>(p); break;
-            case  91: g_fnGlPixelStorei                  = reinterpret_cast<GlPixelStorei_t>(p); break;
+            case  91:
+                g_fnGlPixelStorei   = reinterpret_cast<GlPixelStorei_t>(p);
+                g_origGlPixelStorei = g_fnGlPixelStorei;
+                break;
             case  92: g_origGlPolygonOffset              = reinterpret_cast<GlPolygonOffset_t>(p); break;
             case  93: g_origGlReadPixels                 = reinterpret_cast<GlReadPixels_t>(p); break;
             case  95:
@@ -15021,6 +15723,66 @@ static void ActivateNativeOpenGlOnFirstMakeCurrent() {
     g_afCapsProbeState.store(0, std::memory_order_release);
     g_hd2dIatHooked = g_optHd2dWorldShaders.load(std::memory_order_relaxed) &&
                       (g_fnGlGetUniformLocation && g_fnGlGetProgramiv && g_fnGlUniform4fv);
+    if (void* pTexSub = g_wglRt.ResolveGlProc("glTexSubImage2D")) {
+        g_origGlTexSubImage2D = reinterpret_cast<GlTexSubImage2D_t>(pTexSub);
+    }
+
+    // Layer 4 Phase B: Live-context ColourCube Canary on the REAL game HGLRC & HDC before Frame 1
+    {
+        hs_gpu_compat::CompatConfig liveCfg{};
+        liveCfg.enableCcTexelFetch   = g_compatEnableCcTexelFetch.load(std::memory_order_relaxed);
+        liveCfg.enableCcRgbNormalize = g_compatEnableCcRgbNormalize.load(std::memory_order_relaxed);
+        liveCfg.enableWglExactPfd    = g_compatEnableWglExactPfd.load(std::memory_order_relaxed);
+        liveCfg.enableGlCanaryProbe  = g_compatEnableGlCanaryProbe.load(std::memory_order_relaxed);
+
+        HDC curDc = g_wglRt.pWglGetCurrentDC ? g_wglRt.pWglGetCurrentDC() : g_nativeGameHdc;
+        int curPf = (curDc && g_wglRt.pGetPixelFormat) ? g_wglRt.pGetPixelFormat(curDc) : 0;
+        hs_gpu_compat::PixelFormatInfo livePfd{};
+        if (curDc && curPf > 0) {
+            hs_native_gl::QueryPixelFormatInfo(
+                g_wglRt, curDc, curPf,
+                (g_wglRt.chosenArbPixelFormat > 0 && curPf == g_wglRt.chosenArbPixelFormat),
+                livePfd);
+        } else {
+            livePfd = g_wglRt.chosenPfdInfo;
+        }
+        const char* sVen = g_wglRt.pGlGetString ? g_wglRt.pGlGetString(0x1F00u) : nullptr;
+        const char* sRen = g_wglRt.pGlGetString ? g_wglRt.pGlGetString(0x1F01u) : nullptr;
+        const char* sVer = g_wglRt.pGlGetString ? g_wglRt.pGlGetString(0x1F02u) : nullptr;
+        const std::string liveVen = sVen ? sVen : "";
+        const std::string liveRen = sRen ? sRen : "";
+        const std::string liveVer = sVer ? sVer : "";
+        const bool liveHasAniso = (opt.glTexParameterf != nullptr && opt.glGetFloatv != nullptr);
+
+        hs_gpu_compat::CanaryReport liveReport{};
+        const hs_gpu_compat::CanaryGlOps cGl = hs_native_gl::BuildCanaryGlOps(g_wglRt);
+        const bool liveOk = hs_gpu_compat::RunLiveColourCubeCanary(
+            cGl, g_hwCaps.glMajor, g_hwCaps.glMinor, liveHasAniso, liveCfg,
+            liveVen, liveRen, liveVer, livePfd, /*preserveHostState=*/true, liveReport);
+
+        LogMsg("[GL_COMPAT][LIVE_CANARY] pf=%d(arb=%d,rgba=%d/%d/%d/%d,ds=%d/%d,10bit=%d) ran=%d passed=%d verdict=%d stage=%s maxErr=%d worst=(%d,%d,%c) exp=(%u,%u,%u,%u) got=(%u,%u,%u,%u) texelFetch=%d ms=%.2f decision=%s reason=%s gpu=%s|%s|%s",
+               livePfd.pixelFormat, livePfd.usedArbChoose ? 1 : 0,
+               livePfd.redBits, livePfd.greenBits, livePfd.blueBits, livePfd.alphaBits,
+               livePfd.depthBits, livePfd.stencilBits, livePfd.is10BitRgb ? 1 : 0,
+               liveReport.ran ? 1 : 0, liveReport.passed ? 1 : 0,
+               static_cast<int>(liveReport.verdict), liveReport.stage.c_str(),
+               liveReport.maxErr, liveReport.worstX, liveReport.worstY, liveReport.worstChannel,
+               liveReport.expRgba[0], liveReport.expRgba[1], liveReport.expRgba[2], liveReport.expRgba[3],
+               liveReport.gotRgba[0], liveReport.gotRgba[1], liveReport.gotRgba[2], liveReport.gotRgba[3],
+               liveReport.texelFetchReady ? 1 : 0, liveReport.elapsedMs,
+               liveReport.decision.c_str(), liveReport.fallbackReason.c_str(),
+               liveVen.c_str(), liveRen.c_str(), liveVer.c_str());
+
+        if (!liveOk || !liveReport.passed) {
+            // Never switch rendering backend mid-flight on an already-created game context;
+            // cleanly disarm ColourCube compat layers and preserve vanilla rendering as safe fallback.
+            g_ccTexelFetchReady.store(false, std::memory_order_release);
+            g_ccRgbNormalizeLiveDisabled.store(true, std::memory_order_release);
+            LogMsg("[WARN][GL_COMPAT][LIVE_CTX_MISMATCH] Real game HGLRC canary failed -> disarmed Layer1(texelFetch) & Layer2(rgbNorm) cleanly, keeping vanilla context.");
+        } else {
+            g_ccTexelFetchReady.store(liveReport.texelFetchReady, std::memory_order_release);
+        }
+    }
     LogMsg("[GL_NATIVE] Live GLES2 table bound (resolved=%d/76, directIAT=%d, wrappersUpdated=%d, mapRange=%d, lazyReadback=%d)",
            nResolved, directPatched, wrapperUpdated,
            (g_fnGlMapBufferRange && g_fnGlUnmapBuffer) ? 1 : 0,
@@ -15072,6 +15834,8 @@ static void InstallGlIatHooks() {
         g_fnGlBlendFuncSeparate       = reinterpret_cast<GlBlendFuncSeparate_t>(GetProcAddress(hGles, "glBlendFuncSeparate"));
         g_fnGlBlendEquationSeparate   = reinterpret_cast<GlBlendEquationSeparate_t>(GetProcAddress(hGles, "glBlendEquationSeparate"));
         g_fnGlPixelStorei             = reinterpret_cast<GlPixelStorei_t>(GetProcAddress(hGles, "glPixelStorei"));
+        g_origGlPixelStorei           = g_fnGlPixelStorei;
+        g_origGlTexSubImage2D         = reinterpret_cast<GlTexSubImage2D_t>(GetProcAddress(hGles, "glTexSubImage2D"));
     }
 
     if (PatchExeIatEntry("libGLESv2.dll", 109, "glTexParameteri", reinterpret_cast<void*>(&HookGlTexParameteri), g_origGlTexParameteri)) {
@@ -15105,10 +15869,10 @@ static void InstallGlIatHooks() {
         okSrc = (g_optHd2dWorldShaders.load(std::memory_order_relaxed) || wantSpriteBatch || wantNativeGl)
             ? PatchExeIatEntry("libGLESv2.dll", 99,  "glShaderSource",  reinterpret_cast<void*>(&HookGlShaderSource),  g_origGlShaderSource)
             : false;
-        if (wantSpriteBatch || g_optHd2dWorldShaders.load(std::memory_order_relaxed)) {
+        okLnk = PatchExeIatEntry("libGLESv2.dll", 90,  "glLinkProgram",   reinterpret_cast<void*>(&HookGlLinkProgram),   g_origGlLinkProgram);
+        if (okSrc || okLnk) {
             PatchExeIatEntry("libGLESv2.dll", 2, "glAttachShader", reinterpret_cast<void*>(&HookGlAttachShader), g_origGlAttachShader);
         }
-        okLnk = PatchExeIatEntry("libGLESv2.dll", 90,  "glLinkProgram",   reinterpret_cast<void*>(&HookGlLinkProgram),   g_origGlLinkProgram);
         okUse = PatchExeIatEntry("libGLESv2.dll", 131, "glUseProgram",    reinterpret_cast<void*>(&HookGlUseProgram),    g_origGlUseProgram);
         okDel = PatchExeIatEntry("libGLESv2.dll", 32,  "glDeleteProgram", reinterpret_cast<void*>(&HookGlDeleteProgram), g_origGlDeleteProgram);
         g_hd2dIatHooked = (g_optHd2dWorldShaders.load(std::memory_order_relaxed) &&
@@ -15286,6 +16050,17 @@ static void InstallGlIatHooks() {
             PatchExeIatEntry("libGLESv2.dll", 64, "glGetIntegerv", reinterpret_cast<void*>(&HookGlGetIntegerv), g_fnGlGetIntegerv);
             PatchExeIatEntry("libGLESv2.dll", 54, "glGenTextures", reinterpret_cast<void*>(&HookGlGenTextures), g_origGlGenTextures);
             PatchExeIatEntry("libGLESv2.dll", 61, "glGetError",    reinterpret_cast<void*>(&HookGlGetError),    g_origGlGetError);
+            // Layer 1 + Layer 2 GPU driver compat hooks must stay armed even when gl_state_cache=0 / enable_sprite_batch=0
+            PatchExeIatEntry("libGLESv2.dll",  91, "glPixelStorei",          reinterpret_cast<void*>(&HookGlPixelStorei),          g_origGlPixelStorei);
+            PatchExeIatEntry("libGLESv2.dll", 111, "glTexSubImage2D",        reinterpret_cast<void*>(&HookGlTexSubImage2D),        g_origGlTexSubImage2D);
+            PatchExeIatEntry("libGLESv2.dll",   1, "glActiveTexture",        reinterpret_cast<void*>(&HookGlActiveTexture),        g_origGlActiveTexture);
+            PatchExeIatEntry("libGLESv2.dll",   7, "glBindTexture",          reinterpret_cast<void*>(&HookGlBindTexture),          g_origGlBindTexture);
+            PatchExeIatEntry("libGLESv2.dll",   4, "glBindBuffer",           reinterpret_cast<void*>(&HookGlBindBuffer),           g_origGlBindBuffer);
+            PatchExeIatEntry("libGLESv2.dll",  29, "glDeleteBuffers",        reinterpret_cast<void*>(&HookGlDeleteBuffers),        g_origGlDeleteBuffers);
+            PatchExeIatEntry("libGLESv2.dll", 114, "glUniform1i",            reinterpret_cast<void*>(&HookGlUniform1i),            g_origGlUniform1i);
+            PatchExeIatEntry("libGLESv2.dll",  41, "glDrawArrays",           reinterpret_cast<void*>(&HookGlDrawArrays),           g_origGlDrawArrays);
+            PatchExeIatEntry("libGLESv2.dll",  42, "glDrawElements",         reinterpret_cast<void*>(&HookGlDrawElements),         g_origGlDrawElements);
+            PatchExeIatEntry("libGLESv2.dll",  22, "glCompressedTexImage2D", reinterpret_cast<void*>(&HookGlCompressedTexImage2D), g_origGlCompressedTexImage2D);
         }
         g_kleiEpochHooksReady.store(okLnk && okDel && okMc && okSw && okDbHooked,
                                     std::memory_order_release);
@@ -15765,10 +16540,19 @@ static void __cdecl HookSteamApiRunCallbacks() {
 
 static BOOL WINAPI HookPeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     if (!g_origPeekMessageW) return FALSE;
+    if (hWnd && IsWindow(hWnd) && !g_lastGameHwnd.load(std::memory_order_relaxed)) {
+        g_lastGameHwnd.store(hWnd, std::memory_order_release);
+    }
     const int64_t t0 = NowQpc();
     const BOOL rc = g_origPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (rc && lpMsg && (wRemoveMsg & PM_REMOVE) != 0 && wMsgFilterMin == 0u && wMsgFilterMax == 0u) {
-        if (lpMsg->message == 0x0219u /*WM_DEVICECHANGE*/) {
+    if (rc && lpMsg && (wRemoveMsg & PM_REMOVE) != 0) {
+        if (lpMsg->hwnd && IsWindow(lpMsg->hwnd) && !g_lastGameHwnd.load(std::memory_order_relaxed)) {
+            g_lastGameHwnd.store(lpMsg->hwnd, std::memory_order_release);
+        }
+        if (g_imeShield.OnPeekMessage(lpMsg, GetActiveGameHwnd())) {
+            g_cursorClip.ReleaseUnconditionally(false);
+        }
+        if (wMsgFilterMin == 0u && wMsgFilterMax == 0u && lpMsg->message == 0x0219u /*WM_DEVICECHANGE*/) {
             for (int i = 0; i < 4; ++i) {
                 g_xinputDiscQpc[i].store(0, std::memory_order_relaxed);
             }
@@ -15801,7 +16585,7 @@ static BOOL WINAPI HookMiniDumpWriteDump(HANDLE hProcess, DWORD processId, HANDL
 }
 
 static void InstallDiagnosticsAndUtilityIatHooks() {
-    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.7-beta1");
+    g_crashDetective.Init(g_binDir.c_str(), &g_cursorClip, "2.9.7-beta2");
     g_crashDetective.InstallUnhandledFilter();
     const bool okDump   = PatchExeIatEntry("dbghelp.dll",     0, "MiniDumpWriteDump",     reinterpret_cast<void*>(&HookMiniDumpWriteDump),    g_origMiniDumpWriteDump);
     const bool okSteam  = PatchExeIatEntry("steam_api64.dll", 0, "SteamAPI_RunCallbacks", reinterpret_cast<void*>(&HookSteamApiRunCallbacks), g_origSteamRunCallbacks);
@@ -17100,7 +17884,7 @@ int LuaHyperSmoothGetSpriteBatchStats(void* L) {
 
 int LuaHyperSmoothVersion(void* L) {
     if (!g_luaPushString) return 0;
-    g_luaPushString(L, "DST-HyperSmooth/2.9.7-beta1");
+    g_luaPushString(L, "DST-HyperSmooth/2.9.7-beta2");
     return 1;
 }
 
@@ -17385,7 +18169,7 @@ static int __cdecl LuaHyperSmoothSetClipCursor(void* L) {
         allowG = true;
     }
     g_cursorClip.SetConfig(en, allowG);
-    const bool active = g_cursorClip.Update(g_nativeGameHwnd);
+    const bool active = g_cursorClip.Update(GetActiveGameHwnd());
     g_luaPushBoolean(L, active ? 1 : 0);
     return 1;
 }
@@ -17396,6 +18180,36 @@ static int __cdecl LuaHyperSmoothGetClipCursor(void* L) {
     g_luaPushBoolean(L, g_cursorClip.IsAllowGameplay() ? 1 : 0);
     g_luaPushBoolean(L, g_cursorClip.IsClippedNow() ? 1 : 0);
     return 3;
+}
+
+// Track 2B: HyperSmooth_SetTextInputActive(textInputActive [, inGameplay]) -> needFlushInput
+static int __cdecl LuaHyperSmoothSetTextInputActive(void* L) {
+    if (!g_luaToBoolean || !g_luaPushBoolean) return 0;
+    g_luaBridgeActive.store(1, std::memory_order_release);
+    const bool textActive = (g_luaToBoolean(L, 1) != 0);
+    bool inGame = g_imeShield.IsInGameplay();
+    if (g_clientLuaApi.type) {
+        if (g_clientLuaApi.type(L, 2) > 0) {
+            inGame = (g_luaToBoolean(L, 2) != 0);
+        }
+    } else if (g_inGameplay.load(std::memory_order_relaxed) != 0) {
+        inGame = true;
+    }
+    const bool needFlush = g_imeShield.OnTextInputStateChanged(textActive, inGame, GetActiveGameHwnd());
+    g_luaPushBoolean(L, needFlush ? 1 : 0);
+    return 1;
+}
+
+static int __cdecl LuaHyperSmoothGetImeShieldStats(void* L) {
+    if (!g_luaPushBoolean || !g_luaPushNumber) return 0;
+    g_luaPushBoolean(L, g_imeShield.IsEnabled() ? 1 : 0);
+    g_luaPushBoolean(L, g_imeShield.IsTextInputActive() ? 1 : 0);
+    g_luaPushBoolean(L, g_imeShield.IsInGameplay() ? 1 : 0);
+    g_luaPushBoolean(L, g_imeShield.IsSuppressedNow() ? 1 : 0);
+    g_luaPushNumber(L, static_cast<double>(g_imeShield.SuppressCount()));
+    g_luaPushNumber(L, static_cast<double>(g_imeShield.RestoreCount()));
+    g_luaPushNumber(L, static_cast<double>(g_imeShield.FocusRegains()));
+    return 7;
 }
 
 // v2.9.5 M2: HyperSmooth_ReportLuaCrash(modId, modName, summary)
@@ -17658,6 +18472,8 @@ void RegisterHyperSmoothLuaApi(void* L) {
     reg("HyperSmooth_SetFoliageAnchors", &LuaHyperSmoothSetFoliageAnchors);
     reg("HyperSmooth_SetClipCursor", &LuaHyperSmoothSetClipCursor);
     reg("HyperSmooth_GetClipCursor", &LuaHyperSmoothGetClipCursor);
+    reg("HyperSmooth_SetTextInputActive", &LuaHyperSmoothSetTextInputActive);
+    reg("HyperSmooth_GetImeShieldStats", &LuaHyperSmoothGetImeShieldStats);
     reg("HyperSmooth_GetWorldStudioStatus", &LuaHyperSmoothGetWorldStudioStatus);
     reg("HyperSmooth_GetVisualPerf", &LuaHyperSmoothGetVisualPerf);
     reg("HyperSmooth_GetHostPerf", &LuaHyperSmoothGetHostPerf);
@@ -17758,6 +18574,7 @@ void HookLuaOpenLibs(void* L) {
             g_foliageTableGen.fetch_add(1, std::memory_order_release);
         }
         g_cursorClip.SetConfig(g_cursorClip.IsEnabled(), false);
+        g_imeShield.ResetForNewVm();
         g_combatImpact.SetConfig(false, 1.0f, 1.0f, 1.0f, 1.0f);
         g_visualMipLodBias.store(0.0f, std::memory_order_relaxed);
         ResetExtProfMetricsOnly();
@@ -17795,6 +18612,10 @@ static bool TryResolvePreHookedJump(const uint8_t* src, uint64_t* outNextHop) {
 }
 
 void PrepareLuaBridgeHook(std::vector<PendingCodePatch>& patches, uint8_t* textStart, size_t textSize) {
+    if (g_foreignLuaVmDetected.load(std::memory_order_acquire)) {
+        LogMsg("[COMPAT] Foreign Lua VM active -> skipped PUC Lua 5.1 C API Bridge hooks (all C++ Frame Pacer/GL/Skeletal optimizations remain active).");
+        return;
+    }
     constexpr uint8_t kSigOpenLibs[] = {
         0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20,
         0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00,
@@ -18106,6 +18927,7 @@ void EnsureDefaultIni() {
         "dxgi_flip_present=off\n"
         "enable_vb_pool=1\n"
         "enable_sprite_batch=1\n"
+        "enable_ime_shield=1\n"
         "hardware_tier=balanced\n"
         "\n"
         "[VISUAL]\n"
@@ -18114,6 +18936,12 @@ void EnsureDefaultIni() {
         "fullres_lightmap=0\n"
         "mip_lod_sharp=0\n"
         "hd2d_world_shaders=1\n"
+        "\n"
+        "[COMPAT]\n"
+        "enable_cc_texelfetch=1\n"
+        "enable_cc_rgb_normalize=1\n"
+        "enable_wgl_exact_pfd=1\n"
+        "enable_gl_canary_probe=1\n"
         "\n"
         "[TELEMETRY]\n"
         "enable_blackbox=1\n"
@@ -18330,6 +19158,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
     GetPrivateProfileStringW(L"OPTIMIZE", L"dxgi_flip_present", L"off", optDxgiFlipBuf, 32, g_iniPath.c_str());
     bool optVbPool = ReadIniInt(L"OPTIMIZE", L"enable_vb_pool", 1) != 0;
     bool optSpriteBatch = ReadIniInt(L"OPTIMIZE", L"enable_sprite_batch", 1) != 0;
+    bool optImeShield = ReadIniInt(L"OPTIMIZE", L"enable_ime_shield", 1) != 0;
     {
         DEVMODEW dm{};
         dm.dmSize = sizeof(dm);
@@ -18344,6 +19173,10 @@ DWORD WINAPI WorkerProc(LPVOID) {
     bool optFullresLm = ReadIniInt(L"VISUAL", L"fullres_lightmap", 0) != 0;
     bool optMipSharp = ReadIniInt(L"VISUAL", L"mip_lod_sharp", 0) != 0;
     bool optHd2dWorld = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1) != 0;
+    bool optCompatTexelFetch = ReadIniInt(L"COMPAT", L"enable_cc_texelfetch", 1) != 0;
+    bool optCompatRgbNorm    = ReadIniInt(L"COMPAT", L"enable_cc_rgb_normalize", 1) != 0;
+    bool optCompatExactPfd   = ReadIniInt(L"COMPAT", L"enable_wgl_exact_pfd", 1) != 0;
+    bool optCompatCanary     = ReadIniInt(L"COMPAT", L"enable_gl_canary_probe", 1) != 0;
     bool optBlackbox = ReadIniInt(L"TELEMETRY", L"enable_blackbox", 1) != 0;
     int  bbThreshMs = std::clamp(ReadIniInt(L"TELEMETRY", L"blackbox_threshold_ms", 25), 5, 500);
     int initFps = ReadIniInt(L"FPS", L"target_fps", 240);
@@ -18370,10 +19203,19 @@ DWORD WINAPI WorkerProc(LPVOID) {
     g_cfgDxgiFlipPresent.store(static_cast<int>(hs_dxgi_flip::ParseFlipMode(optDxgiFlipBuf)), std::memory_order_release);
     g_optVbPool.store(optVbPool, std::memory_order_release);
     g_optSpriteBatch.store(optSpriteBatch, std::memory_order_release);
+    g_optImeShield.store(optImeShield, std::memory_order_release);
+    g_imeShield.SetEnabled(optImeShield);
     g_visualAnisoLevel.store(optAniso, std::memory_order_relaxed);
     g_visualFullresLightmap.store(optFullresLm, std::memory_order_relaxed);
     g_visualMipLodBias.store(optMipSharp ? -0.45f : 0.0f, std::memory_order_relaxed);
     g_optHd2dWorldShaders.store(optHd2dWorld, std::memory_order_release);
+    g_compatEnableCcTexelFetch.store(optCompatTexelFetch, std::memory_order_release);
+    g_compatEnableCcRgbNormalize.store(optCompatRgbNorm, std::memory_order_release);
+    g_compatEnableWglExactPfd.store(optCompatExactPfd, std::memory_order_release);
+    g_compatEnableGlCanaryProbe.store(optCompatCanary, std::memory_order_release);
+    LogMsg("[GL_COMPAT] Config: texelFetch=%d rgbNorm=%d exactPfd=%d canary=%d",
+           optCompatTexelFetch ? 1 : 0, optCompatRgbNorm ? 1 : 0,
+           optCompatExactPfd ? 1 : 0, optCompatCanary ? 1 : 0);
     g_optBlackbox.store(optBlackbox, std::memory_order_relaxed);
     g_blackboxThresholdMs.store(bbThreshMs, std::memory_order_relaxed);
 
@@ -18396,6 +19238,15 @@ DWORD WINAPI WorkerProc(LPVOID) {
     uint8_t* textStart = nullptr;
     size_t textSize = 0;
     if (GetTextSection(textStart, textSize)) {
+        const char* foreignLuaReason = nullptr;
+        if (DetectForeignLuaVm(textStart, textSize, &foreignLuaReason)) {
+            g_foreignLuaVmDetected.store(true, std::memory_order_release);
+            g_optMimallocLua.store(false, std::memory_order_release);
+            optMimallocLua = false;
+            optSmoothGc = false;
+            LogMsg("[COMPAT] Foreign Lua VM / LuaJIT2 detected (%s) -> yielding all PUC Lua 5.1 ABI hooks (mimalloc/GC/Bridge); pure C++ FramePacer/GL/Skeletal/VFS optimizations stay ACTIVE!",
+                   foreignLuaReason ? foreignLuaReason : "unknown");
+        }
         // Phase 1: Read-only AOB scanning & W^X trampoline preparation (0 threads suspended)
         std::vector<PendingCodePatch> patches;
         patches.reserve(48);
@@ -18890,7 +19741,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
                 static_cast<float>(avgFps), static_cast<float>(low1Fps),
                 g_emaFrameBusyUs.load(std::memory_order_relaxed) * 0.001f,
                 g_emaSwapUs.load(std::memory_order_relaxed) * 0.001f);
-            g_cursorClip.Update(g_nativeGameHwnd);
+            g_cursorClip.Update(GetActiveGameHwnd());
         }
 
         // Poll dst_fps.ini once per second for manual user edits
@@ -18918,6 +19769,7 @@ DWORD WINAPI WorkerProc(LPVOID) {
                     int asav = ReadIniInt(L"OPTIMIZE", L"enable_async_save", 0);
                     int vbp = ReadIniInt(L"OPTIMIZE", L"enable_vb_pool", 1);
                     int sbat = ReadIniInt(L"OPTIMIZE", L"enable_sprite_batch", 1);
+                    int imes = ReadIniInt(L"OPTIMIZE", L"enable_ime_shield", 1);
                     int hd2d = ReadIniInt(L"VISUAL", L"hd2d_world_shaders", 1);
                     int bbOn = ReadIniInt(L"TELEMETRY", L"enable_blackbox", 1);
                     int bbMs = std::clamp(ReadIniInt(L"TELEMETRY", L"blackbox_threshold_ms", 25), 5, 500);
@@ -18937,6 +19789,8 @@ DWORD WINAPI WorkerProc(LPVOID) {
                     g_optAsyncSave.store((asav != 0) && g_asyncSaveActive.load(std::memory_order_acquire), std::memory_order_relaxed);
                     g_optVbPool.store((vbp != 0) && g_vbPoolHooked.load(std::memory_order_acquire), std::memory_order_relaxed);
                     g_optSpriteBatch.store((sbat != 0) && g_spriteBatchActive.load(std::memory_order_acquire), std::memory_order_release);
+                    g_optImeShield.store(imes != 0, std::memory_order_relaxed);
+                    g_imeShield.SetEnabled(imes != 0);
                     g_optHd2dWorldShaders.store(hd2d != 0, std::memory_order_relaxed);
 
                     if (!luaOwns) {

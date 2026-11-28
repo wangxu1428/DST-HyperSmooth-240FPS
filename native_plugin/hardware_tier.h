@@ -23,6 +23,7 @@ struct HardwareCaps {
     bool     hasBufferStorage   = false;
     bool     hasSsbo            = false;
     bool     hasBindlessTexture = false;
+    bool     hasNonUniformBindless = false;
     bool     hasBaseVertex      = false;
     bool     isNativeGl         = false;
 };

@@ -10,6 +10,12 @@ name = L("HyperShade · 饥荒超帧与视觉引擎（原 HyperSmooth）", "DST 
 description = L([[
 纯客户端 240 帧骨骼/位移/影子/粒子/动态光源/镜头全场景补帧、Native OpenGL 硬件加速（完整兼容 Steam 社区界面）、世界空间独立 ShadowMask FBO 流体阴影与 360° 多光源篝火/提灯动态投影 + 沿岸实景平面水面倒影 + 真·白名单植被风动与穿行拨草、原生崩溃侦探与双屏防甩出鼠标锁、全参数实时画质光影工坊、视觉风格闭环（任意截图吸色拟合自有管线参数 → HS1 分享码）与 HS_EXT_V1 标准 Shader 扩展管线（全自动识别官方中英文语言并支持局内热切换）。
 
+【v2.9.7-beta2 测试版热更新】
+1. 通用 GPU 驱动兼容与 ColourCube 自适配：新增 4 层兼容保护与启动 Canary 自检，修复部分显卡/滤镜下人物与建筑黑体、串色问题。
+2. 智能中文输入法防抢键（IME Shield）：局内自动屏蔽输入法防 WASD 失灵，打开聊天/控制台/木牌秒恢复，切屏粘键自动复位。
+3. LuaJIT2 冲突自动退让：检测到外源 LuaJIT2 时自动退让原生 GC 钩子，避免双开启动存档崩溃。
+4. 新增英文版一键安装脚本（OneClick_Install_Update.bat），请同步更新 `bin64/dinput8.dll` 至 `v2.9.7-beta2`（测试版）。
+
 【v2.9.7-beta1 测试版热更新】
 1. v4.0 Phase 1–5 原生渲染与流送引擎：新增同上下文 3 帧持久一致 PBO 异步贴图上传环、双线程无锁卡顿栈采样、无阻塞 `glGetError`/`glGenTextures` 预分配池、SSE2 向量化与 65520 顶点上限精灵合批、Mode-4 零阻塞环形上传、Klei 64 槽 `VertexDecl::Apply` 硬件直连与 `UiBatcher` 零回读优化，大幅降低大基地转动视角与跑图卡顿。
 2. GPU Compute 清晰度分级 & 三档硬件性能档位：支持原版 / 1080P 清晰 / UltraHD 计算锐化 / BluRay 虚拟 4K 四档切换（附 360 帧 / 2.0ms 滞回防抖与实时 GPU 遥测），配合低配 / 均衡 / 狂暴三档硬件策略一键调度。
@@ -39,6 +45,12 @@ description = L([[
 ]], [[
 Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Overlay compatibility), World-Space ShadowMask FBO fluid shadows with 360-deg Top-3 campfire/lantern dynamic point shadows, coastal-only true planar water reflections, strict tag-whitelisted GPU foliage wind-sway & player parting wake, zero-heap Crash Detective + safe Dual-Monitor Cursor Lock, real-time Visual & Lighting Studio with 6 built-in curated presets, Visual Closed-Loop (any reference screenshot -> HyperShade owned capability whitelist -> transactional HS1 share code), and the HS_EXT_V1 Shader Extension Platform.
 
+[v2.9.7-beta2 Beta Hotfix]
+1. Generic GPU Driver Compat & ColourCube Self-Adapter: 4-layer driver compatibility guard + startup Canary check fixing dark/corrupted sprites and colour filter glitches on sensitive drivers.
+2. Smart CJK IME Shield & Focus Self-Heal: suppresses IME during gameplay so WASD never locks up, restores immediately in chat/console/signs, and flushes stuck modifiers on Alt-Tab.
+3. Foreign LuaJIT2 Auto-Yield: detects LuaJIT2 and safely yields native GC hooks to prevent world-load crashes.
+4. Added English OneClick_Install_Update.bat; please update bin64/dinput8.dll to v2.9.7-beta2 (Beta).
+
 [v2.9.7-beta1 Beta Hotfix]
 1. v4.0 Phase 1-5 Native Rendering & Streaming Engine: 3-frame in-context persistent-coherent PBO async texture upload ring, lockless dual-thread hitch stack sampler, non-blocking glGetError & PreallocTexIdPool, SSE2-vectorized SpriteBatcher with 65520-vertex ceiling, Mode-4 non-blocking ring uploads, direct Klei 64-slot VertexDecl::Apply fastpath, and zero-readback UiBatcher optimization to slash mega-base camera rotation and movement hitches.
 2. GPU Compute Clarity Grades & 3 Hardware Performance Tiers: Vanilla / 1080p Clarity / UltraHD Compute / BluRay Virtual-4K grades (with 360-frame / 2.0ms hysteresis and live GPU telemetry) paired with Low / Balanced / Unleashed hardware tiers.
@@ -67,7 +79,7 @@ Pure client-side 240Hz full-scene interpolation, Native OpenGL (ES2 + Steam Over
    - 1-click "Presets" gallery panel (Vanilla Pure / Eye-Care HD / Cinematic Storybook / Crisp Daylight / Cozy Firelight / Misty Canopy — 100% original HyperShade looks, editable & 1-click Undo); Vanilla Pure strictly keeps stock 0.25x BloomSampler & Magiluminescence brightness with zero added visual effects.
 ]])
 author = "Hakimi Tech Lab"
-version = "2.9.7-beta1"
+version = "2.9.7-beta2"
 dnh_github = "wangxu1428/DST-HyperSmooth-240FPS"
 dnh_github_asset = "dinput8.dll"
 

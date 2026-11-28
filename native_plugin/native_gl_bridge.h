@@ -8,6 +8,8 @@
 #include <cstring>
 #include <string>
 
+#include "gpu_driver_compat.h"
+
 namespace hs_native_gl {
 
 enum class BackendMode : int {
@@ -130,11 +132,27 @@ inline constexpr GlesImportEntry kDstGles2Imports[76] = {
 };
 
 // Explicit WGL/GL/EGL constants (avoid <GL/gl.h> SDK drift under Zig/MinGW).
-inline constexpr int32_t kWglContextMajorVersionArb           = 0x2091;
-inline constexpr int32_t kWglContextMinorVersionArb           = 0x2092;
-inline constexpr int32_t kWglContextProfileMaskArb            = 0x9126;
+inline constexpr int32_t kWglContextMajorVersionArb            = 0x2091;
+inline constexpr int32_t kWglContextMinorVersionArb            = 0x2092;
+inline constexpr int32_t kWglContextProfileMaskArb             = 0x9126;
 inline constexpr int32_t kWglContextCompatibilityProfileBitArb = 0x0002;
-inline constexpr int32_t kWglContextEs2ProfileBitExt          = 0x0004;
+inline constexpr int32_t kWglContextEs2ProfileBitExt           = 0x0004;
+
+inline constexpr int     kWglDrawToWindowArb                   = 0x2001;
+inline constexpr int     kWglAccelerationArb                   = 0x2003;
+inline constexpr int     kWglSupportOpenglArb                  = 0x2010;
+inline constexpr int     kWglDoubleBufferArb                   = 0x2011;
+inline constexpr int     kWglPixelTypeArb                      = 0x2013;
+inline constexpr int     kWglColorBitsArb                      = 0x2014;
+inline constexpr int     kWglRedBitsArb                        = 0x2015;
+inline constexpr int     kWglGreenBitsArb                      = 0x2017;
+inline constexpr int     kWglBlueBitsArb                       = 0x2019;
+inline constexpr int     kWglAlphaBitsArb                      = 0x201B;
+inline constexpr int     kWglDepthBitsArb                      = 0x2022;
+inline constexpr int     kWglStencilBitsArb                    = 0x2023;
+inline constexpr int     kWglFullAccelerationArb               = 0x2027;
+inline constexpr int     kWglTypeRgbaArb                       = 0x202B;
+inline constexpr int     kWglTypeRgbaFloatArb                  = 0x21A0;
 
 inline constexpr uint32_t kGlVendor   = 0x1F00u;
 inline constexpr uint32_t kGlRenderer = 0x1F01u;
@@ -151,20 +169,23 @@ inline constexpr uint32_t kEglBadMatch         = 0x3009u;
 inline constexpr uint32_t kEglBadNativeWindow  = 0x300Bu;
 inline constexpr uint32_t kEglNone             = 0x3038u;
 
-using ChoosePixelFormat_t        = int (WINAPI*)(HDC, const PIXELFORMATDESCRIPTOR*);
-using SetPixelFormat_t           = BOOL (WINAPI*)(HDC, int, const PIXELFORMATDESCRIPTOR*);
-using GetPixelFormat_t           = int (WINAPI*)(HDC);
-using SwapBuffers_t              = BOOL (WINAPI*)(HDC);
+using ChoosePixelFormat_t            = int (WINAPI*)(HDC, const PIXELFORMATDESCRIPTOR*);
+using SetPixelFormat_t               = BOOL (WINAPI*)(HDC, int, const PIXELFORMATDESCRIPTOR*);
+using GetPixelFormat_t               = int (WINAPI*)(HDC);
+using DescribePixelFormat_t          = int (WINAPI*)(HDC, int, UINT, LPPIXELFORMATDESCRIPTOR);
+using SwapBuffers_t                  = BOOL (WINAPI*)(HDC);
 
-using WglCreateContext_t         = HGLRC (WINAPI*)(HDC);
-using WglDeleteContext_t         = BOOL (WINAPI*)(HGLRC);
-using WglMakeCurrent_t           = BOOL (WINAPI*)(HDC, HGLRC);
-using WglGetCurrentContext_t     = HGLRC (WINAPI*)();
-using WglGetCurrentDC_t          = HDC (WINAPI*)();
-using WglGetProcAddress_t        = PROC (WINAPI*)(LPCSTR);
-using WglGetExtensionsStringArb_t = const char* (WINAPI*)(HDC);
-using WglCreateContextAttribsArb_t = HGLRC (WINAPI*)(HDC, HGLRC, const int*);
-using WglSwapIntervalExt_t       = BOOL (WINAPI*)(int);
+using WglCreateContext_t             = HGLRC (WINAPI*)(HDC);
+using WglDeleteContext_t             = BOOL (WINAPI*)(HGLRC);
+using WglMakeCurrent_t               = BOOL (WINAPI*)(HDC, HGLRC);
+using WglGetCurrentContext_t         = HGLRC (WINAPI*)();
+using WglGetCurrentDC_t              = HDC (WINAPI*)();
+using WglGetProcAddress_t            = PROC (WINAPI*)(LPCSTR);
+using WglGetExtensionsStringArb_t    = const char* (WINAPI*)(HDC);
+using WglCreateContextAttribsArb_t   = HGLRC (WINAPI*)(HDC, HGLRC, const int*);
+using WglSwapIntervalExt_t           = BOOL (WINAPI*)(int);
+using WglChoosePixelFormatArb_t      = BOOL (WINAPI*)(HDC, const int*, const FLOAT*, UINT, int*, UINT*);
+using WglGetPixelFormatAttribivArb_t = BOOL (WINAPI*)(HDC, int, int, UINT, const int*, int*);
 
 using GlGetString_t              = const char* (WINAPI*)(uint32_t);
 using GlGetIntegerv_t            = void (WINAPI*)(uint32_t, int32_t*);
@@ -177,10 +198,11 @@ struct WglRuntime {
     HMODULE                 hOpengl32 = nullptr;
     HMODULE                 hGdi32    = nullptr;
 
-    ChoosePixelFormat_t     pChoosePixelFormat = nullptr;
-    SetPixelFormat_t        pSetPixelFormat    = nullptr;
-    GetPixelFormat_t        pGetPixelFormat    = nullptr;
-    SwapBuffers_t           pSwapBuffers       = nullptr;
+    ChoosePixelFormat_t     pChoosePixelFormat   = nullptr;
+    SetPixelFormat_t        pSetPixelFormat      = nullptr;
+    GetPixelFormat_t        pGetPixelFormat      = nullptr;
+    DescribePixelFormat_t   pDescribePixelFormat = nullptr;
+    SwapBuffers_t           pSwapBuffers         = nullptr;
 
     WglCreateContext_t      pWglCreateContext     = nullptr;
     WglDeleteContext_t      pWglDeleteContext     = nullptr;
@@ -189,9 +211,11 @@ struct WglRuntime {
     WglGetCurrentDC_t       pWglGetCurrentDC      = nullptr;
     WglGetProcAddress_t     pWglGetProcAddress    = nullptr;
 
-    WglGetExtensionsStringArb_t  pWglGetExtensionsStringArb  = nullptr;
-    WglCreateContextAttribsArb_t pWglCreateContextAttribsArb = nullptr;
-    WglSwapIntervalExt_t         pWglSwapIntervalExt         = nullptr;
+    WglGetExtensionsStringArb_t    pWglGetExtensionsStringArb    = nullptr;
+    WglCreateContextAttribsArb_t   pWglCreateContextAttribsArb   = nullptr;
+    WglSwapIntervalExt_t           pWglSwapIntervalExt           = nullptr;
+    WglChoosePixelFormatArb_t      pWglChoosePixelFormatArb      = nullptr;
+    WglGetPixelFormatAttribivArb_t pWglGetPixelFormatAttribivArb = nullptr;
 
     GlGetString_t           pGlGetString     = nullptr;
     GlGetIntegerv_t         pGlGetIntegerv   = nullptr;
@@ -199,6 +223,11 @@ struct WglRuntime {
     GlGetFloatv_t           pGlGetFloatv     = nullptr;
     GlTexParameterf_t       pGlTexParameterf = nullptr;
     GlFinish_t              pGlFinish        = nullptr;
+
+    int                            chosenArbPixelFormat = 0;
+    PIXELFORMATDESCRIPTOR          chosenArbPfd{};
+    hs_gpu_compat::PixelFormatInfo chosenPfdInfo{};
+    bool                           enableWglExactPfd = true;
 
     bool Load() noexcept {
         if (hOpengl32 && hGdi32 && pWglCreateContext && pSetPixelFormat && pSwapBuffers) {
@@ -212,10 +241,11 @@ struct WglRuntime {
         }
         if (!hGdi32 || !hOpengl32) return false;
 
-        pChoosePixelFormat = reinterpret_cast<ChoosePixelFormat_t>(GetProcAddress(hGdi32, "ChoosePixelFormat"));
-        pSetPixelFormat    = reinterpret_cast<SetPixelFormat_t>(GetProcAddress(hGdi32, "SetPixelFormat"));
-        pGetPixelFormat    = reinterpret_cast<GetPixelFormat_t>(GetProcAddress(hGdi32, "GetPixelFormat"));
-        pSwapBuffers       = reinterpret_cast<SwapBuffers_t>(GetProcAddress(hGdi32, "SwapBuffers"));
+        pChoosePixelFormat   = reinterpret_cast<ChoosePixelFormat_t>(GetProcAddress(hGdi32, "ChoosePixelFormat"));
+        pSetPixelFormat      = reinterpret_cast<SetPixelFormat_t>(GetProcAddress(hGdi32, "SetPixelFormat"));
+        pGetPixelFormat      = reinterpret_cast<GetPixelFormat_t>(GetProcAddress(hGdi32, "GetPixelFormat"));
+        pDescribePixelFormat = reinterpret_cast<DescribePixelFormat_t>(GetProcAddress(hGdi32, "DescribePixelFormat"));
+        pSwapBuffers         = reinterpret_cast<SwapBuffers_t>(GetProcAddress(hGdi32, "SwapBuffers"));
 
         pWglCreateContext     = reinterpret_cast<WglCreateContext_t>(GetProcAddress(hOpengl32, "wglCreateContext"));
         pWglDeleteContext     = reinterpret_cast<WglDeleteContext_t>(GetProcAddress(hOpengl32, "wglDeleteContext"));
@@ -259,6 +289,14 @@ struct WglRuntime {
         if (!pWglSwapIntervalExt) {
             pWglSwapIntervalExt = reinterpret_cast<WglSwapIntervalExt_t>(
                 ResolveGlProc("wglSwapIntervalEXT"));
+        }
+        if (!pWglChoosePixelFormatArb) {
+            pWglChoosePixelFormatArb = reinterpret_cast<WglChoosePixelFormatArb_t>(
+                ResolveGlProc("wglChoosePixelFormatARB"));
+        }
+        if (!pWglGetPixelFormatAttribivArb) {
+            pWglGetPixelFormatAttribivArb = reinterpret_cast<WglGetPixelFormatAttribivArb_t>(
+                ResolveGlProc("wglGetPixelFormatAttribivARB"));
         }
     }
 };
@@ -315,6 +353,9 @@ struct ProbeResult {
     bool        hasInstancedDraw  = false;
     bool        hasBaseVertex     = false;
     bool        hasBindlessTexture = false;
+    bool        isNvidiaVendor    = false;
+    bool        hasNonUniformBindless = false;
+    bool        ccTexelFetchReady = false;
     int         glMajor           = 0;
     int         glMinor           = 0;
     int         resolvedProcs     = 0;
@@ -322,6 +363,8 @@ struct ProbeResult {
     std::string renderer;
     std::string version;
     std::string reason;
+    hs_gpu_compat::PixelFormatInfo pfdInfo{};
+    hs_gpu_compat::CanaryReport    canary{};
 };
 
 inline bool ContainsAsciiInsensitive(const char* haystack, const char* needle) noexcept {
@@ -380,9 +423,162 @@ inline bool ParseEsVersion(const char* verStr, int& outMajor, int& outMinor) noe
     return false;
 }
 
+inline bool QueryPixelFormatInfo(WglRuntime& rt,
+                                 HDC hdc,
+                                 int pf,
+                                 bool usedArbChoose,
+                                 hs_gpu_compat::PixelFormatInfo& outInfo) noexcept {
+    outInfo = hs_gpu_compat::PixelFormatInfo{};
+    if (!hdc || pf <= 0) return false;
+    outInfo.pixelFormat = pf;
+    outInfo.usedArbChoose = usedArbChoose;
+
+    bool gotPfd = false;
+    PIXELFORMATDESCRIPTOR pfd{};
+    if (rt.pDescribePixelFormat) {
+        pfd.nSize = sizeof(pfd);
+        if (rt.pDescribePixelFormat(hdc, pf, sizeof(pfd), &pfd) > 0) {
+            gotPfd = true;
+            outInfo.isRgba                = (pfd.iPixelType == PFD_TYPE_RGBA);
+            outInfo.isHardwareAccelerated = ((pfd.dwFlags & PFD_GENERIC_FORMAT) == 0);
+            outInfo.redBits               = pfd.cRedBits;
+            outInfo.greenBits             = pfd.cGreenBits;
+            outInfo.blueBits              = pfd.cBlueBits;
+            outInfo.alphaBits             = pfd.cAlphaBits;
+            outInfo.depthBits             = pfd.cDepthBits;
+            outInfo.stencilBits           = pfd.cStencilBits;
+        }
+    }
+
+    if (rt.pWglGetPixelFormatAttribivArb &&
+        rt.pWglGetCurrentContext && rt.pWglGetCurrentContext() != nullptr) {
+        const int attrs[8] = {
+            kWglPixelTypeArb,
+            kWglAccelerationArb,
+            kWglRedBitsArb,
+            kWglGreenBitsArb,
+            kWglBlueBitsArb,
+            kWglAlphaBitsArb,
+            kWglDepthBitsArb,
+            kWglStencilBitsArb,
+        };
+        int vals[8]{};
+        if (rt.pWglGetPixelFormatAttribivArb(hdc, pf, 0, 8, attrs, vals) != FALSE) {
+            gotPfd = true;
+            outInfo.isRgba = (vals[0] == kWglTypeRgbaArb);
+            outInfo.isFloat = (vals[0] == kWglTypeRgbaFloatArb);
+            outInfo.isHardwareAccelerated = (vals[1] == kWglFullAccelerationArb);
+            outInfo.redBits     = vals[2];
+            outInfo.greenBits   = vals[3];
+            outInfo.blueBits    = vals[4];
+            outInfo.alphaBits   = vals[5];
+            outInfo.depthBits   = vals[6];
+            outInfo.stencilBits = vals[7];
+        }
+    }
+
+    if (!gotPfd) return false;
+    outInfo.is10BitRgb = (outInfo.redBits == 10 && outInfo.greenBits == 10 && outInfo.blueBits == 10);
+    outInfo.isExact8888 = outInfo.isRgba && !outInfo.isFloat &&
+                          (outInfo.redBits == 8 && outInfo.greenBits == 8 &&
+                           outInfo.blueBits == 8 && outInfo.alphaBits == 8);
+    // 10-bit RGBA is non-destructively valid for live Canary verification; only float / palette / <8bit are invalid.
+    outInfo.isValidForProbe = outInfo.isRgba && !outInfo.isFloat &&
+                              (outInfo.redBits >= 8 && outInfo.greenBits >= 8 && outInfo.blueBits >= 8);
+    return true;
+}
+
+inline bool SelectBestWindowPixelFormatArb(WglRuntime& rt,
+                                           HDC hdc,
+                                           int& outPf,
+                                           PIXELFORMATDESCRIPTOR& outPfd,
+                                           hs_gpu_compat::PixelFormatInfo& outInfo) noexcept {
+    outPf = 0;
+    std::memset(&outPfd, 0, sizeof(outPfd));
+    outInfo = hs_gpu_compat::PixelFormatInfo{};
+    if (!hdc || !rt.pWglChoosePixelFormatArb || !rt.pDescribePixelFormat) return false;
+
+    const int iAttribs[] = {
+        kWglDrawToWindowArb,  1,
+        kWglSupportOpenglArb, 1,
+        kWglDoubleBufferArb,  1,
+        kWglAccelerationArb,  kWglFullAccelerationArb,
+        kWglPixelTypeArb,     kWglTypeRgbaArb,
+        kWglColorBitsArb,     32,
+        kWglRedBitsArb,       8,
+        kWglGreenBitsArb,     8,
+        kWglBlueBitsArb,      8,
+        kWglAlphaBitsArb,     8,
+        kWglDepthBitsArb,     24,
+        kWglStencilBitsArb,   8,
+        0
+    };
+    int  candidates[32]{};
+    UINT numFormats = 0u;
+    if (rt.pWglChoosePixelFormatArb(hdc, iAttribs, nullptr, 32u, candidates, &numFormats) == FALSE ||
+        numFormats == 0u) {
+        return false;
+    }
+
+    const UINT n = (numFormats > 32u) ? 32u : numFormats;
+    int bestPf = 0;
+    int bestTier = -1; // 3=exact 8-8-8-8 HW, 2=8-8-8-* HW, 1=any valid >=8bit non-float HW RGBA (incl 10-10-10-2)
+    hs_gpu_compat::PixelFormatInfo bestInfo{};
+
+    for (UINT i = 0u; i < n; ++i) {
+        const int pf = candidates[i];
+        if (pf <= 0) continue;
+        hs_gpu_compat::PixelFormatInfo cur{};
+        if (!QueryPixelFormatInfo(rt, hdc, pf, true, cur)) continue;
+        if (!cur.isValidForProbe || !cur.isHardwareAccelerated) continue;
+
+        int tier = 1;
+        if (cur.isExact8888 && cur.depthBits >= 24 && cur.stencilBits >= 8) {
+            tier = 4;
+        } else if (cur.isExact8888) {
+            tier = 3;
+        } else if (cur.redBits == 8 && cur.greenBits == 8 && cur.blueBits == 8) {
+            tier = 2;
+        }
+        if (tier > bestTier) {
+            bestTier = tier;
+            bestPf   = pf;
+            bestInfo = cur;
+            if (bestTier == 4) break;
+        }
+    }
+
+    if (bestPf <= 0) return false;
+    PIXELFORMATDESCRIPTOR desc{};
+    desc.nSize = sizeof(desc);
+    if (rt.pDescribePixelFormat(hdc, bestPf, sizeof(desc), &desc) <= 0) return false;
+    if (desc.iPixelType != PFD_TYPE_RGBA || (desc.dwFlags & PFD_SUPPORT_OPENGL) == 0 ||
+        (desc.dwFlags & PFD_DOUBLEBUFFER) == 0) {
+        return false;
+    }
+    outPf   = bestPf;
+    outPfd  = desc;
+    outInfo = bestInfo;
+    return true;
+}
+
 inline bool EnsureWindowPixelFormat(WglRuntime& rt, HDC hdc) noexcept {
     if (!hdc || !rt.pGetPixelFormat || !rt.pChoosePixelFormat || !rt.pSetPixelFormat) return false;
     if (rt.pGetPixelFormat(hdc) != 0) return true;
+
+    if (rt.enableWglExactPfd && rt.chosenArbPixelFormat > 0 && rt.pDescribePixelFormat) {
+        PIXELFORMATDESCRIPTOR arbPfd{};
+        arbPfd.nSize = sizeof(arbPfd);
+        if (rt.pDescribePixelFormat(hdc, rt.chosenArbPixelFormat, sizeof(arbPfd), &arbPfd) > 0 &&
+            arbPfd.iPixelType == PFD_TYPE_RGBA &&
+            (arbPfd.dwFlags & (PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER)) ==
+                (PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER) &&
+            arbPfd.cRedBits >= 8 && arbPfd.cGreenBits >= 8 && arbPfd.cBlueBits >= 8) {
+            if (rt.pSetPixelFormat(hdc, rt.chosenArbPixelFormat, &arbPfd) != FALSE) {
+                return true;
+            }
+        }
+    }
 
     PIXELFORMATDESCRIPTOR pfd{};
     pfd.nSize        = sizeof(pfd);
@@ -400,7 +596,71 @@ inline bool EnsureWindowPixelFormat(WglRuntime& rt, HDC hdc) noexcept {
     return rt.pSetPixelFormat(hdc, pf, &pfd) != FALSE;
 }
 
-inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexcept {
+inline hs_gpu_compat::CanaryGlOps BuildCanaryGlOps(const WglRuntime& rt) noexcept {
+    hs_gpu_compat::CanaryGlOps gl{};
+    auto load = [&](auto& fn, const char* nm) {
+        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(rt.ResolveGlProc(nm));
+    };
+    load(gl.glGenFramebuffers,          "glGenFramebuffers");
+    load(gl.glDeleteFramebuffers,       "glDeleteFramebuffers");
+    load(gl.glBindFramebuffer,          "glBindFramebuffer");
+    load(gl.glFramebufferTexture2D,     "glFramebufferTexture2D");
+    load(gl.glCheckFramebufferStatus,   "glCheckFramebufferStatus");
+    load(gl.glGenTextures,              "glGenTextures");
+    load(gl.glDeleteTextures,           "glDeleteTextures");
+    load(gl.glActiveTexture,            "glActiveTexture");
+    load(gl.glBindTexture,              "glBindTexture");
+    load(gl.glTexImage2D,               "glTexImage2D");
+    load(gl.glTexParameteri,            "glTexParameteri");
+    load(gl.glTexParameterf,            "glTexParameterf");
+    load(gl.glCreateShader,             "glCreateShader");
+    load(gl.glShaderSource,             "glShaderSource");
+    load(gl.glCompileShader,            "glCompileShader");
+    load(gl.glGetShaderiv,              "glGetShaderiv");
+    load(gl.glGetShaderInfoLog,         "glGetShaderInfoLog");
+    load(gl.glDeleteShader,             "glDeleteShader");
+    load(gl.glCreateProgram,            "glCreateProgram");
+    load(gl.glAttachShader,             "glAttachShader");
+    load(gl.glBindAttribLocation,       "glBindAttribLocation");
+    load(gl.glLinkProgram,              "glLinkProgram");
+    load(gl.glGetProgramiv,             "glGetProgramiv");
+    load(gl.glGetProgramInfoLog,        "glGetProgramInfoLog");
+    load(gl.glDeleteProgram,            "glDeleteProgram");
+    load(gl.glUseProgram,               "glUseProgram");
+    load(gl.glGetUniformLocation,       "glGetUniformLocation");
+    load(gl.glUniform1f,                "glUniform1f");
+    load(gl.glUniform1i,                "glUniform1i");
+    load(gl.glUniform2fv,               "glUniform2fv");
+    load(gl.glUniform3fv,               "glUniform3fv");
+    load(gl.glUniform4fv,               "glUniform4fv");
+    load(gl.glUniformMatrix4fv,         "glUniformMatrix4fv");
+    load(gl.glGenBuffers,               "glGenBuffers");
+    load(gl.glDeleteBuffers,            "glDeleteBuffers");
+    load(gl.glBindBuffer,               "glBindBuffer");
+    load(gl.glBufferData,               "glBufferData");
+    load(gl.glEnableVertexAttribArray,  "glEnableVertexAttribArray");
+    load(gl.glDisableVertexAttribArray, "glDisableVertexAttribArray");
+    load(gl.glVertexAttribPointer,      "glVertexAttribPointer");
+    load(gl.glDrawArrays,               "glDrawArrays");
+    load(gl.glViewport,                 "glViewport");
+    load(gl.glEnable,                   "glEnable");
+    load(gl.glDisable,                  "glDisable");
+    load(gl.glBlendFunc,                "glBlendFunc");
+    load(gl.glClearColor,               "glClearColor");
+    load(gl.glClear,                    "glClear");
+    load(gl.glPixelStorei,              "glPixelStorei");
+    load(gl.glReadPixels,               "glReadPixels");
+    load(gl.glFinish,                   "glFinish");
+    load(gl.glGetError,                 "glGetError");
+    load(gl.glGetIntegerv,              "glGetIntegerv");
+    load(gl.glGetFloatv,                "glGetFloatv");
+    load(gl.glIsEnabled,                "glIsEnabled");
+    return gl;
+}
+
+inline ProbeResult ProbeNativeEs2Support(BackendMode mode,
+                                         WglRuntime& rt,
+                                         const hs_gpu_compat::CompatConfig& compatCfg = hs_gpu_compat::CompatConfig{}) noexcept {
     ProbeResult out{};
     if (mode == BackendMode::D3D9) {
         out.reason = "configured_d3d9";
@@ -411,6 +671,11 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
         return out;
     }
 
+    rt.enableWglExactPfd    = compatCfg.enableWglExactPfd;
+    rt.chosenArbPixelFormat = 0;
+    std::memset(&rt.chosenArbPfd, 0, sizeof(rt.chosenArbPfd));
+    rt.chosenPfdInfo        = hs_gpu_compat::PixelFormatInfo{};
+
     HWND hwnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, nullptr, nullptr);
     if (!hwnd) {
         out.reason = "probe_hwnd_failed";
@@ -418,6 +683,8 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     }
 
     HDC hdc = GetDC(hwnd);
+    HWND probeHwnd2 = nullptr;
+    HDC  probeHdc2  = nullptr;
     HGLRC prevRc = rt.pWglGetCurrentContext();
     HDC   prevDc = rt.pWglGetCurrentDC();
     HGLRC tmpRc = nullptr;
@@ -434,6 +701,14 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
         if (tmpRc) {
             rt.pWglDeleteContext(tmpRc);
             tmpRc = nullptr;
+        }
+        if (probeHdc2 && probeHwnd2) {
+            ReleaseDC(probeHwnd2, probeHdc2);
+            probeHdc2 = nullptr;
+        }
+        if (probeHwnd2) {
+            DestroyWindow(probeHwnd2);
+            probeHwnd2 = nullptr;
         }
         if (hdc) {
             ReleaseDC(hwnd, hdc);
@@ -463,6 +738,42 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
     out.hasSwapControl = ContainsExtensionToken(wglExts, "WGL_EXT_swap_control") ||
                          ContainsExtensionToken(wglExts, "WGL_EXT_swap_control_tear");
 
+    // Layer 3: Prefer exact wglChoosePixelFormatARB (with attribute readback) on a fresh probe HWND so
+    // the startup canary exercises the EXACT pixel format that gameHwnd receives!
+    HDC   targetHdc = hdc;
+    if (compatCfg.enableWglExactPfd && rt.pWglChoosePixelFormatArb) {
+        int arbPf = 0;
+        PIXELFORMATDESCRIPTOR arbPfd{};
+        hs_gpu_compat::PixelFormatInfo arbInfo{};
+        if (SelectBestWindowPixelFormatArb(rt, hdc, arbPf, arbPfd, arbInfo)) {
+            probeHwnd2 = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, nullptr, nullptr);
+            if (probeHwnd2) {
+                probeHdc2 = GetDC(probeHwnd2);
+                if (probeHdc2 && rt.pSetPixelFormat(probeHdc2, arbPf, &arbPfd) != FALSE) {
+                    const int verifiedPf = rt.pGetPixelFormat(probeHdc2);
+                    hs_gpu_compat::PixelFormatInfo readbackInfo{};
+                    if (verifiedPf > 0 && QueryPixelFormatInfo(rt, probeHdc2, verifiedPf, true, readbackInfo) &&
+                        readbackInfo.isValidForProbe) {
+                        rt.chosenArbPixelFormat = verifiedPf;
+                        rt.chosenArbPfd         = arbPfd;
+                        rt.chosenPfdInfo        = readbackInfo;
+                        out.pfdInfo             = readbackInfo;
+                        targetHdc               = probeHdc2;
+                    }
+                }
+            }
+            if (targetHdc != probeHdc2) {
+                if (probeHdc2 && probeHwnd2) { ReleaseDC(probeHwnd2, probeHdc2); probeHdc2 = nullptr; }
+                if (probeHwnd2) { DestroyWindow(probeHwnd2); probeHwnd2 = nullptr; }
+            }
+        }
+    }
+    if (out.pfdInfo.pixelFormat == 0) {
+        const int curPf = rt.pGetPixelFormat(hdc);
+        QueryPixelFormatInfo(rt, hdc, curPf, false, out.pfdInfo);
+        rt.chosenPfdInfo = out.pfdInfo;
+    }
+
     // Use Desktop OpenGL 4.1+ Compatibility Profile (GL_ARB_ES2_compatibility) instead of
     // WGL_CONTEXT_ES2_PROFILE_BIT_EXT:
     //   - 100% native GLSL ES 1.00 (`#version 100`) + all 76 DST GLES2 entry points + S3TC/FBO/VAO=0
@@ -482,11 +793,11 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
                 kWglContextProfileMaskArb,  kWglContextCompatibilityProfileBitArb,
                 0
             };
-            es2Rc = rt.pWglCreateContextAttribsArb(hdc, nullptr, attribs);
+            es2Rc = rt.pWglCreateContextAttribsArb(targetHdc, nullptr, attribs);
             if (es2Rc) break;
         }
     }
-    if (es2Rc && rt.pWglMakeCurrent(hdc, es2Rc)) {
+    if (es2Rc && rt.pWglMakeCurrent(targetHdc, es2Rc)) {
         rt.pWglDeleteContext(tmpRc);
         tmpRc = nullptr;
     } else {
@@ -494,9 +805,29 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
             rt.pWglDeleteContext(es2Rc);
             es2Rc = nullptr;
         }
-        // Fallback to legacy wglCreateContext (which already exposes max Compatibility Profile on Windows)
-        es2Rc = tmpRc;
-        tmpRc = nullptr;
+        if (targetHdc != hdc) {
+            es2Rc = rt.pWglCreateContext(targetHdc);
+            if (es2Rc && rt.pWglMakeCurrent(targetHdc, es2Rc)) {
+                rt.pWglDeleteContext(tmpRc);
+                tmpRc = nullptr;
+            } else {
+                if (es2Rc) {
+                    rt.pWglDeleteContext(es2Rc);
+                    es2Rc = nullptr;
+                }
+                // Fall back to bootstrap context on hdc
+                rt.chosenArbPixelFormat = 0;
+                QueryPixelFormatInfo(rt, hdc, rt.pGetPixelFormat(hdc), false, out.pfdInfo);
+                rt.chosenPfdInfo = out.pfdInfo;
+                es2Rc = tmpRc;
+                tmpRc = nullptr;
+                targetHdc = hdc;
+            }
+        } else {
+            // Fallback to legacy wglCreateContext (which already exposes max Compatibility Profile on Windows)
+            es2Rc = tmpRc;
+            tmpRc = nullptr;
+        }
     }
 
     const char* sVendor   = rt.pGlGetString(kGlVendor);
@@ -524,16 +855,17 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
         return out;
     }
 
+    out.isNvidiaVendor = ContainsAsciiInsensitive(out.vendor.c_str(), "NVIDIA");
+
     if (mode == BackendMode::Auto) {
         // Auto mode enables Native OpenGL Compat on verified NVIDIA drivers AND modern AMD Radeon
         // drivers (OpenGL >= 4.5). Legacy AMD (<4.5) and Intel iGPUs default to ANGLE D3D9
         // (users may still opt in via `render_backend=opengl` in dst_hypersmooth.ini).
-        const bool isNvidia = ContainsAsciiInsensitive(out.vendor.c_str(), "NVIDIA");
         const bool isModernAmd =
             (ContainsAsciiInsensitive(out.vendor.c_str(), "ATI") ||
              ContainsAsciiInsensitive(out.vendor.c_str(), "AMD")) &&
             (glMaj > 4 || (glMaj == 4 && glMin >= 5));
-        if (!isNvidia && !isModernAmd) {
+        if (!out.isNvidiaVendor && !isModernAmd) {
             out.reason = "auto_prefer_d3d9_for_gpu_vendor";
             cleanup();
             return out;
@@ -598,6 +930,10 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
                              (rt.ResolveGlProc("glGetTextureHandleARB") != nullptr) &&
                              (rt.ResolveGlProc("glMakeTextureHandleResidentARB") != nullptr) &&
                              (rt.ResolveGlProc("glMakeTextureHandleNonResidentARB") != nullptr);
+    // Shader SpriteBatcher samples dynamically non-uniform sampler2D(HS_V_BTEX) without
+    // GL_EXT_nonuniform_qualifier; only safe on NVIDIA drivers, whereas AMD GCN/RDNA
+    // requires nonuniformEXT to avoid SGPR undefined texture reads (black sprites/buildings).
+    out.hasNonUniformBindless = out.hasBindlessTexture && out.isNvidiaVendor;
 
     int okCount = 0;
     const char* firstMissing = nullptr;
@@ -615,8 +951,24 @@ inline ProbeResult ProbeNativeEs2Support(BackendMode mode, WglRuntime& rt) noexc
         return out;
     }
 
+    // Layer 4: Real-Path Startup ColourCube Canary (verifies actual PFD + shaders + LUTs + FBO + blend)
+    const hs_gpu_compat::CanaryGlOps cGl = BuildCanaryGlOps(rt);
+    const bool canaryOk = hs_gpu_compat::RunLiveColourCubeCanary(
+        cGl, out.glMajor, out.glMinor, out.hasAniso, compatCfg,
+        out.vendor, out.renderer, out.version, out.pfdInfo,
+        false, out.canary);
+    out.ccTexelFetchReady = out.canary.texelFetchReady;
+    if (!canaryOk && mode == BackendMode::Auto) {
+        out.supported = false;
+        out.reason = !out.canary.fallbackReason.empty()
+            ? out.canary.fallbackReason
+            : (std::string("canary_failed:") + out.canary.stage);
+        cleanup();
+        return out;
+    }
+
     out.supported = true;
-    out.reason = "ok";
+    out.reason = canaryOk ? "ok" : (std::string("forced_opengl_canary_warn:") + out.canary.stage);
     cleanup();
     return out;
 }
