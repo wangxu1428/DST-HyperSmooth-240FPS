@@ -211,7 +211,81 @@ AddSimPostInit(function()
             assert(after_err == 1, "Pool poisoned after listener error")
 
             e:Remove()
-            print("[SERVER_V14_TEST] 4. 0-alloc PushEvent_Internal + Unrolled HasTags/HasOneOfTags PASS")
+
+            -- 4b. Verify debug.getinfo vanilla-source guard yields to third-party EntityScript hooks (full + partial)
+            do
+                local mod_path = "../mods/hypercore_server/modmain.lua"
+                local function run_srv_es_case(mode)
+                    local orig_pe = function() return "pe" end
+                    local orig_ht = function() return "ht" end
+                    local orig_hot = function() return "hot" end
+                    local mock_es = {
+                        PushEvent_Internal = orig_pe,
+                        HasTags = orig_ht,
+                        HasOneOfTags = orig_hot,
+                        HasAllTags = orig_ht,
+                        HasAnyTag = orig_hot,
+                    }
+                    local mock_g = {
+                        rawget = G.rawget, rawset = G.rawset, pcall = G.pcall, type = G.type,
+                        tostring = G.tostring, tonumber = G.tonumber, string = G.string,
+                        math = G.math, table = G.table, print = function() end,
+                        ipairs = G.ipairs, pairs = G.pairs, next = G.next, unpack = G.unpack,
+                        BRANCH = "release",
+                        TheNet = { GetIsServer = function() return true end },
+                        TheSim = { GetTick = function() return 0 end, GetTickTime = function() return 1/30 end },
+                        EntityScript = mock_es,
+                        require = function(m) return m == "entityscript" and mock_es or {} end,
+                        debug = {
+                            getinfo = function(f, what)
+                                if mode == "all_mod" then
+                                    return { source = "../mods/workshop-999999/modmain.lua" }
+                                elseif mode == "partial" then
+                                    if f == orig_ht then return { source = "../mods/workshop-999999/modmain.lua" } end
+                                    if f == orig_pe or f == orig_hot then return { source = "scripts/entityscript.lua" } end
+                                else
+                                    return { source = "scripts/entityscript.lua" }
+                                end
+                                return G.debug.getinfo(f, what)
+                            end,
+                        },
+                    }
+                    mock_g._G = mock_g
+                    local noop = function() end
+                    local mock_env = {
+                        GLOBAL = mock_g,
+                        GetModConfigData = function(k)
+                            if k == "opt_wild_beefalo_cap" or k == "hardware_tier" or k == "opt_replica_pacing" then return 0 end
+                            return false
+                        end,
+                        AddSimPostInit = noop, AddPrefabPostInit = noop, AddPrefabPostInitAny = noop,
+                        AddComponentPostInit = noop, AddClassPostConstruct = noop,
+                        AddClientModRPCHandler = noop, AddModRPCHandler = noop, AddShardModRPCHandler = noop,
+                        SendModRPCToClient = noop, GetClientModRPC = noop,
+                    }
+                    G.setmetatable(mock_env, { __index = mock_g })
+                    local fn_m = assert(G.kleiloadlua(mod_path))
+                    setfenv(fn_m, mock_env)
+                    fn_m()
+                    return mock_es, orig_pe, orig_ht, orig_hot
+                end
+
+                local s1, pe1, ht1, hot1 = run_srv_es_case("all_mod")
+                assert(s1.PushEvent_Internal == pe1 and not s1._hs_fast_pushevent, "Server: third-party PushEvent_Internal was overwritten!")
+                assert(s1.HasTags == ht1 and s1.HasAllTags == ht1 and not s1._hs_fast_hastags, "Server: third-party HasTags was overwritten!")
+                assert(s1.HasOneOfTags == hot1 and s1.HasAnyTag == hot1 and not s1._hs_fast_hasoneoftags, "Server: third-party HasOneOfTags was overwritten!")
+
+                local s2, pe2, ht2, hot2 = run_srv_es_case("partial")
+                assert(s2.PushEvent_Internal ~= pe2 and s2._hs_fast_pushevent == true, "Server: vanilla PushEvent_Internal should patch in partial case!")
+                assert(s2.HasTags == ht2 and s2.HasAllTags == ht2 and not s2._hs_fast_hastags, "Server: third-party HasTags must yield in partial case!")
+                assert(s2.HasOneOfTags ~= hot2 and s2.HasAnyTag == s2.HasOneOfTags and s2._hs_fast_hasoneoftags == true, "Server: vanilla HasOneOfTags should patch in partial case!")
+
+                local s3, pe3, ht3, hot3 = run_srv_es_case("vanilla")
+                assert(s3.PushEvent_Internal ~= pe3 and s3._hs_fast_pushevent == true, "Server: vanilla PushEvent_Internal must patch!")
+                assert(s3.HasTags ~= ht3 and s3.HasAllTags == s3.HasTags and s3._hs_fast_hastags == true, "Server: vanilla HasTags must patch!")
+                assert(s3.HasOneOfTags ~= hot3 and s3.HasAnyTag == s3.HasOneOfTags and s3._hs_fast_hasoneoftags == true, "Server: vanilla HasOneOfTags must patch!")
+            end
+            print("[SERVER_V14_TEST] 4. 0-alloc PushEvent_Internal + Unrolled HasTags/HasOneOfTags + Source Guard PASS")
         end
 
         -- =====================================================================
@@ -369,6 +443,12 @@ AddSimPostInit(function()
                         assert(G.c_hyperpacing("auto") == 96 and G.HyperCore_GetHardwareInfo().replica_budget_explicit == false,
                             "Test 8g: c_hyperpacing('auto') restore failed")
                         print("[SERVER_V14_TEST] 8. Module 10B Replica Pacing + c_hyperpacing + Live Proximity PASS (budget=64/96/128, prox=true)")
+
+                        -- Track 4A: Verify perish_mod_yields telemetry + c_hyperstats output
+                        assert(G.HyperCoreLuaStats ~= nil and G.HyperCoreLuaStats.perish_mod_yields ~= nil,
+                            "Test 9: Missing HyperCoreLuaStats.perish_mod_yields")
+                        G.c_hyperstats()
+                        print("[SERVER_V14_TEST] 9. Track 4A c_hyperstats + perish_mod_yields telemetry PASS")
 
                         print("[SERVER_V14_TEST] ALL_PASS")
                         G.c_shutdown(false)

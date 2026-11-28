@@ -184,6 +184,7 @@ std::atomic<int>           g_activeServerTier{1};
 std::atomic<int64_t>       g_fsNegTtlNs{15000000000LL};
 std::atomic<uint32_t>      g_fastDumpMaxNodes{fast_dumper::kMaxDumpNodes};
 std::atomic<size_t>        g_fastDumpKeepBytes{fast_dumper::kShrinkKeepBytes};
+std::atomic<bool>          g_foreignLuaVmDetected{false};
 std::atomic<int>           g_effectiveDeflateLevel{5};
 std::atomic<uint32_t>      g_effectiveReplicaBudget{96u};
 std::atomic<int>           g_luaReplicaBudgetOverride{-1};
@@ -587,6 +588,53 @@ inline uint8_t* FindUniqueAob(const uint8_t (&pat)[N]) noexcept {
     return FindUniquePattern(pat, N);
 }
 
+inline bool IsEntryPatchedByExternalHook(const uint8_t* fn) noexcept {
+    if (!fn || !g_exeTextBeg || !g_exeTextEnd) return false;
+    if (fn < g_exeTextBeg || fn + 16 > g_exeTextEnd) return false;
+    if (fn[0] == 0xE9 || fn[0] == 0xEB) return true;
+    if (fn[0] == 0xFF && fn[1] == 0x25) return true;
+    if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) return true;
+    if (fn[0] == 0x49 && fn[1] == 0xBB && fn[10] == 0x41 && fn[11] == 0xFF && fn[12] == 0xE3) return true;
+    if (fn[0] == 0x68 && fn[5] == 0xC3) return true;
+    return false;
+}
+
+inline bool AsciiContainsCI(const char* hay, const char* needle) noexcept {
+    if (!hay || !needle || !*needle) return false;
+    auto toLo = [](unsigned char c) -> unsigned char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+    };
+    const size_t nlen = std::strlen(needle);
+    for (const char* p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] && toLo(static_cast<unsigned char>(p[i])) == toLo(static_cast<unsigned char>(needle[i]))) {
+            ++i;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+struct ForeignSoProbeCtx {
+    const char* matchedName = nullptr;
+};
+
+int DlPhdrForeignLuaCb(struct dl_phdr_info* info, size_t /*size*/, void* data) noexcept {
+    if (!info || !info->dlpi_name || !info->dlpi_name[0] || !data) return 0;
+    const char* name = info->dlpi_name;
+    if (AsciiContainsCI(name, "libhypercore")) return 0;
+    if (AsciiContainsCI(name, "luajit") ||
+        AsciiContainsCI(name, "lua51") ||
+        AsciiContainsCI(name, "injector") ||
+        AsciiContainsCI(name, "plugin_core_vm") ||
+        AsciiContainsCI(name, "frida")) {
+        auto* ctx = static_cast<ForeignSoProbeCtx*>(data);
+        ctx->matchedName = name;
+        return 1;
+    }
+    return 0;
+}
+
 struct RelocLea {
     uint8_t offset; // offset inside stolen prologue where `48 8D modrm disp32` starts
 };
@@ -712,6 +760,42 @@ constexpr uint8_t kAobAStarStep[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x57, 0x41
 constexpr uint8_t kAobAStarDtor0[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x48, 0x8D, 0x05, 0xB3, 0xE0, 0x3D, 0x00, 0x55, 0x48, 0x89, 0xFD, 0x53, 0x4C, 0x8B, 0x67, 0x30 };
 constexpr uint8_t kAobAStarDtor1[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0x48, 0x8D, 0x05, 0xD3, 0xDF, 0x3D, 0x00, 0x55, 0x53, 0x4C, 0x8B, 0x67, 0x30, 0x48, 0x89, 0xFB };
 constexpr uint8_t kAobPathDtor0[]   = { 0xF3, 0x0F, 0x1E, 0xFA, 0x48, 0x85, 0xF6, 0x0F, 0x84, 0x63, 0x01, 0x00, 0x00, 0x41, 0x57, 0x41, 0x56, 0x4C, 0x8D, 0x35, 0xE8, 0xD3, 0x3D, 0x00 };
+
+bool DetectForeignLuaVmLinux(const char** outReason = nullptr) noexcept {
+    auto retReason = [&](const char* r) -> bool {
+        if (outReason) *outReason = r;
+        return true;
+    };
+    ForeignSoProbeCtx soCtx{};
+    if (dl_iterate_phdr(&DlPhdrForeignLuaCb, &soCtx) != 0) {
+        return retReason("foreign_lua_shared_object");
+    }
+    if (dlsym(RTLD_DEFAULT, "luaJIT_setmode") != nullptr) {
+        return retReason("dlsym_luaJIT_setmode");
+    }
+    auto checkTails = [&](const uint8_t* pat, size_t len) -> bool {
+        if (FindUniquePattern(pat, len) != nullptr) return false;
+        const size_t skips[2] = { 5u, 14u };
+        for (size_t skip : skips) {
+            if (len <= skip + 6u) continue;
+            uint8_t* pTail = FindUniquePattern(pat + skip, len - skip);
+            if (pTail && pTail >= g_exeTextBeg + skip && IsEntryPatchedByExternalHook(pTail - skip)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (checkTails(kAobLuaNewState, sizeof(kAobLuaNewState))) {
+        return retReason("trampoline_on_lua_newstate");
+    }
+    if (checkTails(kAobSimCollGc, sizeof(kAobSimCollGc))) {
+        return retReason("trampoline_on_sim_collect_garbage");
+    }
+    if (checkTails(kAobLuaGc, sizeof(kAobLuaGc))) {
+        return retReason("trampoline_on_lua_gc");
+    }
+    return false;
+}
 
 // Internal helper AOBs (resolved without hooking)
 constexpr uint8_t kAobLuaCheckStack[]  = { 0xF3, 0x0F, 0x1E, 0xFA, 0x45, 0x31, 0xC0, 0x81, 0xFE, 0x40, 0x1F, 0x00, 0x00, 0x7F, 0x31, 0x55 };
@@ -3278,32 +3362,44 @@ void HyperCoreLinuxInit() {
     }
     LogMsg("[ELF] PIE base=%p .text=%p..%p", g_exeBase, g_exeTextBeg, g_exeTextEnd);
 
-    // 1. Resolve Lua 5.1.4 C API
-    g_lua.checkstack   = reinterpret_cast<decltype(g_lua.checkstack)>(FindUniqueAob(kAobLuaCheckStack));
-    g_lua.gettop       = reinterpret_cast<decltype(g_lua.gettop)>(FindUniqueAob(kAobLuaGetTop));
-    g_lua.settop       = reinterpret_cast<decltype(g_lua.settop)>(FindUniqueAob(kAobLuaSetTop));
-    g_lua.pushvalue    = reinterpret_cast<decltype(g_lua.pushvalue)>(FindUniqueAob(kAobLuaPushValue));
-    g_lua.type         = reinterpret_cast<decltype(g_lua.type)>(FindUniqueAob(kAobLuaType));
-    g_lua.tonumber     = reinterpret_cast<decltype(g_lua.tonumber)>(FindUniqueAob(kAobLuaToNumber));
-    g_lua.toboolean    = reinterpret_cast<decltype(g_lua.toboolean)>(FindUniqueAob(kAobLuaToBoolean));
-    g_lua.tolstring    = reinterpret_cast<decltype(g_lua.tolstring)>(FindUniqueAob(kAobLuaToLString));
-    g_lua.topointer    = reinterpret_cast<decltype(g_lua.topointer)>(FindUniqueAob(kAobLuaToPointer));
-    g_lua.pushnil      = reinterpret_cast<decltype(g_lua.pushnil)>(FindUniqueAob(kAobLuaPushNil));
-    g_lua.pushnumber   = reinterpret_cast<decltype(g_lua.pushnumber)>(FindUniqueAob(kAobLuaPushNumber));
-    g_lua.pushlstring  = reinterpret_cast<decltype(g_lua.pushlstring)>(FindUniqueAob(kAobLuaPushLString));
-    g_lua.pushstring   = reinterpret_cast<decltype(g_lua.pushstring)>(FindUniqueAob(kAobLuaPushString));
-    g_lua.pushcclosure = reinterpret_cast<decltype(g_lua.pushcclosure)>(FindUniqueAob(kAobLuaPushCClos));
-    g_lua.pushboolean  = reinterpret_cast<decltype(g_lua.pushboolean)>(FindUniqueAob(kAobLuaPushBool));
-    g_lua.getfield     = reinterpret_cast<decltype(g_lua.getfield)>(FindUniqueAob(kAobLuaGetField));
-    g_lua.createtable  = reinterpret_cast<decltype(g_lua.createtable)>(FindUniqueAob(kAobLuaCreateTbl));
-    g_lua.setfield     = reinterpret_cast<decltype(g_lua.setfield)>(FindUniqueAob(kAobLuaSetField));
-    g_lua.gc           = reinterpret_cast<decltype(g_lua.gc)>(FindUniqueAob(kAobLuaGc));
-    g_lua.next         = reinterpret_cast<decltype(g_lua.next)>(FindUniqueAob(kAobLuaNext));
-    g_lua.rawset       = reinterpret_cast<decltype(g_lua.rawset)>(FindUniqueAob(kAobLuaRawSet));
-    g_lua.rawseti      = reinterpret_cast<decltype(g_lua.rawseti)>(FindUniqueAob(kAobLuaRawSetI));
-    LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d ReadyForFastJson=%d",
-           g_lua.ReadyForRegister() ? 1 : 0, g_lua.ReadyForFastDump() ? 1 : 0,
-           g_lua.ReadyForFastJson() ? 1 : 0);
+    // 1. Probe foreign Lua VM / LuaJIT2 before touching PUC Lua 5.1 ABI
+    const char* foreignLuaReason = nullptr;
+    if (DetectForeignLuaVmLinux(&foreignLuaReason)) {
+        g_foreignLuaVmDetected.store(true, std::memory_order_release);
+        g_cfg.enable_mimalloc    = false;
+        g_cfg.enable_adaptive_gc = false;
+        g_cfg.enable_anti_stw_gc = false;
+        g_cfg.enable_fast_dumper = false;
+        g_lua = {};
+        LogMsg("[COMPAT] Foreign Lua VM / LuaJIT2 detected (%s) -> yielding all PUC Lua 5.1 ABI hooks (mimalloc/GC/LuaBridge/FastDump/FastJson); pure C++ Sim/Spatial/AStar/Replica/Net/Save/zlib optimizations stay ACTIVE!",
+               foreignLuaReason ? foreignLuaReason : "unknown");
+    } else {
+        g_lua.checkstack   = reinterpret_cast<decltype(g_lua.checkstack)>(FindUniqueAob(kAobLuaCheckStack));
+        g_lua.gettop       = reinterpret_cast<decltype(g_lua.gettop)>(FindUniqueAob(kAobLuaGetTop));
+        g_lua.settop       = reinterpret_cast<decltype(g_lua.settop)>(FindUniqueAob(kAobLuaSetTop));
+        g_lua.pushvalue    = reinterpret_cast<decltype(g_lua.pushvalue)>(FindUniqueAob(kAobLuaPushValue));
+        g_lua.type         = reinterpret_cast<decltype(g_lua.type)>(FindUniqueAob(kAobLuaType));
+        g_lua.tonumber     = reinterpret_cast<decltype(g_lua.tonumber)>(FindUniqueAob(kAobLuaToNumber));
+        g_lua.toboolean    = reinterpret_cast<decltype(g_lua.toboolean)>(FindUniqueAob(kAobLuaToBoolean));
+        g_lua.tolstring    = reinterpret_cast<decltype(g_lua.tolstring)>(FindUniqueAob(kAobLuaToLString));
+        g_lua.topointer    = reinterpret_cast<decltype(g_lua.topointer)>(FindUniqueAob(kAobLuaToPointer));
+        g_lua.pushnil      = reinterpret_cast<decltype(g_lua.pushnil)>(FindUniqueAob(kAobLuaPushNil));
+        g_lua.pushnumber   = reinterpret_cast<decltype(g_lua.pushnumber)>(FindUniqueAob(kAobLuaPushNumber));
+        g_lua.pushlstring  = reinterpret_cast<decltype(g_lua.pushlstring)>(FindUniqueAob(kAobLuaPushLString));
+        g_lua.pushstring   = reinterpret_cast<decltype(g_lua.pushstring)>(FindUniqueAob(kAobLuaPushString));
+        g_lua.pushcclosure = reinterpret_cast<decltype(g_lua.pushcclosure)>(FindUniqueAob(kAobLuaPushCClos));
+        g_lua.pushboolean  = reinterpret_cast<decltype(g_lua.pushboolean)>(FindUniqueAob(kAobLuaPushBool));
+        g_lua.getfield     = reinterpret_cast<decltype(g_lua.getfield)>(FindUniqueAob(kAobLuaGetField));
+        g_lua.createtable  = reinterpret_cast<decltype(g_lua.createtable)>(FindUniqueAob(kAobLuaCreateTbl));
+        g_lua.setfield     = reinterpret_cast<decltype(g_lua.setfield)>(FindUniqueAob(kAobLuaSetField));
+        g_lua.gc           = reinterpret_cast<decltype(g_lua.gc)>(FindUniqueAob(kAobLuaGc));
+        g_lua.next         = reinterpret_cast<decltype(g_lua.next)>(FindUniqueAob(kAobLuaNext));
+        g_lua.rawset       = reinterpret_cast<decltype(g_lua.rawset)>(FindUniqueAob(kAobLuaRawSet));
+        g_lua.rawseti      = reinterpret_cast<decltype(g_lua.rawseti)>(FindUniqueAob(kAobLuaRawSetI));
+        LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d ReadyForFastJson=%d",
+               g_lua.ReadyForRegister() ? 1 : 0, g_lua.ReadyForFastDump() ? 1 : 0,
+               g_lua.ReadyForFastJson() ? 1 : 0);
+    }
 
     // 2. Materialize immortal singletons BEFORE installing hooks
     (void)GetFsNegCache();
@@ -3312,30 +3408,31 @@ void HyperCoreLinuxInit() {
     (void)GetGcPolicyState();
 
     // 3. Module 1: Mimalloc + Lua OpenLibs/Close
-    g_simLuaAllocAddr = FindUniqueAob(kAobSimLuaAlloc);
-    g_wgLuaAllocAddr  = FindUniqueAob(kAobWgLuaAlloc);
-    g_trackLuaMem     = reinterpret_cast<TrackLuaMem_t>(FindUniqueAob(kAobTrackLuaMem));
-    if (uint8_t* pNewState = FindUniqueAob(kAobLuaNewState)) {
-        const bool ok = (g_simLuaAllocAddr && g_wgLuaAllocAddr) &&
-                        InstallHookSysV(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 14,
-                                        reinterpret_cast<void**>(&g_origLuaNewState));
-        LogMsg("[HOOK] lua_newstate @ %p -> %s", pNewState, ok ? "OK" : "FAIL");
-    }
-    if (uint8_t* pOpenLibs = FindUniqueAob(kAobLuaOpenLibs)) {
-        const RelocLea rel{9};
-        const bool ok = InstallHookSysV(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 16,
-                                        reinterpret_cast<void**>(&g_origLuaOpenLibs), &rel, 1);
-        LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
-    }
-    if (uint8_t* pLuaClose = FindUniqueAob(kAobLuaClose)) {
-        const RelocLea rel{6};
-        const bool ok = InstallHookSysV(pLuaClose, reinterpret_cast<void*>(&HookLuaClose), 17,
-                                        reinterpret_cast<void**>(&g_origLuaClose), &rel, 1);
-        LogMsg("[HOOK] lua_close @ %p -> %s", pLuaClose, ok ? "OK" : "FAIL");
+    if (!g_foreignLuaVmDetected.load(std::memory_order_acquire)) {
+        g_simLuaAllocAddr = FindUniqueAob(kAobSimLuaAlloc);
+        g_wgLuaAllocAddr  = FindUniqueAob(kAobWgLuaAlloc);
+        g_trackLuaMem     = reinterpret_cast<TrackLuaMem_t>(FindUniqueAob(kAobTrackLuaMem));
+        if (uint8_t* pNewState = FindUniqueAob(kAobLuaNewState)) {
+            const bool ok = (g_simLuaAllocAddr && g_wgLuaAllocAddr) &&
+                            InstallHookSysV(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 14,
+                                            reinterpret_cast<void**>(&g_origLuaNewState));
+            LogMsg("[HOOK] lua_newstate @ %p -> %s", pNewState, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pOpenLibs = FindUniqueAob(kAobLuaOpenLibs)) {
+            const RelocLea rel{9};
+            const bool ok = InstallHookSysV(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 16,
+                                            reinterpret_cast<void**>(&g_origLuaOpenLibs), &rel, 1);
+            LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pLuaClose = FindUniqueAob(kAobLuaClose)) {
+            const RelocLea rel{6};
+            const bool ok = InstallHookSysV(pLuaClose, reinterpret_cast<void*>(&HookLuaClose), 17,
+                                            reinterpret_cast<void**>(&g_origLuaClose), &rel, 1);
+            LogMsg("[HOOK] lua_close @ %p -> %s", pLuaClose, ok ? "OK" : "FAIL");
+        }
     }
 
     // 4. Module 0A/0B + Module 2 (GC)
-    g_setGcBudget = reinterpret_cast<SetGcBudget_t>(FindUniqueAob(kAobSetGcBudget));
     if (uint8_t* pSimUpd = FindUniqueAob(kAobSimUpdate)) {
         const bool ok = InstallHookSysV(pSimUpd, reinterpret_cast<void*>(&HookSimUpdate), 14,
                                         reinterpret_cast<void**>(&g_origSimUpdate));
@@ -3346,15 +3443,18 @@ void HyperCoreLinuxInit() {
                                         reinterpret_cast<void**>(&g_origSimLuaUpdate));
         LogMsg("[HOOK] Simulation::luaUpdate @ %p -> %s", pSimLua, ok ? "OK" : "FAIL");
     }
-    if (uint8_t* pCollGc = FindUniqueAob(kAobSimCollGc)) {
-        const bool ok = InstallHookSysV(pCollGc, reinterpret_cast<void*>(&HookCollectGarbage), 15,
-                                        reinterpret_cast<void**>(&g_origCollectGarbage));
-        LogMsg("[HOOK] Simulation::CollectGarbage @ %p -> %s", pCollGc, ok ? "OK" : "FAIL");
-    }
-    if (uint8_t* pLuaGc = FindUniqueAob(kAobLuaGc)) {
-        const bool ok = InstallHookSysV(pLuaGc, reinterpret_cast<void*>(&HookLuaGc), 14,
-                                        reinterpret_cast<void**>(&g_origLuaGc));
-        LogMsg("[HOOK] lua_gc (Anti-STW Shield) @ %p -> %s", pLuaGc, ok ? "OK" : "FAIL");
+    if (!g_foreignLuaVmDetected.load(std::memory_order_acquire)) {
+        g_setGcBudget = reinterpret_cast<SetGcBudget_t>(FindUniqueAob(kAobSetGcBudget));
+        if (uint8_t* pCollGc = FindUniqueAob(kAobSimCollGc)) {
+            const bool ok = InstallHookSysV(pCollGc, reinterpret_cast<void*>(&HookCollectGarbage), 15,
+                                            reinterpret_cast<void**>(&g_origCollectGarbage));
+            LogMsg("[HOOK] Simulation::CollectGarbage @ %p -> %s", pCollGc, ok ? "OK" : "FAIL");
+        }
+        if (uint8_t* pLuaGc = FindUniqueAob(kAobLuaGc)) {
+            const bool ok = InstallHookSysV(pLuaGc, reinterpret_cast<void*>(&HookLuaGc), 14,
+                                            reinterpret_cast<void**>(&g_origLuaGc));
+            LogMsg("[HOOK] lua_gc (Anti-STW Shield) @ %p -> %s", pLuaGc, ok ? "OK" : "FAIL");
+        }
     }
     if (uint8_t* pNetUpd = FindUniqueAob(kAobNetMgrUpd)) {
         const RelocLea rel{11};

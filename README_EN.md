@@ -2,7 +2,7 @@
   <a href="README.md">简体中文</a> | <strong>English</strong>
 </p>
 
-# DST HyperCore Server v1.6.0-beta1 — Windows & Linux Dedicated Server Native Engine
+# DST HyperCore Server v1.6.0-beta2 — Windows & Linux Dedicated Server Native Engine
 
 > **Ceiling-Tier Server-Only Native C++ Engine (`bin64/iphlpapi.dll` / `bin64/libhypercore.so`) + Zero-Divergence Mod for Don't Starve Together**  
 > Dedicated Linux x86_64 directory 👉 [`server_hypercore_linux/`](server_hypercore_linux/README_EN.md) ([中文指南](server_hypercore_linux/README.md)) | Client Repo: [`main`](https://github.com/wangxu1428/DST-HyperSmooth-240FPS) | [Releases](https://github.com/wangxu1428/DST-HyperSmooth-240FPS/releases)
@@ -14,7 +14,9 @@
 
 ---
 
-## What's New in v1.6.0-beta1
+## What's New in v1.6.0-beta2
+
+- **beta2 Compatibility Hardening**: `opt_lazy_perishable` now defaults to Disabled (and auto-yields to custom/anti-spoil containers when enabled); Windows & Linux native engines detect foreign LuaJIT2 and safely yield native GC hooks; added English `OneClick_Install_Update.bat`.
 
 ### 0. Module 10B Zero-Desync Tiered Replica Pacing + `O(N)` ReplicaFastPath + Causal 3-Channel RPC QoS + Hardware Tier & Spike Blackbox
 - **Module 10B Zero-Desync Tiered Replica Construction Pacing**: Spreads 1,500+ entity mega-base and wormhole entry bursts across smooth ticks (nearest-first distance buckets) while bypassing Tier-0 objects (proxies, players, classifieds, parented/inventory items, and `<=14wu` threats) with automatic Parent-Before-Child promotion; runtime tuning via `c_hyperpacing()`.

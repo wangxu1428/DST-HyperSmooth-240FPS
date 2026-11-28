@@ -207,6 +207,75 @@ AddSimPostInit(function()
             m7:Remove()
             print("[PERISH_SAFETY_TEST] 7. StartPerishing() settles accumulated lazy decay PASS (" .. string.format("%.1f -> %.1f", pre_start_time, p7.perishremainingtime) .. ")")
 
+            -- TEST 8 (Track 4A): Custom/modded container prefab (outside VANILLA_STATIC_CONTAINERS) MUST yield & count!
+            local prev_yields = G.HyperCoreLuaStats.perish_mod_yields or 0
+            local c8 = G.SpawnPrefab("icebox")
+            c8.Transform:SetPosition(170, 0, 170)
+            c8.prefab = "modded_antisp_bigbox"
+            local m8 = G.SpawnPrefab("monstermeat")
+            m8.components.perishable:SetPercent(0.80)
+            m8.components.perishable:StartPerishing()
+            c8.components.container:GiveItem(m8, 1)
+            m8.components.perishable._HC_EnterLazy()
+            assert(m8.components.perishable._hc_lazy_active == nil,
+                   "FAIL (Track 4A): Custom modded container should NOT enter lazy perishable!")
+            assert(m8.components.perishable.updatetask ~= nil,
+                   "FAIL (Track 4A): Custom container perishable updatetask must remain intact!")
+            assert((G.HyperCoreLuaStats.perish_mod_yields or 0) >= prev_yields + 1,
+                   "FAIL (Track 4A): Expected perish_mod_yields increment on custom container")
+            c8:Remove()
+            print("[PERISH_SAFETY_TEST] 8. Custom container prefab generic yield + telemetry PASS")
+
+            -- TEST 9 (Track 4A): Anti-spoil / zero-perish preserver multiplier (owner_mult <= 0) MUST yield cleanly!
+            local c9 = G.SpawnPrefab("saltbox")
+            c9.Transform:SetPosition(180, 0, 180)
+            c9:RemoveTag("fridge")
+            c9:RemoveTag("foodpreserver")
+            if c9.components.preserver == nil then c9:AddComponent("preserver") end
+            -- Simulate reverse-perish / zero-perish container using a preserver returning <= 0
+            local orig_salt_mult = c9.components.preserver.GetPerishRateMultiplier
+            c9.components.preserver.GetPerishRateMultiplier = function() return -0.5 end
+            local m9 = G.SpawnPrefab("monstermeat")
+            m9.components.perishable:SetPercent(0.50)
+            m9.components.perishable:StartPerishing()
+            c9.components.container:GiveItem(m9, 1)
+            m9.components.perishable._HC_EnterLazy()
+            assert(m9.components.perishable._hc_lazy_active == nil,
+                   "FAIL (Track 4A): Preserver returning <=0 / mod closure should yield cleanly!")
+            assert(m9.components.perishable.updatetask ~= nil,
+                   "FAIL (Track 4A): Preserver <=0 item updatetask must stay active")
+            c9.components.preserver.GetPerishRateMultiplier = orig_salt_mult
+            c9:Remove()
+            print("[PERISH_SAFETY_TEST] 9. Anti-spoil preserver (mult <= 0 / mod hook) generic yield PASS")
+
+            -- TEST 10 (Track 4A): Fueled container (dynamic multiplier dependent on fuel) MUST yield!
+            local c10 = G.SpawnPrefab("icebox")
+            c10.Transform:SetPosition(190, 0, 190)
+            c10:AddComponent("fueled")
+            local m10 = G.SpawnPrefab("monstermeat")
+            m10.components.perishable:SetPercent(0.75)
+            m10.components.perishable:StartPerishing()
+            c10.components.container:GiveItem(m10, 1)
+            m10.components.perishable._HC_EnterLazy()
+            assert(m10.components.perishable._hc_lazy_active == nil,
+                   "FAIL (Track 4A): Fueled container must yield to vanilla perish updates!")
+            c10:Remove()
+            print("[PERISH_SAFETY_TEST] 10. Fueled dynamic-preserver container yield PASS")
+
+            -- TEST 11 (Track 4A): Mod-wrapped perishable.LongUpdate MUST yield via debug.getinfo check!
+            local m11 = G.SpawnPrefab("monstermeat")
+            m11.Transform:SetPosition(200, 0, 200)
+            local p11 = m11.components.perishable
+            p11:SetPercent(0.80)
+            p11:StartPerishing()
+            local orig_lu11 = p11.LongUpdate
+            p11.LongUpdate = function(s, dt) return orig_lu11(s, dt) end
+            p11._HC_EnterLazy()
+            assert(p11._hc_lazy_active == nil,
+                   "FAIL (Track 4A): Mod-wrapped LongUpdate must trigger generic perish yield!")
+            m11:Remove()
+            print("[PERISH_SAFETY_TEST] 11. Mod-hooked perishable method generic debug.getinfo yield PASS")
+
             G.rawset(G, "GetTime", orig_GetTime)
         end
 
@@ -219,6 +288,12 @@ end)
 
 def main():
     assert os.path.isdir(BASE_BACKUP), f"Missing {BASE_BACKUP}"
+    # Verify Track 4A default-off compatibility policy in server_mod/modinfo.lua
+    with open(os.path.join(SERVER_MOD, "modinfo.lua"), "r", encoding="utf-8") as mf:
+        modinfo_txt = mf.read()
+    assert 'name = "opt_lazy_perishable"' in modinfo_txt and "default = false" in modinfo_txt.split('name = "opt_lazy_perishable"', 1)[1].split("\n    },", 1)[0], \
+        "Expected opt_lazy_perishable default = false in server_mod/modinfo.lua"
+    print("[PERISH_SAFETY_TEST] 0. modinfo.lua opt_lazy_perishable default=false PASS")
     if os.path.exists(CLUSTER_DIR):
         shutil.rmtree(CLUSTER_DIR)
     shutil.copytree(BASE_BACKUP, CLUSTER_DIR)

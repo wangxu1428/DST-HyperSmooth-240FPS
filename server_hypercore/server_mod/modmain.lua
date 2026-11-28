@@ -85,6 +85,7 @@ local HC_LUA_STATS = {
     staggered_wakes = 0,
     perish_paused_now = 0,
     perish_syncs = 0,
+    perish_mod_yields = 0,
     autostack_merges = 0,
     beefalo_cap_blocks = 0,
     fastdump_hits = 0,
@@ -342,7 +343,24 @@ do
         end
     end
     if type(EntityScript) == "table" then
-        if not EntityScript._hs_fast_pushevent and type(EntityScript.PushEvent_Internal) == "function" then
+        local _dbg_getinfo_es = (type(G.debug) == "table" and type(G.debug.getinfo) == "function") and G.debug.getinfo or nil
+        local function CanReplaceEntityScriptFn(fn)
+            if fn == nil then
+                return true
+            end
+            if G.type(fn) ~= "function" then
+                return false
+            end
+            if _dbg_getinfo_es == nil then
+                return true
+            end
+            local info = _dbg_getinfo_es(fn, "S")
+            local src = info ~= nil and info.source or nil
+            return G.type(src) ~= "string" or src:find("entityscript%.lua") ~= nil
+        end
+
+        if not EntityScript._hs_fast_pushevent and G.type(EntityScript.PushEvent_Internal) == "function" and
+           CanReplaceEntityScriptFn(EntityScript.PushEvent_Internal) then
             EntityScript._hs_fast_pushevent = true
             local pe_pool = {}
             local pe_pool_n = 0
@@ -420,52 +438,56 @@ do
             end
         end
 
-        if rawget(G, "BRANCH") ~= "dev" and not EntityScript._hs_fast_hastags then
-            EntityScript._hs_fast_hastags = true
+        if rawget(G, "BRANCH") ~= "dev" then
             local _unpack = rawget(G, "unpack") or G.unpack
 
-            function EntityScript:HasTags(t1, ...)
-                if t1 == nil then
-                    return self.entity:HasAllTags(...)
-                elseif G.type(t1) == "table" then
-                    local a, b, c = t1[1], t1[2], t1[3]
-                    if a == nil then
-                        return self.entity:HasAllTags()
-                    elseif b == nil then
-                        return self.entity:HasTag(a)
-                    elseif c == nil then
-                        return self.entity:HasAllTags(a, b)
-                    elseif t1[4] == nil then
-                        return self.entity:HasAllTags(a, b, c)
-                    else
-                        return self.entity:HasAllTags(_unpack(t1))
+            if not EntityScript._hs_fast_hastags and CanReplaceEntityScriptFn(EntityScript.HasTags) then
+                EntityScript._hs_fast_hastags = true
+                function EntityScript:HasTags(t1, ...)
+                    if t1 == nil then
+                        return self.entity:HasAllTags(...)
+                    elseif G.type(t1) == "table" then
+                        local a, b, c = t1[1], t1[2], t1[3]
+                        if a == nil then
+                            return self.entity:HasAllTags()
+                        elseif b == nil then
+                            return self.entity:HasTag(a)
+                        elseif c == nil then
+                            return self.entity:HasAllTags(a, b)
+                        elseif t1[4] == nil then
+                            return self.entity:HasAllTags(a, b, c)
+                        else
+                            return self.entity:HasAllTags(_unpack(t1))
+                        end
                     end
+                    return self.entity:HasAllTags(t1, ...)
                 end
-                return self.entity:HasAllTags(t1, ...)
+                EntityScript.HasAllTags = EntityScript.HasTags
             end
 
-            function EntityScript:HasOneOfTags(t1, ...)
-                if t1 == nil then
-                    return self.entity:HasAnyTag(...)
-                elseif G.type(t1) == "table" then
-                    local a, b, c = t1[1], t1[2], t1[3]
-                    if a == nil then
-                        return self.entity:HasAnyTag()
-                    elseif b == nil then
-                        return self.entity:HasTag(a)
-                    elseif c == nil then
-                        return self.entity:HasAnyTag(a, b)
-                    elseif t1[4] == nil then
-                        return self.entity:HasAnyTag(a, b, c)
-                    else
-                        return self.entity:HasAnyTag(_unpack(t1))
+            if not EntityScript._hs_fast_hasoneoftags and CanReplaceEntityScriptFn(EntityScript.HasOneOfTags) then
+                EntityScript._hs_fast_hasoneoftags = true
+                function EntityScript:HasOneOfTags(t1, ...)
+                    if t1 == nil then
+                        return self.entity:HasAnyTag(...)
+                    elseif G.type(t1) == "table" then
+                        local a, b, c = t1[1], t1[2], t1[3]
+                        if a == nil then
+                            return self.entity:HasAnyTag()
+                        elseif b == nil then
+                            return self.entity:HasTag(a)
+                        elseif c == nil then
+                            return self.entity:HasAnyTag(a, b)
+                        elseif t1[4] == nil then
+                            return self.entity:HasAnyTag(a, b, c)
+                        else
+                            return self.entity:HasAnyTag(_unpack(t1))
+                        end
                     end
+                    return self.entity:HasAnyTag(t1, ...)
                 end
-                return self.entity:HasAnyTag(t1, ...)
+                EntityScript.HasAnyTag = EntityScript.HasOneOfTags
             end
-
-            EntityScript.HasAllTags = EntityScript.HasTags
-            EntityScript.HasAnyTag = EntityScript.HasOneOfTags
         end
     end
 end
@@ -736,9 +758,61 @@ if OPT_LAZY_PERISHABLE then
         end
     end)
 
-    -- Strict safety whitelist: returns false for ANY special perishable item
+    -- Generic compatibility yield helpers for custom perishable & anti-spoil container mods
+    local VANILLA_STATIC_CONTAINERS = {
+        icebox = true,
+        saltbox = true,
+        siestahut = true,
+        portableblender = true,
+        fish_box = true,
+        chester = true,
+        hutch = true,
+        wobybig = true,
+        wobysmall = true,
+        krampus_sack = true,
+        icepack = true,
+        spicepack = true,
+        seedpouch = true,
+        tacklestation = true,
+        beargerfur_sack = true,
+        battlesong_container = true,
+        bookstation = true,
+        elixir_container = true,
+    }
+
+    local function IsVanillaComponentFn(fn, comp_name)
+        if type(fn) ~= "function" then return false end
+        local dbg = rawget(G, "debug")
+        if type(dbg) ~= "table" or type(dbg.getinfo) ~= "function" then return false end
+        local ok, info = pcall(dbg.getinfo, fn, "S")
+        if not ok or type(info) ~= "table" then return false end
+        if info.what == "C" or type(info.source) ~= "string" then return false end
+        local src = string.gsub(info.source, "\\", "/")
+        if src:find("mods/", 1, true) or src:find("workshop-", 1, true) then return false end
+        return src:find("scripts/components/" .. tostring(comp_name), 1, true) ~= nil
+    end
+
+    local function RecordPerishModYield(self)
+        if not self._hc_perish_yield_counted then
+            self._hc_perish_yield_counted = true
+            HC_LUA_STATS.perish_mod_yields = HC_LUA_STATS.perish_mod_yields + 1
+        end
+    end
+
+    -- Strict safety whitelist: returns false for ANY special or modded perishable item
     local function IsEligibleForLazyPerish(self, inst)
         if inst == nil or not inst:IsValid() then return false end
+        local orig_start = self._hc_orig_start or self.StartPerishing
+        local orig_long  = self._hc_orig_long or self.LongUpdate
+        if not IsVanillaComponentFn(orig_start, "perishable") or
+           not IsVanillaComponentFn(orig_long, "perishable") or
+           (self._hc_wrap_start ~= nil and self.StartPerishing ~= self._hc_wrap_start) or
+           (self._hc_wrap_long ~= nil and self.LongUpdate ~= self._hc_wrap_long) or
+           (self.updatetask ~= nil and type(self.updatetask.fn) == "function" and
+            not IsVanillaComponentFn(self.updatetask.fn, "perishable")) then
+            RecordPerishModYield(self)
+            return false
+        end
         -- Skip ALL 17+ special prefabs with custom perishfn or onreplacedfn!
         if self.perishfn ~= nil or self.onreplacedfn ~= nil then return false end
         -- Skip items with frozenfiremult or custom temperature cooling (hot cooked dishes)
@@ -830,12 +904,30 @@ if OPT_LAZY_PERISHABLE then
             -- SpawnSaveRecord calls Transform:SetPosition() -> OnEntitySleep() BEFORE SetPersistData()!
             if G.POPULATING or self._hc_lazy_active or self.updatetask == nil then return end
             if not IsEligibleForLazyPerish(self, inst) then return end
-            StepEnvIntegral()
             local owner = inst.components.inventoryitem ~= nil and inst.components.inventoryitem.owner or nil
-            -- Never lazy-pause items held by players or inside open containers or pocket dimensions with dynamic handlers
+            -- Never lazy-pause items held by players or inside open containers or custom/modded/dynamic containers
             if owner ~= nil then
                 if owner:HasTag("player") or owner.components.inventory ~= nil then return end
                 if owner.components.container ~= nil and owner.components.container:IsOpen() then return end
+                if not VANILLA_STATIC_CONTAINERS[owner.prefab] then
+                    RecordPerishModYield(self)
+                    return
+                end
+                if owner.components.fueled ~= nil then
+                    RecordPerishModYield(self)
+                    return
+                end
+                if owner.components.preserver ~= nil and
+                   not IsVanillaComponentFn(owner.components.preserver.GetPerishRateMultiplier, "preserver") then
+                    RecordPerishModYield(self)
+                    return
+                end
+            end
+            local owner_mult = ComputeOwnerMult(inst, owner)
+            -- Anti-spoil / reverse-perish / zero-perish multipliers (owner_mult <= 0): yield to vanilla/mod task
+            if owner_mult <= 0 then
+                RecordPerishModYield(self)
+                return
             end
             -- Never lazy-pause items sitting inside a local temperatureoverrider bubble (e.g. scaled furnace / polar light)
             if G.GetTemperatureAtXZ ~= nil and G.TheWorld ~= nil and G.TheWorld.state ~= nil then
@@ -848,11 +940,12 @@ if OPT_LAZY_PERISHABLE then
                 end
             end
 
+            StepEnvIntegral()
             self.updatetask:Cancel()
             self.updatetask = nil
             self._hc_lazy_active = true
             self._hc_lazy_is_indoor = (owner ~= nil)
-            self._hc_lazy_owner_mult = ComputeOwnerMult(inst, owner)
+            self._hc_lazy_owner_mult = owner_mult
             self._hc_lazy_is_frozen = inst:HasTag("frozen")
             self._hc_lazy_snap_ground = EnvIntegral.normal_ground
             self._hc_lazy_snap_indoor = EnvIntegral.normal_indoor
@@ -916,6 +1009,7 @@ if OPT_LAZY_PERISHABLE then
         end
 
         local _origStartPerishing = self.StartPerishing
+        self._hc_orig_start = _origStartPerishing
         function self:StartPerishing()
             if self._hc_lazy_active then
                 -- Settle accumulated lazy decay FIRST so StartPerishing never drops elapsed decay!
@@ -924,6 +1018,7 @@ if OPT_LAZY_PERISHABLE then
             end
             return _origStartPerishing(self)
         end
+        self._hc_wrap_start = self.StartPerishing
 
         local _origStopPerishing = self.StopPerishing
         function self:StopPerishing()
@@ -963,6 +1058,7 @@ if OPT_LAZY_PERISHABLE then
         end
 
         local _origLongUpdate = self.LongUpdate
+        self._hc_orig_long = _origLongUpdate
         function self:LongUpdate(dt)
             if self._hc_lazy_active then
                 SyncLazyMode(true)
@@ -970,6 +1066,7 @@ if OPT_LAZY_PERISHABLE then
             end
             return _origLongUpdate(self, dt)
         end
+        self._hc_wrap_long = self.LongUpdate
 
         -- 100% SIDE-EFFECT-FREE OnSave():
         -- NEVER calls Perish() / inst:Remove() / SpawnPrefab() / DoTaskInTime() during serialization,
@@ -1404,22 +1501,24 @@ rawset(G, "c_hyperstats", function()
             or "  [Native] iphlpapi.dll / libhypercore.so not installed (running pure-Lua Layer 2/3 mode)")
     end
     print(zh
-        and string.format("  [Lua优化] 鱼人短路=%d 过滤=%d 错峰苏醒=%d 惰性腐烂(暂停=%d 同步=%d) 极速存档=%d/%d 自动堆叠=%d 野牛拦截=%d",
+        and string.format("  [Lua优化] 鱼人短路=%d 过滤=%d 错峰苏醒=%d 惰性腐烂(暂停=%d 同步=%d 退让=%d) 极速存档=%d/%d 自动堆叠=%d 野牛拦截=%d",
             HC_LUA_STATS.merm_retarget_shortcircuits,
             HC_LUA_STATS.merm_retarget_filtered_calls,
             HC_LUA_STATS.staggered_wakes,
             HC_LUA_STATS.perish_paused_now,
             HC_LUA_STATS.perish_syncs,
+            HC_LUA_STATS.perish_mod_yields,
             HC_LUA_STATS.fastdump_hits,
             HC_LUA_STATS.fastdump_fallbacks,
             HC_LUA_STATS.autostack_merges,
             HC_LUA_STATS.beefalo_cap_blocks)
-        or string.format("  [Lua] MermShortCircuit=%d MermFiltered=%d StaggerWake=%d PerishPaused=%d PerishSyncs=%d FastDumpHits=%d/%d AutoStack=%d BeefaloCapBlocks=%d",
+        or string.format("  [Lua] MermShortCircuit=%d MermFiltered=%d StaggerWake=%d Perish(Paused=%d Syncs=%d Yields=%d) FastDumpHits=%d/%d AutoStack=%d BeefaloCapBlocks=%d",
             HC_LUA_STATS.merm_retarget_shortcircuits,
             HC_LUA_STATS.merm_retarget_filtered_calls,
             HC_LUA_STATS.staggered_wakes,
             HC_LUA_STATS.perish_paused_now,
             HC_LUA_STATS.perish_syncs,
+            HC_LUA_STATS.perish_mod_yields,
             HC_LUA_STATS.fastdump_hits,
             HC_LUA_STATS.fastdump_fallbacks,
             HC_LUA_STATS.autostack_merges,

@@ -8,34 +8,34 @@ end
 
 name = L("HyperCore 服务端深度性能优化引擎", "HyperCore Server Performance Engine")
 description = L([[
-《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.6.0-beta1 测试版热更新 · 零失步分层副本分帧平滑 + O(N) 副本极速引擎 + 因果 3 通道 RPC QoS）。
+《饥荒联机版》纯服务端零玩法分歧深度性能优化套件（v1.6.0-beta2 测试版 · 零失步分层副本分帧平滑 + 兼容加固）。
 单装本 Mod 即可生效全部 Lua 级手术优化（零分配 PushEvent_Internal、HasTags 展开、C++ FastJson 加速与 c_hyperprof() 热点采样）；配合开源原生引擎插件 bin64/iphlpapi.dll（或 Linux x86_64 libhypercore.so）更可解锁无锁 mimalloc 内存池、5/5 空间网格零拷贝、O(N log N) 极速寻路引擎、压力驱动自适应 GC、C++ 原生极速存档序列化、因果 3 通道 RPC QoS、验证原子存盘与巨型基地副本分帧平滑！
 
-【v1.6.0-beta1 测试版热更新（零玩法分歧 · 零失步 · 零存档变更）】
-- Module 10B 零失步分层副本构造限流（Replica Construction Pacing）：进入 1500+ 实体巨型基地或跳虫洞时，自动将远距离静态建筑平滑分散至多帧下发，彻底消除 250KB 单帧网络洪峰与客户端 700ms 瞬间卡顿！
-- 严格 Tier-0 零延迟直通：世界/网络代理、玩家与归属实体、Classified 界面、父子/背包物品、以及玩家 14 格内近身威胁 0ms 直达，并自动父先于子提升（Parent-Before-Child Promotion）杜绝挂件失步。
-- 控制台新增 c_hyperpacing() 实时调参，c_hyperstats() 新增副本加速与分帧统计，并声明 DNH 伴侣（dnh_github）热更新元数据。
+【v1.6.0-beta2 测试版热更新】
+- 反鲜容器兼容加固：`opt_lazy_perishable`（惰性腐烂）改为默认关闭，且开启时自动检测并退让反鲜大箱子/模组容器。
+- LuaJIT2 共存保护：Windows / Linux 双端自动检测外源 LuaJIT2 并安全退让原生 GC 钩子，防止双开启动存档崩溃。
+- 包含 v1.6.0-beta1 全部特性（Module 10B 巨型基地副本分帧限流、`O(N)` 副本加速、因果 RPC QoS、硬件分级与 DNH 托管），新增英文一键安装脚本。
 
 【既有核心特性 · 零分歧默认开启】
 1. 5/5 SpatialGrid 空间网格全零拷贝 + O(N log N) FastAStar 寻路引擎 + mimalloc 无锁 Lua 堆 + RakNet 0ms 事件唤醒 + 因果 3 通道 RPC QoS + 原子存盘防护。
-2. 鱼人村 RetargetFn 无过滤风暴修复 + 生物错峰苏醒 + 安全白名单惰性腐烂精确积分 + 60Hz 双端可选协同逻辑刻。
+2. 鱼人村 RetargetFn 无过滤风暴修复 + 生物错峰苏醒 + 可选白名单惰性腐烂 + 60Hz 双端可选协同逻辑刻。
 3. 控制台 c_hyperstats() 实时查看 Tick P95/P99、GC、SpatialGrid、FastAStar、FastDump、FastJson、RepFast、FSNeg、AsyncSave 与 RpcQoS 指标。
 ]], [[
-Dedicated & Host-Server Deep Performance Optimization Suite for Don't Starve Together (v1.6.0-beta1 Beta Hotfix: Zero-Desync Tiered Replica Construction Pacing + O(N) Replica Fast-Path + Causal 3-Channel RPC QoS).
+Dedicated & Host-Server Deep Performance Optimization Suite for Don't Starve Together (v1.6.0-beta2 Beta: Zero-Desync Tiered Replica Pacing + Compatibility Hardening).
 Install this mod alone for all Lua-level surgical optimizations (zero-alloc PushEvent_Internal pool, unrolled HasTags, FastJson bridge, c_hyperprof() profiler); pair with open-source native companion bin64/iphlpapi.dll (Windows) or libhypercore.so (Linux x86_64) to unlock lockless mimalloc Lua heap, 5/5 SpatialGrid zero-copy, O(N log N) FastAStar pathfinding, pressure-driven adaptive GC, causal 3-channel RPC QoS, verified atomic save commits, and mega-base replica burst pacing!
 
-[v1.6.0-beta1 Beta Hotfix (Zero Gameplay Divergence, Zero Desync, Zero Save Lock-in)]
-- Module 10B Zero-Desync Tiered Replica Construction Pacing: spreads 1,500+ entity mega-base and wormhole entry bursts across smooth ticks (nearest-first buckets) to eliminate 250KB RM3 burst spikes and 700ms client stalls.
-- Strict Tier-0 0-Tick Bypass: World/Net proxies, players, classifieds, parented/inventory items, and <=14wu nearby threats construct immediately with automatic Parent-Before-Child Promotion (zero child-before-parent desync).
-- Added c_hyperpacing() console control, RepFast pacing telemetry in c_hyperstats(), and DNH companion (dnh_github) metadata.
+[v1.6.0-beta2 Beta Hotfix]
+- Anti-Spoil Container Compatibility: opt_lazy_perishable now defaults to Disabled for maximum compatibility and auto-yields to custom/anti-spoil containers when enabled.
+- Foreign LuaJIT2 Safety Guard: both Windows & Linux native engines detect LuaJIT2 and yield native GC hooks to prevent world-load crashes.
+- Includes all v1.6.0-beta1 features (Module 10B Replica Pacing, O(N) ReplicaFastPath, Causal RPC QoS, Hardware Tiers, DNH metadata) plus English OneClick_Install_Update.bat.
 
 [Core Features]
 1. 5/5 SpatialGrid zero-copy queries, O(N log N) FastAStar, mimalloc Lua allocator, 0ms RakNet event wakeup, Causal 3-Channel RPC QoS, Verified Atomic Save-Commit.
-2. Merm RetargetFn tag pre-filter fix, staggered entity wake, safe whitelist lazy perishable integration, optional 60Hz synced SimTick mode.
+2. Merm RetargetFn tag pre-filter fix, staggered entity wake, opt-in safe whitelist lazy perishable, optional 60Hz synced SimTick mode.
 3. Run c_hyperstats() in server console to inspect Tick P95/P99, GC, SpatialGrid, FastAStar, FastDump, FastJson, RepFast, FSNeg, AsyncSave, and RpcQoS telemetry.
 ]])
 author = "Hakimi Tech Lab"
-version = "1.6.0-beta1"
+version = "1.6.0-beta2"
 dnh_github = "wangxu1428/DST-HyperSmooth-240FPS"
 dnh_github_asset = "iphlpapi.dll"
 forumthread = ""
@@ -90,14 +90,14 @@ configuration_options = {
     },
     {
         name = "opt_lazy_perishable",
-        label = L("[零分歧] 白名单惰性腐烂精确积分", "[Zero-Div] Whitelist Lazy Perishable"),
-        hover = L("对休眠与关闭容器内的安全白名单易腐食物按温湿度精确积分（跳过特殊腐烂物品；绝不锁死存档，卸载零残留）",
-                  "Pauses vanilla per-tick perish timers on dormant/closed whitelisted foods and integrates accurately via read-only temperature math (safe to uninstall anytime)"),
+        label = L("[可选激进] 白名单惰性腐烂精确积分", "[Optional] Whitelist Lazy Perishable"),
+        hover = L("对休眠且确认原版静态容器内的易腐食物按温湿度积分（若你使用反鲜箱子/模组容器，建议保持关闭；开启时亦会自动检测并退让）",
+                  "Pauses vanilla per-tick perish timers on dormant/vanilla-container foods via temperature math (keep Disabled for custom/anti-spoil container mods; also auto-yields when enabled)"),
         options = {
-            { description = L("启用 (推荐)", "Enabled (Recommended)"), data = true },
-            { description = L("禁用", "Disabled"), data = false },
+            { description = L("关闭 (兼容优先默认)", "Disabled (Compat Default)"), data = false },
+            { description = L("启用 (原版白名单静态容器)", "Enabled (Vanilla Static Containers)"), data = true },
         },
-        default = true,
+        default = false,
     },
     {
         name = "opt_offline_autostack",

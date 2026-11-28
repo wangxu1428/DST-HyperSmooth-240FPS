@@ -168,6 +168,7 @@ std::atomic<int>           g_idealCoreApplied{-1};
 std::atomic<bool>          g_ecoQosDisabled{false};
 std::atomic<bool>          g_prewarmRan{false};
 std::atomic<bool>          g_simSchedDirty{true};
+std::atomic<bool>          g_foreignLuaVmDetected{false};
 std::atomic<uint64_t>      g_fsNegTtlQpc{150000000ULL};
 std::atomic<uint32_t>      g_fastDumpMaxNodes{fast_dumper::kMaxDumpNodes};
 std::atomic<size_t>        g_fastDumpKeepBytes{fast_dumper::kShrinkKeepBytes};
@@ -536,6 +537,74 @@ uint8_t* FindUniqueAob(const int16_t* pat, size_t len, const char* name) {
         return nullptr;
     }
     return found;
+}
+
+uint8_t* FindUniqueAobSilent(const int16_t* pat, size_t len) {
+    if (!g_textStart || g_textSize < len) return nullptr;
+    size_t firstFixed = 0;
+    while (firstFixed < len && pat[firstFixed] < 0) ++firstFixed;
+    if (firstFixed >= len) return nullptr;
+    const uint8_t fb = static_cast<uint8_t>(pat[firstFixed]);
+
+    uint8_t* found = nullptr;
+    size_t hits = 0;
+    const size_t limit = g_textSize - len;
+    for (size_t i = 0; i <= limit; ++i) {
+        if (g_textStart[i + firstFixed] != fb) continue;
+        bool ok = true;
+        for (size_t k = 0; k < len; ++k) {
+            if (pat[k] >= 0 && g_textStart[i + k] != static_cast<uint8_t>(pat[k])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            found = g_textStart + i;
+            ++hits;
+            if (hits > 1) return nullptr;
+        }
+    }
+    return (hits == 1) ? found : nullptr;
+}
+
+bool IsEntryPatchedByExternalHook(const uint8_t* fn) noexcept {
+    if (!fn || !g_textStart) return false;
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(fn);
+    const uintptr_t lo   = reinterpret_cast<uintptr_t>(g_textStart);
+    const uintptr_t hi   = lo + g_textSize;
+    if (addr < lo || addr + 16u > hi) return false;
+    if (fn[0] == 0xE9 || fn[0] == 0xEB) return true;
+    if (fn[0] == 0xFF && fn[1] == 0x25) return true;
+    if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) return true;
+    if (fn[0] == 0x49 && fn[1] == 0xBB && fn[10] == 0x41 && fn[11] == 0xFF && fn[12] == 0xE3) return true;
+    if (fn[0] == 0x68 && fn[5] == 0xC3) return true;
+    return false;
+}
+
+bool IsLuaJitModuleOrWinmmProxyPresent() {
+    if (GetModuleHandleW(L"lua51DS.dll") != nullptr ||
+        GetModuleHandleW(L"lua51.dll") != nullptr ||
+        GetModuleHandleW(L"Injector.dll") != nullptr ||
+        GetModuleHandleW(L"plugin_core_vm.dll") != nullptr ||
+        GetModuleHandleW(L"frida-gum.dll") != nullptr) {
+        return true;
+    }
+    wchar_t exePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) > 0) {
+        if (wchar_t* slash = wcsrchr(exePath, L'\\')) {
+            *(slash + 1) = L'\0';
+            const std::wstring localWinmm = std::wstring(exePath) + L"Winmm.dll";
+            HMODULE hWinmm = GetModuleHandleW(L"Winmm.dll");
+            if (hWinmm) {
+                wchar_t modPath[MAX_PATH] = {};
+                if (GetModuleFileNameW(hWinmm, modPath, MAX_PATH) > 0 &&
+                    _wcsicmp(modPath, localWinmm.c_str()) == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 uint8_t* ResolveRel32Call(uint8_t* callSite) {
@@ -3953,56 +4022,98 @@ void InitServerHooks() {
         return;
     }
 
-    // Resolve Lua 5.1 C API functions
-    g_lua.checkstack   = reinterpret_cast<decltype(g_lua.checkstack)>(FIND_AOB(kAobLuaCheckStack));
-    g_lua.gettop       = reinterpret_cast<decltype(g_lua.gettop)>(FIND_AOB(kAobLuaGetTop));
-    g_lua.settop       = reinterpret_cast<decltype(g_lua.settop)>(FIND_AOB(kAobLuaSetTop));
-    g_lua.pushvalue    = reinterpret_cast<decltype(g_lua.pushvalue)>(FIND_AOB(kAobLuaPushValue));
-    g_lua.type         = reinterpret_cast<decltype(g_lua.type)>(FIND_AOB(kAobLuaType));
-    g_lua.tonumber     = reinterpret_cast<decltype(g_lua.tonumber)>(FIND_AOB(kAobLuaToNumber));
-    g_lua.toboolean    = reinterpret_cast<decltype(g_lua.toboolean)>(FIND_AOB(kAobLuaToBoolean));
-    g_lua.tolstring    = reinterpret_cast<decltype(g_lua.tolstring)>(FIND_AOB(kAobLuaToLString));
-    g_lua.topointer    = reinterpret_cast<decltype(g_lua.topointer)>(FIND_AOB(kAobLuaToPointer));
-    g_lua.pushnil      = reinterpret_cast<decltype(g_lua.pushnil)>(FIND_AOB(kAobLuaPushNil));
-    g_lua.pushnumber   = reinterpret_cast<decltype(g_lua.pushnumber)>(FIND_AOB(kAobLuaPushNumber));
-    g_lua.pushlstring  = reinterpret_cast<decltype(g_lua.pushlstring)>(FIND_AOB(kAobLuaPushLString));
-    g_lua.pushstring   = reinterpret_cast<decltype(g_lua.pushstring)>(FIND_AOB(kAobLuaPushString));
-    g_lua.pushcclosure = reinterpret_cast<decltype(g_lua.pushcclosure)>(FIND_AOB(kAobLuaPushCClosure));
-    g_lua.pushboolean  = reinterpret_cast<decltype(g_lua.pushboolean)>(FIND_AOB(kAobLuaPushBoolean));
-    g_lua.getfield     = reinterpret_cast<decltype(g_lua.getfield)>(FIND_AOB(kAobLuaGetField));
-    g_lua.createtable  = reinterpret_cast<decltype(g_lua.createtable)>(FIND_AOB(kAobLuaCreateTable));
-    g_lua.setfield     = reinterpret_cast<decltype(g_lua.setfield)>(FIND_AOB(kAobLuaSetField));
-    g_lua.gc           = reinterpret_cast<decltype(g_lua.gc)>(FIND_AOB(kAobLuaGc));
-    g_lua.next         = reinterpret_cast<decltype(g_lua.next)>(FIND_AOB(kAobLuaNext));
-    g_lua.rawset       = reinterpret_cast<decltype(g_lua.rawset)>(FIND_AOB(kAobLuaRawSet));
-    g_lua.rawseti      = reinterpret_cast<decltype(g_lua.rawseti)>(FIND_AOB(kAobLuaRawSetI));
-    LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d ReadyForFastJson=%d",
-           g_lua.ReadyForRegister(), g_lua.ReadyForFastDump(), g_lua.ReadyForFastJson());
+    auto detectForeignLuaVm = [&](const char** outReason) -> bool {
+        auto retReason = [&](const char* r) -> bool {
+            if (outReason) *outReason = r;
+            return true;
+        };
+        if (IsLuaJitModuleOrWinmmProxyPresent()) {
+            return retReason("foreign_lua_module_or_local_winmm");
+        }
+        auto checkTail = [&](const int16_t* pat, size_t totalLen, size_t skipOff) -> bool {
+            if (FindUniqueAobSilent(pat, totalLen) != nullptr) return false;
+            if (totalLen <= skipOff) return false;
+            uint8_t* pTail = FindUniqueAobSilent(pat + skipOff, totalLen - skipOff);
+            if (!pTail || pTail < g_textStart + skipOff) return false;
+            return IsEntryPatchedByExternalHook(pTail - skipOff);
+        };
+        if (checkTail(kAobLuaNewState, sizeof(kAobLuaNewState) / sizeof(kAobLuaNewState[0]), 15)) {
+            return retReason("trampoline_on_lua_newstate");
+        }
+        if (checkTail(kAobCollectGarbage, sizeof(kAobCollectGarbage) / sizeof(kAobCollectGarbage[0]), 13)) {
+            return retReason("trampoline_on_sim_collect_garbage");
+        }
+        if (checkTail(kAobLuaGc, sizeof(kAobLuaGc) / sizeof(kAobLuaGc[0]), 15)) {
+            return retReason("trampoline_on_lua_gc");
+        }
+        if (checkTail(kAobLuaClose, sizeof(kAobLuaClose) / sizeof(kAobLuaClose[0]), 14)) {
+            return retReason("trampoline_on_lua_close");
+        }
+        return false;
+    };
 
-    // 1. Hook lua_newstate -> mimalloc
-    g_simLuaAllocAddr = FIND_AOB(kAobSimLuaAlloc);
-    g_wgLuaAllocAddr  = FIND_AOB(kAobWgLuaAlloc);
-    g_trackLuaMem     = reinterpret_cast<TrackLuaMem_t>(FIND_AOB(kAobTrackLuaMem));
-    if (uint8_t* pNewState = FIND_AOB(kAobLuaNewState)) {
-        bool ok = InstallHookOrdered(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 15,
-                                     reinterpret_cast<void**>(&g_origLuaNewState));
-        LogMsg("[HOOK] lua_newstate @ %p -> %s (simAlloc=%p wgAlloc=%p)",
-               pNewState, ok ? "OK" : "FAIL", g_simLuaAllocAddr, g_wgLuaAllocAddr);
-    }
+    const char* foreignLuaReason = nullptr;
+    if (detectForeignLuaVm(&foreignLuaReason)) {
+        g_foreignLuaVmDetected.store(true, std::memory_order_release);
+        g_cfg.enable_mimalloc    = false;
+        g_cfg.enable_adaptive_gc = false;
+        g_cfg.enable_anti_stw_gc = false;
+        g_cfg.enable_fast_dumper = false;
+        g_lua = {};
+        LogMsg("[COMPAT] Foreign Lua VM / LuaJIT2 detected (%s) -> yielding all PUC Lua 5.1 ABI hooks (mimalloc/GC/LuaBridge/FastDump/FastJson); pure C++ Sim/Spatial/AStar/Replica/Net/Save/zlib optimizations stay ACTIVE!",
+               foreignLuaReason ? foreignLuaReason : "unknown");
+    } else {
+        // Resolve Lua 5.1 C API functions
+        g_lua.checkstack   = reinterpret_cast<decltype(g_lua.checkstack)>(FIND_AOB(kAobLuaCheckStack));
+        g_lua.gettop       = reinterpret_cast<decltype(g_lua.gettop)>(FIND_AOB(kAobLuaGetTop));
+        g_lua.settop       = reinterpret_cast<decltype(g_lua.settop)>(FIND_AOB(kAobLuaSetTop));
+        g_lua.pushvalue    = reinterpret_cast<decltype(g_lua.pushvalue)>(FIND_AOB(kAobLuaPushValue));
+        g_lua.type         = reinterpret_cast<decltype(g_lua.type)>(FIND_AOB(kAobLuaType));
+        g_lua.tonumber     = reinterpret_cast<decltype(g_lua.tonumber)>(FIND_AOB(kAobLuaToNumber));
+        g_lua.toboolean    = reinterpret_cast<decltype(g_lua.toboolean)>(FIND_AOB(kAobLuaToBoolean));
+        g_lua.tolstring    = reinterpret_cast<decltype(g_lua.tolstring)>(FIND_AOB(kAobLuaToLString));
+        g_lua.topointer    = reinterpret_cast<decltype(g_lua.topointer)>(FIND_AOB(kAobLuaToPointer));
+        g_lua.pushnil      = reinterpret_cast<decltype(g_lua.pushnil)>(FIND_AOB(kAobLuaPushNil));
+        g_lua.pushnumber   = reinterpret_cast<decltype(g_lua.pushnumber)>(FIND_AOB(kAobLuaPushNumber));
+        g_lua.pushlstring  = reinterpret_cast<decltype(g_lua.pushlstring)>(FIND_AOB(kAobLuaPushLString));
+        g_lua.pushstring   = reinterpret_cast<decltype(g_lua.pushstring)>(FIND_AOB(kAobLuaPushString));
+        g_lua.pushcclosure = reinterpret_cast<decltype(g_lua.pushcclosure)>(FIND_AOB(kAobLuaPushCClosure));
+        g_lua.pushboolean  = reinterpret_cast<decltype(g_lua.pushboolean)>(FIND_AOB(kAobLuaPushBoolean));
+        g_lua.getfield     = reinterpret_cast<decltype(g_lua.getfield)>(FIND_AOB(kAobLuaGetField));
+        g_lua.createtable  = reinterpret_cast<decltype(g_lua.createtable)>(FIND_AOB(kAobLuaCreateTable));
+        g_lua.setfield     = reinterpret_cast<decltype(g_lua.setfield)>(FIND_AOB(kAobLuaSetField));
+        g_lua.gc           = reinterpret_cast<decltype(g_lua.gc)>(FIND_AOB(kAobLuaGc));
+        g_lua.next         = reinterpret_cast<decltype(g_lua.next)>(FIND_AOB(kAobLuaNext));
+        g_lua.rawset       = reinterpret_cast<decltype(g_lua.rawset)>(FIND_AOB(kAobLuaRawSet));
+        g_lua.rawseti      = reinterpret_cast<decltype(g_lua.rawseti)>(FIND_AOB(kAobLuaRawSetI));
+        LogMsg("[LUA] C API resolved: ReadyForRegister=%d ReadyForFastDump=%d ReadyForFastJson=%d",
+               g_lua.ReadyForRegister(), g_lua.ReadyForFastDump(), g_lua.ReadyForFastJson());
 
-    // 2. Hook luaL_openlibs -> auto-register HyperCore_* Lua APIs before any script/mod runs
-    if (uint8_t* pOpenLibs = FIND_AOB(kAobLuaOpenLibs)) {
-        const RelocItem rel = {10, 7, 3}; // mov rax, [rip + disp32] at +10
-        bool ok = InstallHookOrdered(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 17,
-                                     reinterpret_cast<void**>(&g_origLuaOpenLibs), &rel, 1);
-        LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
-    }
+        // 1. Hook lua_newstate -> mimalloc
+        g_simLuaAllocAddr = FIND_AOB(kAobSimLuaAlloc);
+        g_wgLuaAllocAddr  = FIND_AOB(kAobWgLuaAlloc);
+        g_trackLuaMem     = reinterpret_cast<TrackLuaMem_t>(FIND_AOB(kAobTrackLuaMem));
+        if (uint8_t* pNewState = FIND_AOB(kAobLuaNewState)) {
+            bool ok = InstallHookOrdered(pNewState, reinterpret_cast<void*>(&HookLuaNewState), 15,
+                                         reinterpret_cast<void**>(&g_origLuaNewState));
+            LogMsg("[HOOK] lua_newstate @ %p -> %s (simAlloc=%p wgAlloc=%p)",
+                   pNewState, ok ? "OK" : "FAIL", g_simLuaAllocAddr, g_wgLuaAllocAddr);
+        }
 
-    // 2B. Hook lua_close (21-byte RIP-free prologue) -> reset Anti-STW GC lifecycle on VM teardown
-    if (uint8_t* pLuaClose = FIND_AOB(kAobLuaClose)) {
-        bool ok = InstallHookOrdered(pLuaClose, reinterpret_cast<void*>(&HookLuaClose), 21,
-                                     reinterpret_cast<void**>(&g_origLuaClose));
-        LogMsg("[HOOK] lua_close (GC lifecycle reset) @ %p -> %s", pLuaClose, ok ? "OK" : "FAIL");
+        // 2. Hook luaL_openlibs -> auto-register HyperCore_* Lua APIs before any script/mod runs
+        if (uint8_t* pOpenLibs = FIND_AOB(kAobLuaOpenLibs)) {
+            const RelocItem rel = {10, 7, 3}; // mov rax, [rip + disp32] at +10
+            bool ok = InstallHookOrdered(pOpenLibs, reinterpret_cast<void*>(&HookLuaOpenLibs), 17,
+                                         reinterpret_cast<void**>(&g_origLuaOpenLibs), &rel, 1);
+            LogMsg("[HOOK] luaL_openlibs @ %p -> %s", pOpenLibs, ok ? "OK" : "FAIL");
+        }
+
+        // 2B. Hook lua_close (21-byte RIP-free prologue) -> reset Anti-STW GC lifecycle on VM teardown
+        if (uint8_t* pLuaClose = FIND_AOB(kAobLuaClose)) {
+            bool ok = InstallHookOrdered(pLuaClose, reinterpret_cast<void*>(&HookLuaClose), 21,
+                                         reinterpret_cast<void**>(&g_origLuaClose));
+            LogMsg("[HOOK] lua_close (GC lifecycle reset) @ %p -> %s", pLuaClose, ok ? "OK" : "FAIL");
+        }
     }
 
     // 3. Hook Simulation::Update (Profiler + Adaptive GC feedback + outside-DllMain runtime init)
@@ -4013,25 +4124,27 @@ void InitServerHooks() {
         LogMsg("[HOOK] Simulation::Update @ %p -> %s", pSimUpd, ok ? "OK" : "FAIL");
     }
 
-    // 4. Hook Simulation::CollectGarbage (30Hz Pressure-Driven Adaptive GC + Profiler)
-    if (uint8_t* pGC = FIND_AOB(kAobCollectGarbage)) {
-        g_setGcBudget = reinterpret_cast<SetGcBudget_t>(ResolveRel32Call(pGC + 0x8B));
-        bool ok = InstallHookOrdered(pGC, reinterpret_cast<void*>(&HookCollectGarbage), 16,
-                                     reinterpret_cast<void**>(&g_origCollectGarbage));
-        LogMsg("[HOOK] Simulation::CollectGarbage @ %p (SetGcBudget=%p) -> %s",
-               pGC, g_setGcBudget, ok ? "OK" : "FAIL");
-    }
-
-    // 4B. Hook lua_gc (15-byte RIP-free prologue) -> Anti-STW Full-GC Shield for external Lua/Mod collectgarbage("collect")
-    if (g_cfg.enable_anti_stw_gc && g_lua.gc) {
-        auto* pLuaGc = reinterpret_cast<uint8_t*>(g_lua.gc);
-        bool ok = InstallHookOrdered(pLuaGc, reinterpret_cast<void*>(&HookLuaGc), 15,
-                                     reinterpret_cast<void**>(&g_origLuaGc));
-        if (ok && g_origLuaGc) {
-            // Internal calls inside HookCollectGarbage bypass HookLuaGc via the unhooked trampoline
-            g_lua.gc = g_origLuaGc;
+    if (!g_foreignLuaVmDetected.load(std::memory_order_acquire)) {
+        // 4. Hook Simulation::CollectGarbage (30Hz Pressure-Driven Adaptive GC + Profiler)
+        if (uint8_t* pGC = FIND_AOB(kAobCollectGarbage)) {
+            g_setGcBudget = reinterpret_cast<SetGcBudget_t>(ResolveRel32Call(pGC + 0x8B));
+            bool ok = InstallHookOrdered(pGC, reinterpret_cast<void*>(&HookCollectGarbage), 16,
+                                         reinterpret_cast<void**>(&g_origCollectGarbage));
+            LogMsg("[HOOK] Simulation::CollectGarbage @ %p (SetGcBudget=%p) -> %s",
+                   pGC, g_setGcBudget, ok ? "OK" : "FAIL");
         }
-        LogMsg("[HOOK] lua_gc (Anti-STW Shield) @ %p -> %s", pLuaGc, ok ? "OK" : "FAIL");
+
+        // 4B. Hook lua_gc (15-byte RIP-free prologue) -> Anti-STW Full-GC Shield for external Lua/Mod collectgarbage("collect")
+        if (g_cfg.enable_anti_stw_gc && g_lua.gc) {
+            auto* pLuaGc = reinterpret_cast<uint8_t*>(g_lua.gc);
+            bool ok = InstallHookOrdered(pLuaGc, reinterpret_cast<void*>(&HookLuaGc), 15,
+                                         reinterpret_cast<void**>(&g_origLuaGc));
+            if (ok && g_origLuaGc) {
+                // Internal calls inside HookCollectGarbage bypass HookLuaGc via the unhooked trampoline
+                g_lua.gc = g_origLuaGc;
+            }
+            LogMsg("[HOOK] lua_gc (Anti-STW Shield) @ %p -> %s", pLuaGc, ok ? "OK" : "FAIL");
+        }
     }
 
     // 5. Paired, Fail-Closed, Independently AOB-Verified SpatialGrid::Query Hook with Rollback!

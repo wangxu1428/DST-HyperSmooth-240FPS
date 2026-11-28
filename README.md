@@ -2,7 +2,7 @@
   <strong>简体中文</strong> | <a href="README_EN.md">English</a>
 </p>
 
-# DST HyperCore Server v1.6.0-beta1 — Windows & Linux Dedicated Server Native Engine
+# DST HyperCore Server v1.6.0-beta2 — Windows & Linux Dedicated Server Native Engine
 
 > **《饥荒联机版》服务端旗舰级「原生 C++ 引擎 (`bin64/iphlpapi.dll` / `bin64/libhypercore.so`) + 零分歧纯服务端 Mod」双端全栈优化套件**  
 > **Ceiling-Tier Server-Only Native Engine (Windows + Linux x86_64) + Module 10B Replica Pacing + O(N) ReplicaFastPath + Causal 3-Ch RPC QoS + Server HW Tier + Spike Blackbox**  
@@ -15,7 +15,9 @@
 
 ---
 
-## v1.6.0-beta1 核心升级与全模块矩阵 / What's New in v1.6.0-beta1
+## v1.6.0-beta2 核心升级与全模块矩阵 / What's New in v1.6.0-beta2
+
+- **beta2 兼容加固**：`opt_lazy_perishable`（惰性腐烂）默认关闭以优先兼容反鲜大箱子/模组容器（开启时亦自动检测退让）；Windows / Linux 双端新增外源 LuaJIT2 自动检测与原生 GC 钩子安全退让，防止双开启动存档崩溃；新增英文一键安装脚本。
 
 ### 0. Module 10B 零失步分层副本分帧平滑 + `O(N)` 副本极速引擎 + 硬件档位 & 尖峰黑匣子
 - **Module 10B 零失步分层副本构造限流（Replica Construction Pacing）**：进入 1500+ 实体巨型基地或跳虫洞时，自动按距离分桶平滑下发远距静态建筑，消除 250KB RM3 网络洪峰与客户端瞬时卡顿；世界/网络代理、玩家、Classified、背包物品及 14 格近身威胁 0ms 直达，且父先于子提升杜绝挂件失步；支持 `c_hyperpacing()` 实时调参。

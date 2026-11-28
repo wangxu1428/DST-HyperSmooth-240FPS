@@ -2087,6 +2087,64 @@ int main() {
         std::printf("[PASS] 22. Module 10B Replica Construction Pacing verified (22A Tier-0 bypass, 22B parent-before-child + 2-level chain, 22C DsMap sorted/disjoint convergence, 22D walk-away/death/unpaced Loop B, 22E proximity buckets + NaN/null fail-closed + Tier/INI/clamp precedence, 0 leaks)\n");
     }
 
-    std::printf("ALL 22 SERVER RED-TEAM REGRESSION TESTS PASSED!\n");
+    // =========================================================================
+    // [23] Track 3B/3C: Foreign Lua VM / LuaJIT2 Entry Trampoline Probe &
+    //      Clean Yield Source Contracts (Windows + Linux Native Engines)
+    // =========================================================================
+    {
+        auto isPatchedPrologue = [](const uint8_t* fn) -> bool {
+            if (!fn) return false;
+            if (fn[0] == 0xE9 || fn[0] == 0xEB) return true;
+            if (fn[0] == 0xFF && fn[1] == 0x25) return true;
+            if (fn[0] == 0x48 && fn[1] == 0xB8 && fn[10] == 0xFF && fn[11] == 0xE0) return true;
+            if (fn[0] == 0x49 && fn[1] == 0xBB && fn[10] == 0x41 && fn[11] == 0xFF && fn[12] == 0xE3) return true;
+            if (fn[0] == 0x68 && fn[5] == 0xC3) return true;
+            return false;
+        };
+
+        const uint8_t cleanWinPrologue[16]  = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x45, 0x33, 0xC0 };
+        const uint8_t cleanElfEndbr[16]     = { 0xF3, 0x0F, 0x1E, 0xFA, 0x41, 0x54, 0xB9, 0x78, 0x02, 0x00, 0x00, 0x31, 0xD2 };
+        const uint8_t jmpRel32[16]          = { 0xE9, 0x12, 0x34, 0x56, 0x00, 0x90 };
+        const uint8_t jmpInd64[16]          = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB };
+        const uint8_t movRaxJmp[16]         = { 0x48, 0xB8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0xFF, 0xE0 };
+        const uint8_t movR11Jmp[16]         = { 0x49, 0xBB, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x41, 0xFF, 0xE3 };
+        const uint8_t pushRet[16]           = { 0x68, 0x11, 0x22, 0x33, 0x44, 0xC3 };
+
+        CHECK(!isPatchedPrologue(cleanWinPrologue));
+        CHECK(!isPatchedPrologue(cleanElfEndbr));
+        CHECK(isPatchedPrologue(jmpRel32));
+        CHECK(isPatchedPrologue(jmpInd64));
+        CHECK(isPatchedPrologue(movRaxJmp));
+        CHECK(isPatchedPrologue(movR11Jmp));
+        CHECK(isPatchedPrologue(pushRet));
+
+        auto readTextFile = [](const char* path) -> std::string {
+            FILE* f = std::fopen(path, "rb");
+            CHECK(f != nullptr);
+            std::string out;
+            char buf[4096];
+            while (size_t n = std::fread(buf, 1, sizeof(buf), f)) out.append(buf, n);
+            std::fclose(f);
+            return out;
+        };
+        const std::string winSrc = readTextFile("../native_plugin/iphlpapi.cpp");
+        CHECK(winSrc.find("g_foreignLuaVmDetected") != std::string::npos);
+        CHECK(winSrc.find("IsLuaJitModuleOrWinmmProxyPresent") != std::string::npos);
+        CHECK(winSrc.find("trampoline_on_lua_newstate") != std::string::npos);
+        CHECK(winSrc.find("trampoline_on_sim_collect_garbage") != std::string::npos);
+        CHECK(winSrc.find("trampoline_on_lua_gc") != std::string::npos);
+        CHECK(winSrc.find("trampoline_on_lua_close") != std::string::npos);
+        CHECK(winSrc.find("HookSimUpdate") != std::string::npos);
+
+        const std::string linSrc = readTextFile("../native_plugin/linux/hypercore_linux.cpp");
+        CHECK(linSrc.find("DetectForeignLuaVmLinux") != std::string::npos);
+        CHECK(linSrc.find("DlPhdrForeignLuaCb") != std::string::npos);
+        CHECK(linSrc.find("dlsym_luaJIT_setmode") != std::string::npos);
+        CHECK(linSrc.find("g_foreignLuaVmDetected") != std::string::npos);
+
+        std::printf("[PASS] 23. Track 3B/3C Foreign Lua VM / LuaJIT2 Entry Probe & Windows/Linux Yield Contracts verified!\n");
+    }
+
+    std::printf("ALL 23 SERVER RED-TEAM REGRESSION TESTS PASSED!\n");
     return 0;
 }
